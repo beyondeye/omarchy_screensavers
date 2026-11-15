@@ -37,3 +37,6 @@ __pycache__/
 
 # Shadow concern-rejection store (per-task, local-only; pruned at archive)
 .aitask-shadow/
+
+# Scratchpad notes (per-task, local-only; pruned at archive)
+.aitask-scratchpad/
