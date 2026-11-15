@@ -22,3 +22,6 @@
 !.claude/skills/task-workflow-remote-/
 !.agents/skills/task-workflow-remote-codex-/
 !.opencode/skills/task-workflow-remote-/
+
+# Draft tasks (local, not committed)
+aitasks/new/
