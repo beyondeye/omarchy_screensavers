@@ -287,3 +287,103 @@ Step 9 (Post-Implementation): archive via the workflow.
 - timing: post-phase | name: frame_data_guard | type: test | priority: high | effort: low | inline_risk: low | added_complexity: low | addresses: frame-derived data leaking into the commit | desc: grep the staged diff for large literals, cap hex values per scene, confirm .refs/ stays ignored
 - timing: post-phase | name: signature_feasibility | type: test | priority: medium | effort: low | inline_risk: low | added_complexity: low | addresses: unattainable/ambiguous signature lines | desc: check every signature against the reference's own halfblock frame with the scratch sampler; widen or fix failing lines
 - timing: post-phase | name: timeline_handoff | type: chore | priority: medium | effort: low | inline_risk: low | added_complexity: low | addresses: siblings hard-coding 60 s | desc: ait note t1_3/t1_4/t1_5 with the exact total, tick counts, PERF_SECONDS/FRAMES and the transition convention
+
+## Post-Review Changes
+
+### Change Request 1 (2026-11-15 16:10)
+- **Requested by user:** five review findings, all verified as valid:
+  1. (medium) 2b's endpoints (0.35 H in 3.5 s) contradicted its 0.16 H/s speed.
+  2. (medium) the global rule called every sub-shot boundary a hard cut, but 2a → 2b is continuous.
+  3. (medium) several particle systems were missing velocity, size, colour ramp or drag/buoyancy.
+  4. (medium) the branding fg `#f3efe6` against 11d's light sky and smoke could not meet the
+     promised ≥ 0.35 luma contrast.
+  5. (low) reveal starts up to 59.5 s plus a 0.25 s fade overran the 59.5–62.5 full-text hold.
+- **Changes made:**
+  1. Re-measured the 2b rocket tip from the valid reference frames (per-row median background).
+     2b has two phases: a camera zoom-out (12.5–13.4: tip v 0.24 → 0.57, body 0.30 → 0.10 H,
+     modelled as camera zoom 1.0 → 0.33 about (0.50, 0.75), `InOutSine`), then the climb
+     (13.4–16.0: tip (0.51, 0.57) → (0.57, 0.11), progress `CubicBezier(0.25, 0.65, 1.0, 1.0)`,
+     fit rmse 0.005; mean 0.18 H/s; 0.047 H/s of source, consistent with p1_1's ≈0.04).
+     That is now the single authoritative trajectory; the 0.16 H/s line is gone.
+  2. 1.4 now lists the hard-cut boundaries and names 2a → 2b as the one continuous exception; 1.5
+     "Continuous" covers it; 1.7 says a continuous boundary does not clear the pool.
+  3. 1.7 gained a "Particle system fields" block (every field required, plus shared defaults: spawn
+     and speed jitter, linear size/colour interpolation, `OutQuad` alpha fade, pixel/disc drawing).
+     All 21 systems in section 2 and the branding smoke now state rate, life, velocity, size, ramp,
+     drag, buoyancy and peak (checked mechanically).
+  4. Text cells get a bg **luma cap**, `bg = c · min(1, 0.50 / luma(c))`, ramped in with each
+     character's fade and released during the loop fade. Contrast is then ≥ 0.938 − 0.50 = 0.438 by
+     construction. Verified on 11d's reference frames (k 101/112/130): without the cap the default
+     30×5 text box under 0.6-alpha smoke reaches only 0.30 (whole screen 0.155); with it, 0.438.
+  5. Reveal start times are now in [58.0, 59.25], so every 0.25 s fade ends by 59.5.
+- **Files affected:** `aidocs/starship/storyboard.md`
+
+### Change Request 2 (2026-11-15 16:35)
+- **Requested by user:** (medium, verified valid) scene 2's sizes were still inconsistent across the
+  continuous 2a → 2b boundary (2a body 0.45 H / plume 0.35 H, 2b starting at 0.30 H / 0.25 H at
+  zoom 1.0), and the 0.25 H plume contradicted "plume = 1.2 × body".
+- **Changes made:** re-measured the body (steel) and the pink plume separately in the valid 2a/2b
+  reference frames. Scene 2 now uses one rocket model: body `B = 0.55 H · z · s`, width `B/13.7`,
+  pink plume `P = 0.67 · B` (measured ratio, at both ends of the scene) plus a 0.5·B grey trail.
+  The zoom-out actually starts inside 2a: z 1.0 → 0.29 over 11.95–13.3 (`InOutSine`), across the
+  continuous boundary, about the pivot (0.50, 0.77), fitted to the tip (0.08 → 0.57) and the plume
+  start (0.63 → 0.73). The tilt pan ends at 11.6 (measured), and the distance scale s goes
+  1.0 → 0.375 during the climb. A single schedule table (10.0 / 11.6 / 11.95 / 12.5 / 13.3 / 13.4 /
+  16.0) gives camera, s, tip, B, P and tilt, all consistent with the formulas (12.5: z 0.75, tip
+  v 0.25, B 0.41 vs measured 0.23 / 0.37). The climb's bezier and speeds are unchanged.
+- **Files affected:** `aidocs/starship/storyboard.md`
+
+## Final Implementation Notes
+- **Actual work done:** `aidocs/starship/storyboard.md` (Global: grid/units, camera, colour
+  metrics, 64.0 s timeline, transitions, measurement region, particle budget with field defaults
+  and the combined-peak table, reference time mapping with valid spans, easings; the 9 scenes, each
+  with elements, palette, motion, particles, transitions and signature; branding reveal and loop;
+  signatures summary). Doc pointers: one row each in CLAUDE.md and AGENTS.md, one line in README.md.
+  Scratch-only tools (never committed): `sample.py` (map_time / valid_frames / pick / measure,
+  palette, features, rect and check), `fontmetrics.py`, contact-sheet scripts.
+- **Deviations from plan:**
+  - Step 1: `make headless` uses a fixed 120×40 grid, so the cell geometry was read from the
+    rasterizer's font file instead (JetBrainsMono Nerd Font: advance 600, ascent 1020, descent −300,
+    1000 upm → 14×32 px at FONT_PX 24 → 137×33 at 1080p, 274×67 at 4K, pixel aspect 0.875).
+  - Step 3 (optional anim fits) was skipped. The booster fall is an eye estimate from 1 s frames
+    (marked as such). The 2b climb was measured instead by tracking the rocket tip in the valid
+    frames (bezier fit, rmse 0.005).
+  - Step 6: README needed no blob staging. The other README edits had meanwhile been committed by
+    another session (t3, `6dc9005`), so the working-tree diff was exactly our line.
+  - Hex cap: the plan said "about 8 hex values per scene". The palette lines are 5–10 per scene,
+    and with particle ramps and signature colours the distinct values are 6–15 per scene (23 for
+    the four-shot catch), 100 in the doc. It is all short palette data, flagged at review, and the
+    user approved.
+  - Signature list: scene 10 has two signatures (before the bloom, during it) instead of one;
+    2a's is deliberately loose (camera tilt).
+- **Issues encountered:**
+  - The hot-staging range's first frame (77.6 s) still shows the high-altitude whiteout. The
+    cut-distance rule excludes it, as designed.
+  - The parent's "orange flames" at hot staging: the reference shows a blue-white burst, so the
+    doc follows the footage. "Clears to a starfield" at SECO is not in the reference; it was kept
+    as a faint stylistic addition with no signature depending on it.
+  - Two review rounds fixed: the 2b trajectory, the 2a → 2b continuity, incomplete particle
+    definitions, branding contrast and reveal timing (CR1); and scene 2's sizes across the
+    continuous boundary (CR2).
+- **Key decisions:**
+  - total 64.0 s (7680 ticks @120, 3840 @60, PERF_SECONDS 65, FRAMES 7800);
+  - measurement region `v < 0.82` (the HUD band starts at row 55 of 66);
+  - the "near" distance is 48 RGB;
+  - near-black luma < 0.08, bright luma > 0.70;
+  - cross-fades occupy the incoming scene's first d s;
+  - one 5 000 pool with emitters stopped at end_A;
+  - large smoke masses that must pre-exist are billow discs, not particles;
+  - branding text gets a bg luma cap of 0.50 (contrast ≥ 0.438 by construction).
+- **Upstream defects identified:** None
+- **Notes for sibling tasks:**
+  - Read the Global section first. The rules t1_3–t1_5 must follow are 1.3 (metrics), 1.5
+    (transitions), 1.6 (measurement region), 1.7 (particle pool and field defaults) and 1.8 (time
+    mapping, for any animatic comparison).
+  - The tests should render at each signature's t and measure exactly as in section 4. Every line
+    passes against the reference itself, including the ±0.5 s neighbours.
+  - Scene 2 has one rocket model (`B = 0.55 H · z · s`, plume 0.67·B) and a schedule table. The
+    zoom crosses the continuous 2a → 2b boundary.
+  - Scene 1 at t = 0 must have no particles (the loop fade's target).
+  - The scratch sampler was not committed. To re-check a changed signature, reimplement section
+    1.8's valid-frames/pick rules (small, stdlib) against `.refs/starship/` after
+    `frames2text.py extract`.
