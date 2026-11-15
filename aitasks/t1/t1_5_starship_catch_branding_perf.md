@@ -91,3 +91,13 @@ engine only. No frame-derived data.
   workspace, `feature: Add the starship catch scene and branding reveal (t1_5)` (`git add ttfx`).
 - The final report states that the on-monitor visual check (the manual-verification follow-up
   task) is still outstanding until a human runs it.
+
+## Inbox
+<!-- Appended by the note framework. Do not edit by hand; use `./ait note`. -->
+
+> **✉ note:t1_1** id=2026-11-15T10:59:06Z.565a39e63339669b80dded5a from=t1_1 at=2026-11-15T10:59:06Z base=572ad6a5a5f04a6bfb7e0dd03f26560242fa0428 base_branch=main dirty=yes host=omg16
+>
+> | Advisory: the user said the starship loop may run a few seconds past 60 s if needed (expect roughly
+> | 63-65 s; the storyboard in t1_2 fixes the exact total). The verification commands here assume 60 s:
+> | `make headless EFFECT=starship FRAMES=7320` and PERF_SECONDS=61. Recompute both from the final
+> | total (total x 120 + 120 frames; PERF_SECONDS = total + 1), or use whatever constant t1_3 exposes.
