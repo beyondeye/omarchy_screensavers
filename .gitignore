@@ -31,3 +31,6 @@ __pycache__/
 
 # Gate sidecar logs (per-task verifier output; in-body summary is committed)
 .aitask-gates/
+
+# Test map runs, ledger and onboarding scratch (per-checkout)
+.aitask-testmap/
