@@ -101,3 +101,31 @@ palettes from the storyboard.
 > |   frames only), never global time.
 > | - Branding (3): reveal starts in [58.0, 59.25] (0.25 s fades), and the text cells' bg gets a luma
 > |   cap of 0.50, so fg #f3efe6 has contrast >= 0.438.
+
+> **✉ note:t1_3** id=2026-11-15T21:30:55Z.e97b1b44bef5fcb5b996b58b from=t1_3 from_verified=yes at=2026-11-15T21:30:55Z base=b35a6054cd70fa4762e4dfd47a45bd22f64909da base_branch=main dirty=no host=omg16
+>
+> | Advisory, from t1_3 (starship skeleton), as of commit b35a605 (ttfx de82884, omarchy-screensaver e39c449).
+> | The full record is the archived plan aiplans/archived/p1/p1_3_starship_effect_skeleton.md ("Notes for sibling tasks").
+> | 
+> | - Bounded palette: every fg/bg the effect emits must be an entry of the fixed palette P
+> |   (ttfx/src/effects/starship/palette.rs). ttfx never frees cell appearances, so P×P is the
+> |   memory bound. P_CAP = 340 and |P| = 317 today: only about 23 entries of headroom for scenes
+> |   4/5/6/9/10. Add each scene's gradients as RAMPS_* in ALL_RAMPS, reuse storyboard colours, or
+> |   prune the 4×4×4 coverage cube first.
+> | - After any palette change, re-run `cargo test --release --test starship_pool_ceiling`. It
+> |   saturates P×P, replays the screensaver's rebuild overlap and requires ≤ 64 MB (55.7 MB now).
+> |   Also re-run `palette_error_*`.
+> | - The plan's `render_scene_only(scene, t)` is `Starship::render_only(scene)` in the code: the
+> |   last frame's state with one scene's layer.
+> | - One emission path: only `emit_appearance` may call `set_appearance` (test
+> |   `emission_path_shared`).
+> | - Scenes: `scenes/<name>.rs` with `step(world, rng, t, dt)` and `draw(world, t, buf)`,
+> |   dispatched in `scenes/mod.rs`. Emitters use `World::spawn` with a `Slot`. Particle sizes and
+> |   1 px details are defined at 137×66 and must scale with `buf.h / 66`, or the 4K signatures
+> |   drift.
+> | - Tests: drop scenes from PLACEHOLDER_SCENES and add their rows to SIGS in
+> |   ttfx/tests/starship.rs.
+> | - Perf: `make perf EFFECT=starship RES=4k` (and `TTFX_STARSHIP_STRESS=1` for the
+> |   every-cell-changes stress). On this hybrid CPU, pin with `taskset -c 0-7` and compare runs
+> |   taken under the same load. render_delta now redraws only changed cells, so raster cost
+> |   follows the changed-cell count.
