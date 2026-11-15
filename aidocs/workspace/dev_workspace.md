@@ -14,6 +14,8 @@ omarchy_screensavers/
 
 Both submodules are forks of `omacom/...`. Each has `origin` (the fork, where you
 push) and `upstream` (omacom, where PRs go). `make setup` adds the `upstream` remotes.
+Working through your own forks instead? `make use-forks` re-points `origin` at them; see
+[contributing_with_forks.md](contributing_with_forks.md).
 
 ## The loop
 

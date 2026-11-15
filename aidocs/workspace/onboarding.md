@@ -8,6 +8,8 @@
 - `gh` (GitHub CLI), logged in, if you will push or open PRs
 - Push access to `beyondeye/omarchy_screensavers`, `beyondeye/ttfx` and
   `beyondeye/omarchy-screensaver`. Ask the owner to add you as a collaborator on all three.
+  No push access, or you'd rather use your own forks? Follow
+  [contributing_with_forks.md](contributing_with_forks.md) instead.
 
 ## 2. Clone
 
@@ -63,8 +65,7 @@ submodule in `.gitmodules`.)
 
 ```bash
 git pull                     # the workspace, including new submodule pointers
-git submodule update         # check out the pinned submodule commits (detached HEAD)
-make setup                   # back onto the tracked branches
+make sync                    # fetch the submodules, check out the pins, back onto the tracked branches
 git -C ttfx pull             # newest commits on that branch, if past the pin
 ```
 

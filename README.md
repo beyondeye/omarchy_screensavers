@@ -11,7 +11,11 @@ cd omarchy_screensavers && make setup && ./ait setup
 make try
 ```
 
+That's for collaborators with push access. To work through your own forks instead, see
+[Contributing with forks](aidocs/workspace/contributing_with_forks.md).
+
 All documentation is in [`aidocs/`](aidocs/):
-- [Onboarding](aidocs/workspace/onboarding.md): set up and start working
+- [Onboarding](aidocs/workspace/onboarding.md): set up and start working (collaborators)
+- [Contributing with forks](aidocs/workspace/contributing_with_forks.md): the same, through your own forks
 - [The dev workspace](aidocs/workspace/dev_workspace.md): layout, the stub effect, submitting upstream
 - [Testing](aidocs/testing/manual_testing.md): manual testing, step by step
