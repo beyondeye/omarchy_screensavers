@@ -51,3 +51,6 @@ __pycache__/
 aiwork/
 .aitask-crews/
 
+
+# Reference frames derived from local videos (never commit)
+/.refs/
