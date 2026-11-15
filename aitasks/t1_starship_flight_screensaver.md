@@ -6,7 +6,7 @@ issue_type: feature
 status: Ready
 labels: [screensaver, effect, tooling]
 created_at: 2026-11-15 08:51
-updated_at: 2026-11-15 08:51
+updated_at: 2026-11-15 08:57
 ---
 
 ## Goal
@@ -92,9 +92,52 @@ Numbers and words only; no images or text-art frames.
 
 - Implement it in `ttfx/` as a new effect, using the stub as the template. There are three
   touch points; see `aidocs/workspace/dev_workspace.md`.
-- It draws on the whole canvas, not only the input text. Study how `matrix`, `smoke`, `beams`
-  and `sweep` use fill characters (`CharacterFilter.inner_fill_chars` / `outer_fill_chars`
-  in `ttfx/src/engine/terminal.rs`).
+
+### Engine decision (settled 2026-11-15)
+
+**Use ttfx's original engine** (`ttfx/src/engine/`, the `engine::effect::Effect` trait with
+`build` / `next_frame -> Option<String>`). Do **not** target the fx engine (`ttfx/src/fx/`),
+and add `EffectCommand::Starship(_) => None` in `src/fx/effects/mod.rs` like the stub.
+
+Why:
+- **The screensaver only runs the original engine.** `omarchy-screensaver/src/engine.rs`
+  builds an `EngineCtx` and calls `command.build_effect()`; nothing there calls `ttfx::fx`.
+  An fx-only effect would never play in the screensaver.
+- The fx engine is a byte-identical rebuild of the same character/scene model, and only speeds
+  up the `ttfx` CLI. A port can come later if CLI performance ever matters.
+- The engine's usual model (every input character gets scenes of frames and a path to its
+  home position) is built for text effects, and doesn't fit rocket scenes.
+
+**Pattern: draw your own buffer, then copy it onto the fill characters.**
+1. Each tick, draw the scene into the effect's own cell buffer (`symbol, fg, bg` per cell).
+   Use half-blocks (`▀`) with a separate fg/bg colour for 2 vertical "pixels" per cell.
+2. Copy that buffer onto the canvas's fill characters (`CharacterFilter` with
+   `inner_fill_chars` + `outer_fill_chars`, which covers the whole canvas) with
+   `ch.animation.set_appearance(input_symbol, uses_pre, Some(symbol), Some(ColorPair))`, the
+   same call `ttfx/src/effects/matrix.rs` makes. Keep a shadow buffer and touch only cells
+   that changed since the last frame. Make the fill characters visible
+   (`set_character_visibility`).
+3. Return `Some(ctx.frame())`. Let the engine format the frame.
+
+Verified facts this relies on:
+- The screensaver's parser (`omarchy-screensaver/src/vt.rs`) handles truecolor fg and bg
+  (`38;2` / `48;2`), cursor position and clears. Its `Cell` is `{ch, fg, bg}`, so half-block
+  output displays exactly.
+- **Don't** have the effect write its own frame string instead of using `ctx.frame()`. The
+  screensaver would show it, but the `ttfx` CLI on a tty ignores the frame string and draws
+  from the engine's internal grid (`print_differential_frame` in `ttfx/src/engine/terminal.rs`),
+  so `make try` would break after the first frame.
+
+Timing: define every duration in **seconds** and convert using the frame rate in the config
+(`ctx.terminal.config.frame_rate`). The screensaver runs at 120 (`FRAME_RATE` in
+`omarchy-screensaver/src/engine.rs`); the ttfx CLI defaults to 60 (`--frame-rate`). Return
+`None` after ~60 s: the screensaver then rebuilds the effect, so looping comes for free.
+
+Reuse the engine's helpers: `utils::easing` for camera moves and motion, `ctx.rng` for
+`--seed` determinism, and the input characters' positions/symbols if the branding text is shown.
+
+### Drawing
+
 - Build it from parametric primitives: polygons rasterised to half-blocks (rocket body, fins,
   tower lattice, chopstick arms); particle systems (smoke billows, flames, ice, stars, sparks);
   gradients (sky, Earth limb and atmosphere glow, sun glare, plume bloom); simple camera pans
@@ -103,9 +146,8 @@ Numbers and words only; no images or text-art frames.
   **Not allowed:** embedded bitmaps, frame dumps or big ASCII-art strings taken from the video.
 - Decide what happens to the branding text (`screensaver.txt`), for example revealed in the
   clouds or smoke after the catch, or shown at the start. Ask the user during planning.
-- Check pacing: the screensaver always runs at 120 Hz (omarchy-screensaver "Always run at
-  120 Hz"), while ttfx's own frame rate defaults differ. Make the effect last ~60 s in the
-  screensaver, not only in a terminal.
+- Check pacing in both places (see Timing above): ~60 s in the screensaver (`make run`/
+  `make headless`, which runs at 120 fps) and in `make try` (60 fps by default).
 - Performance: it must keep up at 120 Hz on a large grid. Use `make benchmark` in
   omarchy-screensaver and ttfx's own timing tools.
 
