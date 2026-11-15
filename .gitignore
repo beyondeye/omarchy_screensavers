@@ -1,0 +1,24 @@
+# Task data (lives on aitask-data branch, accessed via symlinks)
+/.aitask-data
+/aitasks
+/aiplans
+
+# Per-profile rendered skill variants (on-demand, not committed)
+# Convention: rendered dirs end with a trailing hyphen; authoring
+# dirs never do. See https://www.aitasks.io/docs/concepts/skill-templating/
+.claude/skills/*-/
+.agents/skills/*-/
+.opencode/skills/*-/
+
+# Pre-rendered headless variants, committed so the skill works where
+# 'ait setup' has not run (e.g. Claude Code Web). Negations win only
+# when they follow the broad patterns above.
+!.claude/skills/aitask-pickrem-remote-/
+!.agents/skills/aitask-pickrem-remote-codex-/
+!.opencode/skills/aitask-pickrem-remote-/
+!.claude/skills/aitask-pickweb-remote-/
+!.agents/skills/aitask-pickweb-remote-codex-/
+!.opencode/skills/aitask-pickweb-remote-/
+!.claude/skills/task-workflow-remote-/
+!.agents/skills/task-workflow-remote-codex-/
+!.opencode/skills/task-workflow-remote-/
