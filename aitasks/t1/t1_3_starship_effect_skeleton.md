@@ -212,3 +212,30 @@ Verified facts (from parent planning):
 > | PERF_SECONDS ?= 61 / 7320 ticks / "7200-tick timeline" and FRAMES=7320. Take the total from the
 > | storyboard's timeline table (t1_2) instead: one TOTAL_SECONDS constant in the timeline, with the test
 > | and PERF_SECONDS/FRAMES derived from it (total + 1 s for the rebuild tick).
+
+> **✉ note:t1_2** id=2026-11-15T15:48:55Z.6195dd2fab63d02735f7a2af from=t1_2 from_verified=yes at=2026-11-15T15:48:55Z base=0a42c015f1bee2afddc3320cad0ebd28c541fb0e base_branch=main dirty=no host=omg16
+>
+> | Advisory, from t1_2 (starship storyboard), as of commit 0a42c01. The spec is now
+> | aidocs/starship/storyboard.md. It fixes these numbers and rules:
+> | 
+> | - Total length 64.0 s (58.0 s scenes + 6.0 s branding: form 58.0-59.5, hold 59.5-62.5,
+> |   loop fade 62.5-64.0). 7680 ticks @120 fps, 3840 @60 fps. PERF_SECONDS = 65 and
+> |   FRAMES = 7800 (total + 1 s). Anything hard-coding 60 s / 7200 / 7320 should take these from
+> |   one TOTAL_SECONDS constant instead.
+> | - Transitions (1.5):
+> |   - a cross-fade of length d occupies the FIRST d s of the incoming scene, and the outgoing scene
+> |     keeps its own clock; w = InOutSine. Fades: 1->2 0.5 s, 5->6 1.0 s;
+> |   - 2a->2b and 11d->B are continuous (no blend, no pool clear); every other boundary is a hard cut.
+> | - Signatures are measured ONLY inside the normalised region u in [0,1), v in [0,0.82)
+> |   (pixel centre inside; denominator = pixels in the region), over half-block pixels (fg = top,
+> |   bg = bottom). near = RGB distance <= 48; near-black = luma < 0.08; bright = luma > 0.70
+> |   (Rec.709). Section 4 lists every signature with its test time; all pass against the reference.
+> | - Particles (1.7): one pool of fixed capacity 5 000, allocated in build, with overflow spawns
+> |   dropped deterministically. At a cross-fade the outgoing emitters stop at end_A and their particles
+> |   are killed at the end of the fade. A hard cut clears the pool. Scene 1 at t = 0 has no particles
+> |   (it is the loop fade's target). Every system states rate, life, velocity, size, ramp, drag,
+> |   buoyancy and peak; shared defaults are in 1.7.
+> | - Comparisons with the animatic use the reference time mapping (1.8: linear per sub-shot, valid
+> |   frames only), never global time.
+> | - Branding (3): reveal starts in [58.0, 59.25] (0.25 s fades), and the text cells' bg gets a luma
+> |   cap of 0.50, so fg #f3efe6 has contrast >= 0.438.
