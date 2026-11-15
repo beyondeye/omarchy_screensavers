@@ -111,3 +111,5 @@ Decisions already settled (do not re-ask):
 > | 63-65 s is acceptable. Compress only where it reads better, not to hit 60 s exactly. Whatever total
 > | you settle on, state it explicitly in the timeline table: t1_3 and t1_5 size their tick counts and
 > | perf/headless frame counts from it.
+
+> **👁 note:read** id=2026-11-15T11:05:57Z.0dde34fb6aa34283a8738c74 by=t1_2 at=2026-11-15T11:05:57Z mode=explicit ids=2026-11-15T10:58:06Z.2ad0f5057bb5d090a9c7c064,2026-11-15T10:59:03Z.2e3a95571eabe0ec9cecab28
