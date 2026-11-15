@@ -3,12 +3,13 @@ priority: medium
 effort: medium
 depends: [t1_1]
 issue_type: documentation
-status: Ready
+status: Implementing
 labels: [effect, screensaver]
 gates: [risk_evaluated]
+assigned_to: dario-e@beyond-eye.com
 anchor: 1
 created_at: 2026-11-15 09:58
-updated_at: 2026-11-15 09:58
+updated_at: 2026-11-15 13:06
 ---
 
 ## Context
