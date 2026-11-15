@@ -3,12 +3,13 @@ priority: high
 effort: high
 depends: [t1_2]
 issue_type: feature
-status: Ready
+status: Implementing
 labels: [effect, screensaver, tooling]
 gates: [risk_evaluated]
+assigned_to: dario-e@beyond-eye.com
 anchor: 1
 created_at: 2026-11-15 09:59
-updated_at: 2026-11-15 09:59
+updated_at: 2026-11-15 17:53
 ---
 
 ## Context
