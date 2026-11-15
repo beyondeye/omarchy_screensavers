@@ -1,0 +1,747 @@
+# Project-level configuration (git-tracked, shared across team)
+#
+# This file configures project-specific settings used by the aitask workflow.
+# It is copied from seed/ during `ait setup` — edit it to match your project.
+#
+# For per-user settings (email, etc.), use aitasks/metadata/userconfig.yaml instead.
+# For workflow behavior (skip prompts, etc.), use execution profiles in aitasks/metadata/profiles/.
+#
+# ──────────────────────────────────────────────────────────────────────
+# project — Logical identity for this aitasks project.
+#
+# Used by the cross-repo project registry. When `ait projects add` is run
+# in this directory (or auto-fired by `ait ide`), `project.name` becomes
+# the logical key under which the project is registered in the per-user
+# index at `~/.config/aitasks/projects.yaml`. Other repos then refer to
+# this project by `name` (e.g. `ait projects exec <name> -- <cmd>` or
+# `ait create --batch --project <name> ...`) without hardcoding a path.
+#
+# Fields:
+#   name        — Logical project name. Defaults to the directory basename
+#                 if omitted. Lowercase, [a-z0-9_-].
+#   git_remote  — Optional. The canonical clone URL (`git remote get-url
+#                 origin`). Used today only for display in `ait projects
+#                 list`; future tooling may use it to auto-clone on
+#                 `NOT_FOUND`.
+#   project_group — Optional. Bootstrap seed for this repo's project-group (the
+#                 umbrella grouping connected repos in TUI navigation). Slug:
+#                 ^[a-z0-9][a-z0-9_-]*$. Seeds the per-user registry on
+#                 `ait projects add`; the registry value wins thereafter.
+#                 Manage with `ait projects group set/unset/sync`.
+#
+# Example:
+#
+#   project:
+#     name: aitasks
+#     git_remote: https://github.com/beyondeye/aitasks.git
+#     project_group: aitasks_suite
+#
+# See aidocs/framework/cross_repo_references.md for the full registry schema and
+# resolver semantics.
+# ──────────────────────────────────────────────────────────────────────
+
+# project:
+#   name:
+#   git_remote:
+#   project_group:
+
+# ──────────────────────────────────────────────────────────────────────
+# codeagent_coauthor_domain — Email domain for custom AI code-agent commit coauthors.
+#
+# Used by the shared task-workflow commit-attribution logic for supported
+# code agents. The resulting coauthor email format is:
+#
+#   <agent>@<codeagent_coauthor_domain>
+#
+# Example:
+#
+#   # Codex
+#   codeagent_coauthor_domain: aitasks.io
+#   # → codex@aitasks.io
+#
+# If omitted or left empty, workflows fall back to `aitasks.io`.
+# ──────────────────────────────────────────────────────────────────────
+
+codeagent_coauthor_domain: aitasks.io
+
+# ──────────────────────────────────────────────────────────────────────
+# verify_build — Shell command(s) to verify the build after merging.
+#
+# Used by post-implementation steps in task-workflow, aitask-pickrem, and
+# aitask-pickweb to verify the build still passes after implementation.
+#
+# Options:
+#   - Omit or leave empty: build verification is skipped
+#   - Single string: one command
+#   - List of strings: run each sequentially, stop on first failure
+#
+# An INLINE-LIST ITEM containing a comma must use the block ("- ...") form
+# instead: the inline [a, b] form splits on every comma, including one inside
+# quotes. A single scalar command is unaffected -- "pytest -k 'a,b'" is read
+# whole.
+#
+# If the build fails due to this task's changes, the agent automatically
+# goes back to fix and re-runs. Pre-existing failures are logged and skipped.
+#
+# Examples by project type:
+#
+#   # Android (Kotlin/Java with Gradle):
+#   verify_build: "JAVA_HOME=/opt/android-studio/jbr ./gradlew assembleDebug"
+#
+#   # Rust:
+#   verify_build: "cargo build"
+#
+#   # Python:
+#   verify_build: "python -m py_compile main.py"
+#
+#   # Node.js / TypeScript:
+#   verify_build: "npm run build"
+#
+#   # Go:
+#   verify_build: "go build ./..."
+#
+#   # C++ with CMake:
+#   verify_build:
+#     - "cmake -B build"
+#     - "cmake --build build"
+#
+#   # Multi-step (install + build + test):
+#   verify_build:
+#     - "npm install"
+#     - "npm run build"
+#     - "npm test"
+# ──────────────────────────────────────────────────────────────────────
+
+verify_build:
+
+# ──────────────────────────────────────────────────────────────────────
+# test_command — Shell command(s) to run project tests.
+#
+# Used by /aitask-qa skill to execute tests and verify test coverage.
+# Accepts a single command string or a YAML list of commands.
+# Leave blank to let aitask-qa auto-detect tests from project structure.
+#
+# An INLINE-LIST ITEM containing a comma must use the block ("- ...") form
+# instead: the inline [a, b] form splits on every comma, including one inside
+# quotes. A single scalar command is unaffected -- "pytest -k 'a,b'" is read
+# whole.
+#
+# Examples by project type:
+#
+#   # Python:
+#   test_command: "pytest"
+#
+#   # JavaScript:
+#   test_command: "npm test"
+#
+#   # Go:
+#   test_command: "go test ./..."
+#
+#   # Rust:
+#   test_command: "cargo test"
+#
+#   # Shell (aitasks):
+#   test_command: "bash tests/test_*.sh"
+#
+#   # Multi-step:
+#   test_command:
+#     - "npm run unit"
+#     - "npm run integration"
+# ──────────────────────────────────────────────────────────────────────
+
+test_command:
+
+# ──────────────────────────────────────────────────────────────────────
+# lint_command — Shell command(s) to lint/check project code.
+#
+# Used by /aitask-qa skill to run linting on changed files.
+# Accepts a single command string or a YAML list of commands.
+# Leave blank to skip linting or let aitask-qa auto-detect.
+#
+# An INLINE-LIST ITEM containing a comma must use the block ("- ...") form
+# instead: the inline [a, b] form splits on every comma, including one inside
+# quotes. A single scalar command is unaffected -- "pytest -k 'a,b'" is read
+# whole.
+#
+# Examples by project type:
+#
+#   # Python:
+#   lint_command: "ruff check ."
+#
+#   # JavaScript:
+#   lint_command: "eslint ."
+#
+#   # Go:
+#   lint_command: "golangci-lint run"
+#
+#   # Rust:
+#   lint_command: "cargo clippy"
+#
+#   # Shell:
+#   lint_command: "shellcheck .aitask-scripts/aitask_*.sh"
+# ──────────────────────────────────────────────────────────────────────
+
+lint_command:
+
+# ──────────────────────────────────────────────────────────────────────
+# resource_admission_command — Asked whether this host can afford to START
+# implementing a task.
+#
+# Consulted once by task-workflow Step 7, after the plan is approved and the
+# remote drift check has passed, and BEFORE any branch or worktree is cut.
+# Implementation and verification are usually the memory-bound phases; this is
+# where a project gets to say "not right now" instead of OOMing mid-run.
+#
+# ONE command (unlike the keys above, which take a list) — a project needing
+# several probes points this at one wrapper script. A list value is refused
+# whatever its length, so there is no length-dependent edge: ["./probe.sh"] is
+# rejected exactly as [a, b] is.
+#
+#   exit 0  -> admit: implementation proceeds
+#   exit 2  -> defer: the task returns to Ready KEEPING its approved plan, so
+#              the next pick skips planning (`ait ls --plan-approved` finds it)
+#   other   -> error: also defers, and says the hook could not be evaluated
+#
+# Print an `ADMISSION_REASON: <text>` line to tell the user why. Everything
+# else the command prints goes to a log, whose path is reported with the stop.
+#
+# Leave blank to disable — unset means this step does nothing at all: no
+# prompt, no display, no file.
+#
+#   # Refuse below 8 GiB of available memory:
+#   resource_admission_command: "./tools/check_memory.sh"
+#
+#     #!/usr/bin/env bash
+#     avail_gib=$(awk '/^MemAvailable:/ {printf "%d", $2/1048576}' /proc/meminfo)
+#     if [ "$avail_gib" -lt 8 ]; then
+#         echo "ADMISSION_REASON: only ${avail_gib} GiB available, need 8"
+#         exit 2
+#     fi
+# ──────────────────────────────────────────────────────────────────────
+
+resource_admission_command:
+
+# ──────────────────────────────────────────────────────────────────────
+# gate_command_exit_contract — Which of the THREE GATE command keys above
+# (verify_build, test_command, lint_command) speak the gate exit contract, so
+# an exit of 2 means "I did not run" (a gate SKIP) instead of "I ran and
+# failed".
+#
+# resource_admission_command is NOT one of them and cannot be listed here: it
+# is not a gate, and its exit 2 already has a fixed meaning of its own
+# ("defer this task"), defined at that key rather than opted into here.
+#
+# The three machine gates that run project commands — build_verified
+# (verify_build), tests_pass (test_command) and lint (lint_command) — treat
+# EVERY non-zero exit as a failure by default, 2 included. A command that
+# deliberately reports "did not run" is therefore recorded as a red gate; on
+# tests_pass (blocks_dependents: true) that also holds back every task that
+# depends on this one, for a run that never executed.
+#
+# The contract is NOT gate-only. The same three keys are also run as the
+# post-implementation build-verification step (/aitask-pick, /aitask-pickrem,
+# /aitask-pickweb) and by /aitask-qa; opting a key in here covers every one of
+# them, so a command cannot mean one thing to a gate and another to the
+# build step. What each does with a skip differs: a gate is satisfied and
+# releases dependents, the build step proceeds without sending the agent back
+# to fix a build that never ran, and qa scores the component N/A rather than 0.
+#
+# List a key here and that key's command(s) are read as:
+#
+#     exit 0  -> pass
+#     exit 1  -> fail
+#     exit 2  -> skip  ("evaluated, not applicable" — satisfies the gate,
+#                       releases dependents, stays distinct from pass in the
+#                       ledger history)
+#     anything else -> fail
+#
+# One exception, and it is not an opt-out: a command that cannot be PARSED
+# never ran, so it is always recorded as a FAIL, never a skip — even with the
+# key listed here. bash exits 2 on a syntax error, and letting that count as
+# "evaluated, not applicable" would release dependents for work that never
+# happened. exit 2 means the command RAN and reported it did not do the work.
+#
+# Only the documented skip code is a skip: an unexpected status can never be
+# laundered into one.
+#
+# WHY OPT-IN, and why per key: exit 2 is NOT free to reserve. GNU make exits 2
+# on a build error and pytest exits 2 on interrupt, so `verify_build: "make"`
+# would silently turn real build failures into satisfied gates. A project may
+# legitimately want the contract on for test_command and off for verify_build.
+#
+# Accepted entries: verify_build, test_command, lint_command. Anything else is
+# a typo — it is ignored (it never changes a gate result), and reported on the
+# gate-run block's `Note:` line so a misspelling does not look identical to
+# "not opted in".
+#
+# COMMAND LISTS: a failure short-circuits the list; a skip does not. Any fail
+# wins, else any skip makes the gate a skip, else it passes.
+#
+# Examples:
+#
+#   # A test command serialised behind a host-global lock: it exits 2 when
+#   # another worktree holds the lock, so nothing was run and nothing failed.
+#   gate_command_exit_contract: [test_command]
+#
+#   # Block form:
+#   gate_command_exit_contract:
+#     - test_command
+#     - lint_command
+# ──────────────────────────────────────────────────────────────────────
+
+gate_command_exit_contract:
+
+# ──────────────────────────────────────────────────────────────────────
+# attachments_gc_grace — Grace window before `ait attach gc` reclaims a
+# FULLY-orphaned attachment blob (one no active OR archived task references).
+#
+# Archiving a task never dereferences its attachments — an archived task is a
+# real referrer (browsable history), so its blobs are kept indefinitely. This
+# knob only governs blobs left unreferenced by `ait attach rm` or by deleting a
+# task; gc skips any orphan younger than the grace window.
+#
+# Accepts a duration: 30d / 24h / 90m / 120s, or a bare integer (seconds).
+# Default: 30d. `ait attach gc` is opt-in (never run automatically by archive).
+#
+# Example:
+#   attachments_gc_grace: 30d
+# ──────────────────────────────────────────────────────────────────────
+
+# attachments_gc_grace: 30d
+
+# ──────────────────────────────────────────────────────────────────────
+# artifacts — Backend registry for versioned task artifacts (`ait artifact`).
+#
+# Describes how to reach the storage backends that hold artifact blobs, so an
+# artifact handle (art:<id>) created on one machine resolves on any machine
+# with this config. The `local` backend (blobs on the task-data branch) is
+# ALWAYS registered and needs no configuration — omit this whole block unless
+# you want a shared store.
+#
+# `default_backend` names the backend `ait artifact create` uses when
+# --backend is not given (default: local). `backends.<name>` registers a
+# backend; each entry carries only that backend's non-secret coordinates.
+#
+# SECRETS NEVER GO HERE — this file is git-tracked and team-shared.
+# Credentials for remote backends belong in env vars or gitignored per-user
+# files (remote adapters: s3 t1089, gdrive t1090).
+#
+# `dir` backend: a directory root shared by every checkout — a NAS mount,
+# network share, or USB drive. `path` must be ABSOLUTE and is the SAME for
+# the whole team: every participating machine must mount the share at that
+# path (use a symlink if your mountpoint differs). The root must already
+# exist ("is the share mounted?" guard) — only shard subdirs are created —
+# and must be initialized ONCE, with the share mounted:
+#   ait artifact init-store dir
+# which writes a store marker into the root. Every operation refuses a root
+# without the marker, so an unmounted share's empty mountpoint directory or a
+# wrong path is never mistaken for the store. Design:
+# aidocs/unified_artifact_design.md §6.
+#
+# Example:
+#   artifacts:
+#     default_backend: dir
+#     backends:
+#       dir:
+#         path: /mnt/share/ait-artifacts
+#
+# `gitbranch` backend: blobs on a dedicated git branch of THIS repository
+# (default name aitask-artifacts), so they stay in git without growing the
+# task-data branch. No mount and no secret. When the repository has an
+# `origin`, every write is pushed there and succeeds only once origin accepts
+# it, so origin must be reachable; without an `origin`, the local branch is
+# the store. The branch is created by the first artifact write, or eagerly by:
+#   ait artifact init-store gitbranch
+# It must be a branch that does not exist yet (or is already this store) —
+# an existing ordinary branch is refused, and main, master, aitask-data,
+# aitask-locks, aitask-ids and HEAD are reserved. To rename it once the store
+# exists, run `ait artifact gitbranch-migrate --from <old> --to <new>`, then
+# change `branch:` here. `ait settings` (Artifacts tab, `k`) edits this block.
+#
+# Example:
+#   artifacts:
+#     default_backend: gitbranch
+#     backends:
+#       gitbranch:
+#         branch: aitask-artifacts
+# ──────────────────────────────────────────────────────────────────────
+
+# artifacts:
+#   default_backend: dir
+#   backends:
+#     dir:
+#       path: /mnt/share/ait-artifacts
+
+# artifacts:
+#   default_backend: gitbranch
+#   backends:
+#     gitbranch:
+#       branch: aitask-artifacts
+
+# ──────────────────────────────────────────────────────────────────────
+# doc_update — Spec for the `docs_updated` procedure gate (a gate a task can
+# declare in its `gates:` to require its docs be updated).
+#
+# `guide` points at the project's doc-update guide — how docs are updated for a
+# change (where docs live, format/styling, which code-change kind maps to which
+# docs). `ait setup` installs the generic default guide to the path below; edit
+# that file to describe your project's own doc layout and conventions.
+# `extra_guides` (optional) layers additional reference guides on top.
+# ──────────────────────────────────────────────────────────────────────
+doc_update:
+  guide: aitasks/metadata/doc_update_guide.md
+  # extra_guides: []
+
+# ──────────────────────────────────────────────────────────────────────
+# learn_skill_authoring_guide — Skill-authoring guide applied by
+# /aitask-learn-skill when it generates a new skill (generate.md).
+#
+# Points at the skill-authoring best-practices guide the generated skill should
+# follow. `ait setup` installs the generic default below (from seed/reviewguides/);
+# leave this UNSET to use that default. Set it to your project's own house guide
+# to override.
+#
+# Do NOT point this at aidocs/framework/skill_authoring_conventions.md — those are
+# framework-internal (stubs/profiles/goldens) and must not be adopted by a user's
+# own generated skill.
+#
+# Example:
+#   learn_skill_authoring_guide: aireviewguides/aiagents/skill_authoring_best_practices.md
+# ──────────────────────────────────────────────────────────────────────
+
+# learn_skill_authoring_guide:
+
+# ──────────────────────────────────────────────────────────────────────
+# default_profiles — Default execution profile for each skill.
+#
+# Maps skill names to profile names (without .yaml extension). When a
+# skill starts, it checks this setting before prompting for a profile.
+# Users can override per-skill in userconfig.yaml (gitignored, personal).
+# The --profile argument on any skill overrides both.
+#
+# Valid skill names: pick, fold, review, pr-import, revert, explore,
+#                    pickrem, pickweb, qa, shadow, brainstorm-discuss
+#
+# Resolution order:
+#   1. --profile <name> argument (highest priority)
+#   2. userconfig.yaml default_profiles.<skill> (personal)
+#   3. project_config.yaml default_profiles.<skill> (team)
+#   4. Interactive selection / auto-select (fallback)
+#
+# Examples:
+#
+#   # Team-wide: use 'fast' for pick, 'default' for review
+#   default_profiles:
+#     pick: fast
+#     review: default
+#
+#   # Set all interactive skills to 'fast'
+#   default_profiles:
+#     pick: fast
+#     fold: fast
+#     review: fast
+#     pr-import: fast
+#     revert: fast
+#     explore: fast
+#     qa: fast
+#
+#   # Remote skills: use 'remote' profile
+#   default_profiles:
+#     pickrem: remote
+#     pickweb: remote
+# ──────────────────────────────────────────────────────────────────────
+
+default_profiles:
+
+# ──────────────────────────────────────────────────────────────────────
+# Release notifications — `ait release-notify` comments "Released in <tag>"
+# on the issues whose fixes ship in a release. It posts only when the release
+# is verifiably published, and only from one designated machine.
+#
+# release_notify_host
+#   The one machine that posts, compared byte-for-byte with `hostname`. Unset
+#   means no machine posts. There is no automatic failover: to move it, make
+#   sure no run is in progress on the old machine, change the value, then run
+#   `./ait sync` on both machines.
+#
+# release_publication_workflow
+#   GitHub only: a workflow file whose run for the tag and its commit must
+#   have concluded `success`.
+#
+# release_publication_assets
+#   Asset names that must be uploaded, non-empty release assets. A string or
+#   a list. Only {tag} and {version} (the tag without a leading v) may appear.
+#
+# release_publication_checksum_manifests
+#   Globs of sha256sum manifests among the assets; every file a matching
+#   manifest lists must itself be a published asset.
+#
+# With none of the release_publication_* keys set, the release must only
+# exist, match the tag, and not be a draft or upcoming.
+#
+# Example:
+#   release_notify_host: build-box
+#   release_publication_workflow: release.yml
+#   release_publication_assets:
+#     - myapp-{tag}.tar.gz
+#     - myapp_{version}_amd64.deb
+#   release_publication_checksum_manifests: "*_SHA256SUMS.txt"
+# ──────────────────────────────────────────────────────────────────────
+
+# ──────────────────────────────────────────────────────────────────────
+# tmux — Tmux integration settings.
+#
+# These settings control how aitasks integrates with tmux sessions.
+# ──────────────────────────────────────────────────────────────────────
+
+tmux:
+  # ──────────────────────────────────────────────────────────────────
+  # default_session — tmux session name used by `ait ide` and other TUIs.
+  #
+  # Set automatically during `ait setup` (you are prompted for the name
+  # with "aitasks" as default). Edit here to change the team default.
+  # Write it as a single-line plain or quoted value. Other YAML forms (block
+  # scalars, flow mappings, or unquoted values YAML reads as a bool, number
+  # or date, e.g. yes or 0123) fall back to "aitasks" with a warning.
+  #
+  # The name may not contain "." or ":" — tmux reads both as target
+  # separators, so such a session can be created but never addressed. A
+  # value holding either is ignored and "aitasks" is used instead.
+  # `ait ide`, `ait setup` and the TUI switcher say so; the other TUIs
+  # fall back without a message.
+  #
+  # Example:
+  #   default_session: aitasks
+  # ──────────────────────────────────────────────────────────────────
+  default_session:
+
+  # ──────────────────────────────────────────────────────────────────
+  # git_tui — External git management TUI for the TUI switcher.
+  #
+  # Integrates an external git TUI (like lazygit, gitui, or tig) as a
+  # "pseudo-native" TUI in the aitasks TUI switcher (press 'j' / 'g').
+  # Only one instance runs per tmux session (singleton behavior).
+  #
+  # Set to the tool name (e.g., "lazygit") or leave empty to disable.
+  # Detected automatically during `ait setup`.
+  #
+  # Supported tools:
+  #   - lazygit  (recommended, most popular)
+  #   - gitui    (Rust-based, fast)
+  #   - tig      (ncurses-based, lightweight)
+  #
+  # Example:
+  #   git_tui: lazygit
+  # ──────────────────────────────────────────────────────────────────
+  git_tui:
+
+  # ──────────────────────────────────────────────────────────────────
+  # shadow_same_window — placement of the shadow companion agent.
+  #
+  # The shadow agent is launched from `ait minimonitor` (press 'e' on a
+  # followed coding agent). It reads the followed agent's terminal output
+  # and helps the user reason about it (explain / answer / interrogate a
+  # plan) — advisory only.
+  #
+  # When `true` (default), the shadow opens as a new pane in the followed
+  # agent's tmux window. When `false`, it opens in a separate window
+  # (`agent-shadow-<task_id>`).
+  #
+  # Example:
+  #   shadow_same_window: true
+  # ──────────────────────────────────────────────────────────────────
+  # shadow_same_window: true
+
+  # ──────────────────────────────────────────────────────────────────
+  # shadow_pane_width — width (columns) of the shadow agent pane.
+  #
+  # When shadow_same_window is true, `ait minimonitor` ('e') spawns the
+  # shadow companion as a pane next to the followed agent (between the agent
+  # and the minimonitor), sized to this width. tmux applies it as the pane's
+  # initial width.
+  #
+  # Default: 60.
+  #
+  # Example:
+  #   shadow_pane_width: 60
+  # ──────────────────────────────────────────────────────────────────
+  # shadow_pane_width: 60
+
+  # ──────────────────────────────────────────────────────────────────
+  # scratchpad_position — where the scratchpad notes pane goes.
+  #
+  # `ait minimonitor` ('o') opens the scratchpad in a vertical split of
+  # the followed agent's pane: above it (top) or below it (bottom). Any
+  # other value falls back to bottom.
+  #
+  # Default: bottom.
+  #
+  # Example:
+  #   scratchpad_position: top
+  # ──────────────────────────────────────────────────────────────────
+  # scratchpad_position: bottom
+
+  # ──────────────────────────────────────────────────────────────────
+  # scratchpad_height — height (rows) of the scratchpad notes pane.
+  #
+  # tmux applies it as the pane's initial height. A value that is not a
+  # whole number >= 1 falls back to the default.
+  #
+  # Default: 12.
+  #
+  # Example:
+  #   scratchpad_height: 16
+  # ──────────────────────────────────────────────────────────────────
+  # scratchpad_height: 12
+
+  # ──────────────────────────────────────────────────────────────────
+  # syncer — `ait syncer` TUI for remote desync tracking.
+  #
+  # The syncer TUI tracks ahead/behind state for the project's tracked
+  # refs (`main`, `aitask-data`) and offers pull/push actions. Launch
+  # it manually any time with `ait syncer`.
+  #
+  # autostart — When `true`, `ait ide` opens (or focuses) a singleton
+  # `syncer` window inside the project's tmux session, alongside the
+  # monitor window that `ait ide` already starts. When `false` or
+  # omitted, `ait ide` does not auto-launch the syncer.
+  #
+  # Default: false (omit, leave blank, or set explicitly to false).
+  #
+  # Example:
+  #   syncer:
+  #     autostart: true
+  # ──────────────────────────────────────────────────────────────────
+  # syncer:
+  #   autostart: false
+
+  # ──────────────────────────────────────────────────────────────────
+  # monitor — `ait monitor` / `ait minimonitor` settings.
+  #
+  # The whole `monitor` block is optional; loader defaults apply when
+  # omitted. Documented here so the keys are discoverable.
+  #
+  # compare_mode_default — Idle-detection comparison mode for pane
+  # content snapshots:
+  #
+  #   stripped (default) — strip ANSI escape codes from captured pane
+  #     content before equality check. Required to detect Codex CLI
+  #     agents as idle: Codex animates the spinner color via SGR escape
+  #     codes even while waiting on user input, so a raw byte-equal
+  #     comparison declares the pane "changed" every refresh tick.
+  #
+  #   raw — compare the full captured bytes including escape codes.
+  #     Legacy behavior; only useful as a fallback if a future agent
+  #     renders idle UI by toggling escape codes that semantically
+  #     matter.
+  #
+  # Per-pane override is available at runtime via the `d` shortcut in
+  # `ait monitor` / `ait minimonitor` (cycles default → raw → stripped).
+  # ──────────────────────────────────────────────────────────────────
+  # monitor:
+  #   compare_mode_default: stripped
+
+  # ──────────────────────────────────────────────────────────────────
+  # applink — `ait applink` mobile-companion data-plane settings.
+  #
+  # history_capture_lines — CEILING (max depth) for a single on-demand
+  # terminal-scrollback capture served by the applink "history" RPC. This
+  # is decoupled from monitor.capture_lines: live frames only need the
+  # viewport, but a history pull wants deep scrollback. The per-request
+  # capture depth is sized to `viewport + count` and clamped to this value;
+  # it is NOT a fixed depth.
+  #
+  # Bounds: clamped to [1, 10000] at load. It is itself capped by tmux's own
+  # server `history-limit` (default ~2000), so values past ~2000 retrieve no
+  # further scrollback unless tmux's history-limit is also raised.
+  #
+  # Default: 2000 (coincides with tmux's default history-limit).
+  #
+  # Example:
+  #   applink:
+  #     history_capture_lines: 2000
+  #
+  # advertised_host / advertised_port / advertised_kind / advertised_trust —
+  # advertised-endpoint override for the pairing QR (see
+  # aidocs/applink/protocol.md §Pairing flow, "Endpoint & trust model").
+  # By default the QR advertises the detected LAN IP; set advertised_host to
+  # a mesh-VPN IP (e.g. a Tailscale 100.x address) or a tunnel hostname to
+  # make the QR reachable from outside the LAN. Advertisement-only: the
+  # server keeps binding 0.0.0.0 on the serving port.
+  #
+  #   advertised_host  — hostname/FQDN or IP. Accepted forms are normalized:
+  #                      a leading scheme (https://…), path, and trailing
+  #                      slashes are stripped; host:port and bracketed IPv6
+  #                      ([fd7a::1]:443) are accepted (an embedded port acts
+  #                      as advertised_port unless that is set explicitly).
+  #                      An unparseable value is ignored with a visible
+  #                      warning and the QR falls back to the LAN address.
+  #   advertised_port  — port to advertise (default: the serving port).
+  #   advertised_kind  — lan | mesh | tunnel (racing preference hint;
+  #                      default: mesh when advertised_host is set).
+  #   advertised_trust — pin | ca (default pin). Use ca only for a
+  #                      TLS-terminating tunnel endpoint (cloudflared/ngrok).
+  #
+  # Any --advertise-* CLI flag on `ait applink` / the headless runner makes
+  # the CLI define the entire override — all advertised_* keys here are then
+  # ignored (no field mixing between CLI and config).
+  #
+  # Firewall note: the firewall doctor resolves interface-scoped rules only
+  # for numeric IPs on a local interface; a mesh DNS name (e.g. Tailscale
+  # MagicDNS) is treated as external — set the numeric mesh IP to get
+  # interface-scoped firewall guidance.
+  #
+  # Example (advertise a Tailscale mesh IP):
+  #   applink:
+  #     advertised_host: 100.101.102.103
+  #     advertised_kind: mesh
+  #
+  # auto_tunnel — auto-spawn a public tunnel when the applink server starts
+  # and advertise its hostname as a CA-trusted alternate endpoint in the
+  # pairing QR (the LAN endpoint stays primary, so old clients keep
+  # working). Only accepted value: cloudflared (Cloudflare Quick Tunnel —
+  # ephemeral hostname, no account; requires the cloudflared binary on
+  # PATH). Equivalent one-shot CLI flag: --auto-tunnel. See
+  # aidocs/applink/tunnel_howto.md Recipe 3 for the trust model and
+  # security notes.
+  #
+  # Example:
+  #   applink:
+  #     auto_tunnel: cloudflared
+  # ──────────────────────────────────────────────────────────────────
+  # applink:
+  #   history_capture_lines: 2000
+  #   advertised_host: 100.101.102.103
+  #   advertised_port: 8765
+  #   advertised_kind: mesh
+  #   advertised_trust: pin
+
+# ──────────────────────────────────────────────────────────────────────
+# relations — Background task-relations analysis (aidocs/framework/task_relations.md D5).
+#
+# A worker analyses each task against statically found candidate tasks and
+# records how they relate on the `aitask-relations` branch. It is OFF by
+# default because it spends tokens: it runs headless Claude print mode, which
+# bills at a higher per-token rate.
+#
+#   enabled           — DELIBERATELY ABSENT here. An absent key means "disabled,
+#                       never asked": interactive `ait setup` asks once and
+#                       writes the answer; `ait relations enable|disable`
+#                       sets it explicitly. AIT_RELATIONS=0 switches analysis
+#                       off on one host.
+#   max_jobs_per_day  — per-host daily cap on agent calls (retries included)
+#   job_timeout_s     — wall-clock bound of one agent call
+#   settle_s          — wait after the last trigger before a job runs
+#   candidate_cap     — candidates that get full cards and evidence
+#   triggers          — per-trigger switches (created, plan_approved, fold, landed)
+# ──────────────────────────────────────────────────────────────────────
+relations:
+  max_jobs_per_day: 40
+  job_timeout_s: 600
+  settle_s: 120
+  candidate_cap: 25
+  triggers:
+    created: true
+    plan_approved: true
+    fold: true
+    landed: true

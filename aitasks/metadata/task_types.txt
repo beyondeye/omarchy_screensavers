@@ -1,0 +1,10 @@
+bug
+chore
+documentation
+enhancement
+feature
+performance
+refactor
+style
+test
+manual_verification

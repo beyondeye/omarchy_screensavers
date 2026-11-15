@@ -1,0 +1,17 @@
+# Draft tasks (local, not committed)
+aitasks/new/
+
+# Per-user config (local, not shared)
+aitasks/metadata/userconfig.yaml
+
+# Per-user overrides (*.local.json files, not shared)
+aitasks/metadata/*.local.json
+
+# Per-user execution profiles (local, not shared)
+aitasks/metadata/profiles/local/
+
+# chatlink runtime state (per-PC: bot token + relay spools)
+aitasks/metadata/chatlink_sessions/
+
+# applink runtime state (per-PC: TLS cert/key + active bearer sessions)
+aitasks/metadata/applink_sessions/

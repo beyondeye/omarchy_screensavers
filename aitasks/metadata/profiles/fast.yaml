@@ -1,0 +1,48 @@
+name: fast
+description: Minimal prompts - skip confirmations, stop after plan approval
+skip_task_confirmation: true
+default_email: userconfig
+create_worktree: false
+plan_preference: use_current
+plan_preference_child: verify
+post_plan_action: ask
+post_plan_action_for_child: ask
+# Usage is still recorded; only the rating prompt and the verified-score update
+# are rendered away from this profile's skills.
+enableFeedbackQuestions: false
+explore_auto_continue: false
+explore_label_confirm: ask
+manual_verification_followup_mode: never
+record_gates: true
+default_gates: [risk_evaluated]
+# Default effort tier for the shadow's implementation review. Takes effect only
+# when default_profiles.shadow names this profile (project_config.yaml for the
+# team, userconfig.yaml for you personally):
+#     default_profiles:
+#       shadow: fast
+# Without that mapping the shadow resolves to 'default' and keeps prompting.
+shadow_impl_review_tier: advanced
+# SHIPPED OFF. Quoted deliberately: YAML 1.1 parses a bare `off` as the boolean
+# false (the renderer accepts both, but the quoted form says what it means).
+#
+# `warn` remains the default when the key is ABSENT -- this is an opt-OUT by the
+# shipped profiles, not a change of default. The check prompts too often to
+# ship on: measured 2026-09-17 over 131 live candidates it returns 0
+# CLEAR / 86 CLEAR_CAVEATED / 31 CONFLICT / 14 UNCHECKABLE -- 45 prompts, 34% of
+# picks -- and of 6 sampled CONFLICTs only 1 was a real edit collision; the other
+# 5 named a file one side merely runs or cites. Set `warn` or `confirm` in your
+# own profile to opt in.
+parallel_admission: "off"
+
+# The OPT-IN pre-claim parallel-safety assessment (`aitask-pick`, immediately
+# before the task is claimed). "off" -- which is also what an ABSENT key means --
+# renders the procedure away entirely: no checker invocation, no reading of
+# in-flight tasks, no prompt, and so no cost on a normal pick. Set "show"
+# (display; prompt only on a graded overlap or an unusable checker) or "ask"
+# (always prompt) to opt in. A headless profile never prompts in either mode.
+parallel_assessment: "off"
+
+# Step 8e: which option to take when the relations analysis is incomplete
+# (ask | wait | fallback | proceed). `wait` never passes --over-cap; a headless
+# profile cannot ask, so `ask` there means proceed.
+relations_incomplete_action: ask

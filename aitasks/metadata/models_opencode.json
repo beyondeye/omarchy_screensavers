@@ -1,0 +1,1955 @@
+{
+  "models": [
+    {
+      "name": "openai_codex_mini_latest",
+      "cli_id": "openai/codex-mini-latest",
+      "notes": "Codex Mini (200k context, openai provider)",
+      "status": "unavailable",
+      "verified": {
+        "batch-review": 0,
+        "pick": 0,
+        "explain": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "openai_gpt_5_1_codex",
+      "cli_id": "openai/gpt-5.1-codex",
+      "notes": "GPT-5.1 Codex (400k context, openai provider)",
+      "status": "unavailable",
+      "verified": {
+        "batch-review": 0,
+        "pick": 0,
+        "explain": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "openai_gpt_5_1_codex_max",
+      "cli_id": "openai/gpt-5.1-codex-max",
+      "notes": "GPT-5.1 Codex Max (400k context, openai provider)",
+      "status": "unavailable",
+      "verified": {
+        "batch-review": 0,
+        "pick": 0,
+        "explain": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "openai_gpt_5_1_codex_mini",
+      "cli_id": "openai/gpt-5.1-codex-mini",
+      "notes": "GPT-5.1 Codex mini (400k context, openai provider)",
+      "status": "unavailable",
+      "verified": {
+        "batch-review": 0,
+        "pick": 0,
+        "explain": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "openai_gpt_5_2",
+      "cli_id": "openai/gpt-5.2",
+      "notes": "GPT-5.2 (400k context, openai provider)",
+      "status": "unavailable",
+      "verified": {
+        "batch-review": 0,
+        "pick": 0,
+        "explain": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "openai_gpt_5_2_codex",
+      "cli_id": "openai/gpt-5.2-codex",
+      "notes": "GPT-5.2 Codex (400k context, openai provider)",
+      "status": "unavailable",
+      "verified": {
+        "batch-review": 0,
+        "pick": 0,
+        "explain": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "openai_gpt_5_3_codex",
+      "cli_id": "openai/gpt-5.3-codex",
+      "notes": "GPT-5.3 Codex (400k context, openai provider)",
+      "status": "unavailable",
+      "verified": {
+        "batch-review": 0,
+        "pick": 0,
+        "explain": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "openai_gpt_5_3_codex_spark",
+      "cli_id": "openai/gpt-5.3-codex-spark",
+      "notes": "GPT-5.3 Codex Spark (128k context, openai provider)",
+      "status": "active",
+      "verified": {
+        "batch-review": 0,
+        "pick": 0,
+        "explain": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "openai_gpt_5_4",
+      "cli_id": "openai/gpt-5.4",
+      "notes": "GPT-5.4 (1050k context, openai provider)",
+      "status": "active",
+      "verified": {
+        "batch-review": 0,
+        "pick": 95,
+        "explain": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {
+        "pick": {
+          "runs": 4,
+          "score_sum": 380
+        }
+      }
+    },
+    {
+      "name": "openai_gpt_5_4_fast",
+      "cli_id": "openai/gpt-5.4-fast",
+      "notes": "GPT-5.4 Fast (1050k context, openai provider)",
+      "status": "active",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "openai_gpt_5_4_mini",
+      "cli_id": "openai/gpt-5.4-mini",
+      "notes": "GPT-5.4 mini (400k context, openai provider)",
+      "status": "active",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "openai_gpt_5_4_mini_fast",
+      "cli_id": "openai/gpt-5.4-mini-fast",
+      "notes": "GPT-5.4 mini Fast (400k context, openai provider)",
+      "status": "active",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "openai_gpt_5_4_mini_flex",
+      "cli_id": "openai/gpt-5.4-mini-flex",
+      "notes": "GPT-5.4 mini Flex (400k context, openai provider)",
+      "status": "active",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "openai_gpt_5_5",
+      "cli_id": "openai/gpt-5.5",
+      "notes": "GPT-5.5 (400k context, openai provider)",
+      "status": "active",
+      "verified": {
+        "batch-review": 0,
+        "pick": 0,
+        "explain": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "openai_gpt_5_5_fast",
+      "cli_id": "openai/gpt-5.5-fast",
+      "notes": "GPT-5.5 Fast (400k context, openai provider)",
+      "status": "active",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "openai_gpt_5_5_pro",
+      "cli_id": "openai/gpt-5.5-pro",
+      "notes": "GPT-5.5 Pro (400k context, openai provider)",
+      "status": "unavailable",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "openai_gpt_5_6_luna",
+      "cli_id": "openai/gpt-5.6-luna",
+      "notes": "GPT-5.6 Luna (400k context, openai provider)",
+      "status": "active",
+      "verified": {
+        "batch-review": 0,
+        "pick": 0,
+        "explain": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "openai_gpt_5_6_luna_fast",
+      "cli_id": "openai/gpt-5.6-luna-fast",
+      "notes": "GPT-5.6 Luna Fast (400k context, openai provider)",
+      "status": "active",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "openai_gpt_5_6_sol",
+      "cli_id": "openai/gpt-5.6-sol",
+      "notes": "GPT-5.6 Sol (400k context, openai provider)",
+      "status": "active",
+      "verified": {
+        "batch-review": 0,
+        "pick": 0,
+        "explain": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "openai_gpt_5_6_sol_fast",
+      "cli_id": "openai/gpt-5.6-sol-fast",
+      "notes": "GPT-5.6 Sol Fast (400k context, openai provider)",
+      "status": "active",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "openai_gpt_5_6_terra",
+      "cli_id": "openai/gpt-5.6-terra",
+      "notes": "GPT-5.6 Terra (400k context, openai provider)",
+      "status": "active",
+      "verified": {
+        "batch-review": 0,
+        "pick": 0,
+        "explain": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "openai_gpt_5_6_terra_fast",
+      "cli_id": "openai/gpt-5.6-terra-fast",
+      "notes": "GPT-5.6 Terra Fast (400k context, openai provider)",
+      "status": "active",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "openai_gpt_5_codex",
+      "cli_id": "openai/gpt-5-codex",
+      "notes": "GPT-5-Codex (400k context, openai provider)",
+      "status": "unavailable",
+      "verified": {
+        "batch-review": 0,
+        "pick": 0,
+        "explain": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "openai_gpt_6_1_sol",
+      "cli_id": "openai/gpt-6.1-sol",
+      "notes": "GPT-6.1 Sol (1050k context, openai provider)",
+      "status": "active",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "openai_gpt_6_1_sol_fast",
+      "cli_id": "openai/gpt-6.1-sol-fast",
+      "notes": "GPT-6.1 Sol Fast (1050k context, openai provider)",
+      "status": "active",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "openai_gpt_6_1_sol_ultrafast",
+      "cli_id": "openai/gpt-6.1-sol-ultrafast",
+      "notes": "GPT-6.1 Sol Ultrafast (1050k context, openai provider)",
+      "status": "active",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "openai_gpt_6_1_terra",
+      "cli_id": "openai/gpt-6.1-terra",
+      "notes": "GPT-6.1 Terra (1050k context, openai provider)",
+      "status": "active",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "openai_gpt_6_1_terra_fast",
+      "cli_id": "openai/gpt-6.1-terra-fast",
+      "notes": "GPT-6.1 Terra Fast (1050k context, openai provider)",
+      "status": "active",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "openai_gpt_6_astra",
+      "cli_id": "openai/gpt-6-astra",
+      "notes": "GPT-6 Astra (1050k context, openai provider)",
+      "status": "active",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "openai_gpt_6_astra_fast",
+      "cli_id": "openai/gpt-6-astra-fast",
+      "notes": "GPT-6 Astra Fast (1050k context, openai provider)",
+      "status": "active",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "openai_gpt_6_astra_ultrafast",
+      "cli_id": "openai/gpt-6-astra-ultrafast",
+      "notes": "GPT-6 Astra Ultrafast (1050k context, openai provider)",
+      "status": "active",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "openai_gpt_6_luna",
+      "cli_id": "openai/gpt-6-luna",
+      "notes": "GPT-6 Luna (1050k context, openai provider)",
+      "status": "active",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "openai_gpt_6_luna_fast",
+      "cli_id": "openai/gpt-6-luna-fast",
+      "notes": "GPT-6 Luna Fast (1050k context, openai provider)",
+      "status": "active",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "openai_gpt_6_sol",
+      "cli_id": "openai/gpt-6-sol",
+      "notes": "GPT-6 Sol (1050k context, openai provider)",
+      "status": "active",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "openai_gpt_6_sol_fast",
+      "cli_id": "openai/gpt-6-sol-fast",
+      "notes": "GPT-6 Sol Fast (1050k context, openai provider)",
+      "status": "active",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_beam_free",
+      "cli_id": "opencode/beam-free",
+      "notes": "Beam Free (1048k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_big_pickle",
+      "cli_id": "opencode/big-pickle",
+      "notes": "Big Pickle (200k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "batch-review": 0,
+        "pick": 0,
+        "explain": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_claude_3_5_haiku",
+      "cli_id": "opencode/claude-3-5-haiku",
+      "notes": "Claude Haiku 3.5 (200k context, opencode provider)",
+      "status": "unavailable",
+      "verified": {
+        "batch-review": 0,
+        "pick": 0,
+        "explain": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_claude_fable_5",
+      "cli_id": "opencode/claude-fable-5",
+      "notes": "Claude Fable 5 (1000k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_claude_fable_5_1",
+      "cli_id": "opencode/claude-fable-5-1",
+      "notes": "Claude Fable 5.1 (1000k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_claude_haiku_4_5",
+      "cli_id": "opencode/claude-haiku-4-5",
+      "notes": "Claude Haiku 4.5 (200k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "batch-review": 0,
+        "pick": 0,
+        "explain": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_claude_haiku_5_5",
+      "cli_id": "opencode/claude-haiku-5-5",
+      "notes": "Claude Haiku 5.5 (1000k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_claude_opus_4_1",
+      "cli_id": "opencode/claude-opus-4-1",
+      "notes": "Claude Opus 4.1 (200k context, opencode provider)",
+      "status": "unavailable",
+      "verified": {
+        "batch-review": 0,
+        "pick": 0,
+        "explain": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_claude_opus_4_5",
+      "cli_id": "opencode/claude-opus-4-5",
+      "notes": "Claude Opus 4.5 (200k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "batch-review": 0,
+        "pick": 0,
+        "explain": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_claude_opus_4_6",
+      "cli_id": "opencode/claude-opus-4-6",
+      "notes": "Claude Opus 4.6 (1000k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "batch-review": 0,
+        "pick": 0,
+        "explain": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_claude_opus_4_7",
+      "cli_id": "opencode/claude-opus-4-7",
+      "notes": "Claude Opus 4.7 (1000k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_claude_opus_4_8",
+      "cli_id": "opencode/claude-opus-4-8",
+      "notes": "Claude Opus 4.8 (1000k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_claude_opus_5",
+      "cli_id": "opencode/claude-opus-5",
+      "notes": "Claude Opus 5 (1000k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_claude_opus_5_5",
+      "cli_id": "opencode/claude-opus-5-5",
+      "notes": "Claude Opus 5.5 (1000k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_claude_sonnet_4",
+      "cli_id": "opencode/claude-sonnet-4",
+      "notes": "Claude Sonnet 4 (1000k context, opencode provider)",
+      "status": "unavailable",
+      "verified": {
+        "batch-review": 0,
+        "pick": 0,
+        "explain": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_claude_sonnet_4_5",
+      "cli_id": "opencode/claude-sonnet-4-5",
+      "notes": "Claude Sonnet 4.5 (1000k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "batch-review": 0,
+        "pick": 0,
+        "explain": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_claude_sonnet_4_6",
+      "cli_id": "opencode/claude-sonnet-4-6",
+      "notes": "Claude Sonnet 4.6 (1000k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "batch-review": 0,
+        "pick": 0,
+        "explain": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_claude_sonnet_5",
+      "cli_id": "opencode/claude-sonnet-5",
+      "notes": "Claude Sonnet 5 (1000k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_claude_sonnet_5_5",
+      "cli_id": "opencode/claude-sonnet-5-5",
+      "notes": "Claude Sonnet 5.5 (1000k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_deepseek_v4_1_flash",
+      "cli_id": "opencode/deepseek-v4.1-flash",
+      "notes": "DeepSeek V4.1 Flash (1000k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_deepseek_v4_1_flash_free",
+      "cli_id": "opencode/deepseek-v4.1-flash-free",
+      "notes": "DeepSeek V4.1 Flash Free (200k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_deepseek_v4_flash",
+      "cli_id": "opencode/deepseek-v4-flash",
+      "notes": "DeepSeek V4 Flash (1000k context, opencode provider)",
+      "status": "unavailable",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_deepseek_v4_flash_free",
+      "cli_id": "opencode/deepseek-v4-flash-free",
+      "notes": "DeepSeek V4 Flash Free (1000k context, opencode provider)",
+      "status": "unavailable",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_deepseek_v4_flash_vision_exp",
+      "cli_id": "opencode/deepseek-v4-flash-vision-exp",
+      "notes": "DeepSeek V4 Flash Vision Exp (1000k context, opencode provider)",
+      "status": "unavailable",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_deepseek_v4_pro",
+      "cli_id": "opencode/deepseek-v4-pro",
+      "notes": "DeepSeek V4 Pro (1000k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_exo_free",
+      "cli_id": "opencode/exo-free",
+      "notes": "Exo Free (1048k context, opencode provider)",
+      "status": "unavailable",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_fledge_alpha_free",
+      "cli_id": "opencode/fledge-alpha-free",
+      "notes": "Fledge Alpha Free (1048k context, opencode provider)",
+      "status": "unavailable",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_flint_40b_free",
+      "cli_id": "opencode/flint-40b-free",
+      "notes": "Flint 40B Free (262k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_gemini_3_1_pro",
+      "cli_id": "opencode/gemini-3.1-pro",
+      "notes": "Gemini 3.1 Pro Preview (1048k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "batch-review": 0,
+        "pick": 0,
+        "explain": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_gemini_3_5_flash",
+      "cli_id": "opencode/gemini-3.5-flash",
+      "notes": "Gemini 3.5 Flash (1048k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_gemini_3_5_flash_lite",
+      "cli_id": "opencode/gemini-3.5-flash-lite",
+      "notes": "Gemini 3.5 Flash Lite (1048k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_gemini_3_6_flash",
+      "cli_id": "opencode/gemini-3.6-flash",
+      "notes": "Gemini 3.6 Flash (1048k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_gemini_3_7_flash",
+      "cli_id": "opencode/gemini-3.7-flash",
+      "notes": "Gemini 3.7 Flash (1048k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_gemini_3_8_flash",
+      "cli_id": "opencode/gemini-3.8-flash",
+      "notes": "Gemini 3.8 Flash (1048k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_gemini_3_flash",
+      "cli_id": "opencode/gemini-3-flash",
+      "notes": "Gemini 3 Flash (1048k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "batch-review": 0,
+        "pick": 0,
+        "explain": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_gemini_3_pro",
+      "cli_id": "opencode/gemini-3-pro",
+      "notes": "Gemini 3 Pro (1048k context, opencode provider)",
+      "status": "unavailable",
+      "verified": {
+        "batch-review": 0,
+        "pick": 0,
+        "explain": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_gemini_4_argon",
+      "cli_id": "opencode/gemini-4-argon",
+      "notes": "Gemini 4 Argon (1048k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_glm_4_6",
+      "cli_id": "opencode/glm-4.6",
+      "notes": "GLM-4.6 (204k context, opencode provider)",
+      "status": "unavailable",
+      "verified": {
+        "batch-review": 0,
+        "pick": 0,
+        "explain": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_glm_4_7",
+      "cli_id": "opencode/glm-4.7",
+      "notes": "GLM-4.7 (204k context, opencode provider)",
+      "status": "unavailable",
+      "verified": {
+        "batch-review": 0,
+        "pick": 0,
+        "explain": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_glm_5",
+      "cli_id": "opencode/glm-5",
+      "notes": "GLM-5 (204k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "batch-review": 0,
+        "pick": 0,
+        "explain": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_glm_5_1",
+      "cli_id": "opencode/glm-5.1",
+      "notes": "GLM-5.1 (204k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_glm_5_2",
+      "cli_id": "opencode/glm-5.2",
+      "notes": "GLM-5.2 (1000k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_glm_5_3",
+      "cli_id": "opencode/glm-5.3",
+      "notes": "GLM-5.3 (1000k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_glm_5_3_flash",
+      "cli_id": "opencode/glm-5.3-flash",
+      "notes": "GLM-5.3-Flash (1000k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_glm_5_3_flash_free",
+      "cli_id": "opencode/glm-5.3-flash-free",
+      "notes": "GLM-5.3-Flash Free (200k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_gpt_5",
+      "cli_id": "opencode/gpt-5",
+      "notes": "GPT-5 (400k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "batch-review": 0,
+        "pick": 0,
+        "explain": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_gpt_5_1",
+      "cli_id": "opencode/gpt-5.1",
+      "notes": "GPT-5.1 (400k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "batch-review": 0,
+        "pick": 0,
+        "explain": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_gpt_5_1_codex",
+      "cli_id": "opencode/gpt-5.1-codex",
+      "notes": "GPT-5.1 Codex (400k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "batch-review": 0,
+        "pick": 0,
+        "explain": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_gpt_5_1_codex_max",
+      "cli_id": "opencode/gpt-5.1-codex-max",
+      "notes": "GPT-5.1 Codex Max (400k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "batch-review": 0,
+        "pick": 0,
+        "explain": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_gpt_5_1_codex_mini",
+      "cli_id": "opencode/gpt-5.1-codex-mini",
+      "notes": "GPT-5.1 Codex Mini (400k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "batch-review": 0,
+        "pick": 0,
+        "explain": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_gpt_5_2",
+      "cli_id": "opencode/gpt-5.2",
+      "notes": "GPT-5.2 (400k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "batch-review": 0,
+        "pick": 0,
+        "explain": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_gpt_5_2_codex",
+      "cli_id": "opencode/gpt-5.2-codex",
+      "notes": "GPT-5.2 Codex (400k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "batch-review": 0,
+        "pick": 0,
+        "explain": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_gpt_5_3_codex",
+      "cli_id": "opencode/gpt-5.3-codex",
+      "notes": "GPT-5.3 Codex (400k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "batch-review": 0,
+        "pick": 0,
+        "explain": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_gpt_5_3_codex_spark",
+      "cli_id": "opencode/gpt-5.3-codex-spark",
+      "notes": "GPT-5.3 Codex Spark (128k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "batch-review": 0,
+        "pick": 0,
+        "explain": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_gpt_5_4",
+      "cli_id": "opencode/gpt-5.4",
+      "notes": "GPT-5.4 (1050k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "batch-review": 0,
+        "pick": 0,
+        "explain": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_gpt_5_4_mini",
+      "cli_id": "opencode/gpt-5.4-mini",
+      "notes": "GPT-5.4 Mini (400k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_gpt_5_4_nano",
+      "cli_id": "opencode/gpt-5.4-nano",
+      "notes": "GPT-5.4 Nano (400k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_gpt_5_4_pro",
+      "cli_id": "opencode/gpt-5.4-pro",
+      "notes": "GPT-5.4 Pro (1050k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "batch-review": 0,
+        "pick": 0,
+        "explain": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_gpt_5_5",
+      "cli_id": "opencode/gpt-5.5",
+      "notes": "GPT-5.5 (1050k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "batch-review": 0,
+        "pick": 0,
+        "explain": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_gpt_5_5_pro",
+      "cli_id": "opencode/gpt-5.5-pro",
+      "notes": "GPT-5.5 Pro (1050k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_gpt_5_6_luna",
+      "cli_id": "opencode/gpt-5.6-luna",
+      "notes": "GPT-5.6 Luna (1050k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "batch-review": 0,
+        "pick": 0,
+        "explain": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_gpt_5_6_sol",
+      "cli_id": "opencode/gpt-5.6-sol",
+      "notes": "GPT-5.6 Sol (1050k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "batch-review": 0,
+        "pick": 0,
+        "explain": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_gpt_5_6_terra",
+      "cli_id": "opencode/gpt-5.6-terra",
+      "notes": "GPT-5.6 Terra (1050k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "batch-review": 0,
+        "pick": 0,
+        "explain": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_gpt_5_codex",
+      "cli_id": "opencode/gpt-5-codex",
+      "notes": "GPT-5 Codex (400k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "batch-review": 0,
+        "pick": 0,
+        "explain": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_gpt_5_nano",
+      "cli_id": "opencode/gpt-5-nano",
+      "notes": "GPT-5 Nano (400k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "batch-review": 0,
+        "pick": 0,
+        "explain": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_gpt_6_1_sol",
+      "cli_id": "opencode/gpt-6.1-sol",
+      "notes": "GPT-6.1 Sol (1050k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_gpt_6_astra",
+      "cli_id": "opencode/gpt-6-astra",
+      "notes": "GPT-6 Astra (1050k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_gpt_6_luna",
+      "cli_id": "opencode/gpt-6-luna",
+      "notes": "GPT-6 Luna (1050k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_gpt_6_sol",
+      "cli_id": "opencode/gpt-6-sol",
+      "notes": "GPT-6 Sol (1050k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_grok_4_5",
+      "cli_id": "opencode/grok-4.5",
+      "notes": "Grok 4.5 (500k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_grok_4_6",
+      "cli_id": "opencode/grok-4.6",
+      "notes": "Grok 4.6 (500k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_grok_4_7",
+      "cli_id": "opencode/grok-4.7",
+      "notes": "Grok 4.7 (500k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_grok_build_0_1",
+      "cli_id": "opencode/grok-build-0.1",
+      "notes": "Grok Build 0.1 (256k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_kimi_k2_5",
+      "cli_id": "opencode/kimi-k2.5",
+      "notes": "Kimi K2.5 (262k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "batch-review": 0,
+        "pick": 0,
+        "explain": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_kimi_k2_6",
+      "cli_id": "opencode/kimi-k2.6",
+      "notes": "Kimi K2.6 (262k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_kimi_k2_7_code",
+      "cli_id": "opencode/kimi-k2.7-code",
+      "notes": "Kimi K2.7 Code (262k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_kimi_k3",
+      "cli_id": "opencode/kimi-k3",
+      "notes": "Kimi K3 (1048k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_ling_3_0_flash_fin_free",
+      "cli_id": "opencode/ling-3.0-flash-fin-free",
+      "notes": "Ling 3.0 Flash Fin Free (262k context, opencode provider)",
+      "status": "unavailable",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_ling_3_1_flash_free",
+      "cli_id": "opencode/ling-3.1-flash-free",
+      "notes": "Ling 3.1 Flash Free (262k context, opencode provider)",
+      "status": "unavailable",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_longcat_2_5_preview_free",
+      "cli_id": "opencode/longcat-2.5-preview-free",
+      "notes": "LongCat 2.5 Preview Free (1000k context, opencode provider)",
+      "status": "unavailable",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_mimo_v2_5_free",
+      "cli_id": "opencode/mimo-v2.5-free",
+      "notes": "MiMo V2.5 Free (200k context, opencode provider)",
+      "status": "unavailable",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_mimo_v2_6_flash_free",
+      "cli_id": "opencode/mimo-v2.6-flash-free",
+      "notes": "MiMo-V2.6-Flash Free (200k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_minimax_m2_1",
+      "cli_id": "opencode/minimax-m2.1",
+      "notes": "MiniMax M2.1 (204k context, opencode provider)",
+      "status": "unavailable",
+      "verified": {
+        "batch-review": 0,
+        "pick": 0,
+        "explain": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_minimax_m2_5",
+      "cli_id": "opencode/minimax-m2.5",
+      "notes": "MiniMax-M2.5 (204k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "batch-review": 0,
+        "pick": 0,
+        "explain": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_minimax_m2_5_free",
+      "cli_id": "opencode/minimax-m2.5-free",
+      "notes": "MiniMax M2.5 Free (204k context, opencode provider)",
+      "status": "unavailable",
+      "verified": {
+        "batch-review": 0,
+        "pick": 0,
+        "explain": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_minimax_m2_7",
+      "cli_id": "opencode/minimax-m2.7",
+      "notes": "MiniMax-M2.7 (204k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_minimax_m3",
+      "cli_id": "opencode/minimax-m3",
+      "notes": "MiniMax-M3 (512k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_mistral_large_4",
+      "cli_id": "opencode/mistral-large-4",
+      "notes": "Mistral Large 4 (524k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_muse_spark_1_2",
+      "cli_id": "opencode/muse-spark-1.2",
+      "notes": "Muse Spark 1.2 (1048k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_muse_spark_1_2_contributor_free",
+      "cli_id": "opencode/muse-spark-1.2-contributor-free",
+      "notes": "Muse Spark 1.2 Free (1048k context, opencode provider)",
+      "status": "unavailable",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_muse_spark_1_3",
+      "cli_id": "opencode/muse-spark-1.3",
+      "notes": "Muse Spark 1.3 (1048k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_muse_spark_1_3_contributor_free",
+      "cli_id": "opencode/muse-spark-1.3-contributor-free",
+      "notes": "Muse Spark 1.3 Free (1048k context, opencode provider)",
+      "status": "unavailable",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_muse_wonder_1_0",
+      "cli_id": "opencode/muse-wonder-1.0",
+      "notes": "Muse Wonder (1048k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_nemotron_3_5_lightning_free",
+      "cli_id": "opencode/nemotron-3.5-lightning-free",
+      "notes": "Nemotron 3.5 Lightning Free (262k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_nemotron_3_5_super_vl_free",
+      "cli_id": "opencode/nemotron-3.5-super-vl-free",
+      "notes": "Nemotron 3.5 Super VL Free (1048k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_nemotron_3_super_free",
+      "cli_id": "opencode/nemotron-3-super-free",
+      "notes": "Nemotron 3 Super Free (204k context, opencode provider)",
+      "status": "unavailable",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_nemotron_3_ultra_free",
+      "cli_id": "opencode/nemotron-3-ultra-free",
+      "notes": "Nemotron 3 Ultra Free (1000k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_qwen3_5_plus",
+      "cli_id": "opencode/qwen3.5-plus",
+      "notes": "Qwen3.5 Plus (262k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_qwen3_6_plus",
+      "cli_id": "opencode/qwen3.6-plus",
+      "notes": "Qwen3.6 Plus (262k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_qwen3_8_flash",
+      "cli_id": "opencode/qwen3.8-flash",
+      "notes": "Qwen3.8 Flash (1000k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_qwen3_8_max",
+      "cli_id": "opencode/qwen3.8-max",
+      "notes": "Qwen3.8 Max (262k context, opencode provider)",
+      "status": "active",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_ring_2_6_1t_free",
+      "cli_id": "opencode/ring-2.6-1t-free",
+      "notes": "Ring 2.6 1T Free (262k context, opencode provider)",
+      "status": "unavailable",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_space_bunny_free",
+      "cli_id": "opencode/space-bunny-free",
+      "notes": "Space Bunny Free (1048k context, opencode provider)",
+      "status": "unavailable",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    },
+    {
+      "name": "opencode_union_alpha",
+      "cli_id": "opencode/union-alpha",
+      "notes": "Union Alpha Free (262k context, opencode provider)",
+      "status": "unavailable",
+      "verified": {
+        "pick": 0,
+        "explain": 0,
+        "batch-review": 0,
+        "work-report": 0,
+        "trail": 0
+      },
+      "verifiedstats": {}
+    }
+  ]
+}
