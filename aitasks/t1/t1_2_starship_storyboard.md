@@ -83,3 +83,22 @@ Decisions already settled (do not re-ask):
   `git diff --cached | grep -nE '"[^"]{200,}"|\[[^]]{400,}\]'` and review it by hand.
   `git status --ignored`: `.refs/` stays ignored.
 - Commit: `documentation: Add the starship storyboard (t1_2)`.
+
+## Inbox
+<!-- Appended by the note framework. Do not edit by hand; use `./ait note`. -->
+
+> **✉ note:t1_1** id=2026-11-15T10:58:06Z.2ad0f5057bb5d090a9c7c064 from=t1_1 from_verified=yes at=2026-11-15T10:58:06Z base=572ad6a5a5f04a6bfb7e0dd03f26560242fa0428 base_branch=main dirty=yes host=omg16
+>
+> | Advisory, from t1_1 (frames2text reference tool), as of code commit 572ad6a:
+> | 
+> | 1. Timeline budget: the scene list tools/frames2text/scenes/starship_flight15.toml totals 60.4 s of
+> |    footage (10.0 / 6.1 / 6.0 / 3.0 / 4.9 / 6.0 / 4.1 / 7.0 / 13.3 s for liftoff, ascent, onboard,
+> |    high_altitude, hot_staging, coast, ship_over_earth, seco, catch). It holds no branding hold and no
+> |    outro fade. If the storyboard keeps the ~3 s branding hold plus the outro inside 60 s, the scene
+> |    durations need about 4 s of compression (the coast and catch have the most slack). The animatic
+> |    speeds are a reference, not a constraint.
+> | 2. The SpaceX footage ends at 244.04 s, not ~236 s as the parent t1 body says: 236.47-244.04 s is the
+> |    wide shot of the caught ship on the tower (good reference for a final hold), and CNN starts at 244.04.
+> | 3. Cut times, shot contents and anim motion fits are in the archived p1_1 plan, "Notes for t1_2".
+> |    The full-frame anim fits are rough (camera shake and compression dominate); the decelerating
+> |    smoke/bloom curves and the catch settle (spring, damping ratio about 0.8) are the usable ones.
