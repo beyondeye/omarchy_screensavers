@@ -12,8 +12,9 @@ active_gates_profile: fast
 active_gates_digest: 5892c63ff1b4.681bafac2cb9.d73bba2fc21f
 assigned_to: dario-e@beyond-eye.com
 anchor: 1
+implemented_with: claudecode/opus5_5
 created_at: 2026-11-15 09:58
-updated_at: 2026-11-15 13:06
+updated_at: 2026-11-15 17:06
 ---
 
 ## Context
@@ -118,3 +119,8 @@ Decisions already settled (do not re-ask):
 > | perf/headless frame counts from it.
 
 > **👁 note:read** id=2026-11-15T11:05:57Z.0dde34fb6aa34283a8738c74 by=t1_2 at=2026-11-15T11:05:57Z mode=explicit ids=2026-11-15T10:58:06Z.2ad0f5057bb5d090a9c7c064,2026-11-15T10:59:03Z.2e3a95571eabe0ec9cecab28
+
+## Gate Runs
+<!-- Appended by the gate framework. Do not edit by hand; use `./.aitask-scripts/aitask_gate.sh append` for corrections. -->
+
+> **✅ gate:plan_approved** run=2026-11-15T15:06:06Z status=pass attempt=1 type=human
