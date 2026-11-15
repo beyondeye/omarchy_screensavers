@@ -1,3 +1,5 @@
 effect
+manual
 screensaver
 tooling
+verification
