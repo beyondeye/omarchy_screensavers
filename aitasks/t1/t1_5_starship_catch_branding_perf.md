@@ -128,3 +128,29 @@ engine only. No frame-derived data.
 > |   frames only), never global time.
 > | - Branding (3): reveal starts in [58.0, 59.25] (0.25 s fades), and the text cells' bg gets a luma
 > |   cap of 0.50, so fg #f3efe6 has contrast >= 0.438.
+
+> **✉ note:t1_3** id=2026-11-15T21:30:57Z.378ae362617f8f2289dc93d3 from=t1_3 from_verified=yes at=2026-11-15T21:30:57Z base=b35a6054cd70fa4762e4dfd47a45bd22f64909da base_branch=main dirty=no host=omg16
+>
+> | Advisory, from t1_3 (starship skeleton), as of commit b35a605 (ttfx de82884, omarchy-screensaver e39c449).
+> | The full record is the archived plan aiplans/archived/p1/p1_3_starship_effect_skeleton.md ("Notes for sibling tasks").
+> | 
+> | - Bounded palette: every fg/bg the effect emits must be an entry of the fixed palette P
+> |   (ttfx/src/effects/starship/palette.rs); ttfx never frees cell appearances. P_CAP = 340 and
+> |   |P| = 317 today, with little headroom (t1_4 needs some too).
+> | - Branding: text cells add symbols, so the bound grows to
+> |   |P|² + |text symbols| · |fg ramp| · |bg set|. Give the text fg a bounded ramp (e.g. ≤ 16
+> |   steps of #afaca3 → #f3efe6), take bg from P after the luma cap (quantise again), and extend
+> |   ttfx/tests/starship_pool_ceiling.rs to saturate those appearances too. The gate is ≤ 64 MB
+> |   including the rebuild overlap (55.7 MB now). Emit through `emit_appearance` or a sibling that
+> |   also takes only palette indices, and keep `emission_path_shared` true.
+> | - No `#[ignore]` is left on real assertions. The loop test already runs: the loop fade
+> |   (62.5–64.0 → scene 1 at t = 0) is generic in timeline.rs, and B's content replaces only the
+> |   placeholder. The only ignored tests are dev aids (palette_preview, calibrate_distances,
+> |   dump_frames).
+> | - The verification commands are already 64 s-based: PERF_SECONDS defaults to 65 in the
+> |   Makefile, and the headless smoke run is `make headless EFFECT=starship FRAMES=7800`.
+> | - The plan's `render_scene_only` is `Starship::render_only(scene)` in the code.
+> | - Perf: render_delta (omarchy-screensaver) now redraws only changed cells. The 4K timeline
+> |   passes with scenes 1–3 (p99 about 2.4 ms unpinned). The every-cell-changes stress
+> |   (`TTFX_STARSHIP_STRESS=1`) still misses p99 at 4K, as an accepted exception. On this hybrid
+> |   CPU, pin with `taskset -c 0-7` and compare runs taken under the same load.
