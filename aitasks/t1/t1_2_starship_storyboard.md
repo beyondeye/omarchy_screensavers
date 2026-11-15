@@ -1,0 +1,85 @@
+---
+priority: medium
+effort: medium
+depends: [t1_1]
+issue_type: documentation
+status: Ready
+labels: [effect, screensaver]
+gates: [risk_evaluated]
+anchor: 1
+created_at: 2026-11-15 09:58
+updated_at: 2026-11-15 09:58
+---
+
+## Context
+
+Child 2 of t1 (the `starship` screensaver effect: a ~60 s procedural animation of the Starship
+Flight 15 mission). The parent plan is `aiplans/p1_starship_flight_screensaver.md`; read it first.
+Also read the archived t1_1 plan (`aiplans/archived/p1/p1_1_*.md`): it has the refined scene cuts
+and the measured motion numbers.
+
+This child writes the **storyboard**, the numeric spec that the effect children (t1_3–t1_5)
+implement and test against. **Numbers and words only**: no images, no text-art, no frame dumps.
+
+Decisions already settled (do not re-ask):
+- **9 scenes: 1–6, 9, 10, 11.** Scenes 7 and 8 (the booster's descent and landing) are dropped by
+  the user. After hot staging, the booster just falls away out of frame. Their ~11 s goes to the
+  liftoff (1) and the catch (11).
+- **Branding text** (`~/.config/omarchy/branding/screensaver.txt`, or
+  `omarchy-screensaver/assets/screensaver.txt`) is revealed **after the catch**: it forms out of the
+  smoke/clouds, holds ~3 s, then fades into scene 1's opening colours. Then the effect returns
+  `None` and the screensaver rebuilds it, so it loops.
+- Total: about 60 s, including the reveal and the loop transition.
+
+## Key Files to Modify
+
+- `aidocs/starship/storyboard.md` (new).
+- `CLAUDE.md`: add a row to the docs table.
+
+## Reference Files for Patterns
+
+- `aidocs/starship/reference_tooling.md` and `tools/frames2text/` (from t1_1): use
+  `frames2text.py extract`/`convert` and the raw `rgb24` frames in `.refs/` to sample hex colours
+  (e.g. average a region with a few lines of stdlib Python, run with `python3 -I`). Only the
+  resulting hex values go in the doc.
+- `./.aitask-scripts/aitask_screen_recording.sh anim --window` for motion fits.
+- The original task's scene table, in `aitasks/t1_starship_flight_screensaver.md`.
+
+## Implementation Plan
+
+1. Global section:
+   - grid 137×33 cells → 137×66 half-block pixels;
+   - coordinate system: world units vs. pixels, origin and y direction;
+   - the camera model (pan/zoom/shake);
+   - the timeline table: scene, start s, duration s, transition into the next (cut or cross-fade
+     with its duration), totalling 60 s, including the ~3 s branding hold and the outro fade.
+2. Per scene (1–6, 9, 10, 11):
+   - **Elements as parameters**: rocket proportions (booster 71 m + ship 52 m, 9 m diameter → as
+     ratios of the screen height in each shot), fins and flaps, the tower lattice (bay spacing,
+     width, height ratio), chopstick arm geometry (pivot, length, closing angle over time), the
+     Earth limb (radius as a multiple of the screen width, centre offset), sun position and glare
+     radius.
+   - **Palette**: hex values sampled from the reference.
+   - **Motion**: direction, speed (px/s at 137×66), easing (an `Easing` name from
+     `ttfx/src/utils/easing.rs`), from the t1_1 `anim` fits where they are measurable.
+   - **Particle systems**: smoke billows, exhaust/flames, ice flakes, stars. For each: spawn rate,
+     life, velocity, size, colour ramp, drag/buoyancy, and the expected peak particle count (the
+     t1_3 perf budget assumes ≤ ~5 000).
+   - **Transitions** in and out.
+   - **Signature line**, used for the automated tests: the dominant colours with expected screen
+     fractions and tolerances, plus **scene-specific** darkness/variety limits. For example:
+     "scene 10 starfield: ≥95 % near #05070d, ≥ 20 bright star cells"; "scene 1 pad: < 30 %
+     near-black". There is no universal near-black cap.
+3. Branding-reveal section: how the text forms in the post-catch smoke, the hold, and the fade
+   into scene 1's first-frame colours, with numbers for each step.
+4. Add the CLAUDE.md table row.
+
+## Verification Steps
+
+- The doc covers all 9 kept scenes, each with a duration, elements, palette, motion, particles,
+  transitions and a signature line, and the durations add up to ~60 s.
+- It contains no images, ASCII/ANSI art or pasted frame data.
+- **frame_data_guard**: before committing, run
+  `git diff --cached | grep -nE '"[^"]{200,}"|\[[^]]{400,}\]'` and review it by hand.
+  `git status --ignored`: `.refs/` stays ignored.
+- Commit: `documentation: Add the starship storyboard (t1_2)`.
