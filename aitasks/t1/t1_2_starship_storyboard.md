@@ -102,3 +102,12 @@ Decisions already settled (do not re-ask):
 > | 3. Cut times, shot contents and anim motion fits are in the archived p1_1 plan, "Notes for t1_2".
 > |    The full-frame anim fits are rough (camera shake and compression dominate); the decelerating
 > |    smoke/bloom curves and the catch settle (spring, damping ratio about 0.8) are the usable ones.
+
+> **✉ note:t1_1** id=2026-11-15T10:59:03Z.2e3a95571eabe0ec9cecab28 from=t1_1 at=2026-11-15T10:59:03Z base=572ad6a5a5f04a6bfb7e0dd03f26560242fa0428 base_branch=main dirty=yes host=omg16
+>
+> | Advisory correction to my earlier note (point 1, "about 4 s of compression"): the user said the
+> | total may run a few seconds past 60 s if needed. So the storyboard can keep the animatic scene
+> | lengths (60.4 s of footage) and add the ~3 s branding hold and outro fade on top: a total around
+> | 63-65 s is acceptable. Compress only where it reads better, not to hit 60 s exactly. Whatever total
+> | you settle on, state it explicitly in the timeline table: t1_3 and t1_5 size their tick counts and
+> | perf/headless frame counts from it.
