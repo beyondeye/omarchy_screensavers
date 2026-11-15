@@ -486,10 +486,140 @@ by `current_coord`. Grids are 137×33 at 60 fps unless stated otherwise.
 
 ## Perf notes
 
-(Filled in during the pre-phase: |P|; ceiling_mb, final_mb and the analytic estimate from
-starship_pool_ceiling; palette_error mean
-and p99; CPU p50/p95/p99/max and changed_frac at 1080p/4K (stress and timeline); the supporting
-entropy series; the gate verdict.)
+Pre-phase gate, measured 2026-11-15 on omg16 (release builds).
+
+- **Palette:** |P| = 345 (cap 448), so the bound is 119 025 `▀` appearances.
+- **`starship_pool_ceiling`** (4K grid, all of P×P through `emit_appearance`, isolated process):
+  - distinct_visuals = 119 025, and re-emitting P×P regrew the heap by 0 bytes;
+  - build 11.94 MB (mostly the engine's 274×67 character arena);
+  - pairs 36.98 MB (≈ 326 B per appearance: a 208 B visual chunk, the symbol, and two colour-code
+    `String`s);
+  - **ceiling 51.78 MB ≤ 64**; model 49.83 MB, ratio 1.039.
+  - The first model missed the two `ColorCode::Rgb(String)` allocations per visual (ratio 1.217);
+    they are now in the model.
+- **`palette_error` (synthetic):** n = 3563, mean 4.52, p99 16.73, max 23.43. Within the budget
+  (6 / 20).
+- **CPU stress** (`TTFX_STARSHIP_STRESS=1`, 10 s, `changed_frac` min = 1.000 at both sizes):
+  - 1080p (137×33): total p50 3.39, p99 4.80, max 7.44 ms; step p99 1.52; 0 ticks over 8.3 ms.
+    **Pass.**
+  - 4K (274×67): step p50 1.62, p99 2.39; parse p99 1.09; **raster p50 6.81, p99 8.91**;
+    total p99 11.93, max 13.90; 941/1200 ticks over 8.3 ms. **Fail**, dominated by the
+    screensaver raster: about 20.7M pixel writes per tick (a black clear of the damage box, then
+    a bg fill and a `▀` top-half fill per cell).
+  - Before the per-pair visual cache: 4K step p50 3.17 ms and about 8 000 allocations per tick,
+    because the engine's 4096-slot appearance memo thrashes. With the cache: about 200 per tick.
+- **Terminal:** stress mode in a 137×33 tmux pane draws all 4521 cells as `▀` and keeps changing
+  between captures.
+- **Gate verdict (the user, 2026-11-15):**
+  - Continue to the scenes. The 4K stress failure is a screensaver-raster limit, not the
+    effect's. Queue a follow-up task to cut the redundant raster writes in omarchy-screensaver,
+    and re-measure the real timeline at 4K after the scenes.
+  - The palette banding is acceptable (seen via `palette_preview`), so there is no dither.
+
+After scenes 1–3:
+
+- **Palette:** |P| = 380, so the bound is 144 400.
+  - `starship_pool_ceiling`: ceiling **59.33 MB ≤ 64**; model 57.38, ratio 1.034; re-emitting all
+    pairs regrew the heap by 0 bytes.
+  - `P_CAP` was lowered from 448 to 400. At about 322 B per pair plus about 12 MB of arena, 448
+    would be about 77 MB, over the gate. The ceiling test with the real |P| is the authority.
+- **`palette_error`:** synthetic mean 4.34, p99 15.07; real scene frames (the signature times)
+  mean 2.42, p99 10.20.
+- **Signatures** (1080p; 4K for 1a and 3):
+
+  | Shot | Measured | Want |
+  |---|---|---|
+  | 1a | 49.4 / 19.8 % | 45±15 / 15±12 |
+  | 1b | 67.6 / 67.6 / 6.0 % | 65±12 / 60±12 / 11±10 |
+  | 2a | 58.0 % | 55±20 |
+  | 2b | 99.6 % | 90±10 |
+  | 3 | 50.6 / 45.1 / 2.8 %, bright 3.0 % | 47±12 / 50±12 / 4±10 |
+
+  4K gives the same within 1.5 points. Particle sizes and hex-seam widths are defined at the
+  137×66 reference and scale with the grid.
+- **Real timeline, CPU** (`make perf EFFECT=starship`, seed 1, 65 s, on a quiet machine):
+  - 1080p: total p99 4.50, max 5.80 ms, 0 over 8.3 ms;
+  - 4K: total p99 5.69, max 7.51 ms, 0 over 8.3 ms. **Pass.**
+  - Re-run later under heavy unrelated load (load average about 4.4: browser and other agent
+    sessions), the same seed-1 4K run gave p99 14.9 ms with 1423 ticks over. The bench measures
+    wall time, so re-check CPU on an idle machine.
+- **Supporting multi-seed runs, 4K** (`PERF_SEED=entropy PERF_SECONDS=321`, 5 loops):
+  - timeline: 11 034 appearances (bound 144 400); window growth 2.32 %; retained 47.24 MB,
+    including the bench's own 33 MB framebuffer;
+  - stress: 72 110 appearances, window growth 0.01 %.
+- **CLI determinism:** two `--seed 1` runs, 757 710 834 bytes each, have identical SHA-256.
+- **Terminal:** `make try` at 137×33 draws scenes 1–3 at the signature times (4521 `▀`, no
+  magenta), then the placeholders, and exits after about 64 s.
+- `make headless EFFECT=starship FRAMES=7800`: `non_space=4800`, `empty_rows=0`.
+- **Review round 1 (the user's concerns, all confirmed and fixed):**
+  1. *Rebuild overlap.* The screensaver builds the replacement before dropping the ended
+     instance (`omarchy-screensaver/src/engine.rs` `next_frame`). The ceiling test now replays
+     that lifecycle: the old instance saturates P×P and plays to `None`; then a new ctx and
+     effect are built and played while the old one is alive. A diagnostic of the same overlap
+     at |P| = 380 reached 69.70 MB.
+     - Fixes: the effect releases its own buffers when it returns `None` (asserted with
+       `holds_buffers()`), and the coverage cube went from 5×5×5 to 4×4×4, so |P| = 317 and
+       `P_CAP` is 340.
+     - Result: **ceiling 55.71 MB ≤ 64** (overlap 54.02); model 54.34, ratio 1.025. Palette
+       error is unchanged (synthetic mean 4.37 / p99 15.30; real frames 2.42 / 10.20).
+  2. *Plume direction.* `plume_spec` used π/2 − tilt, giving +vx against the drawn axis
+     (−sin, cos). It is now π/2 + tilt. The new test `ascent_plume_leaves_along_the_body`
+     checks at 14.2 s that the mean vx is < 0 and the direction is within about 18° of the axis.
+  3. *Gradients.* Added `Pixbuf::radial` (elliptical, colour and alpha from the centre to the
+     rim) and `polygon_linear` (any direction, clipped to a polygon), both on a generic
+     allocation-free `polygon_with`. They are used for the fire puff, the pad glows and the
+     stainless sheen. Tested by `gradient_primitives`.
+  4. *Boundary test gap.* `continuous_2a_2b_keeps_the_world` now requires particles older than
+     one tick to survive 12.5 s, including the edge detail. The new `hard_cuts_clear_the_pool`
+     checks the opposite at 6, 16 and 22 s.
+  5. *`EmitSpec.rate`* was unused, so it is removed; the rate is `World::spawn`'s argument,
+     documented there.
+  - The motion test now counts changed pixels (≥ 20) instead of a frame-wide mean, which is
+    meaningless for a small rocket on a clear sky.
+  - A 4K timeline re-run under load (load average 3.7) gave p99 9.66 ms (321 over) with raster
+    p99 7.2 ms; raster code was not changed. Re-check on an idle machine.
+- **Review round 2: 4K timeline sign-off (the user chose per-cell raster damage in t1_3).**
+  - **Diagnosis.**
+    - An A/B over 1a, alternating the pre-review and current render code under the same load,
+      measured the same (total p99 about 9 ms both), so the review fixes caused no regression.
+    - 1a was raster-bound: about 10 % of cells change per tick, but they are scattered across
+      the screen, and `render_delta` redrew their whole bounding box.
+    - The CPU is a hybrid (P-cores 0–7, E-cores 8–23, powersave governor), so runs vary with
+      load. Measure pinned with `taskset -c <P-core>`.
+  - **Change** (`omarchy-screensaver/src/raster.rs`):
+    - `render_delta` redraws only the changed cells, with cell clipping kept. It still reports
+      the changed-cell bounding box as the `Damage`.
+    - A cell is cleared to black only when its new bg is black, since a non-black bg is an
+      opaque fill of the whole cell.
+    - The per-cell drawing moved into `draw_cell`, which `draw_region` (the full render) also
+      uses.
+  - **Tests:**
+    - `delta_matches_full_render_for_each_transition` covers text → block, block on a bg → text
+      on black, text/block → blank (black and coloured bg), NUL, shade, an unchanged frame, and
+      everything going black. It runs at scales 1 and 2 on a surface with margins.
+    - `delta_matches_full_render_for_random_frames`: 200 seeded frames with 0/1/3/24 changes
+      each.
+    - Both compare every frame with a fresh full render and check the damage rectangle (or
+      `None`). Removing the black clear makes both fail.
+    - `render.rs`'s own full-frame oracle assert passes.
+  - **Re-measured** under the same load (load average about 4.4):
+
+    | Run | total p99 | max | ticks over 8.3 ms |
+    |---|---|---|---|
+    | 4K timeline, pinned P-core, ×3 | 3.83–4.31 ms | 8.70–9.27 ms | 1 of 7800 |
+    | 4K timeline, unpinned | 2.37 ms | 6.57 ms | 0 |
+    | 1080p timeline, unpinned | 0.62 ms | 2.23 ms | 0 |
+
+    **The 4K timeline passes** (it was p99 about 9–17 ms under the same load). Raster p99 went
+    from about 6.4 to 1.5 ms.
+  - **Forced stress, reported separately** (unpinned, 10 s, `changed_frac` min 1.000):
+    - 4K: total p99 10.56, max 13.84 ms, 353/1200 over; raster p50 5.05 ms (it was 6.81). It
+      still misses p99, so **the stress exception is kept**: the raster's floor when every cell
+      changes.
+    - 1080p: p99 3.03, max 4.98 ms, 0 over.
+- **Tests:** the tests in `tests/starship.rs` (27 after review) take about 3–5 s in release mode, so none are
+  `#[ignore]`d and no `make check-slow` is needed. The 3 ignored ones are dev aids
+  (`palette_preview`, `calibrate_distances`, `dump_frames`).
 
 ## Risk
 
@@ -509,3 +639,87 @@ entropy series; the gate verdict.)
 - timing: pre-phase | name: renderer_spike | type: test | priority: high | effort: medium | inline_risk: low | added_complexity: low | addresses: unbounded visual-pool growth; 120 Hz stutter; palette banding | desc: build the fixed-palette bounded pipeline (reachable appearances ≤ |P|² by construction), stress it with a forced every-cell-changes plasma + 5k particles at 1080p/4K, measure the byte ceiling by saturating all of P×P through the real engine path in an isolated process (≤ 64 MB), and measure the palette error, with finite-run measurements as supporting evidence; stop and revisit the rendering path if the visual or memory budget fails
 - timing: post-phase | name: frame_data_guard | type: chore | priority: medium | effort: low | inline_risk: low | added_complexity: low | addresses: frame-derived data leaking into commits | desc: grep the staged diff for large literals and confirm .refs/ is ignored before each of the three commits
 - timing: after | name: visual_pool_engine_fix | type: performance | priority: medium | effort: high | inline_risk: high | added_complexity: high | addresses: unbounded visual-pool growth (root cause) | desc: design an engine-side bounded/evictable visual path in the ttfx fork for buffer-drawing effects (render_visuals/emitted_visuals compare raw pointers, so freeing needs care)
+
+## Final Implementation Notes
+- **Actual work done:**
+  - `ttfx/src/effects/starship/`:
+    - `mod.rs`: config, clock, build/next_frame, the single emission path `emit_appearance`,
+      a per-pair visual cache, buffer release on `None`, test hooks;
+    - `palette.rs`: the fixed seed-free palette, the RGB555 LUT, `Color` table, `P_CAP`;
+    - `raster.rs`: pixbuf, scanline polygon (`polygon_with` / `polygon_linear`), radial
+      gradient, ellipse, line, rect, vgradient, camera, shake, hash noise;
+    - `particles.rs`: the 5 000 pool, emit specs, deterministic spawn;
+    - `timeline.rs`: the scene table, sub-shots, `scene_at`, `blend_weight` (fades and loop),
+      pool events;
+    - `scenes/{mod,pad,ascent,onboard}.rs`: world, stress mode, placeholder, billows,
+      gradients, scenes 1–3.
+  - Registration in `src/effects/mod.rs` and `src/fx/effects/mod.rs`.
+  - Tests:
+    - `tests/starship.rs`: 27 tests, plus 3 ignored dev aids;
+    - `tests/starship_pool_ceiling.rs`: harness-free, its own process;
+    - `[[test]]` in `Cargo.toml`; the `tests/fixtures/starship_input.txt` fixture.
+  - omarchy-screensaver:
+    - `benches/timeline.rs` and its `[[bench]]` entry;
+    - `src/raster.rs`: `render_delta` redraws only the changed cells (`draw_cell` is shared
+      with the full render), plus two oracle tests.
+  - Workspace: the `Makefile` (`TTFX_ARGS`/`EFFECT_ARGS`, `FRAMES`/`COLS`/`ROWS`,
+    `perf`/`RES`/`PERF_SECONDS`=65/`PERF_SEED`) and `aidocs/testing/manual_testing.md`.
+- **Deviations from plan:**
+  - The memory bound is a fixed palette (decided at verify), not free RGB.
+  - The visual cache was added, because without it the engine's 4096-slot appearance memo
+    thrashes at about 8k allocations per tick.
+  - Stress is selected by `--stress` or `TTFX_STARSHIP_STRESS=1`, since the screensaver parses
+    effect names only. So the bench has no `SSAVER_BENCH_EFFECT_ARGS`.
+  - `P_CAP` is 340 (planned 448). The ceiling test now covers the rebuild overlap.
+  - `render_delta` changed in the screensaver: the user's choice at the 4K sign-off, in place
+    of the queued raster follow-up.
+  - The loop fade is generic now, not `#[ignore]`d.
+  - Particle sizes and hex-seam widths scale with the grid (they are defined at 137×66).
+  - Scene 3's hull is lit `#5d6570` with a dark band, and its sea is `#3b70a7`/`#44709b`. That
+    matches the reference frame and the signature, while the storyboard text says "hull
+    `#454448`".
+- **Issues encountered:**
+  - The model missed the two colour-code `String`s per visual (ratio 1.217 → 1.034).
+  - Review round 1 found five issues: the rebuild overlap pushed the ceiling to 69.7 MB, the
+    plume direction sign was wrong, the linear and radial gradients were missing, the 2a→2b
+    test had a gap, and `EmitSpec.rate` was dead. All are fixed.
+  - Bench numbers swing with machine load on this hybrid CPU. Use `taskset` and compare runs
+    taken under the same conditions.
+  - Review round 2: scene 1a at 4K was raster-bound by the bounding-box redraw. Per-cell damage
+    fixed it.
+- **Key decisions:**
+  - every colour is in P, and P×P is measured exhaustively in-process, including the
+    rebuild overlap;
+  - one emission path;
+  - storyboard-time stepping, with a seek that simulates without drawing;
+  - parsers reject non-finite and out-of-range timing values;
+  - the forced-stress 4K exception is kept: when every cell changes on every tick, the raster's
+    floor is above the budget.
+- **Upstream defects identified:**
+  - `ttfx/src/engine/animation.rs:228` — `CharacterVisual::interned` `Box::leak`s every
+    distinct appearance into a process-lifetime `VISUAL_POOL` that is never freed. Any
+    continuous-colour effect grows memory without bound under the screensaver's re-seeding
+    (tracked as the planned after-mitigation `visual_pool_engine_fix`).
+- **Notes for sibling tasks (t1_4, t1_5):**
+  - **Palette:** add each scene's gradients to `palette.rs` (`RAMPS_*` plus `ALL_RAMPS`) and
+    keep `|P| ≤ P_CAP = 340`. `|P|` is 317 now, so there is room for only about 23 more entries:
+    prune the 4×4×4 cube or reuse storyboard colours first.
+  - **Re-run** `cargo test --release --test starship_pool_ceiling` (≤ 64 MB, rebuild overlap
+    included) and `palette_error_*` after every palette change.
+  - **Branding (t1_5):** text cells add symbols. Their fg must come from a bounded ramp, so the
+    bound becomes `|text symbols| · |ramp| · |P|` plus `|P|²`, and the ceiling test must be
+    extended to saturate those too. Use `emit_appearance` or a sibling that also takes only
+    `PalIdx`, and keep `emission_path_shared` true.
+  - **Scenes:** each implements `step(world, rng, t, dt)` and `draw(world, t, buf)` in
+    `scenes/<name>.rs`, dispatched in `scenes/mod.rs`. Emitters go through `World::spawn` with
+    a `Slot` (add slots for new systems).
+  - **Lengths:** particle sizes and 1 px details are defined at 137×66 and must scale with
+    `buf.h / 66`, so the signatures match on every grid. Check 4K too (`signatures_4k`).
+  - **Tests:** remove scenes from `PLACEHOLDER_SCENES` and add their rows to `SIGS`. The loop
+    fade stays in `timeline.rs`. B's content replaces the placeholder only.
+  - **Tools:** `dump_frames` plus a scratch reference-map script (block-wise nearest-signature
+    colour) were the fastest way to match layouts. `.refs/` holds the animatic frames as raw
+    137×66 RGB.
+  - **Perf:** re-run `make perf EFFECT=starship RES=4k` (pinned with `taskset -c 0-7` on this
+    machine) and `TTFX_STARSHIP_STRESS=1 make perf …`. Raster now costs in proportion to the
+    changed cells.
