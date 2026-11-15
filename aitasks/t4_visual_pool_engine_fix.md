@@ -5,6 +5,7 @@ depends: []
 issue_type: performance
 status: Ready
 labels: [effect, screensaver, tooling]
+gates: [risk_evaluated]
 anchor: 1
 followup_kind: risk_mitigation
 created_at: 2026-11-15 23:12
