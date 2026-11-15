@@ -12,8 +12,9 @@ active_gates_profile: fast
 active_gates_digest: 5892c63ff1b4.681bafac2cb9.d73bba2fc21f
 assigned_to: dario-e@beyond-eye.com
 anchor: 1
+implemented_with: claudecode/opus5_5
 created_at: 2026-11-15 09:57
-updated_at: 2026-11-15 11:16
+updated_at: 2026-11-15 12:18
 ---
 
 ## Context
@@ -128,3 +129,8 @@ Target grid: **137×33 cells** (1080p at scale 1; `FONT_PX = 24` in
   `git diff --cached | grep -nE '"[^"]{200,}"|\[[^]]{400,}\]'` and check by hand that no hex
   dumps, ANSI frames or pixel arrays are staged.
 - Commit in this repo: `feature: Add the frames2text reference tool (t1_1)`.
+
+## Gate Runs
+<!-- Appended by the gate framework. Do not edit by hand; use `./.aitask-scripts/aitask_gate.sh append` for corrections. -->
+
+> **✅ gate:plan_approved** run=2026-11-15T10:18:12Z status=pass attempt=1 type=human
