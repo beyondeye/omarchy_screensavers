@@ -3,10 +3,11 @@ priority: medium
 effort: high
 depends: []
 issue_type: feature
-status: Ready
+status: Implementing
 labels: [screensaver, effect, tooling]
+assigned_to: dario-e@beyond-eye.com
 created_at: 2026-11-15 08:51
-updated_at: 2026-11-15 08:57
+updated_at: 2026-11-15 09:00
 ---
 
 ## Goal
