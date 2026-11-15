@@ -21,6 +21,7 @@ the real code is in two **git submodules**, and this repo holds the glue
 | work through personal forks (remotes `origin`/`team`/`upstream`, PR merge order) | [aidocs/workspace/contributing_with_forks.md](aidocs/workspace/contributing_with_forks.md) |
 | test an effect (commands, accepted option values, checklists, idle-trigger testing) | [aidocs/testing/manual_testing.md](aidocs/testing/manual_testing.md) |
 | build or play the `starship` reference animatic (frames2text tool, storage rule, scene cuts, converters) | [aidocs/starship/reference_tooling.md](aidocs/starship/reference_tooling.md) |
+| implement or test the `starship` effect against its spec (timeline, per-scene parameters, palettes, particle budget, signatures) | [aidocs/starship/storyboard.md](aidocs/starship/storyboard.md) |
 
 ## Rules for agents
 

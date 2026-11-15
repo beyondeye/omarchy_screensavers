@@ -28,3 +28,4 @@ All documentation is in [`aidocs/`](aidocs/):
 - [The dev workspace](aidocs/workspace/dev_workspace.md): layout, the stub effect, submitting upstream
 - [Testing](aidocs/testing/manual_testing.md): manual testing, step by step
 - [Starship reference tooling](aidocs/starship/reference_tooling.md): the frames2text animatic tool and scene cuts
+- [Starship storyboard](aidocs/starship/storyboard.md): the effect's spec: timeline, scenes, palettes, signatures
