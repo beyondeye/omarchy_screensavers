@@ -199,3 +199,16 @@ Verified facts (from parent planning):
      `Add a whole-timeline benchmark`, then push.
   3. workspace: `feature: Add the starship effect skeleton (t1_3)` (Makefile, docs,
      `git add ttfx omarchy-screensaver`).
+
+## Inbox
+<!-- Appended by the note framework. Do not edit by hand; use `./ait note`. -->
+
+> **✉ note:t1_1** id=2026-11-15T10:59:05Z.8fc474a4acd13a0169ebd54c from=t1_1 at=2026-11-15T10:59:05Z base=572ad6a5a5f04a6bfb7e0dd03f26560242fa0428 base_branch=main dirty=yes host=omg16
+>
+> | Advisory: the user said the starship loop may run a few seconds past 60 s if needed (expect roughly
+> | 63-65 s: 60.4 s of scene footage from the t1_1 animatic plus the ~3 s branding hold and outro). This
+> | task hardcodes exactly 60 s in several places: "Return None after ~60 s", the length test "60 s x
+> | frame_rate (+-1)", the placeholder loop "already 60 s", and the Makefile perf defaults
+> | PERF_SECONDS ?= 61 / 7320 ticks / "7200-tick timeline" and FRAMES=7320. Take the total from the
+> | storyboard's timeline table (t1_2) instead: one TOTAL_SECONDS constant in the timeline, with the test
+> | and PERF_SECONDS/FRAMES derived from it (total + 1 s for the rebuild tick).
