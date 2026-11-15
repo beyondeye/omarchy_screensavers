@@ -513,7 +513,7 @@ tmux:
   # Example:
   #   default_session: aitasks
   # ──────────────────────────────────────────────────────────────────
-  default_session:
+  default_session: omarchy_ssavers
 
   # ──────────────────────────────────────────────────────────────────
   # git_tui — External git management TUI for the TUI switcher.
@@ -533,7 +533,7 @@ tmux:
   # Example:
   #   git_tui: lazygit
   # ──────────────────────────────────────────────────────────────────
-  git_tui:
+  git_tui: lazygit
 
   # ──────────────────────────────────────────────────────────────────
   # shadow_same_window — placement of the shadow companion agent.
@@ -736,6 +736,7 @@ tmux:
 #   triggers          — per-trigger switches (created, plan_approved, fold, landed)
 # ──────────────────────────────────────────────────────────────────────
 relations:
+  enabled: false
   max_jobs_per_day: 40
   job_timeout_s: 600
   settle_s: 120
