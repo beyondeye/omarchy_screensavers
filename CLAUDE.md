@@ -1,3 +1,45 @@
+# omarchy_screensavers — project instructions
+
+A workspace for developing new Omarchy screensaver effects. It is a thin wrapper:
+the real code is in two **git submodules**, and this repo holds the glue
+(`Makefile`, `.cargo/config.toml`, `scripts/`) and the docs (`aidocs/`).
+
+| Path | What |
+|---|---|
+| `ttfx/` | submodule, fork of `omacom/ttfx` (branch `feat/stub-effect`). **The effects live here** (Rust). |
+| `omarchy-screensaver/` | submodule, fork of `omacom/omarchy-screensaver` (branch `main`). The Wayland overlay that plays effects. |
+| `.cargo/config.toml` | `[patch]` so `omarchy-screensaver` builds against the local `./ttfx` |
+| `Makefile` | `setup`, `use-forks`, `sync`, `try`, `run`, `headless`, `check`, `status` (comment header lists them) |
+| `scripts/use-forks.sh` | re-points the submodules at a developer's own forks |
+
+## Read these instead of scanning the repo
+
+| When you need to… | Read |
+|---|---|
+| understand the layout, the stub effect's files, how to add/rename an effect, how to submit upstream | [aidocs/workspace/dev_workspace.md](aidocs/workspace/dev_workspace.md) |
+| set up a fresh clone, work inside a submodule, bump a submodule pointer, pull others' work | [aidocs/workspace/onboarding.md](aidocs/workspace/onboarding.md) |
+| work through personal forks (remotes `origin`/`team`/`upstream`, PR merge order) | [aidocs/workspace/contributing_with_forks.md](aidocs/workspace/contributing_with_forks.md) |
+| test an effect (commands, accepted option values, checklists, idle-trigger testing) | [aidocs/testing/manual_testing.md](aidocs/testing/manual_testing.md) |
+
+## Rules for agents
+
+- **Verify without a display:** `make check` (tests in both submodules) and `make headless EFFECT=<name>`
+  (expect `non_space=` > 0). `make try` plays in a terminal. **Do not run `make run`** unless the
+  user asks: it covers every monitor until keyboard/mouse input, which an agent cannot provide.
+- **A new effect touches three places in `ttfx/`:** `src/effects/<name>.rs`, `src/effects/mod.rs`
+  (mod, `EffectCommand` variant, `build_effect()`, `name()`, all alphabetical), and
+  `src/fx/effects/mod.rs` (`EffectCommand::<Name>(_) => None` unless ported to the fx engine).
+  `src/effects/stub.rs` is the template.
+- **Never commit `omarchy-screensaver/Cargo.lock`**: the local `[patch]` rewrites it. Run
+  `git -C omarchy-screensaver checkout Cargo.lock` before committing in that submodule.
+- **Commits are per repo.** Inside a submodule, follow that repo's style (plain imperative
+  sentence, e.g. "Add the stub effect"), commit and push there first; then commit the new
+  pointer in this repo (`git add ttfx`). In this repo, use `<type>: <description>` as described below.
+- **Docs go in topic subdirectories of `aidocs/`** (`aidocs/<topic>/<snake_case>.md`). The root
+  `README.md` is only a short pointer into `aidocs/`. Update the table above when adding a doc.
+- ttfx is a byte-exact port of Python TerminalTextEffects; genuinely new effects go upstream
+  there first (see dev_workspace.md, "Submitting upstream").
+
 >>>aitasks
 # aitasks Framework — Agent Instructions
 
