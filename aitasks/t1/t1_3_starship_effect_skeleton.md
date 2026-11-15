@@ -239,3 +239,5 @@ Verified facts (from parent planning):
 > |   frames only), never global time.
 > | - Branding (3): reveal starts in [58.0, 59.25] (0.25 s fades), and the text cells' bg gets a luma
 > |   cap of 0.50, so fg #f3efe6 has contrast >= 0.438.
+
+> **👁 note:read** id=2026-11-15T15:53:25Z.95aec08d952a0c2151272d3c by=t1_3 at=2026-11-15T15:53:25Z mode=explicit ids=2026-11-15T10:59:05Z.8fc474a4acd13a0169ebd54c,2026-11-15T15:48:55Z.6195dd2fab63d02735f7a2af
