@@ -1,5 +1,7 @@
 ---
 priority: high
+risk_code_health: medium
+risk_goal_achievement: medium
 effort: high
 depends: [t1_2]
 issue_type: feature
@@ -252,3 +254,5 @@ Verified facts (from parent planning):
 <!-- Appended by the gate framework. Do not edit by hand; use `./.aitask-scripts/aitask_gate.sh append` for corrections. -->
 
 > **✅ gate:plan_approved** run=2026-11-15T16:20:00Z status=pass attempt=1 type=human
+
+> **✅ gate:review_approved** run=2026-11-15T21:09:22Z status=pass attempt=1 type=human
