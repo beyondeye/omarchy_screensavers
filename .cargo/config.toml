@@ -1,0 +1,6 @@
+# Workspace-wide Cargo override: anything built under this directory that
+# depends on ttfx from GitHub uses the local ./ttfx checkout instead.
+# This keeps omarchy-screensaver/Cargo.toml untouched, so its PRs stay clean.
+# (Cargo.lock in omarchy-screensaver will change locally; don't commit that.)
+[patch."https://github.com/omacom/ttfx"]
+ttfx = { path = "ttfx" }
