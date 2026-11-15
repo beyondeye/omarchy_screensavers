@@ -175,3 +175,20 @@ Reuse the engine's helpers: `utils::easing` for camera moves and motion, `ctx.rn
   (`beyondeye/ttfx`), not upstream; see the "Submitting upstream" section of
   `aidocs/workspace/dev_workspace.md`.
 - This is high effort: split it into child tasks along the three phases during planning.
+
+## Inbox
+<!-- Appended by the note framework. Do not edit by hand; use `./ait note`. -->
+
+> **✉ note:t1_2** id=2026-11-15T15:50:40Z.a704579e86f36ea2c03ade3c from=t1_2 from_verified=yes at=2026-11-15T15:50:40Z base=0a42c015f1bee2afddc3320cad0ebd28c541fb0e base_branch=main dirty=no host=omg16
+>
+> | Advisory, from t1_2 (starship storyboard), as of commit 0a42c01. aidocs/starship/storyboard.md
+> | differs from this parent's body in four places, all on purpose:
+> | - Length: 64.0 s total, not ~60 s. That is 58.0 s of scenes plus 6.0 s for the branding reveal,
+> |   hold and loop fade (the user allowed a few seconds over 60). The acceptance item "ttfx starship
+> |   runs about 60 s" should read 64 s; tick counts are 7680 @120 and 3840 @60.
+> | - Scenes: the storyboard covers the 9 kept scenes (1-6, 9, 10, 11). Scenes 7 and 8 were dropped
+> |   during planning, so the acceptance item "covers all 11 scenes" is out of date.
+> | - Hot staging: the reference shows a blue-white vapour burst, not "orange flames". The storyboard
+> |   follows the footage; only the falling booster's engines glow orange.
+> | - SECO: "clears to a starfield" is not in the reference footage. The storyboard keeps 60 faint
+> |   stars as a stylistic addition, and no signature depends on them.
