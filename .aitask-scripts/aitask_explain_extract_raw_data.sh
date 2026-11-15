@@ -1,0 +1,421 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# aitask_explain_extract_raw_data.sh - Extract raw git data for the aitask-explain skill
+# Gathers commit history, blame data, and aitask/aiplan files for specified files.
+# Outputs structured raw data that is then processed by aitask_explain_process_raw_data.py
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/aitask_path.sh
+source "$SCRIPT_DIR/lib/aitask_path.sh"
+# shellcheck source=lib/python_resolve.sh
+source "$SCRIPT_DIR/lib/python_resolve.sh"
+# shellcheck source=lib/task_utils.sh
+source "$SCRIPT_DIR/lib/task_utils.sh"
+
+PYTHON="$(require_python)"
+
+# --- Defaults ---
+MODE=""
+MAX_COMMITS=50
+CLEANUP_DIR=""
+SOURCE_KEY=""
+NO_RECURSE=false
+INPUT_PATHS=()
+AITASK_EXPLAIN_DIR="${AITASK_EXPLAIN_DIR:-${AITASK_EXPLAIN_DIR:-.aitask-explain}}"
+
+# --- Functions ---
+
+# Expand a path to a list of git-tracked files
+# If path is a file, output it directly; if a directory, list tracked files
+expand_path() {
+    local path="$1"
+    # Strip trailing slash for consistent prefix matching
+    path="${path%/}"
+    if [[ -d "$path" ]]; then
+        # List git-tracked files in the directory
+        git ls-files "$path" | while IFS= read -r f; do
+            if [[ "$NO_RECURSE" == "true" ]]; then
+                # Get path relative to the directory
+                local rel="${f#"$path"/}"
+                # For root directory (path="."), rel == f
+                if [[ "$path" == "." ]]; then
+                    rel="$f"
+                fi
+                # Skip if still contains / (means it's in a subdirectory)
+                [[ "$rel" == */* ]] && continue
+            fi
+            # Skip binary files by checking if file contains null bytes
+            if file -b --mime-encoding "$f" 2>/dev/null | grep -qv 'binary'; then
+                echo "$f"
+            fi
+        done
+    elif [[ -f "$path" ]]; then
+        # Verify it's tracked by git
+        if git ls-files --error-unmatch "$path" &>/dev/null; then
+            echo "$path"
+        else
+            warn "File not tracked by git: $path"
+        fi
+    else
+        warn "Path does not exist: $path"
+    fi
+}
+
+# Check if a file is binary using MIME encoding detection
+# Returns 0 (true) if binary, 1 (false) if text
+is_binary() {
+    local filepath="$1"
+    file -b --mime-encoding "$filepath" 2>/dev/null | grep -q 'binary'
+}
+
+# Extract task ID from a commit message (parenthesized pattern only)
+# Input: commit message
+# Output: task ID (e.g., "16" or "16_2") or empty
+extract_task_id_from_message() {
+    local msg="$1"
+    local match
+    match=$(echo "$msg" | grep -oE '\(t[0-9]+(_[0-9]+)?\)' | head -1 || true)
+    if [[ -n "$match" ]]; then
+        echo "$match" | sed 's/[()]//g; s/^t//'
+    fi
+}
+
+# Convert a directory path to a cache key (mirrors Python _dir_to_key)
+dir_to_key() {
+    local dir="$1"
+    if [[ "$dir" == "." || -z "$dir" ]]; then
+        echo "_root_"
+    else
+        local trimmed="${dir%/}"
+        echo "${trimmed//\//__}"
+    fi
+}
+
+# Compute common parent directory from INPUT_PATHS array
+compute_common_parent() {
+    local common=""
+    for path in "${INPUT_PATHS[@]}"; do
+        local dir
+        if [[ -d "$path" ]]; then
+            dir="${path%/}"
+        elif [[ -f "$path" ]]; then
+            dir=$(dirname "$path")
+        else
+            continue
+        fi
+        if [[ -z "$common" ]]; then
+            common="$dir"
+        else
+            # Find common prefix by comparing path segments
+            IFS='/' read -ra parts_a <<< "$common"
+            IFS='/' read -ra parts_b <<< "$dir"
+            local result="" i=0
+            while [[ $i -lt ${#parts_a[@]} && $i -lt ${#parts_b[@]} ]]; do
+                if [[ "${parts_a[$i]}" == "${parts_b[$i]}" ]]; then
+                    result="${result:+$result/}${parts_a[$i]}"
+                else
+                    break
+                fi
+                i=$((i + 1))
+            done
+            common="$result"
+        fi
+    done
+    echo "${common:-.}"
+}
+
+# Process a single file: gather commit timeline and blame data
+process_file() {
+    local filepath="$1"
+    local raw_data_file="$2"
+
+    echo "=== FILE: ${filepath} ===" >> "$raw_data_file"
+    echo "" >> "$raw_data_file"
+
+    # Detect binary file
+    local file_is_binary=false
+    if is_binary "$filepath"; then
+        file_is_binary=true
+        echo "BINARY_FILE" >> "$raw_data_file"
+        echo "" >> "$raw_data_file"
+    fi
+
+    # --- Commit Timeline (newest first) --- always extracted
+    echo "COMMIT_TIMELINE:" >> "$raw_data_file"
+    local timeline_num=0
+    while IFS='|' read -r full_hash short_hash date author message; do
+        [[ -z "$full_hash" ]] && continue
+        timeline_num=$((timeline_num + 1))
+        local task_id
+        task_id=$(extract_task_id_from_message "$message")
+        echo "${timeline_num}|${short_hash}|${date}|${author}|${message}|${task_id}" >> "$raw_data_file"
+    done < <(git log --follow --format="%H|%h|%as|%an|%s" --max-count="$MAX_COMMITS" -- "$filepath" 2>/dev/null || true)
+
+    echo "" >> "$raw_data_file"
+
+    # --- Blame Lines (skipped for binary files) ---
+    if [[ "$file_is_binary" == "false" ]]; then
+        echo "BLAME_LINES:" >> "$raw_data_file"
+        # Parse git blame porcelain output: extract line_num and commit hash
+        local current_hash=""
+        while IFS= read -r blame_line; do
+            # Boundary lines start with a 40-char hex hash
+            if [[ "$blame_line" =~ ^([0-9a-f]{40})[[:space:]]([0-9]+)[[:space:]]([0-9]+) ]]; then
+                current_hash="${BASH_REMATCH[1]}"
+                local final_line="${BASH_REMATCH[3]}"
+                echo "${final_line}|${current_hash}" >> "$raw_data_file"
+            fi
+        done < <(git blame --porcelain "$filepath" 2>/dev/null || true)
+        echo "" >> "$raw_data_file"
+    fi
+
+    echo "=== END FILE ===" >> "$raw_data_file"
+    echo "" >> "$raw_data_file"
+}
+
+# --- Main modes ---
+
+gather() {
+    if [[ ${#INPUT_PATHS[@]} -eq 0 ]]; then
+        die "No input files or directories specified. Usage: $0 --gather PATH [PATH...]"
+    fi
+
+    # Expand all paths to individual files
+    local all_files=()
+    for path in "${INPUT_PATHS[@]}"; do
+        while IFS= read -r f; do
+            [[ -n "$f" ]] && all_files+=("$f")
+        done < <(expand_path "$path")
+    done
+
+    if [[ ${#all_files[@]} -eq 0 ]]; then
+        die "No git-tracked files found in the specified paths"
+    fi
+
+    # Create run directory with timestamp
+    local run_id
+    run_id=$(date +"%Y%m%d_%H%M%S")
+    local run_dir="${AITASK_EXPLAIN_DIR}/${run_id}"
+    mkdir -p "${run_dir}/tasks" "${run_dir}/plans"
+
+    # Write files.txt
+    printf '%s\n' "${all_files[@]}" > "${run_dir}/files.txt"
+
+    local raw_data_file="${run_dir}/raw_data.txt"
+    : > "$raw_data_file"
+
+    # Collect all unique task IDs across all files
+    local -A all_task_ids
+
+    # Process each file
+    for filepath in "${all_files[@]}"; do
+        info "Processing: $filepath"
+        process_file "$filepath" "$raw_data_file"
+
+        # Collect task IDs from this file's commit timeline
+        while IFS='|' read -r _ _ _ _ _ message; do
+            local tid
+            tid=$(extract_task_id_from_message "$message")
+            if [[ -n "$tid" ]]; then
+                all_task_ids["$tid"]=1
+            fi
+        done < <(git log --follow --format="|%H|%h|%as|%an|%s" --max-count="$MAX_COMMITS" -- "$filepath" 2>/dev/null || true)
+    done
+
+    # Extract task and plan files for all unique task IDs
+    echo "=== TASK_INDEX ===" >> "$raw_data_file"
+
+    for task_id in $(echo "${!all_task_ids[@]}" | tr ' ' '\n' | sort -t'_' -k1,1n -k2,2n); do
+        local task_file_path=""
+        local plan_file_path=""
+
+        # Resolve and copy task file
+        local resolved_task
+        resolved_task=$(resolve_task_file "$task_id" 2>/dev/null || echo "")
+        if [[ -n "$resolved_task" && -f "$resolved_task" ]]; then
+            local task_dest="${run_dir}/tasks/t${task_id}.md"
+            cp "$resolved_task" "$task_dest"
+            task_file_path="tasks/t${task_id}.md"
+        fi
+
+        # Resolve and copy plan file
+        local resolved_plan
+        resolved_plan=$(resolve_plan_file "$task_id" 2>/dev/null || echo "")
+        if [[ -n "$resolved_plan" && -f "$resolved_plan" ]]; then
+            local plan_dest="${run_dir}/plans/p${task_id}.md"
+            cp "$resolved_plan" "$plan_dest"
+            plan_file_path="plans/p${task_id}.md"
+        fi
+
+        echo "${task_id}|${task_file_path}|${plan_file_path}" >> "$raw_data_file"
+    done
+
+    echo "=== END TASK_INDEX ===" >> "$raw_data_file"
+
+    # Call Python processor to generate reference.yaml
+    local reference_yaml="${run_dir}/reference.yaml"
+    info "Processing raw data into YAML..."
+    "$PYTHON" "${SCRIPT_DIR}/aitask_explain_process_raw_data.py" "$raw_data_file" "$reference_yaml"
+
+    # Compute directory key for naming
+    local dir_key
+    if [[ -n "$SOURCE_KEY" ]]; then
+        dir_key="$SOURCE_KEY"
+    else
+        local common_parent
+        common_parent=$(compute_common_parent)
+        dir_key=$(dir_to_key "$common_parent")
+    fi
+
+    # Rename run directory to include dir_key
+    local named_dir="${AITASK_EXPLAIN_DIR}/${dir_key}__${run_id}"
+    if [[ "$run_dir" != "$named_dir" ]]; then
+        mv "$run_dir" "$named_dir"
+        run_dir="$named_dir"
+    fi
+
+    # Auto-cleanup stale runs for this AITASK_EXPLAIN_DIR
+    if [[ -x "$SCRIPT_DIR/aitask_explain_cleanup.sh" ]]; then
+        "$SCRIPT_DIR/aitask_explain_cleanup.sh" --quiet --target "$AITASK_EXPLAIN_DIR" 2>/dev/null || true
+    fi
+
+    echo "RUN_DIR: ${run_dir}"
+}
+
+cleanup() {
+    local dir="$1"
+
+    # Safety: only delete directories under .aitask-explain/
+    local canonical
+    canonical=$(realpath "$dir" 2>/dev/null || echo "$dir")
+    local base
+    base=$(realpath "$AITASK_EXPLAIN_DIR" 2>/dev/null || echo "$AITASK_EXPLAIN_DIR")
+
+    if [[ "$canonical" != "$base"/* ]]; then
+        die "Refusing to delete directory outside ${AITASK_EXPLAIN_DIR}/: $dir"
+    fi
+
+    if [[ -d "$dir" ]]; then
+        rm -rf "$dir"
+        info "Removed: $dir"
+        # Remove parent if empty
+        rmdir "$AITASK_EXPLAIN_DIR" 2>/dev/null || true
+    else
+        warn "Directory does not exist: $dir"
+    fi
+}
+
+# --- Argument Parsing ---
+
+show_help() {
+    cat << 'EOF'
+Usage: aitask_explain_extract_raw_data.sh [OPTIONS] MODE
+
+Extract raw git data for the aitask-explain skill.
+
+Modes:
+  --gather PATH [PATH...]    Analyze files/directories and produce reference data
+  --cleanup RUN_DIR          Remove a specific run directory
+
+Options:
+  --no-recurse               Only list direct children of directories (not recursive)
+  --source-key KEY           Explicit directory key for run naming (default: auto-derived)
+  --max-commits N            Limit commits per file (default: 50)
+  --help, -h                 Show help
+
+Output:
+  Creates a run-specific directory under .aitask-explain/ with:
+  - files.txt       List of analyzed files
+  - raw_data.txt    Intermediate pipe-delimited data
+  - reference.yaml  Final YAML reference (produced by Python)
+  - tasks/          Extracted aitask files (ID-only names)
+  - plans/          Extracted aiplan files (ID-only names)
+
+  Prints "RUN_DIR: <path>" to stdout for the skill to capture.
+
+Output naming:
+  Run directories are named <dir_key>__<timestamp> where dir_key is auto-derived
+  from the common parent of input paths (e.g., aiscripts__lib__20260226_120000).
+  Use --source-key to override the auto-derived key.
+
+Examples:
+  # Analyze a single file (dir named aiscripts__lib__<timestamp>)
+  ./.aitask-scripts/aitask_explain_extract_raw_data.sh --gather .aitask-scripts/lib/task_utils.sh
+
+  # Analyze a directory (dir named aiscripts__lib__<timestamp>)
+  ./.aitask-scripts/aitask_explain_extract_raw_data.sh --gather .aitask-scripts/lib/
+
+  # Analyze with explicit source key (dir named myproject__<timestamp>)
+  ./.aitask-scripts/aitask_explain_extract_raw_data.sh --gather --source-key myproject .aitask-scripts/
+
+  # Analyze with commit limit
+  ./.aitask-scripts/aitask_explain_extract_raw_data.sh --gather .aitask-scripts/ --max-commits 20
+
+  # Clean up a run
+  ./.aitask-scripts/aitask_explain_extract_raw_data.sh --cleanup .aitask-explain/20260221_143052
+EOF
+}
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --gather)
+                MODE="gather"
+                shift
+                # Collect all subsequent non-flag arguments as input paths
+                while [[ $# -gt 0 && ! "$1" =~ ^-- ]]; do
+                    INPUT_PATHS+=("$1")
+                    shift
+                done
+                ;;
+            --cleanup)
+                MODE="cleanup"
+                [[ $# -ge 2 ]] || die "--cleanup requires a directory argument"
+                CLEANUP_DIR="$2"
+                shift 2
+                ;;
+            --no-recurse)
+                NO_RECURSE=true
+                shift
+                ;;
+            --source-key)
+                [[ $# -ge 2 ]] || die "--source-key requires a key argument"
+                SOURCE_KEY="$2"
+                shift 2
+                ;;
+            --max-commits)
+                [[ $# -ge 2 ]] || die "--max-commits requires a number"
+                MAX_COMMITS="$2"
+                shift 2
+                ;;
+            --help|-h)
+                show_help
+                exit 0
+                ;;
+            *)
+                # If in gather mode, treat as additional path
+                if [[ "$MODE" == "gather" ]]; then
+                    INPUT_PATHS+=("$1")
+                    shift
+                else
+                    die "Unknown option: $1. Use --help for usage."
+                fi
+                ;;
+        esac
+    done
+
+    if [[ -z "$MODE" ]]; then
+        die "Mode required: --gather or --cleanup. Use --help for usage."
+    fi
+}
+
+main() {
+    parse_args "$@"
+    case "$MODE" in
+        gather) gather ;;
+        cleanup) cleanup "$CLEANUP_DIR" ;;
+    esac
+}
+
+main "$@"

@@ -1,0 +1,1036 @@
+"""sync_action_runner - Shared task-data sync runner and conflict modal for Textual TUIs.
+
+Encapsulates the parsing/dispatch glue around `.aitask-scripts/aitask_sync.sh --batch`
+so multiple TUIs (board, syncer) can trigger a sync, classify the result, and offer
+the same conflict-resolution UX without re-implementing it.
+
+Layers exposed:
+
+- `parse_sync_output(stdout)` — pure string-to-`SyncResult` parser. No subprocess,
+  no Textual import. Easy to unit-test.
+- `run_sync_batch(timeout)` — blocking subprocess invocation that returns a
+  `SyncResult`. Designed to be called from inside a `@work(thread=True)` worker.
+  On timeout it stops the sync's whole session before returning (see
+  `_stop_sync_session`); `sync_session_running(sid)` re-checks a session it
+  could not prove stopped.
+- `SyncConflictScreen` (`GuardedModalScreen`) — modal listing conflicted files
+  with "Launch agent to resolve" / "Resolve Interactively" / "Dismiss" buttons.
+  Dismisses with a CONFLICT_CHOICE_* value or None. Self-contained CSS.
+- `build_data_conflict_prompt(files, repo_root)` — pure builder for the prompt
+  the "Launch agent to resolve" choice hands a code agent.
+- `build_main_conflict_prompt(action, reason, branch, upstream, repo_root,
+  output_tail)` — the syncer's counterpart for a main-branch pull or push
+  that needs assistance (diverged, or deferred for recursive submodules).
+- `run_interactive_sync(app, on_done)` — terminal-spawn-or-suspend fallback that
+  runs `./ait sync` interactively.
+
+Status-to-notification wording and the agent launch itself are left to each
+caller; this module only owns parsing, dispatch, the modal, the agent prompt,
+and the interactive fallback.
+
+Usage (from a host App's worker):
+
+    from sync_action_runner import (
+        SyncConflictScreen, run_sync_batch, run_interactive_sync,
+        STATUS_CONFLICT, STATUS_PUSHED, ...,
+    )
+
+    @work(thread=True, exclusive=True)
+    def _sync_worker(self):
+        result = run_sync_batch()
+        if result.status == STATUS_CONFLICT:
+            self.app.call_from_thread(
+                self.push_screen, SyncConflictScreen(result.conflicted_files), on_resolve)
+"""
+from __future__ import annotations
+
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Callable, Sequence
+
+from textual import on
+from textual.binding import Binding
+from textual.containers import Container, Horizontal
+from textual.widgets import Button, Label
+
+_LIB_DIR = str(Path(__file__).resolve().parent)
+if _LIB_DIR not in sys.path:
+    sys.path.insert(0, _LIB_DIR)
+
+from agent_launch_utils import find_terminal, spawn_in_terminal  # noqa: E402
+from bounded_run import GRACE_ENV, child_grace, effective_grace  # noqa: E402
+from guarded_dismiss import GuardedModalScreen  # noqa: E402
+
+
+# --- Wire-protocol status constants (must match aitask_sync.sh --batch exactly) ---
+STATUS_SYNCED = "SYNCED"
+STATUS_PUSHED = "PUSHED"
+STATUS_PULLED = "PULLED"
+STATUS_NOTHING = "NOTHING"
+STATUS_AUTOMERGED = "AUTOMERGED"
+#: A diverged branch converged by a guarded merge commit and was pushed (t1731):
+#: the rebase was blocked by protected dirty files, which stay uncommitted.
+STATUS_MERGED = "MERGED"
+STATUS_CONFLICT = "CONFLICT"
+STATUS_NO_NETWORK = "NO_NETWORK"
+STATUS_NO_REMOTE = "NO_REMOTE"
+STATUS_DEFERRED = "DEFERRED"
+STATUS_ERROR = "ERROR"
+
+# Closed set of DEFERRED reasons. A `DEFERRED:` line is `DEFERRED:<reason>` or
+# `DEFERRED:<reason>:<detail>`, split on the FIRST colon only — <detail> is free
+# text and may itself contain colons. Pinned here (and asserted in
+# tests/test_sync_action_runner.py) so a reason added on the shell side with no
+# Python counterpart is caught rather than surfacing as raw text.
+DEFERRED_REASONS = frozenset({
+    "publication_blocked",   # a commit we cannot vouch for is being withheld
+    "protected_dirty",       # files another session owns block the rebase
+    "worktree_wedged",       # the data worktree is stuck mid-rebase/merge
+    "fetch_exclusion",       # the gitbranch store exclusion could not be
+                             # confirmed, so the broad fetch was not run (t2099)
+})
+# Deliberately four, not six. `locks_unavailable` and `lock_contended` are
+# per-file SKIP reasons inside the sweep: they surface in the stderr report and
+# roll up into `protected_dirty` on the wire, so they are not wire reasons and
+# declaring them here would make this set untrue.
+
+# The per-file SUB-reasons carried on `DEFERRED_FILE:` continuation lines. These
+# are the `_protect "<reason>"` literals in aitask_sync.sh, and a scan test in
+# tests/test_sync_action_runner.py holds the two sides together. They are a
+# different vocabulary from DEFERRED_REASONS above -- that one names the wire
+# STATUS, this one names why an individual file could not be committed -- and
+# merging them would make the status set untrue.
+DEFERRED_FILE_REASONS = frozenset({
+    "scan_failed",
+    "lock_contended",
+    "locks_unavailable",
+    "ownerless",
+    "ambiguous_rename",
+    "unverifiable",
+    "live_lock",
+    "unknown_liveness",
+    "lock_acquired_during_scan",
+    "staged_elsewhere",
+    "content_changed",
+    "commit_failed",
+    "commit_scope_changed",
+    "holder_not_waiting",
+})
+
+#: Closed vocabularies for the bare (un-encoded) record columns.
+_TREE_STATES = frozenset({"tracked", "untracked", "unknown"})
+_HOLDER_CLASSES = frozenset({"self", "other", "remote", "unverified", "none"})
+_TASK_RE = re.compile(r"^[0-9]+(_[0-9]+)?$")
+_PID_RE = re.compile(r"^[0-9]*$")
+#: `waiting_<kind>` carries the monitor's prompt-pattern name, `active` means no
+#: prompt was detected, and empty means not probed / unresolvable.
+_PANE_STATE_RE = re.compile(r"^(waiting_[a-z0-9_]+|active|)$")
+
+_DEFERRED_FILE_COLUMNS = 11
+
+
+def _pct_decode(value: str) -> str:
+    """Mirror `_pct_decode` in aitask_sync.sh, INCLUDING its order.
+
+    `%25` is decoded LAST so a field that literally contained "%7C" (encoded as
+    "%257C") does not decode twice into a delimiter.
+    """
+    value = value.replace("%0A", "\n")
+    value = value.replace("%0D", "\r")
+    value = value.replace("%7C", "|")
+    value = value.replace("%25", "%")
+    return value
+
+
+@dataclass
+class DeferredFile:
+    """One file the pre-sync sweep could not commit, as reported on the wire.
+
+    The record is the COMPLETE snapshot for that file: everything a consumer
+    renders -- who holds it, where that session runs, what it is doing, and the
+    exact action that would clear it -- is present here, so no caller has to
+    re-derive locks, pane state or the dirty set for itself.
+
+    TEXTUAL FIELDS USE PYTHON'S FILESYSTEM-SURROGATE CONVENTION. A git path may
+    contain any byte but NUL, including bytes that are not valid UTF-8, so
+    ``run_sync_batch`` decodes with ``errors="surrogateescape"``. ``path``,
+    ``host``, ``email``, ``pane`` and ``action`` may therefore contain lone
+    surrogates; recover the original bytes with
+    ``value.encode("utf-8", "surrogateescape")``. Writing such a value to a
+    strict-UTF-8 stream raises -- rendering one safely is the caller's job.
+    """
+
+    sub_reason: str
+    task: str
+    path: str
+    tree_state: str
+    holder: str
+    email: str
+    host: str
+    pid: str
+    pane: str
+    pane_state: str
+    action: str
+
+
+def _parse_deferred_file(line: str) -> DeferredFile | None:
+    """Parse one `DEFERRED_FILE:` line, or return None if it is malformed.
+
+    FAILS CLOSED. Every bare column is validated against its closed vocabulary,
+    because those columns are what a consumer branches on: a `holder` outside
+    the known set would reach a UI that has no case for it, and a caller that
+    silently dropped the row would render a deferral with files missing from it.
+    """
+    body = line[len("DEFERRED_FILE:"):]
+    parts = body.split("|")
+    if len(parts) != _DEFERRED_FILE_COLUMNS:
+        return None
+    (sub_reason, task, path, tree_state, holder,
+     email, host, pid, pane, pane_state, action) = parts
+
+    if sub_reason not in DEFERRED_FILE_REASONS:
+        return None
+    if task and not _TASK_RE.match(task):
+        return None
+    if tree_state not in _TREE_STATES:
+        return None
+    if holder not in _HOLDER_CLASSES:
+        return None
+    if not _PID_RE.match(pid):
+        return None
+    if not _PANE_STATE_RE.match(pane_state):
+        return None
+
+    return DeferredFile(
+        sub_reason=sub_reason,
+        task=task,
+        path=_pct_decode(path),
+        tree_state=tree_state,
+        holder=holder,
+        email=_pct_decode(email),
+        host=_pct_decode(host),
+        pid=pid,
+        pane=_pct_decode(pane),
+        pane_state=pane_state,
+        action=_pct_decode(action),
+    )
+
+
+# --- Synthetic statuses owned by run_sync_batch ---
+STATUS_TIMEOUT = "TIMEOUT"
+STATUS_NOT_FOUND = "NOT_FOUND"
+
+# Wall-clock cap on the whole batch invocation. The underlying aitask_sync.sh
+# applies its own NETWORK_TIMEOUT=10 to each fetch/push, so 30s leaves headroom
+# for auto-merge attempts on top of the network calls.
+DEFAULT_SYNC_TIMEOUT_SECONDS = 30
+
+# Stopping a timed-out sync (t1947). SIGTERM first: git removes its *.lock
+# files on TERM, and aitask_sync.sh has no traps of its own. Then SIGKILL
+# rounds until the session is empty — repeated, so a member that forks between
+# one membership listing and the kill is caught by the next round.
+#
+# The sync's fetch/push run under lib/bounded_run.py. The sync has no
+# controlling terminal (start_new_session below), so bounded_run keeps git in
+# its own process GROUP inside the sync's session rather than a session of its
+# own: every transport stays a member here, so the SIGKILL rounds reach it and
+# an empty session proves it gone even when the runner itself was killed
+# mid-cleanup. The budgets are still ordered so that cleanup is normally the
+# runner's own, orderly one (git removes its *.lock files on SIGTERM): the sync
+# gets AIT_BOUNDED_RUN_GRACE = child_grace(_TERM_GRACE_SECONDS)
+# (_sync_child_env), so on our SIGTERM + SIGCONT the runner kills its group —
+# SIGTERM, that grace, SIGKILL — and exits inside this TERM window.
+_TERM_GRACE_SECONDS = 3.0
+_KILL_DEADLINE_SECONDS = 5.0
+_POLL_SECONDS = 0.05
+
+_SYNC_SCRIPT = "./.aitask-scripts/aitask_sync.sh"
+
+
+@dataclass
+class SyncResult:
+    status: str
+    conflicted_files: list[str] = field(default_factory=list)
+    error_message: str | None = None
+    raw_output: str = ""
+    #: Set only for STATUS_DEFERRED. Deliberately NOT folded into
+    #: ``error_message``: a deferral is a benign outcome, and anything
+    #: inspecting the dataclass would read a populated ``error_message`` as a
+    #: failure. ``deferred_reason`` is one of :data:`DEFERRED_REASONS` when the
+    #: shell and Python sides agree; ``deferred_detail`` is free text.
+    deferred_reason: str | None = None
+    deferred_detail: str | None = None
+    #: Per-file records from the `DEFERRED_FILE:` continuation lines. Populated
+    #: only when the status line was `DEFERRED:` -- see parse_sync_output.
+    deferred_files: list["DeferredFile"] = field(default_factory=list)
+    #: Set only for STATUS_TIMEOUT, when the timed-out sync's session could
+    #: not be proven empty (a member survived SIGKILL, or membership could not
+    #: be queried). Its processes may still be changing task data: treat the
+    #: data as unsafe to edit or re-sync until `sync_session_running(sid)` is
+    #: False (t1947).
+    stray_session: int | None = None
+
+
+def parse_sync_output(stdout: str) -> SyncResult:
+    """Parse the first non-empty line of `aitask_sync.sh --batch` stdout.
+
+    Pure function — no subprocess, no Textual. Mirrors the parsing previously
+    inlined in `aitask_board.py:_run_sync` so behavior is identical for every
+    documented status, including the bare `CONFLICT:` edge case (which yields
+    `[""]` because `"".split(",")` does, matching the historical board path).
+    """
+    raw = stdout
+    # SPLIT ON LF ALONE, never str.splitlines(). splitlines() also breaks on CR,
+    # VT, FF, FS, GS, RS, NEL and (after decoding) U+2028/U+2029 -- every one of
+    # which is a legal byte in a git path, and all of which travel inside the
+    # percent-encoded fields of a DEFERRED_FILE: record. Using it would let a
+    # hostile-but-valid filename split one record into two unparseable halves.
+    # The shell encodes LF (and CR) precisely so this one rule is sufficient.
+    lines = raw.split("\n")
+
+    line = ""
+    first_idx = -1
+    for idx, candidate in enumerate(lines):
+        stripped = candidate.strip()
+        if stripped:
+            line = stripped
+            first_idx = idx
+            break
+
+    if not line:
+        return SyncResult(
+            status=STATUS_ERROR,
+            error_message="empty output from sync script",
+            raw_output=raw,
+        )
+
+    if line.startswith("CONFLICT:"):
+        suffix = line[len("CONFLICT:"):]
+        return SyncResult(
+            status=STATUS_CONFLICT,
+            conflicted_files=suffix.split(","),
+            raw_output=raw,
+        )
+
+    if line.startswith("DEFERRED:"):
+        suffix = line[len("DEFERRED:"):]
+        reason, _, detail = suffix.partition(":")
+        if reason not in DEFERRED_REASONS:
+            # FAIL CLOSED, exactly like the unknown-status branch below. A
+            # deferral renders as a benign warning in both TUIs and is
+            # deliberately not captured as a failure — so accepting an
+            # unrecognised reason would turn a shell-side typo into "all fine,
+            # just deferred" and silently suppress a real sync failure. The
+            # reason set is a closed protocol; an unknown one is a bug.
+            return SyncResult(
+                status=STATUS_ERROR,
+                error_message=f"unknown deferral reason: {reason or '(empty)'}",
+                raw_output=raw,
+            )
+        # Continuation lines are collected ONLY under a DEFERRED status line.
+        # A DEFERRED_FILE: line in the first position is not a deferral with a
+        # missing header, it is an unknown status -- and is handled as one by
+        # the fallthrough below.
+        deferred_files: list[DeferredFile] = []
+        for candidate in lines[first_idx + 1:]:
+            stripped = candidate.strip()
+            if not stripped or not stripped.startswith("DEFERRED_FILE:"):
+                continue
+            record = _parse_deferred_file(stripped)
+            if record is None:
+                # FAIL CLOSED, same rule as an unknown deferral reason above. A
+                # record we cannot parse is a file the user would never be told
+                # about, and silently dropping it turns an actionable deferral
+                # back into the opaque one this whole protocol replaced.
+                return SyncResult(
+                    status=STATUS_ERROR,
+                    error_message=f"malformed DEFERRED_FILE record: {stripped[:120]}",
+                    raw_output=raw,
+                )
+            deferred_files.append(record)
+
+        return SyncResult(
+            status=STATUS_DEFERRED,
+            deferred_reason=reason,
+            deferred_detail=detail or None,
+            deferred_files=deferred_files,
+            raw_output=raw,
+        )
+
+    if line.startswith("ERROR:"):
+        return SyncResult(
+            status=STATUS_ERROR,
+            error_message=line[len("ERROR:"):],
+            raw_output=raw,
+        )
+
+    if line in (
+        STATUS_SYNCED,
+        STATUS_PUSHED,
+        STATUS_PULLED,
+        STATUS_NOTHING,
+        STATUS_AUTOMERGED,
+        STATUS_MERGED,
+        STATUS_NO_NETWORK,
+        STATUS_NO_REMOTE,
+    ):
+        return SyncResult(status=line, raw_output=raw)
+
+    return SyncResult(
+        status=STATUS_ERROR,
+        error_message=f"unknown status: {line}",
+        raw_output=raw,
+    )
+
+
+def sync_batch_command(repo_root: Path | None = None) -> tuple[list[str], str | None]:
+    """(argv, cwd) for the ``aitask_sync.sh --batch`` invocation.
+
+    Pure command-resolution seam (no subprocess) so targeting is unit-testable
+    without live git. ``None`` preserves the legacy CWD-relative invocation
+    (the board caller); a root targets that repo's own installed script with
+    ``cwd=<root>`` so its ``_AIT_DATA_WORKTREE`` resolution applies.
+    """
+    if repo_root is None:
+        return [_SYNC_SCRIPT, "--batch"], None
+    return [str(repo_root / ".aitask-scripts" / "aitask_sync.sh"), "--batch"], str(repo_root)
+
+
+def _session_members(sid: int) -> list[int] | None:
+    """Live (non-zombie) pids in session ``sid``; ``None`` = cannot tell.
+
+    Session, not process group: a descendant may move itself into its own
+    group (bounded_run.py does, for every fetch/push) and close every inherited
+    fd, but it keeps the session. Only an explicit ``setsid()`` leaves it.
+
+    Two backends: ``/proc`` where it exists (Linux), else ``ps`` + ``getsid``.
+    """
+    if os.path.exists("/proc/self/stat"):
+        members = []
+        try:
+            entries = os.listdir("/proc")
+        except OSError:
+            return None
+        for name in entries:
+            if not name.isdigit():
+                continue
+            try:
+                with open(f"/proc/{name}/stat", "rb") as fh:
+                    stat = fh.read()
+            except (FileNotFoundError, ProcessLookupError):
+                continue  # exited between listing and reading
+            except OSError:
+                # Unreadable (permissions, I/O): it may be a member. Never
+                # let an unknown read pass as "gone".
+                return None
+            # comm (field 2) may hold spaces or parens: parse after the last
+            # ")". Then: state ppid pgrp session ...
+            fields = stat[stat.rfind(b")") + 2:].split()
+            try:
+                state, session = fields[0], int(fields[3])
+            except (IndexError, ValueError):
+                return None
+            if state == b"Z":
+                continue
+            if session == sid:
+                members.append(int(name))
+        return members
+    # No /proc (macOS, BSD): list every pid with ps and ask getsid() for its
+    # session. Not `pgrep -s`: macOS pgrep has no -s, and an unknown answer
+    # there left every timed-out sync uncontained (t2113).
+    try:
+        out = subprocess.run(["ps", "-A", "-o", "pid=,stat="],
+                             capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    members = []
+    for line in out.stdout.splitlines():
+        try:
+            pid_text, state = line.split(None, 1)
+            pid = int(pid_text)
+        except ValueError:
+            return None
+        if state.startswith("Z"):
+            continue  # exited, only awaiting its reaper
+        try:
+            if os.getsid(pid) == sid:
+                members.append(pid)
+        except ProcessLookupError:
+            continue  # exited between listing and asking
+        except OSError:
+            # EPERM and the like: it may be a member. Never let an unknown
+            # answer pass as "gone".
+            return None
+    return members
+
+
+def sync_session_running(sid: int) -> bool:
+    """True while session ``sid`` has live members — or membership is unknown.
+
+    The recovery probe for `SyncResult.stray_session`: fails closed, so an
+    unavailable query keeps the data unsafe rather than declaring it safe.
+    """
+    return _session_members(sid) != []
+
+
+def _signal_members(members: list[int], sig: int) -> None:
+    for pid in members:
+        try:
+            os.kill(pid, sig)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+
+def _wait_session_empty(sid: int, seconds: float, kill: bool = False) -> bool:
+    """Poll until session ``sid`` is empty (True) or ``seconds`` pass.
+
+    With ``kill``, SIGKILL whatever is listed on every poll. An unknown
+    membership returns False at once — it never counts as empty.
+    """
+    deadline = time.monotonic() + seconds
+    while True:
+        members = _session_members(sid)
+        if members is None:
+            return False
+        if not members:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        if kill:
+            _signal_members(members, signal.SIGKILL)
+        time.sleep(_POLL_SECONDS)
+
+
+def _term_session(sid: int, members: list[int]) -> bool:
+    """SIGTERM session ``sid`` — late joiners included; True once it is empty.
+
+    One snapshot is not enough: a member started after it (the sync launching
+    bounded_run.py for a fetch the instant before our signal) would never be
+    asked to stop, and would meet only the SIGKILL rounds — no orderly cleanup.
+    So every poll re-lists the session and signals whoever has not been yet,
+    and escalation waits until each member still alive has had
+    ``_TERM_GRACE_SECONDS`` since ITS own SIGTERM. Each SIGTERM is followed by
+    SIGCONT: a stopped member cannot run its handler otherwise. The window is
+    capped at twice the grace, so a session that keeps spawning still reaches
+    the SIGKILL rounds — which is safe, because every transport is a session
+    member (see ``_TERM_GRACE_SECONDS``). Unknown membership returns False.
+    """
+    termed: dict[int, float] = {}
+    started = time.monotonic()
+    cap = 2 * _TERM_GRACE_SECONDS
+    while True:
+        now = time.monotonic()
+        fresh = [pid for pid in members if pid not in termed]
+        if fresh:
+            _signal_members(fresh, signal.SIGTERM)
+            _signal_members(fresh, signal.SIGCONT)
+            for pid in fresh:
+                termed[pid] = now
+        time.sleep(_POLL_SECONDS)
+        members = _session_members(sid)
+        if members is None:
+            return False
+        if not members:
+            return True
+        now = time.monotonic()
+        newest = max(termed.get(pid, now) for pid in members)
+        if now - newest >= _TERM_GRACE_SECONDS or now - started >= cap:
+            return False
+
+
+def _stop_sync_session(proc: subprocess.Popen) -> int | None:
+    """Stop every process of a timed-out sync; return its sid if unproven.
+
+    The sync was started with ``start_new_session``, so its sid is its pid.
+    Returns ``None`` only when the session is proven empty.
+    """
+    sid = proc.pid
+    members = _session_members(sid)
+    if members:
+        if not _term_session(sid, members):
+            _wait_session_empty(sid, _KILL_DEADLINE_SECONDS, kill=True)
+    # Reap the direct child. proc.kill() is a no-op on a reaped pid; it only
+    # matters when membership could not be listed at all.
+    try:
+        proc.kill()
+    except OSError:
+        pass
+    proc.wait()
+    # Never communicate() again: a stray could hold the pipes open.
+    for pipe in (proc.stdout, proc.stderr):
+        if pipe is not None:
+            pipe.close()
+    return None if _session_members(sid) == [] else sid
+
+
+class SyncProcessTimeout(subprocess.TimeoutExpired):
+    """A timed-out sync, already stopped; ``stray_session`` as in SyncResult."""
+
+    def __init__(self, cmd, timeout, stray_session: int | None):
+        super().__init__(cmd, timeout)
+        self.stray_session = stray_session
+
+
+def _sync_child_env() -> dict:
+    """The sync's environment: os.environ plus a nested-runner grace that fits
+    inside ``_TERM_GRACE_SECONDS`` (see the comment there). A smaller grace
+    already in the environment is kept."""
+    env = dict(os.environ)
+    grace = min(effective_grace(), child_grace(_TERM_GRACE_SECONDS))
+    env[GRACE_ENV] = f"{grace:g}"
+    return env
+
+
+def _run_sync_process(argv, *, cwd, timeout, encoding, errors):
+    """``subprocess.run`` for the sync that contains its whole session.
+
+    ``subprocess.run(timeout=)`` kills only the direct child: the pull/rebase
+    git children outlive it and keep writing task data after the caller was
+    told the sync timed out (t1947). Here the sync gets its own session and a
+    timeout stops every member before `SyncProcessTimeout` is raised.
+
+    A clean exit is not drained: aitask_sync.sh waits for every child it
+    starts, so anything still in the session then is a helper daemon git
+    spawned on purpose (credential-cache, fsmonitor), not task-data work.
+    """
+    proc = subprocess.Popen(
+        argv,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        encoding=encoding,
+        errors=errors,
+        cwd=cwd,
+        env=_sync_child_env(),
+        start_new_session=True,
+    )
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise SyncProcessTimeout(
+            argv, timeout, stray_session=_stop_sync_session(proc)) from None
+    return subprocess.CompletedProcess(argv, proc.returncode, out, err)
+
+
+def run_sync_batch(
+    timeout: float = DEFAULT_SYNC_TIMEOUT_SECONDS,
+    repo_root: Path | None = None,
+) -> SyncResult:
+    """Invoke `aitask_sync.sh --batch` and return a parsed `SyncResult`.
+
+    Blocking — designed to be called from inside a `@work(thread=True)` worker.
+    Owns subprocess error mapping: timeouts become `STATUS_TIMEOUT`, missing
+    script becomes `STATUS_NOT_FOUND`. Otherwise hands off to
+    `parse_sync_output`. ``repo_root`` targets another repo's sync script
+    (see `sync_batch_command`); ``None`` is the legacy CWD-relative behavior.
+
+    A timeout returns only after the sync's whole session was stopped
+    (`_run_sync_process`); when that cannot be proven the result carries
+    ``stray_session``. A descendant that called ``setsid()`` itself — a
+    deliberately detached daemon — is outside the session and not tracked.
+    """
+    argv, cwd = sync_batch_command(repo_root)
+    try:
+        result = _run_sync_process(
+            argv,
+            # BYTE-PRESERVING, and pinned to one codec. A git path may contain
+            # any byte but NUL, so a plain `text=True` (locale codec,
+            # errors="strict") raises UnicodeDecodeError INSIDE communicate()
+            # on a path like b"a\xffb" -- before parse_sync_output ever sees it,
+            # and past the two excepts below, so it would escape this function
+            # and crash the calling TUI. surrogateescape round-trips such bytes:
+            # value.encode("utf-8", "surrogateescape") returns the original.
+            # `encoding` is explicit so the convention does not depend on
+            # whatever LC_ALL happens to be.
+            encoding="utf-8",
+            errors="surrogateescape",
+            timeout=timeout,
+            cwd=cwd,
+        )
+    except SyncProcessTimeout as exc:
+        message = f"sync timed out after {timeout:g}s"
+        if exc.stray_session is not None:
+            message += (f"; its processes could not be confirmed stopped "
+                        f"(session {exc.stray_session})")
+        return SyncResult(
+            status=STATUS_TIMEOUT,
+            error_message=message,
+            stray_session=exc.stray_session,
+        )
+    except FileNotFoundError:
+        return SyncResult(
+            status=STATUS_NOT_FOUND,
+            error_message="sync script not found",
+        )
+
+    return parse_sync_output(result.stdout)
+
+
+#: SyncConflictScreen dismiss values — a CLOSED set (t1911); None means
+#: Dismiss / escape. Callers dispatch by equality, never by truthiness: the
+#: modal used to dismiss with a bool, and `if choice:` would read "agent" as
+#: the old True (interactive).
+CONFLICT_CHOICE_AGENT = "agent"
+CONFLICT_CHOICE_INTERACTIVE = "interactive"
+
+#: tmux window for the data-conflict resolution agent (syncer and board alike).
+DATA_CONFLICT_WINDOW_NAME = "agent-syncfix-data-conflict"
+
+
+def build_data_conflict_prompt(
+    conflicted_files: Sequence[str], repo_root: Path | str
+) -> str:
+    """The prompt for a code agent resolving an aitask-data sync CONFLICT.
+
+    Context, the outcome wanted, one constraint and the known pitfalls — not
+    a recipe (t1911). The agent investigates the live state itself and picks
+    its own tools, strategy and recovery; the constraint is the one thing it
+    may not trade away, because a mid-rebase `.aitask-data` makes every other
+    session's task writes die in `assert_data_worktree_clean`.
+
+    Both pitfalls are facts about this framework, not advice: `git rebase`
+    drops merge commits (and `ait sync` / `_task_pull_rebase` both rebase on
+    pull), and `board/aitask_merge.py` unions `labels`/`depends` without the
+    merge base and lets `Implementing` beat `Done`.
+    """
+    files = [f for f in conflicted_files if f]
+    if files:
+        listing = (
+            "its auto-merge engine could not resolve:\n"
+            + "\n".join(f"  - {f}" for f in files)
+        )
+    else:
+        listing = (
+            "its auto-merge engine could not resolve. The sync did not name the "
+            "conflicted files; inspect the branch state to find them."
+        )
+    return (
+        f"An `ait sync` of the aitask-data branch in {repo_root} stopped on "
+        f"merge conflicts {listing}\n"
+        "\n"
+        "Context: in batch mode `ait sync` aborts its rebase before reporting a "
+        "conflict, so at that moment the shared `.aitask-data` checkout was clean "
+        "on the local aitask-data branch — local commits intact, remote commits "
+        "not applied. The state may have moved since; check it yourself. "
+        "(`ait sync` without `--batch` opens $EDITOR on conflicts.)\n"
+        "\n"
+        "Goal: resolve the conflicts and leave the aitask-data branch integrated "
+        "with the remote and published, with the live `.aitask-data` checkout up "
+        "to date. Task and plan files are merged, not superseded: keep both "
+        "sides' intent, in frontmatter and body. Choose your own approach, tools "
+        "and recovery, following this repository's instructions. Ask the user "
+        "when the intended merge is ambiguous or a decision needs their input.\n"
+        "\n"
+        "When you are done, other sessions' ongoing work must be preserved — "
+        "their uncommitted edits in `.aitask-data` and any commits they made "
+        "there while you worked — and the shared checkout must be usable, with "
+        "no unresolved merge or rebase in progress.\n"
+        "\n"
+        "Constraint: do the resolution in a separate git worktree, never in "
+        "`.aitask-data`. That checkout is shared by every session on this "
+        "machine, and while it is mid-rebase or mid-merge their task writes "
+        "fail. Keep it available to them throughout.\n"
+        "\n"
+        "Pitfalls:\n"
+        "- An ordinary rebase drops merge commits, so edits that exist only in a "
+        "merge commit's conflict resolution can disappear without any conflict "
+        "— and `ait sync` and the framework's push retry both rebase when they "
+        "pull.\n"
+        "- The auto-merge driver (`.aitask-scripts/board/aitask_merge.py`, which "
+        "`ait sync` runs) can undo deliberate changes: it unions list fields "
+        "such as `labels` and `depends` without consulting the merge base "
+        "(re-adding an entry one side removed), and it lets `Implementing` win "
+        "over `Done` for `status`.\n"
+        "\n"
+        "Before you finish, verify — by whatever method you choose — that the "
+        "final integrated result preserves the intended resolution, both as "
+        "published on the remote and in the live `.aitask-data` checkout, and "
+        "that the end state above holds. Remove any worktree you created.\n"
+    )
+
+
+#: The syncer's main-branch actions that can need an agent's help (t2126).
+MAIN_CONFLICT_ACTIONS = ("pull", "push")
+
+#: Why a main-branch action needs assistance — a closed set.
+#: diverged: the local branch and its upstream each have commits the other
+#: lacks (pull could not fast-forward; push was rejected).
+#: submodules: a pull deferred before changing anything, because
+#: `submodule.recurse` is set and the checkout has initialized submodules,
+#: which the syncer deliberately does not update itself.
+MAIN_REASON_DIVERGED = "diverged"
+MAIN_REASON_SUBMODULES = "submodules"
+MAIN_CONFLICT_REASONS = (MAIN_REASON_DIVERGED, MAIN_REASON_SUBMODULES)
+
+#: tmux window prefix for the main-branch agent; the action is appended.
+#: Distinct from DATA_CONFLICT_WINDOW_NAME and the generic failure agent's
+#: `agent-syncfix-<action>`.
+MAIN_CONFLICT_WINDOW_PREFIX = "agent-syncfix-main-"
+
+
+def _check_main_conflict_action(action: str, reason: str | None = None) -> None:
+    if action not in MAIN_CONFLICT_ACTIONS:
+        raise ValueError(f"not a main-branch conflict action: {action!r}")
+    if reason is not None and reason not in MAIN_CONFLICT_REASONS:
+        raise ValueError(f"not a main-branch assistance reason: {reason!r}")
+
+
+def main_conflict_window_name(action: str) -> str:
+    """The tmux window name for the main-branch agent of ``action``."""
+    _check_main_conflict_action(action)
+    return f"{MAIN_CONFLICT_WINDOW_PREFIX}{action}"
+
+
+def describe_main_conflict_reason(
+    action: str, reason: str, branch: str, upstream: str
+) -> str:
+    """One plain sentence or two on why the action stopped — shared by the
+    syncer's dialog and the resolver prompt, so both say the same thing."""
+    _check_main_conflict_action(action, reason)
+    if reason == MAIN_REASON_SUBMODULES:
+        return (
+            "submodule.recurse is set and this checkout has initialized "
+            "submodules. The syncer does not update submodules automatically, "
+            "so it stopped before changing anything."
+        )
+    if action == "pull":
+        return (
+            f"The local {branch} and its upstream {upstream} have diverged: each "
+            "has commits the other lacks, so the fast-forward was refused. "
+            "Nothing was changed."
+        )
+    return (
+        f"The push to {upstream} was rejected: {upstream} has commits the local "
+        f"{branch} lacks. Nothing was published."
+    )
+
+
+def build_main_conflict_prompt(
+    action: str,
+    reason: str,
+    branch: str,
+    upstream: str,
+    repo_root: Path | str,
+    output_tail: str,
+) -> str:
+    """The prompt for a code agent finishing a main-branch pull or push the
+    syncer stopped (t2126).
+
+    ``reason`` is MAIN_REASON_DIVERGED or MAIN_REASON_SUBMODULES.
+    ``upstream`` names the remote branch involved: for a pull the branch's
+    configured upstream, which need not share its name (git's refusal never
+    names it); for a push ``origin/<branch>``. Same shape as
+    build_data_conflict_prompt: the facts, the outcome wanted, the
+    constraints and the pitfalls — not a recipe.
+
+    The constraints exist because the main checkout is shared by several live
+    agent sessions: their uncommitted edits sit in its working tree and they
+    commit to it while the agent works.
+    """
+    _check_main_conflict_action(action, reason)
+    tail = output_tail.strip()
+    if tail:
+        quoted = "\n".join(f"    {line}" for line in tail.splitlines())
+        reported = f"Git reported:\n{quoted}\n"
+    else:
+        reported = ""
+    if action == "pull":
+        publish = (
+            "Publishing is not part of this goal: ask the user before you push "
+            "anything."
+        )
+    else:
+        publish = f"Publish the integrated result to `{upstream}`."
+    submodules = sub_constraint = sub_pitfall = ""
+    if reason == MAIN_REASON_SUBMODULES:
+        submodules = (
+            " Its submodules are checked out at the commits the result records, "
+            "as `git pull` with `submodule.recurse` would leave them."
+        )
+        sub_constraint = (
+            "- Never strand local work in a submodule: commits there that no "
+            "branch holds, or uncommitted changes.\n"
+        )
+        sub_pitfall = (
+            "- `git submodule update` moves a submodule's HEAD to its recorded "
+            "commit, which strands commits made there on a detached HEAD, and "
+            "`git pull` with `submodule.recurse` runs it.\n"
+        )
+    why = describe_main_conflict_reason(action, reason, branch, upstream)
+    return (
+        f"`ait syncer` stopped a {action} of `{branch}` and needs your help.\n"
+        "\n"
+        f"Repository: {repo_root}\n"
+        f"Local branch: {branch}\n"
+        f"Upstream: {upstream}\n"
+        f"Operation: {action}\n"
+        f"Reason: {reason} — {why}\n"
+        f"{reported}"
+        "\n"
+        "Context: the state may have moved since; check it yourself. This "
+        "checkout is shared by several live agent sessions: their uncommitted "
+        "edits are in its working tree, and they commit to it while you work.\n"
+        "\n"
+        f"Goal: integrate the local `{branch}` with `{upstream}`, keeping both "
+        f"sides' commits. {publish} Leave the live checkout at {repo_root} up "
+        f"to date with the integrated result.{submodules} Choose your own "
+        "approach, tools and recovery, following this repository's "
+        "instructions. Ask the user when the choice between merge and rebase, "
+        "or an ambiguous conflict resolution, is theirs to make.\n"
+        "\n"
+        "Constraints:\n"
+        "- Never force-push, in any form.\n"
+        "- Keep every commit other sessions made, local or published.\n"
+        "- Never stash, reset, check out, restore or clean other sessions' "
+        "uncommitted edits: they must stay byte-for-byte intact.\n"
+        "- Keep the shared checkout available: do not leave a merge or rebase "
+        "in progress there, not even while you work — other sessions commit "
+        "there.\n"
+        f"{sub_constraint}"
+        "\n"
+        "Pitfalls:\n"
+        "- A rebase drops merge commits, and this branch carries merge commits "
+        "from task branches.\n"
+        f"- Other sessions may commit to `{branch}` while you work, so check "
+        "again before you publish or finish.\n"
+        "- An incoming change to a file another session has modified blocks "
+        "updating the live checkout. Stop and ask the user rather than moving "
+        "their edits.\n"
+        f"{sub_pitfall}"
+        "\n"
+        "Before you finish, verify — by whatever method you choose — that the "
+        "end state above holds. Remove any worktree you created.\n"
+    )
+
+
+class SyncConflictScreen(GuardedModalScreen):
+    """Modal dialog shown when `ait sync` detects merge conflicts.
+
+    Self-contained: ships its own CSS via `DEFAULT_CSS` so it renders correctly
+    in any host App (board, syncer) without depending on app-level styling.
+
+    Dismisses with CONFLICT_CHOICE_AGENT, CONFLICT_CHOICE_INTERACTIVE, or None
+    (Dismiss / escape). It only offers: launching anything is the host's job,
+    and only on that explicit choice — with the board's sync_on_refresh this
+    modal can appear unattended.
+    """
+
+    DEFAULT_CSS = """
+    #sync_conflict_dialog {
+        width: 72%;
+        /* The three buttons need 64 columns of content (+6 for border and
+           padding); the floor keeps them all visible on an 80-column screen,
+           where 72% alone leaves 51. */
+        min-width: 72;
+        height: auto;
+        max-height: 50%;
+        background: $surface;
+        border: thick $accent;
+        padding: 1 2;
+    }
+    #sync_conflict_title {
+        text-align: center;
+        padding: 0 0 1 0;
+        text-style: bold;
+    }
+    #sync_conflict_files {
+        padding: 0 1;
+        color: $text-muted;
+    }
+    #sync_conflict_buttons {
+        dock: bottom;
+        height: 3;
+        align: center middle;
+    }
+    """
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel", show=False)]
+
+    def __init__(self, conflicted_files: list[str], repo_label: str = ""):
+        super().__init__()
+        self.conflicted_files = conflicted_files
+        # Names the repo in the multi-repo syncer; empty keeps the plain title.
+        self.repo_label = repo_label
+
+    def compose(self):
+        file_list = "\n".join(f"  - {f}" for f in self.conflicted_files)
+        title = "Sync Conflict Detected"
+        if self.repo_label:
+            title = f"{title} — {self.repo_label}"
+        with Container(id="sync_conflict_dialog"):
+            yield Label(title, id="sync_conflict_title")
+            yield Label(
+                f"Conflicts between local and remote task data:\n\n{file_list}\n\n"
+                "Launch a code agent to resolve them, or resolve them yourself "
+                "in an interactive terminal?",
+                id="sync_conflict_files",
+            )
+            with Horizontal(id="sync_conflict_buttons"):
+                yield Button("Launch agent to resolve", variant="warning", id="btn_sync_agent")
+                yield Button("Resolve Interactively", variant="primary", id="btn_sync_resolve")
+                yield Button("Dismiss", variant="default", id="btn_sync_dismiss")
+
+    @on(Button.Pressed, "#btn_sync_agent")
+    def launch_agent(self):
+        self.dismiss(CONFLICT_CHOICE_AGENT)
+
+    @on(Button.Pressed, "#btn_sync_resolve")
+    def resolve(self):
+        self.dismiss(CONFLICT_CHOICE_INTERACTIVE)
+
+    @on(Button.Pressed, "#btn_sync_dismiss")
+    def dismiss_dialog(self):
+        self.dismiss(None)
+
+    def action_cancel(self):
+        self.dismiss(None)
+
+
+def run_interactive_sync(
+    app,
+    on_done: Callable[[], None] | None = None,
+    repo_root: Path | None = None,
+) -> None:
+    """Launch interactive `./ait sync` for conflict resolution.
+
+    Two paths:
+    - If a terminal emulator is available (`find_terminal()`), spawn it
+      detached running `./ait sync`. Fire-and-forget — `on_done` is NOT
+      invoked because we cannot observe the spawned terminal's exit. This
+      matches the board's pre-extraction behavior.
+    - Otherwise, suspend the Textual app and run `./ait sync` inline. After
+      the inline call returns, invoke `on_done` (if provided) so the host
+      app can refresh its state.
+
+    ``repo_root`` targets another repo's own ``ait`` dispatcher (the absolute
+    path suffices — ``ait`` cds to its repo root itself); ``None`` keeps the
+    legacy CWD-relative invocation.
+
+    The no-terminal path uses `app.suspend()`, which blocks; call this from a
+    worker context (e.g., `@work(exclusive=True)`) to avoid stalling the
+    event loop. The terminal-spawn path is non-blocking and safe from any
+    context.
+    """
+    if repo_root is None:
+        ait_argv = ["./ait", "sync"]
+        cwd = None
+    else:
+        ait_argv = [str(repo_root / "ait"), "sync"]
+        cwd = str(repo_root)
+
+    terminal = find_terminal()
+    if terminal:
+        spawn_in_terminal(terminal, ait_argv)
+        return
+
+    with app.suspend():
+        subprocess.call(ait_argv, cwd=cwd)
+    if on_done is not None:
+        on_done()

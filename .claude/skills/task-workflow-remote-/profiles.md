@@ -1,0 +1,284 @@
+# Execution Profiles
+
+Reference documentation for execution profiles used by the task-workflow skill
+and calling skills (aitask-pick, aitask-explore, etc.).
+
+## Table of Contents
+
+- [Profile Schema Reference](#profile-schema-reference)
+  - [Parallel admission](#parallel-admission)
+- [Gate Declaration Model](#gate-declaration-model)
+- [Customizing Execution Profiles](#customizing-execution-profiles)
+- [Default Profile Configuration](#default-profile-configuration)
+- [Profile Override Argument](#profile-override-argument)
+
+---
+
+Profiles are YAML files stored in `aitasks/metadata/profiles/`. They pre-answer workflow questions to reduce interactive prompts. Two profiles ship by default:
+- **default** — All questions asked normally (empty profile, serves as template)
+- **fast** — Skip confirmations, use userconfig email, work locally on current branch, reuse existing plans
+
+## Profile Schema Reference
+
+| Key | Type | Required | Values | Step |
+|-----|------|----------|--------|------|
+| `name` | string | yes | Display name shown during profile selection | Step 0a |
+| `description` | string | yes | Description shown below profile name during selection | Step 0a |
+| `skip_task_confirmation` | bool | no | `true` = auto-confirm task; omit or `false` = ask | Step 0b |
+| `default_email` | string | no | `"userconfig"` = from userconfig.yaml (falls back to first from emails.txt); `"first"` = first from emails.txt; or a literal email address; omit = ask. Note: `assigned_to` from task metadata always takes priority regardless of this setting (see Step 4 email resolution). | Step 4 |
+| `create_worktree` | bool | no | `true` = worktree mode; `false` = current branch. The fork itself is cut at Step 7, after plan approval and the remote drift check | Step 5 (resolve), Step 7 (fork) |
+| `base_branch` | string | no | Branch the task branch is cut from (e.g., `"main"`). Recorded in the plan header as `Base branch:`, which is what Re-entry Routing and the resumed remote-drift check read; ignored (like `output_branch`) outside worktree mode | Step 5 (resolve), Step 6 (recorded in the plan header) |
+| `output_branch` | string | no | Branch the finished work is merged into (e.g., `"dev"`); omit to merge into the resolved `base_branch` | Step 5 (resolve), Step 9 (merge) |
+| `plan_preference` | string | no | `"use_current"`, `"verify"`, or `"create_new"` | Step 6.0 |
+| `plan_preference_child` | string | no | Same values as `plan_preference`; overrides `plan_preference` for child tasks. Defaults to `plan_preference` if omitted | Step 6.0 |
+| `plan_verification_required` | int | no | Positive integer; default `1` | Step 6.0 |
+| `plan_verification_stale_after_hours` | int | no | Positive integer; default `24` | Step 6.0 |
+| `post_plan_action` | string | no | `"start_implementation"` = skip to impl; `"ask"` = always show checkpoint; omit = ask | Step 6 checkpoint |
+| `post_plan_action_for_child` | string | no | Same values as `post_plan_action`; overrides `post_plan_action` when the current task is a child task. Defaults to `post_plan_action` if omitted | Step 6 checkpoint |
+| `record_gates` | bool | no | `true` = record approval checkpoints (plan/review/merge approval, plus build and risk evaluation when they run) as gate-run entries in the task's `## Gate Runs` ledger, committed for cross-PC visibility and later resume; omit or `false` = disabled (opt-in, off by default) | Steps 6–9 |
+| `default_gates` | list | no | Comma-separated gate names declared into new tasks' `gates:` frontmatter (auto-injected as `--gates` at creation) and used as the resolve fallback for a picked task lacking the field (materialized into `active_gates` at claim, Step 4). Drives the planning risk producer in lockstep with the verify-time checker — declaring `risk_evaluated` is what now runs risk evaluation (it replaces the former `risk_evaluation` toggle). Omit/empty = declare nothing. See **Gate Declaration Model**. | task creation / Step 4 (materialize) |
+| `rendered_gates` | list | no | **Render ceiling (t635_33):** the gates whose workflow machinery is rendered into this profile's task-workflow variant, and the cap on every task's enforced set (`active_gates = resolve(gates:, default_gates) ∩ rendered set`). Key-presence semantics: present (even `[]` — an explicit render-nothing override) wins; omitted = defaults to `default_gates`, so existing profiles need no new key. A gate outside the ceiling is invisible everywhere — never rendered, never enforced, never blocks archival or dependents. | render time / Step 4 (materialize) |
+| `max_parallel_gates` | int | no | Max unlocked machine-gate verifiers the gate orchestrator (`aitask-run-gates` / `ait gates run`) dispatches concurrently, capped by core count; omit = `2` | `aitask_run_gates.sh` (gate orchestrator) |
+| `enableFeedbackQuestions` | bool | no | `false` = render the satisfaction rating prompt and the verified-score update away (skill usage is still recorded); omit or `true` = ask them. The shipped `fast` and `remote` profiles set `false` | Satisfaction Feedback Procedure |
+| `qa_mode` | string | no | `"ask"` = prompt; `"create_task"` = auto-create follow-up; `"implement"` = implement tests now; `"plan_only"` = export plan only; omit = ask | aitask-qa Step 5 |
+| `qa_run_tests` | bool | no | `true` = run discovered tests; `false` = skip test execution; omit or `true` = run | aitask-qa Step 4 |
+| `qa_tier` | string | no | `"quick"`, `"standard"` (default), `"exhaustive"` | aitask-qa Step 1c |
+| `shadow_impl_review_tier` | string | no | `"quick"`, `"default"`, `"advanced"`, `"deep"` — default effort tier for the shadow's implementation review. Set = a generic "review the implementation" runs at that tier with no prompt; omit = the 4-option tier prompt. A tier named in the user's ask always overrides it. **Inert unless `default_profiles.shadow` names this profile** — the shadow resolves its profile like any other skill, so the shipped `fast.yaml` value does nothing until that mapping exists. | aitask-shadow `impl-challenge.md` Tier selection |
+| `explore_auto_continue` | bool | no | `true` = continue straight to implementation after the task is created; omit or `false` = ask | aitask-explore Step 4 |
+| `explore_label_confirm` | string | no | `"ask"` (default when omitted — show the proposed labels split into existing / near-duplicate / new and confirm), `"auto"` (accept the proposed labels with no prompt; new ones still enter the vocabulary), `"existing_only"` (never mint a new label: keep existing ones, substitute near-duplicates, report the rest as dropped). Headless profiles must set `auto` or `existing_only` so no prompt is emitted. | aitask-explore Step 3a |
+| `remote_drift_check` | string | no | `"warn"` (default — soft warning when remote is ahead with no plan-overlap, strong warning with overlap), `"skip"` (do nothing), `"strong-only"` (only prompt when overlap exists) | Step 6 checkpoint (post-plan) |
+| `parallel_admission` | string | no | `"confirm"`, `"warn"` (**the default** when omitted), or `"off"`. Governs how loudly the [Parallel-Admission Preflight](#parallel-admission) surfaces a non-CLEAR verdict. **No value ever stops the workflow** — every stop is a user choice at the prompt. **All three shipped profiles set `"off"`** (an opt-out; the absent-key default is still `warn`). Quote it: YAML parses a bare `off` as the boolean false (the renderer accepts both, but the quoted form says what it means) | Step 6 checkpoint (post-plan), Re-entry Routing `IMPLEMENT` |
+| `parallel_assessment` | string | no | `"off"` (**the default**, and also what an absent key means), `"show"` or `"ask"`. Opt-in: enables the pre-claim [Parallel-Safety Assessment](#parallel-safety-assessment) in `aitask-pick`, before the task is claimed. Disabled renders the procedure away entirely — no checker invocation, no reading, no prompt. **All three shipped profiles set `"off"`.** Quote it, for the same YAML-boolean reason as `parallel_admission` | `aitask-pick` Step 3 (pre-claim) |
+| `relations_incomplete_action` | string | no | `"ask"` (**the default**, and what an absent key means), `"wait"`, `"fallback"` or `"proceed"`. Picks the Step 8e option when the relations analysis is **incomplete**: `wait` runs `ait relations analyze --now --wait` and **never** passes `--over-cap`; `fallback` runs the static discovery fallback (reported unavailable until its generator exists); `proceed` uses the rows from whatever record exists. Under `ask` an interactive profile asks; a `headless` profile cannot, so it proceeds. Shipped: `default` and `fast` `"ask"`, `remote` `"proceed"` | Step 8e (relations-derived offers) |
+| `manual_verification_mode` | string | no | `"ask"` (default — prompt fires with autonomous / autonomous_with_plan / skip), `"manual"` (skip prompt; straight to interactive), `"autonomous"` (skip prompt; run autonomous), `"autonomous_with_plan"` (skip prompt; design + approve + execute). Controls only the up-front prompt — the per-item `auto` verb in the interactive loop is always available regardless. | Manual Verification Step 1.5 |
+| `headless` | bool | no | `true` = a fully autonomous profile (no interactive prompts) used where `ait setup` never ran, e.g. Claude Code Web. Marks the profile as one whose `prerender_for_headless` skills ship committed prerenders. Currently only `remote`. | (build-time: `aitask_skill_verify.sh`) |
+
+Only `name` and `description` are required. Omitting any other key means the corresponding question is asked interactively.
+
+> **Committed headless prerenders (`headless` × `prerender_for_headless`):** A
+> skill that declares `prerender_for_headless: true` in its `SKILL.md.j2`
+> frontmatter ships a pre-rendered closure for every `headless: true` profile,
+> committed to git (the `!…-<profile>-/` un-ignore entries in `.gitignore`), so
+> it works in environments where `ait setup` has not rendered skills on demand.
+> `aitask_skill_verify.sh` discovers these two markers and fails loudly if any
+> committed prerender is missing or has drifted from its source closure — run
+> `aitask_skill_rerender.sh <profile>` and commit when it does.
+
+> **Plan verification tracking (`plan_verification_required`, `plan_verification_stale_after_hours`):** When `plan_preference` (or `plan_preference_child`) is `"verify"`, the workflow consults the plan file's `plan_verified` metadata list to decide whether a fresh verification is actually needed. `plan_verification_required` is the number of fresh (non-stale) entries required to skip re-verification — default `1` means a single prior verification is sufficient. `plan_verification_stale_after_hours` is how old (in hours) an entry may be before it no longer counts as fresh — default `24`. Both keys apply uniformly to parent and child tasks — there are no `_child` variants. The actual decision (skip / verify / ask) is computed by `./.aitask-scripts/aitask_plan_verified.sh decide`, which returns a structured report the workflow parses directly.
+
+> **Remote-specific profile fields** (e.g., `done_task_action`, `review_action`, `issue_action`) are documented in the `aitask-pickrem` skill. They are only recognized by that skill and ignored by this workflow.
+
+### Parallel admission
+
+`parallel_admission` governs the **Parallel-Admission Preflight**
+(`parallel-admission.md`), which asks the shared checker whether another
+in-flight task collides with this one. It runs at the planning Checkpoint and on
+the `IMPLEMENT` re-entry route, in both cases immediately after the Remote Drift
+Check.
+
+| value | behaviour |
+|---|---|
+| `"confirm"` | every non-CLEAR verdict requires explicit confirmation to continue |
+| `"warn"` | **default.** `CONFLICT` and `UNCHECKABLE` require confirmation; `CLEAR_CAVEATED` renders as a visible note, distinct from `CLEAR` |
+| `"off"` | whole-step no-op: no invocation, no display |
+
+**No value of this key ever stops the workflow.** The knob controls only how
+loudly a non-CLEAR verdict is surfaced; every stop is a choice the user makes at
+the prompt.
+
+**There is deliberately no `block` value.** A value named for a behaviour the
+procedure does not have would be a lie. The evidence the checker reasons over is
+regex-extracted from plan prose — a path a plan merely *runs* inside a fenced
+command is indistinguishable from one it declares it will edit — so a measured
+false `CONFLICT` is on record. A heuristic of that shape may inform a decision;
+it may not make one. Any future hard-stop mode is gated on a structured per-task
+declaration of intended edits (t1343), not on this knob.
+
+`warn` is the default for that reason, not as a conservative first step toward
+something stricter.
+
+**Every shipped profile sets `"off"`, and that is an opt-OUT, not the default.**
+An absent key still means `warn`; `default.yaml`, `fast.yaml` and `remote.yaml`
+each opt out explicitly.
+
+**Why it ships off, measured 2026-09-17.** Over **131** live candidates the
+verdicts are **0 CLEAR / 86 CLEAR_CAVEATED / 31 CONFLICT / 14 UNCHECKABLE** (an
+in-flight task with no plan is read from its description, so most candidates are
+checkable). But `warn` prompts on both `CONFLICT` and `UNCHECKABLE`, so
+that is **45 prompts — 34% of picks**, above the 30% bar set for flipping the
+default. Prompt *quality* is the second reason: of 6 sampled `CONFLICT`
+verdicts — counterparties named through `pa.conflict_refs`, the only sanctioned
+way — exactly **1 was a real edit collision** (two tasks both adding defaults to
+`codeagent_config.json`). The other 5 named a file one side merely *runs* or
+*cites*: a test both plans execute, a guard script one plan only mentions. That
+is the false-positive shape the Notes below describe, now quantified.
+
+The remaining `UNCHECKABLE` causes are `all_phantom` (5) and
+`no_extractable_paths` (9) — plans whose declared paths no longer exist, and
+plans that declare none. Set `warn` or `confirm` in your own profile to opt in;
+the numbers above are a corpus snapshot and move with the backlog.
+
+Headless profiles must keep `"off"` regardless: under `confirm` and `warn` the
+procedure prompts, which an unattended run cannot answer.
+
+### Parallel-safety assessment
+
+`parallel_assessment` governs the **Parallel-Safety Assessment Procedure**
+(`parallel-assessment.md`), which `aitask-pick` runs **after a task is selected
+and before it is claimed** — the moment a user actually asks "given what is in
+flight, is it safe to pick this?". It is agent judgement over what the in-flight
+tasks' descriptions and plans say they touch, with the deterministic checker's
+output as structured input.
+
+| value | behaviour |
+|---|---|
+| `"off"` | **the default, and what an absent key means.** Whole-procedure no-op: nothing is invoked, read or displayed |
+| `"show"` | assess and display; prompt only when a row is graded `overlaps` or the checker was unusable |
+| `"ask"` | assess, display, and always prompt |
+
+**Opt-in on purpose.** Every enabled pick pays a real cost — a checker call plus
+reading the description (and plan) of every live in-flight task — and pays it
+*before* the claim, on a task the user may not even keep. A knob that charges
+that by default would be paid most often by the picks that least need it, so
+`"off"` ships everywhere and the absent key agrees.
+
+**Headless profiles never prompt**, in either mode: under `headless: true` the
+procedure displays its assessment and continues. `"ask"` is accepted there and
+behaves like `"show"` — an unattended run cannot answer a question, and a mode
+that asked one would hang the pick.
+
+**It is advisory, never a guard**, for the same reason `parallel_admission` is:
+descriptions and plans are heuristic accounts of what a task will edit. A hard
+stop waits on t1343's declared per-task edit manifest.
+
+**Two call sites, two evidence qualities, one checker.** This runs pre-claim
+against task descriptions; `parallel_admission`'s preflight runs post-plan
+against plans. Both classify the checker's output through the same contract
+(`parallel-admission-checker.md`), so they cannot disagree about what a usable
+answer is.
+
+## Gate Declaration Model
+
+Profiles declare **which gates** a task carries via `default_gates`; the gate
+registry (`aitasks/metadata/gates.yaml`) defines **how** each gate runs. A
+checkpoint is configured in exactly one place — never both. (This is the principle
+behind retiring the former `risk_evaluation` toggle in favour of declaring the
+`risk_evaluated` gate.)
+
+- **Active gate set (enforced).** For any task, resolution starts from its own
+  `gates:` frontmatter field when present (even an explicit empty `gates: []`, a
+  deliberate opt-out), otherwise the active profile's `default_gates`; the result
+  is then intersected with the profile's **render ceiling** (`rendered_gates`,
+  defaulting to `default_gates`). Step 4 persists the outcome on the task as the
+  four-field `active_gates` tuple (`aitask_gate.sh materialize-active`), which
+  every enforcer — planning producer (`aitask_gate.sh active`), Step-9
+  orchestrator, archival guard, dependency-unblock — reads. Raw `gates:` stays
+  the declared **intent**; a declared-but-unrendered gate is filtered into
+  `active_gates_filtered` and can never block anything.
+- **Declaration points.** Profile-driven task creation auto-injects `--gates` from
+  `default_gates` (see `task-creation-batch.md`); a picked task's enforcement
+  comes from the claim-time materialization above (there is no `gates:` backfill —
+  a task without the field keeps it absent). Re-picking under another profile
+  re-materializes the tuple, so enforcement always follows the CURRENT profile;
+  `aitask_gate.sh active-gates-status <task_id> --profile <file>` reports
+  freshness. (`aitask_gate.sh effective-gates` remains for introspection of the
+  pre-ceiling resolve.)
+- **Producer + checker toggle together.** Declaring `risk_evaluated` runs **both**
+  the planning-time risk **producer** (the `## Risk` section + levels, before plan
+  approval) and the verify-time **checker** (the `aitask-gate-risk` verifier at
+  Step 9). One never runs without the other.
+- **Caveat — human gates need `record_gates`.** A declared **human** gate
+  (`plan_approved` / `review_approved` / `merge_approved`) is recorded only by the
+  workflow (under `record_gates: true`), not by the orchestrator. Declaring one
+  without `record_gates` would leave it unrecorded and **deadlock archival** (which
+  requires every declared gate to pass). The shipped `fast` profile declares only
+  `risk_evaluated` (a machine gate the orchestrator records), so it is unaffected —
+  but custom profiles must pair any human-gate declaration with `record_gates`.
+- **Registry-level `default_gates` (future).** The registry may also carry a
+  top-level `default_gates` as a project-wide baseline applied when a task has no
+  profile context; that fallback is **not yet implemented** — the profile key is the
+  active mechanism.
+
+## Customizing Execution Profiles
+
+**To create a custom profile:**
+1. Copy an existing profile: `cp aitasks/metadata/profiles/fast.yaml aitasks/metadata/profiles/my-profile.yaml`
+2. Edit `name` and `description` (both required — `description` is shown during profile selection)
+3. Add, remove, or change setting keys as needed
+4. Any key you omit will cause that question to be asked interactively
+
+**Example — worktree-based workflow:**
+```yaml
+name: worktree
+description: Like fast but creates a worktree on main for each task
+skip_task_confirmation: true
+default_email: first
+create_worktree: true
+base_branch: main
+plan_preference: use_current
+post_plan_action: start_implementation
+enableFeedbackQuestions: true
+```
+
+**Example — merge into an integration branch:**
+```yaml
+name: integration
+description: Cut task branches from main, merge finished work into dev
+skip_task_confirmation: true
+create_worktree: true
+base_branch: main
+output_branch: dev
+```
+
+`output_branch` is only needed when the merge target differs from the branch task
+branches are cut from. A project that both branches from and merges into `dev`
+just sets `base_branch: dev` — `output_branch` defaults to it.
+
+## Default Profile Configuration
+
+Set a default execution profile per skill in `project_config.yaml` (team-wide) or `userconfig.yaml` (personal override):
+
+```yaml
+# project_config.yaml (shared with team)
+default_profiles:
+  pick: fast
+  review: default
+
+# userconfig.yaml (personal, gitignored)
+default_profiles:
+  pick: default   # overrides team's "fast"
+```
+
+Valid skill names: `pick`, `fold`, `review`, `pr-import`, `revert`, `explore`, `pickrem`, `pickweb`, `qa`, `shadow`.
+
+Values are profile names (without `.yaml` extension) matching the `name` field in profile YAML files.
+
+You can also set defaults via the Settings TUI (`ait settings` → Project Config tab), which renders a per-skill profile picker for `default_profiles`.
+
+## Profile Override Argument
+
+All skills that support profiles accept an optional `--profile <name>` argument:
+
+```
+/aitask-pick --profile fast
+/aitask-pick 42 --profile fast
+/aitask-fold --profile fast 106,108
+/aitask-review --profile default
+/aitask-pickrem 42 --profile remote
+```
+
+The argument is position-independent — it can appear anywhere in the argument string.
+
+### Resolution Order
+
+1. `--profile <name>` argument (highest priority)
+2. `userconfig.yaml` → `default_profiles.<skill>` (personal)
+3. `project_config.yaml` → `default_profiles.<skill>` (team)
+4. Interactive selection / auto-select (fallback)
+
+**Notes:**
+- Profiles are partial — only include keys you want to pre-configure
+- The `description` field is shown next to the profile name when selecting a profile
+- Profiles are preserved during `install.sh --force` upgrades (existing files are not overwritten)
+- Plan approval (ExitPlanMode) is always mandatory and cannot be skipped by profiles
+- `enableFeedbackQuestions` defaults to `true` when omitted; set it to `false` to drop the rating prompt (and the verified-score update) from the rendered skills — skill usage is still recorded either way. The shipped `fast` and `remote` profiles set `false`

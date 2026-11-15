@@ -1,0 +1,1353 @@
+"""agent_command_screen - Shared modal dialog for displaying and launching code agent commands.
+
+Provides a reusable Textual ModalScreen with two tabs:
+- Direct: Copy command/prompt, run in new terminal
+- tmux: Launch into tmux session/window/pane (only shown when tmux is installed)
+
+Usage:
+    from agent_command_screen import AgentCommandScreen
+    from agent_launch_utils import TmuxLaunchConfig
+
+    def callback(result):
+        if result is None:
+            pass  # cancelled
+        elif result == "run":
+            pass  # direct run in terminal
+        elif isinstance(result, TmuxLaunchConfig):
+            launch_in_tmux(command, result)
+
+    screen = AgentCommandScreen(
+        title="Pick Task t42",
+        full_command="claude --model opus '/aitask-pick 42'",
+        prompt_str="/aitask-pick 42",
+        default_window_name="agent-pick-42",
+    )
+    app.push_screen(screen, callback)
+
+The `/aitask-pick <N>` dialog has one shared construction —
+`build_pick_screen(project_root, task_id)` returns it configured (or None when
+the command cannot be resolved); the caller keeps its own result handling.
+
+A host that opens this dialog with a key the dialog itself binds may pass
+`debounce_key=<that key>` (opt-in, off by default) so an immediate repeat of
+the launching key cannot confirm the dialog — see OPENING_DEBOUNCE_SECONDS.
+"""
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import yaml
+from textual import on, work
+from textual.binding import Binding
+from textual.containers import Container, Horizontal, VerticalScroll
+from textual.keys import _character_to_key
+from textual.reactive import reactive
+from textual.screen import ModalScreen
+from textual.widgets import Button, Input, Label, Select, Static, TabbedContent, TabPane
+from textual.widgets._select import SelectOverlay
+
+# Add lib dir to path for agent_launch_utils import
+_LIB_DIR = str(Path(__file__).resolve().parent)
+if _LIB_DIR not in sys.path:
+    sys.path.insert(0, _LIB_DIR)
+
+from agent_launch_utils import (  # noqa: E402
+    TmuxLaunchConfig,
+    get_tmux_sessions,
+    get_tmux_windows,
+    is_tmux_available,
+    load_tmux_defaults,
+    pick_launch_argv,
+    resolve_agent_string,
+    resolve_dry_run_command,
+)
+from guarded_dismiss import GuardedDismissMixin  # noqa: E402
+from shortcuts_mixin import ShortcutsMixin  # noqa: E402
+from tui_clipboard import copy_to_system_clipboard  # noqa: E402
+
+
+_NEW_SESSION_SENTINEL = "__new_session__"
+_NEW_WINDOW_SENTINEL = "__new_window__"
+_FRESH_WINDOW_PREFIXES = ("agent-", "create-")
+_FRESH_WINDOW_OPERATIONS = frozenset(
+    {"pick", "raw", "explain", "qa", "resume", "syncfix", "work-report", "trail"}
+)
+
+_PROFILES_DIR = Path("aitasks/metadata/profiles")
+_LOCAL_PROFILES_DIR = _PROFILES_DIR / "local"
+_SKILLRUN_PRUNE_AGE_SECONDS = 3600  # 1 hour
+
+# Opening-window debounce (t1279). A host that opens this dialog with a key the
+# dialog itself binds (e.g. the board's By-Trail `R`, which lands on `R -> run`)
+# passes that key as `debounce_key`; an immediate repeat is swallowed for this
+# long after the dialog is first painted, so a double-tap cannot confirm a
+# dialog the user has not read yet. Sized for an accidental burst, not for
+# reading time: terminal auto-repeat lands keys ~30-80ms apart and a human
+# double-tap ~100-250ms apart, while a considered second press is well past
+# this and would feel like a dead key much beyond ~500ms.
+OPENING_DEBOUNCE_SECONDS = 0.3
+
+
+def _monotonic() -> float:
+    """Indirection so tests can drive the opening-window debounce (t1279)."""
+    return time.monotonic()
+
+
+def _prune_stale_skillrun_overrides() -> None:
+    """Best-effort remove _skillrun_*.yaml in profiles/local/ older than 1h.
+
+    Long enough that an in-flight agent has already loaded its override (the
+    on-disk file is no longer load-bearing once read), short enough that the
+    directory does not accumulate stale per-run overrides.
+    """
+    if not _LOCAL_PROFILES_DIR.is_dir():
+        return
+    now = time.time()
+    for p in _LOCAL_PROFILES_DIR.glob("_skillrun_*.yaml"):
+        try:
+            if now - p.stat().st_mtime > _SKILLRUN_PRUNE_AGE_SECONDS:
+                p.unlink(missing_ok=True)
+        except OSError:
+            continue
+
+
+def resolve_skill_profile(
+    skill_name: str,
+    project_root: Path | str = ".",
+) -> str:
+    """Resolve the active profile name for a given skill.
+
+    Returns the profile name (e.g., "fast") on success, or "default" on
+    any error (missing script, timeout, non-zero exit). The default
+    ensures the launch dialog still opens — the Profile row will simply
+    show "default".
+    """
+    script = Path(project_root) / ".aitask-scripts" / "aitask_skill_resolve_profile.sh"
+    try:
+        result = subprocess.run(
+            [str(script), skill_name],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip() or "default"
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        pass
+    return "default"
+
+
+def pick_initial_session(
+    sessions: list[str],
+    default_from_config: str | None,
+    last_for_project: str | None,
+    explicit_session: str | None = None,
+) -> str:
+    """Resolve the initial session selection for the tmux tab.
+
+    Priority:
+    1. The caller's explicit session (e.g. the TUI switcher's selected
+       session), if live.
+    2. Last session chosen in THIS project (per-project memory).
+    3. project_config.yaml's tmux.default_session, if live.
+    4. First live session (fallback for legacy/unconfigured projects).
+    5. _NEW_SESSION_SENTINEL when no sessions exist.
+    """
+    if explicit_session and explicit_session in sessions:
+        return explicit_session
+    if last_for_project and last_for_project in sessions:
+        return last_for_project
+    if default_from_config and default_from_config in sessions:
+        return default_from_config
+    if sessions:
+        return sessions[0]
+    return _NEW_SESSION_SENTINEL
+
+
+def should_default_to_new_window(
+    default_window_name: str,
+    operation: str | None,
+    explicit_tmux_window: str | None,
+) -> bool:
+    """Return whether the dialog should initially select ``+ New window``.
+
+    Code-agent launches carry task/classification context in their tmux window
+    name. A remembered existing window such as ``monitor`` must not override
+    the caller's ``agent-*`` default, but explicit caller intent still wins.
+    """
+    if explicit_tmux_window:
+        return False
+    name = default_window_name or ""
+    if name.startswith(_FRESH_WINDOW_PREFIXES):
+        return True
+    return bool(operation and operation in _FRESH_WINDOW_OPERATIONS)
+
+
+def _is_existing_window(value) -> bool:
+    """True when a window Select value names a live window to split into.
+
+    Every other value — "✦ New window" and the blank entry alike — launches a
+    new window named by #tmux_new_window_input. _on_window_changed (which row
+    shows) and _build_tmux_config (what launches) both branch on this one
+    test, so a visible control always decides the launch (t2027).
+    """
+    return bool(value) and value != Select.NULL and value != _NEW_WINDOW_SENTINEL
+
+
+class AgentCommandScreen(GuardedDismissMixin, ShortcutsMixin, ModalScreen):
+    # Shared sub-scope: this dialog is reused across multiple TUIs (board,
+    # codebrowser, monitor, syncer), so its shortcuts belong under "shared"
+    # (like shared.stale_entry), not under any single TUI's scope.
+    _shortcuts_scope = "shared.agent_cmd"
+
+    """Dialog showing an agent command for copying or running.
+
+    Supports two modes via tabs:
+    - Direct: copy command/prompt, run in new terminal
+    - tmux: launch into a tmux session/window/pane
+    """
+
+    DEFAULT_CSS = """
+    #agent_cmd_dialog {
+        width: 80%;
+        height: auto;
+        max-height: 90%;
+        background: $surface;
+        border: thick $accent;
+        padding: 1 2;
+        /* Scroll instead of clipping when the content outgrows the terminal
+           (a short terminal, a narrow pane, the new-session row shown).
+           Screen.set_focus scrolls a focused control into view. */
+        overflow-y: auto;
+        scrollbar-size-vertical: 1;
+    }
+    #agent_cmd_title {
+        text-align: center;
+        padding: 0 0 1 0;
+        text-style: bold;
+    }
+    #agent_cmd_input {
+        margin: 0 0 1 0;
+    }
+    #agent_row, #profile_row {
+        height: 3;
+        width: 100%;
+        align: left middle;
+        margin: 0 0 1 0;
+    }
+    #agent_row Label, #profile_row Label {
+        height: 3;
+        padding: 0 1;
+        content-align: left middle;
+    }
+    #agent_row Button, #profile_row Button {
+        margin: 0 1;
+        width: auto;
+        min-width: 10;
+    }
+    /* No max-height: once the dialog scrolls, a cap only clips the tab
+       content inside the TabbedContent, the Run / Cancel row first. */
+    #agent_cmd_tabs {
+        height: auto;
+    }
+    /* Container defaults to height: 1fr, which in the auto-height dialog
+       fills it with blank rows below the buttons. */
+    #direct_content, #tmux_content {
+        height: auto;
+    }
+    .agent-cmd-copy-row {
+        height: 3;
+        width: 100%;
+        align: left middle;
+    }
+    .agent-cmd-copy-row Button {
+        width: auto;
+        min-width: 14;
+    }
+    #agent_cmd_prompt_label {
+        padding: 0 1;
+        width: 1fr;
+    }
+    .agent-cmd-buttons {
+        height: 3;
+        width: 100%;
+        align: center middle;
+        margin: 1 0 0 0;
+    }
+    .agent-cmd-buttons Button {
+        margin: 0 1;
+    }
+    .tmux-field-row {
+        height: 3;
+        width: 100%;
+        align: left middle;
+        margin: 0 0 1 0;
+    }
+    .tmux-field-row Label {
+        width: 12;
+        padding: 0 1;
+    }
+    .tmux-field-row Select {
+        width: 1fr;
+    }
+    .tmux-field-row Input {
+        width: 1fr;
+    }
+    #tmux_new_session_row, #tmux_new_window_row {
+        height: 3;
+        width: 100%;
+        align: left middle;
+        margin: 0 0 1 0;
+    }
+    #tmux_new_session_row Label, #tmux_new_window_row Label {
+        width: 12;
+        padding: 0 1;
+    }
+    #tmux_new_session_input, #tmux_new_window_input {
+        width: 1fr;
+    }
+    #tmux_split_row {
+        height: 3;
+        width: 100%;
+        align: left middle;
+        margin: 0 0 1 0;
+    }
+    #tmux_split_row Label {
+        width: 12;
+        padding: 0 1;
+    }
+    #tmux_split_row Button {
+        width: auto;
+        min-width: 20;
+    }
+    .hidden {
+        display: none;
+    }
+
+    /* Narrow variant (minimonitor companion pane, ~40 cols): the default
+       80%-wide dialog with horizontal rows overflows. Widen the dialog, trim
+       chrome, and stack every horizontal row vertically so labels sit above
+       their controls and buttons span the full width. Mirrors the narrow mode
+       of NextSiblingDialog/ChooseSiblingModal in monitor_shared.py. */
+    AgentCommandScreen.narrow #agent_cmd_dialog {
+        width: 100%;
+        min-width: 30;
+        padding: 0 1;
+        border: round $accent;
+    }
+    AgentCommandScreen.narrow #agent_cmd_title {
+        padding: 0;
+    }
+    AgentCommandScreen.narrow #agent_cmd_input {
+        margin: 0;
+    }
+    AgentCommandScreen.narrow #agent_row,
+    AgentCommandScreen.narrow #profile_row,
+    AgentCommandScreen.narrow .agent-cmd-copy-row,
+    AgentCommandScreen.narrow .agent-cmd-buttons {
+        layout: vertical;
+        height: auto;
+        align: left top;
+    }
+    AgentCommandScreen.narrow #agent_row,
+    AgentCommandScreen.narrow #profile_row {
+        margin: 0;
+    }
+    AgentCommandScreen.narrow #agent_row Label,
+    AgentCommandScreen.narrow #profile_row Label {
+        height: auto;
+    }
+    AgentCommandScreen.narrow #agent_row Button,
+    AgentCommandScreen.narrow #profile_row Button,
+    AgentCommandScreen.narrow .agent-cmd-copy-row Button,
+    AgentCommandScreen.narrow .agent-cmd-buttons Button {
+        width: 1fr;
+        margin: 0;
+    }
+    AgentCommandScreen.narrow #agent_cmd_prompt_label {
+        width: 1fr;
+        height: auto;
+    }
+    AgentCommandScreen.narrow .tmux-field-row,
+    AgentCommandScreen.narrow #tmux_new_session_row,
+    AgentCommandScreen.narrow #tmux_new_window_row,
+    AgentCommandScreen.narrow #tmux_split_row {
+        layout: vertical;
+        height: auto;
+        margin: 0;
+    }
+    AgentCommandScreen.narrow .tmux-field-row Label,
+    AgentCommandScreen.narrow #tmux_new_session_row Label,
+    AgentCommandScreen.narrow #tmux_new_window_row Label,
+    AgentCommandScreen.narrow #tmux_split_row Label {
+        width: auto;
+        height: 1;
+    }
+    AgentCommandScreen.narrow .tmux-field-row Select,
+    AgentCommandScreen.narrow .tmux-field-row Input,
+    AgentCommandScreen.narrow #tmux_new_session_input,
+    AgentCommandScreen.narrow #tmux_new_window_input,
+    AgentCommandScreen.narrow #tmux_split_row Button {
+        width: 1fr;
+    }
+    """
+
+    AUTO_FOCUS = ""
+    ESCAPE_TO_MINIMIZE = False
+
+    BINDINGS = [
+        Binding("c", "copy_command", "Copy Command", show=False),
+        Binding("C", "copy_command", "Copy Command", show=False),
+        Binding("p", "copy_prompt", "Copy Prompt", show=False),
+        Binding("P", "copy_prompt", "Copy Prompt", show=False),
+        Binding("r", "run", "Run", show=False),
+        Binding("R", "run", "Run", show=False),
+        Binding("d", "tab_direct", "Direct tab", show=False),
+        Binding("D", "tab_direct", "Direct tab", show=False),
+        Binding("e", "edit_profile", "Edit Profile", show=False),
+        Binding("E", "edit_profile", "Edit Profile", show=False),
+        # Own the escape key so the dialog is cancelable on hosts that do NOT
+        # delegate to handle_escape() (e.g. the minimonitor Shift+E launch).
+        # Non-priority: board/codebrowser bind escape App-level with
+        # priority=True, so their modal-aware handler still preempts this and
+        # calls handle_escape() itself — no double-dismiss.
+        Binding("escape", "escape", "Cancel", show=False),
+    ]
+
+    # Per-project remembered selections, keyed by resolved project_root.
+    # Class-level (process lifetime) but partitioned per project to prevent
+    # cross-project leakage (see CLAUDE.md: one tmux session per project).
+    _last_session_by_project: dict[Path, str] = {}
+    _last_window_by_project: dict[Path, str] = {}
+    # Per-operation remembered agent override (process lifetime).
+    # Only populated when the user picks something other than the default,
+    # so the (U)se previous button never recalls the default itself.
+    _previous_agent_override: dict[str, str] = {}
+
+    def __init__(
+        self,
+        title: str,
+        full_command: str,
+        prompt_str: str,
+        default_window_name: str = "",
+        project_root: Path | None = None,
+        operation: str | None = None,
+        operation_args: list[str] | None = None,
+        default_agent_string: str | None = None,
+        default_tmux_window: str | None = None,
+        default_tmux_session: str | None = None,
+        skill_name: str | None = None,
+        default_profile: str | None = None,
+        narrow: bool = False,
+        debounce_key: str = "",
+    ):
+        super().__init__()
+        self.title_text = title
+        self.full_command = full_command
+        self.prompt_str = prompt_str
+        self.default_window_name = default_window_name
+        self._project_root = project_root or Path.cwd()
+        self._project_key = self._project_root.resolve()
+        self.operation = operation
+        self.operation_args: list[str] = list(operation_args or [])
+        self.current_agent_string: str | None = default_agent_string
+        self._default_agent_string: str | None = default_agent_string
+        self._default_tmux_window: str | None = default_tmux_window
+        self._default_tmux_session: str | None = default_tmux_session
+        self._tmux_available = is_tmux_available()
+        self._tmux_defaults = load_tmux_defaults(self._project_root)
+        self._split_horizontal = self._tmux_defaults["default_split"] == "horizontal"
+        self._selected_session: str | None = None
+        self._selected_window: str | None = None
+        # Per-run profile editing state. Profile row is rendered only when
+        # skill_name is set (operation alone is not enough — brainstorm uses
+        # `operation=None` but has a slash-command-less launch).
+        self.skill_name = skill_name
+        self.default_profile = default_profile
+        self.current_profile_name: str | None = default_profile
+        self._profile_override_name: str | None = None
+        # Narrow layout for the minimonitor companion pane (~40 cols). When set,
+        # compose() adds the `narrow` CSS class that stacks rows vertically.
+        self._narrow = narrow
+        # Opening-window debounce (t1279), opt-in per host. resolve_key() hands
+        # back the literal a user typed in the shortcut editor ("#"), but
+        # event.key and BindingsMap use Textual's normalised name
+        # ("number_sign") — mirror Binding.make_bindings (binding.py:150-156)
+        # or a remapped key silently never matches.
+        self._debounce_key = (
+            _character_to_key(debounce_key) if len(debounce_key) == 1 else debounce_key
+        )
+        # Stamped at first paint by _stamp_opened(); None means "not on screen
+        # yet", which swallows the key (fail safe).
+        self._opened_at: float | None = None
+        _prune_stale_skillrun_overrides()
+
+    def compose(self):
+        if self._narrow:
+            self.add_class("narrow")
+        with Container(id="agent_cmd_dialog"):
+            yield Label(self.title_text, id="agent_cmd_title")
+            if self.skill_name:
+                with Horizontal(id="profile_row"):
+                    yield Label(
+                        f"Profile: {self.current_profile_name or '(default)'}",
+                        id="profile_row_label",
+                    )
+                    yield Button(
+                        "(E)dit", variant="primary", id="btn_edit_profile",
+                    )
+            if self.operation:
+                with Horizontal(id="agent_row"):
+                    yield Label(
+                        f"Agent: {self.current_agent_string or '(unknown)'}",
+                        id="agent_row_label",
+                    )
+                    yield Button(
+                        "(A)gent", variant="primary", id="btn_change_agent",
+                    )
+                    yield Button(
+                        "",
+                        variant="default",
+                        id="btn_use_last_agent",
+                        classes="hidden",
+                    )
+            yield Label("Command:")
+            yield Input(
+                value=self.full_command,
+                id="agent_cmd_input",
+            )
+
+            if self._tmux_available:
+                with TabbedContent(id="agent_cmd_tabs"):
+                    with TabPane("(D)irect", id="tab_direct"):
+                        yield self._compose_direct_tab()
+                    with TabPane("(T)mux", id="tab_tmux"):
+                        yield self._compose_tmux_tab()
+            else:
+                yield self._compose_direct_tab()
+
+    def _compose_direct_tab(self) -> Container:
+        container = Container(id="direct_content")
+        return container
+
+    def _compose_tmux_tab(self) -> Container:
+        container = Container(id="tmux_content")
+        return container
+
+    def handle_escape(self) -> None:
+        """Custom escape: unfocus Input/Select if focused, otherwise dismiss."""
+        focused = self.focused
+        if isinstance(focused, (Input, Select)):
+            self.set_focus(None)
+        else:
+            self.dismiss(None)
+
+    def action_escape(self) -> None:
+        """Screen-level escape binding target — routes through handle_escape so
+        the unfocus-then-dismiss behavior is identical to the host-delegated
+        path (board/codebrowser call handle_escape() directly)."""
+        self.handle_escape()
+
+    def on_mount(self) -> None:
+        # Populate direct tab
+        direct = self.query_one("#direct_content")
+        # The prompt row is only meaningful when there is a prompt to copy. A
+        # no-task launch (e.g. the switcher's bare-agent command, operation
+        # "raw" with an empty prompt) leaves prompt_str empty — skip the row so
+        # it does not render as a vestigial empty "Prompt only:" field.
+        if self.prompt_str:
+            direct.mount(Label("Prompt only:"))
+            row = Horizontal(classes="agent-cmd-copy-row")
+            direct.mount(row)
+            row.mount(Label(self.prompt_str, id="agent_cmd_prompt_label"))
+            row.mount(Button(self.label("copy_prompt", "Copy Prompt"), variant="primary", id="btn_copy_prompt"))
+        buttons = Horizontal(classes="agent-cmd-buttons")
+        direct.mount(buttons)
+        buttons.mount(Button(self.label("copy_command", "Copy cmd"), variant="primary", id="btn_copy_command"))
+        buttons.mount(Button(self.label("run", "Run in terminal"), variant="warning", id="btn_run_terminal"))
+        buttons.mount(Button("Cancel", variant="default", id="btn_cancel"))
+
+        if self._tmux_available:
+            self._populate_tmux_tab()
+            # Pre-select tmux tab if prefer_tmux is enabled or running inside tmux
+            if self._tmux_defaults.get("prefer_tmux") or os.environ.get("TMUX"):
+                try:
+                    self.query_one("#agent_cmd_tabs", TabbedContent).active = "tab_tmux"
+                except Exception:
+                    pass
+
+        self._refresh_agent_row()
+        self._refresh_profile_row()
+        self.call_after_refresh(self._stamp_opened)
+
+    def _stamp_opened(self) -> None:
+        """Start the opening window once the dialog is actually on screen.
+
+        Deliberately NOT stamped in __init__: on_mount above runs
+        _populate_tmux_tab() -> get_tmux_sessions(), a tmux subprocess on the
+        UI thread, and the event loop is single-threaded, so a repeat keypress
+        is queued behind all of it. A construction-stamped window can therefore
+        already be expired by the time the user first sees the dialog (t1279).
+        """
+        self._opened_at = _monotonic()
+
+    def _in_opening_window(self, key: str) -> bool:
+        """True while `key` is the launching key and the dialog is still new."""
+        if not self._debounce_key or key != self._debounce_key:
+            return False
+        if self._opened_at is None:
+            return True  # not painted yet — swallow (fail safe)
+        return (_monotonic() - self._opened_at) < OPENING_DEBOUNCE_SECONDS
+
+    def _populate_tmux_tab(self) -> None:
+        tmux = self.query_one("#tmux_content")
+
+        # Session selector
+        sessions = get_tmux_sessions()
+        session_options = [(s, s) for s in sessions]
+        session_options.append(("+ Create new session", _NEW_SESSION_SENTINEL))
+
+        initial_session = self._initial_session(sessions)
+
+        sess_row = Horizontal(classes="tmux-field-row")
+        tmux.mount(sess_row)
+        sess_row.mount(Label("(S)ession:"))
+        sess_row.mount(Select(session_options, value=initial_session, id="tmux_session_select"))
+
+        # New session name input (hidden by default)
+        new_sess_row = Horizontal(id="tmux_new_session_row", classes="hidden")
+        tmux.mount(new_sess_row)
+        new_sess_row.mount(Label("Session (n)ame:"))
+        new_sess_row.mount(Input(
+            value=self._tmux_defaults["default_session"],
+            id="tmux_new_session_input",
+            placeholder="Session name",
+        ))
+
+        # Window selector — pre-populate options/value at construction time so
+        # the Select widget does not have to mutate set_options or value after
+        # mount. This avoids two timing races on Select internals: SelectOverlay
+        # not-yet-mounted on Textual 8.0 (set_options) and SelectCurrent's
+        # #label not-yet-mounted under fast reactive flow on 8.1.x (_watch_value).
+        # Event-driven re-population still goes through _update_window_options.
+        if initial_session != _NEW_SESSION_SENTINEL:
+            win_options, win_value = self._compute_window_options(initial_session)
+        else:
+            win_options = []
+            win_value = Select.NULL
+
+        win_row = Horizontal(classes="tmux-field-row")
+        tmux.mount(win_row)
+        win_row.mount(Label("(W)indow:"))
+        win_row.mount(Select(
+            win_options,
+            value=win_value,
+            allow_blank=True,
+            id="tmux_window_select",
+        ))
+
+        # New window name input
+        new_win_row = Horizontal(id="tmux_new_window_row", classes="hidden")
+        tmux.mount(new_win_row)
+        new_win_row.mount(Label("Window na(m)e:"))
+        new_win_row.mount(Input(
+            value=self.default_window_name,
+            id="tmux_new_window_input",
+            placeholder="Window name",
+        ))
+
+        # Split direction toggle (hidden until existing window selected)
+        split_row = Horizontal(id="tmux_split_row", classes="hidden")
+        tmux.mount(split_row)
+        split_row.mount(Label("Split:"))
+        split_label = "\u27f7 Horizontal" if self._split_horizontal else "\u2195 Vertical"
+        split_row.mount(Button(split_label, variant="default", id="btn_split_toggle"))
+
+        # Buttons
+        buttons = Horizontal(classes="agent-cmd-buttons")
+        tmux.mount(buttons)
+        buttons.mount(Button(self.label("run", "Run in tmux"), variant="warning", id="btn_run_tmux"))
+        buttons.mount(Button("Cancel", variant="default", id="btn_tmux_cancel"))
+
+        # The Select is already populated; defer only the post-mount visibility
+        # toggles (and _on_window_changed side effects) until widgets in the
+        # row containers are fully composed.
+        if initial_session != _NEW_SESSION_SENTINEL:
+            self._selected_session = initial_session
+            self.call_after_refresh(self._on_window_changed, win_value)
+        else:
+            self.call_after_refresh(self._show_new_session_input)
+
+    def _initial_session(self, sessions: list[str]) -> str:
+        """Initial tmux-tab session: the caller's explicit session wins (if
+        live) over the per-project memory and the configured default."""
+        return pick_initial_session(
+            sessions,
+            self._tmux_defaults.get("default_session"),
+            AgentCommandScreen._last_session_by_project.get(self._project_key),
+            explicit_session=self._default_tmux_session,
+        )
+
+    def _compute_window_options(self, session: str):
+        """Compute (options, value) for the window selector for a given session.
+
+        Default-window selection priority:
+        1. Caller's tmux window (split-pane case), if it is a live window.
+        2. Last window chosen in this project (per-project memory), if live.
+        3. _NEW_WINDOW_SENTINEL.
+        """
+        windows = get_tmux_windows(session)
+        options: list[tuple[str, str]] = [
+            (f"\u2726 New window", _NEW_WINDOW_SENTINEL),
+        ]
+        options.extend(
+            (f"{idx}: {name}", f"{idx}") for idx, name in windows
+        )
+
+        last_window_for_project = AgentCommandScreen._last_window_by_project.get(self._project_key)
+        live_indices = {idx for idx, _name in windows}
+        if self._default_tmux_window and self._default_tmux_window in live_indices:
+            value = self._default_tmux_window
+        elif should_default_to_new_window(
+            self.default_window_name,
+            self.operation,
+            self._default_tmux_window,
+        ):
+            value = _NEW_WINDOW_SENTINEL
+        elif last_window_for_project and last_window_for_project in live_indices:
+            value = last_window_for_project
+        else:
+            value = _NEW_WINDOW_SENTINEL
+
+        return options, value
+
+    def _update_window_options(self, session: str) -> None:
+        """Update window selector based on selected session (event-driven, post-mount)."""
+        try:
+            win_select = self.query_one("#tmux_window_select", Select)
+        except Exception:
+            return
+
+        options, value = self._compute_window_options(session)
+        win_select.set_options(options)
+        win_select.value = value
+        self._on_window_changed(value)
+
+    def _show_new_session_input(self) -> None:
+        try:
+            self.query_one("#tmux_new_session_row").remove_class("hidden")
+            # When creating new session, always create new window
+            win_select = self.query_one("#tmux_window_select", Select)
+            win_select.set_options([])
+            win_select.clear()
+            self._show_new_window_input()
+            self.query_one("#tmux_split_row").add_class("hidden")
+        except Exception:
+            pass
+
+    def _hide_new_session_input(self) -> None:
+        try:
+            self.query_one("#tmux_new_session_row").add_class("hidden")
+        except Exception:
+            pass
+
+    def _show_new_window_input(self) -> None:
+        try:
+            self.query_one("#tmux_new_window_row").remove_class("hidden")
+            self.query_one("#tmux_split_row").add_class("hidden")
+        except Exception:
+            pass
+
+    def _hide_new_window_input(self) -> None:
+        try:
+            self.query_one("#tmux_new_window_row").add_class("hidden")
+        except Exception:
+            pass
+
+    def _new_session_pending(self) -> bool:
+        """True while the session selector holds "+ Create new session"."""
+        try:
+            sess_select = self.query_one("#tmux_session_select", Select)
+        except Exception:
+            return False
+        return sess_select.value == _NEW_SESSION_SENTINEL
+
+    def _on_window_changed(self, value) -> None:
+        # Mirrors _build_tmux_config: only an existing window on an existing
+        # session splits. Everything else launches a new window named by the
+        # name row, so that row shows — for "✦ New window", for the blank entry
+        # (t2027), and while a new session is pending whatever the window
+        # Select holds, since the Changed(NULL) that _show_new_session_input's
+        # set_options([]) posts arrives after that row was shown (t2025).
+        if _is_existing_window(value) and not self._new_session_pending():
+            self._hide_new_window_input()
+            self._selected_window = value
+            # Show split direction for existing windows
+            try:
+                self.query_one("#tmux_split_row").remove_class("hidden")
+            except Exception:
+                pass
+        else:
+            self._show_new_window_input()
+            self._selected_window = None
+
+    # --- Event handlers ---
+
+    @on(Select.Changed, "#tmux_session_select")
+    def on_session_changed(self, event: Select.Changed) -> None:
+        value = event.value
+        if value == _NEW_SESSION_SENTINEL:
+            self._selected_session = None
+            self._show_new_session_input()
+        elif value and value != Select.NULL:
+            self._selected_session = value
+            self._hide_new_session_input()
+            self._update_window_options(value)
+        else:
+            self._selected_session = None
+
+    @on(Select.Changed, "#tmux_window_select")
+    def on_window_changed(self, event: Select.Changed) -> None:
+        self._on_window_changed(event.value)
+
+    @on(Button.Pressed, "#btn_split_toggle")
+    def toggle_split(self) -> None:
+        self._split_horizontal = not self._split_horizontal
+        label = "\u27f7 Horizontal" if self._split_horizontal else "\u2195 Vertical"
+        try:
+            self.query_one("#btn_split_toggle", Button).label = label
+        except Exception:
+            pass
+
+    @on(Button.Pressed, "#btn_copy_command")
+    def copy_command(self) -> None:
+        cmd = self._get_current_command()
+        copy_to_system_clipboard(self.app, cmd)
+        self.app.notify("Command copied to clipboard")
+
+    @on(Button.Pressed, "#btn_copy_prompt")
+    def copy_prompt(self) -> None:
+        copy_to_system_clipboard(self.app, self.prompt_str)
+        self.app.notify("Prompt copied to clipboard")
+
+    @on(Button.Pressed, "#btn_run_terminal")
+    def run_terminal(self) -> None:
+        self._store_command()
+        self.dismiss("run")
+
+    @on(Button.Pressed, "#btn_run_tmux")
+    def run_tmux(self) -> None:
+        config = self._build_tmux_config()
+        if config:
+            self._store_command()
+            # Remember selections for next dialog open in THIS project only.
+            AgentCommandScreen._last_session_by_project[self._project_key] = config.session
+            if config.new_window:
+                AgentCommandScreen._last_window_by_project.pop(self._project_key, None)
+            else:
+                AgentCommandScreen._last_window_by_project[self._project_key] = f"{config.window}"
+            self.dismiss(config)
+
+    @on(Button.Pressed, "#btn_cancel")
+    def cancel_direct(self) -> None:
+        self.dismiss(None)
+
+    @on(Button.Pressed, "#btn_tmux_cancel")
+    def cancel_tmux(self) -> None:
+        self.dismiss(None)
+
+    # --- Actions ---
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def action_copy_command(self) -> None:
+        self.copy_command()
+
+    def action_copy_prompt(self) -> None:
+        self.copy_prompt()
+
+    def action_run(self) -> None:
+        """Run dispatched based on active tab."""
+        if self._is_tmux_tab_active():
+            self.run_tmux()
+        else:
+            self.run_terminal()
+
+    def action_tab_direct(self) -> None:
+        if self._tmux_available:
+            try:
+                self.query_one("#agent_cmd_tabs", TabbedContent).active = "tab_direct"
+            except Exception:
+                pass
+
+    def action_change_agent(self) -> None:
+        if not self.operation:
+            return
+        from agent_model_picker import AgentModelPickerScreen, load_all_models
+        all_models = load_all_models(self._project_root)
+        current_agent, current_model = "", ""
+        if self.current_agent_string and "/" in self.current_agent_string:
+            current_agent, current_model = self.current_agent_string.split("/", 1)
+        picker = AgentModelPickerScreen(
+            self.operation,
+            current_agent,
+            current_model,
+            all_models=all_models,
+            narrow=self._narrow,
+        )
+        self.app.push_screen(picker, self._on_agent_picked)
+
+    def _on_agent_picked(self, result) -> None:
+        if not result or not isinstance(result, dict):
+            return
+        new_agent_string = result.get("value")
+        if not new_agent_string:
+            return
+        self._apply_agent_override(new_agent_string)
+        if self.operation and new_agent_string != self._default_agent_string:
+            AgentCommandScreen._previous_agent_override[self.operation] = new_agent_string
+        self._refresh_agent_row()
+
+    def action_use_previous_agent(self) -> None:
+        if not self.operation:
+            return
+        previous = AgentCommandScreen._previous_agent_override.get(self.operation)
+        if previous and previous != self.current_agent_string:
+            self._apply_agent_override(previous)
+            self._refresh_agent_row()
+
+    def _apply_agent_override(self, agent_string: str) -> None:
+        self.current_agent_string = agent_string
+        if not self.operation:
+            return
+        new_cmd = resolve_dry_run_command(
+            self._project_root,
+            self.operation,
+            *self._build_command_args(),
+            agent_string=agent_string,
+        )
+        if new_cmd:
+            self.full_command = new_cmd
+            try:
+                self.query_one("#agent_cmd_input", Input).value = new_cmd
+            except Exception:
+                pass
+        else:
+            self.app.notify(
+                f"Failed to resolve command for {agent_string}",
+                severity="error",
+            )
+
+    def _build_command_args(self) -> list[str]:
+        """Build args for resolve_dry_run_command.
+
+        Prepends `--profile <override_name>` when a one-shot override is
+        active, so agent-change and profile-edit code paths converge on the
+        same arg shape (stub contract: agent's slash command receives
+        --profile parsed from ARGUMENTS).
+        """
+        args = list(self.operation_args)
+        if self._profile_override_name:
+            args = ["--profile", self._profile_override_name] + args
+        return args
+
+    def _refresh_agent_row(self) -> None:
+        if not self.operation:
+            return
+        try:
+            label = self.query_one("#agent_row_label", Label)
+            label.update(
+                f"Agent: {self.current_agent_string or '(unknown)'}"
+            )
+        except Exception:
+            return
+        try:
+            use_last_btn = self.query_one("#btn_use_last_agent", Button)
+        except Exception:
+            return
+        previous = AgentCommandScreen._previous_agent_override.get(self.operation)
+        if previous and previous != self.current_agent_string:
+            use_last_btn.label = f"(U)se previous: {previous}"
+            use_last_btn.remove_class("hidden")
+        else:
+            use_last_btn.add_class("hidden")
+
+    def _refresh_profile_row(self) -> None:
+        if not self.skill_name:
+            return
+        try:
+            label = self.query_one("#profile_row_label", Label)
+            label.update(f"Profile: {self.current_profile_name or '(default)'}")
+        except Exception:
+            return
+
+    def action_edit_profile(self) -> None:
+        if not self.skill_name:
+            return
+        from profile_editor import ProfileEditScreen
+        data = self._load_active_profile_data()
+        base_name = (
+            self._profile_override_name
+            or self.current_profile_name
+            or "(default)"
+        )
+        title = f"Edit Profile: {base_name}"
+        self.app.push_screen(
+            ProfileEditScreen(
+                data,
+                on_save_persistent=self._on_profile_saved_persistent,
+                on_save_one_shot=self._on_profile_saved_one_shot,
+                title=title,
+            )
+        )
+
+    def _load_active_profile_data(self) -> dict:
+        """Load the in-flight override or the active base profile YAML.
+
+        local/ shadows project/ — same precedence as
+        aitask_scan_profiles.sh. Returns an empty dict if no file is found
+        (the schema still renders, with every field as _UNSET).
+        """
+        if self._profile_override_name:
+            path = _LOCAL_PROFILES_DIR / f"{self._profile_override_name}.yaml"
+            if path.is_file():
+                try:
+                    with open(path) as f:
+                        return yaml.safe_load(f) or {}
+                except OSError:
+                    pass
+        name = self.current_profile_name or self.default_profile
+        if not name:
+            return {}
+        candidates = [
+            _LOCAL_PROFILES_DIR / f"{name}.yaml",
+            _PROFILES_DIR / f"{name}.yaml",
+        ]
+        for p in candidates:
+            if p.is_file():
+                try:
+                    with open(p) as f:
+                        return yaml.safe_load(f) or {}
+                except OSError:
+                    continue
+        return {}
+
+    def _on_profile_saved_persistent(self, updated: dict) -> None:
+        if not self.skill_name:
+            return
+        name = self.default_profile or self.current_profile_name
+        if not name:
+            self.app.notify("No active profile to save", severity="error")
+            return
+        updated = dict(updated)
+        updated["name"] = name
+        _LOCAL_PROFILES_DIR.mkdir(parents=True, exist_ok=True)
+        out_path = _LOCAL_PROFILES_DIR / f"{name}.yaml"
+        try:
+            with open(out_path, "w") as f:
+                yaml.safe_dump(updated, f, sort_keys=False)
+        except OSError as exc:
+            self.app.notify(f"Failed to save profile: {exc}", severity="error")
+            return
+        self.app.notify(f"Saved profile '{name}' to profiles/local/")
+        # Synchronously refresh every rendered skill closure for this
+        # profile (t777_20). Atomic per-file overwrites keep any open
+        # SKILL.md handles in concurrently-running agents valid.
+        try:
+            subprocess.run(
+                ["./.aitask-scripts/aitask_skill_rerender.sh", name],
+                check=False, capture_output=True, text=True, timeout=60,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            self.app.notify(
+                "Profile saved but rerender helper failed — "
+                "next render will still re-check freshness.",
+                severity="warning", timeout=5,
+            )
+        if self._profile_override_name:
+            # Persistent save supersedes the one-shot override — reset the
+            # dialog command back to the resolved profile name.
+            self._clear_one_shot_override()
+        self._refresh_profile_row()
+
+    def _on_profile_saved_one_shot(self, updated: dict) -> None:
+        if not self.skill_name:
+            return
+        if self._profile_override_name is None:
+            unique = f"{os.getpid()}_{int(time.time() * 1000)}"
+            self._profile_override_name = f"_skillrun_{unique}"
+        name = self._profile_override_name
+        updated = dict(updated)
+        updated["name"] = name
+        base_desc = updated.get("description") or ""
+        if "(per-run override)" not in base_desc:
+            updated["description"] = f"{base_desc} (per-run override)".strip()
+        _LOCAL_PROFILES_DIR.mkdir(parents=True, exist_ok=True)
+        out_path = _LOCAL_PROFILES_DIR / f"{name}.yaml"
+        try:
+            with open(out_path, "w") as f:
+                yaml.safe_dump(updated, f, sort_keys=False)
+        except OSError as exc:
+            self.app.notify(
+                f"Failed to write override: {exc}", severity="error"
+            )
+            return
+        self.current_profile_name = name
+        self._apply_profile_override()
+        self._refresh_profile_row()
+
+    def _apply_profile_override(self) -> None:
+        if not self.operation or not self._profile_override_name:
+            return
+        new_args = self._build_command_args()
+        new_cmd = resolve_dry_run_command(
+            self._project_root,
+            self.operation,
+            *new_args,
+            agent_string=self.current_agent_string,
+        )
+        if new_cmd:
+            self.full_command = new_cmd
+            try:
+                self.query_one("#agent_cmd_input", Input).value = new_cmd
+            except Exception:
+                pass
+            self.prompt_str = (
+                f"/aitask-{self.skill_name} {' '.join(new_args)}".rstrip()
+            )
+        else:
+            self.app.notify(
+                f"Failed to resolve command with override profile "
+                f"{self._profile_override_name}",
+                severity="error",
+            )
+
+    def _clear_one_shot_override(self) -> None:
+        """Reset the dialog to use the base profile (no override)."""
+        if not self._profile_override_name:
+            return
+        # Leave the override file in profiles/local/ — the 1h prune handles
+        # cleanup. Mid-run deletion would be a no-op anyway since the agent
+        # has already read it.
+        self._profile_override_name = None
+        self.current_profile_name = self.default_profile
+        if not self.operation:
+            return
+        new_cmd = resolve_dry_run_command(
+            self._project_root, self.operation,
+            *self._build_command_args(),
+            agent_string=self.current_agent_string,
+        )
+        if new_cmd:
+            self.full_command = new_cmd
+            try:
+                self.query_one("#agent_cmd_input", Input).value = new_cmd
+            except Exception:
+                pass
+            if self.skill_name:
+                self.prompt_str = (
+                    f"/aitask-{self.skill_name} "
+                    f"{' '.join(self.operation_args)}"
+                ).rstrip()
+
+    @on(Button.Pressed, "#btn_change_agent")
+    def _btn_change_agent(self) -> None:
+        self.action_change_agent()
+
+    @on(Button.Pressed, "#btn_use_last_agent")
+    def _btn_use_previous_agent(self) -> None:
+        self.action_use_previous_agent()
+
+    @on(Button.Pressed, "#btn_edit_profile")
+    def _btn_edit_profile(self) -> None:
+        self.action_edit_profile()
+
+    def on_key(self, event) -> None:
+        if self._in_opening_window(event.key):
+            # An immediate repeat of the key that opened this dialog is
+            # swallowed for OPENING_DEBOUNCE_SECONDS after it appears, so a
+            # double-tap cannot confirm a dialog the user has not read yet
+            # (t1279). Time-limited on purpose: after the window the key runs
+            # normally, and `r` / Enter / the Run button work throughout.
+            #
+            # MUST stay above the Input/Select early-return below: a collapsed
+            # Select defines neither _on_key nor check_consume_key, so with the
+            # tmux Select focused the key would bubble on to App._on_key and
+            # fire the `R -> run` binding. Typing is unaffected because
+            # Input._on_key stops printable keys before they reach this screen.
+            event.stop()  # keep the event off the App entirely
+            event.prevent_default()  # ...and suppress App._on_key -> _check_bindings
+            return
+        focused = self.app.focused
+        if isinstance(focused, (Input, Select, SelectOverlay)):
+            return  # Let input/select/overlay handle the key
+        # Agent override shortcuts — must run regardless of tmux availability
+        if event.key in ("a", "A"):
+            if self.operation:
+                self.action_change_agent()
+            event.prevent_default()
+            return
+        if event.key in ("u", "U"):
+            if self.operation:
+                self.action_use_previous_agent()
+            event.prevent_default()
+            return
+        if event.key in ("e", "E"):
+            if self.skill_name:
+                self.action_edit_profile()
+            event.prevent_default()
+            return
+        if not self._tmux_available:
+            return
+        # Tab navigation shortcuts (only when no Input/Select focused)
+        if event.key == "t":
+            try:
+                self.query_one("#agent_cmd_tabs", TabbedContent).active = "tab_tmux"
+            except Exception:
+                pass
+            event.prevent_default()
+        elif event.key == "s":
+            try:
+                self.query_one("#tmux_session_select", Select).focus()
+            except Exception:
+                pass
+            event.prevent_default()
+        elif event.key == "n":
+            try:
+                self.query_one("#tmux_new_session_input", Input).focus()
+            except Exception:
+                pass
+            event.prevent_default()
+        elif event.key == "w":
+            try:
+                self.query_one("#tmux_window_select", Select).focus()
+            except Exception:
+                pass
+            event.prevent_default()
+        elif event.key == "m":
+            try:
+                self.query_one("#tmux_new_window_input", Input).focus()
+            except Exception:
+                pass
+            event.prevent_default()
+
+    # --- Helpers ---
+
+    def _get_current_command(self) -> str:
+        """Get command from the shared Input widget."""
+        try:
+            return self.query_one("#agent_cmd_input", Input).value
+        except Exception:
+            return self.full_command
+
+    def _store_command(self) -> None:
+        """Store edited command back to self.full_command."""
+        self.full_command = self._get_current_command()
+
+    def _is_tmux_tab_active(self) -> bool:
+        if not self._tmux_available:
+            return False
+        try:
+            tabs = self.query_one("#agent_cmd_tabs", TabbedContent)
+            return tabs.active == "tab_tmux"
+        except Exception:
+            return False
+
+    def _build_tmux_config(self) -> TmuxLaunchConfig | None:
+        """Build TmuxLaunchConfig from current dialog state."""
+        # Resolve session
+        try:
+            sess_select = self.query_one("#tmux_session_select", Select)
+        except Exception:
+            self.app.notify("Cannot read session selection", severity="error")
+            return None
+
+        if sess_select.value == _NEW_SESSION_SENTINEL:
+            try:
+                session = self.query_one("#tmux_new_session_input", Input).value.strip()
+            except Exception:
+                session = ""
+            if not session:
+                self.app.notify("Session name cannot be empty", severity="error")
+                return None
+            new_session = True
+        elif sess_select.value and sess_select.value != Select.NULL:
+            session = sess_select.value
+            new_session = False
+        else:
+            self.app.notify("Please select a session", severity="error")
+            return None
+
+        # Resolve window
+        try:
+            win_select = self.query_one("#tmux_window_select", Select)
+        except Exception:
+            win_select = None
+
+        if (
+            not new_session
+            and win_select is not None
+            and _is_existing_window(win_select.value)
+        ):
+            window = win_select.value
+            new_window = False
+        else:
+            # A new window — "✦ New window", the blank entry or a new session:
+            # the states whose name row _on_window_changed shows (t2027).
+            try:
+                window = self.query_one("#tmux_new_window_input", Input).value.strip()
+            except Exception:
+                window = ""
+            if not window:
+                window = self.default_window_name or "aitask"
+            new_window = True
+
+        split_direction = "horizontal" if self._split_horizontal else "vertical"
+
+        return TmuxLaunchConfig(
+            session=session,
+            window=window,
+            new_session=new_session,
+            new_window=new_window,
+            split_direction=split_direction,
+            cwd=str(self._project_root),
+        )
+
+
+def build_pick_screen(
+    project_root: Path,
+    task_id: str,
+    *,
+    narrow: bool = False,
+) -> AgentCommandScreen | None:
+    """The `/aitask-pick <task_id>` launch dialog every TUI opens (t1946).
+
+    One construction for the board (Kanban card and task detail), the
+    stand-alone trails TUI, monitor (next-sibling pick and restart) and
+    minimonitor. Returns None when the pick command cannot be resolved. What to
+    do then — and with the dialog's result — stays with each caller: the board
+    falls back to a direct wrapper launch, the monitors notify, and kill order
+    and notify wording differ per caller.
+
+    `pick_launch_argv` is called WITHOUT `agent_string`, so the operation's
+    configured agent is resolved, exactly as every TUI site did before
+    (`tests/test_pick_launch_argv.py`). `narrow` is passed only when set, so a
+    non-narrow caller's construction is identical to its pre-t1946 call.
+    """
+    full_cmd, window_name = pick_launch_argv(project_root, task_id)
+    if not full_cmd:
+        return None
+    return AgentCommandScreen(
+        f"Pick Task t{task_id}", full_cmd, f"/aitask-pick {task_id}",
+        default_window_name=window_name,
+        project_root=project_root,
+        operation="pick",
+        operation_args=[task_id],
+        default_agent_string=resolve_agent_string(project_root, "pick"),
+        skill_name="pick",
+        default_profile=resolve_skill_profile("pick", project_root),
+        **({"narrow": True} if narrow else {}),
+    )

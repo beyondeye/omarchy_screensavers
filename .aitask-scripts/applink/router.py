@@ -1,0 +1,890 @@
+"""Pure frame router for the ait applink JSON control plane (t822_7).
+
+``FrameRouter.handle(envelope, conn)`` parses one JSON envelope
+(``aidocs/applink/protocol.md`` §Message envelope), authenticates it, gates the
+verb against the session's permission profile, dispatches the allowed verbs into
+``monitor_core``, and returns the ``res``/``err`` reply frame. It is deliberately
+free of sockets, TLS, and asyncio so the dispatch logic — pairing, auth,
+``PERMISSION_DENIED`` gating, the pull-model confirm round-trip, key translation
+— is unit-testable against a stub monitor.
+
+One reply is not built synchronously: ``cycle_compare_mode`` on a
+``MonitorClient`` (the shared monitor status server, t2037_4) returns a
+:class:`DeferredReply`. The authoritative answer comes from the status server,
+and awaiting it here would hold the connection's read loop for up to the
+client's request timeout, so the transport runs it in a task and sends the
+``res`` when it arrives — possibly after replies to later requests, which the
+envelope's ``id`` correlation allows.
+
+Verb inventory and payload schemas follow the canonical table in
+``aidocs/applink/monitor_port_design.md``. The binary data plane
+(``snapshot``/``subscribe``/``request_keyframe``) and the workflow verbs
+(``pick_next_sibling``/``restart_task``) are recognized but deferred to sibling
+tasks — they return ``UNKNOWN_VERB`` here.
+"""
+from __future__ import annotations
+
+import logging
+import re
+import sys
+import time
+from pathlib import Path
+
+from content import Subscription, MAX_SUBSCRIBED_PANES
+
+# ``lib/`` holds the canonical TUI registry (the spawn_tui allowlist). Insert it
+# explicitly so the router resolves it whether imported by the server or a test.
+_LIB_DIR = Path(__file__).resolve().parent.parent / "lib"
+if str(_LIB_DIR) not in sys.path:
+    sys.path.insert(0, str(_LIB_DIR))
+from tui_registry import TUI_NAMES  # noqa: E402
+
+# ``monitor.monitor_core`` (for ``FROZEN_OPTION``) is imported lazily by the
+# kill guard; its package root must be importable whoever imports the router.
+_SCRIPTS_DIR = _LIB_DIR.parent
+if str(_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_DIR))
+
+PROTOCOL_VERSION = 1
+
+# Input-validation bounds (t985). tmux pane/window ids have a fixed shape;
+# constraining client-supplied ids to it removes the rich tmux target-spec
+# surface ({mouse}, =sess:win.pane, top, …) and any leading-dash value.
+_PANE_ID_RE = re.compile(r"^%\d+$")
+_WINDOW_ID_RE = re.compile(r"^@\d+$")
+_MAX_STR = 4096        # cap any single client-supplied string field
+_MAX_PANES = MAX_SUBSCRIBED_PANES  # subscribe pane-list reject threshold (canonical bound in content.py)
+_MAX_HISTORY_ROWS = 1000  # cap a history `count` (bounds the scrollback scan)
+
+# Error codes (protocol.md §Message envelope error frame).
+ERR_AUTH_FAILED = "AUTH_FAILED"
+ERR_PERMISSION_DENIED = "PERMISSION_DENIED"
+ERR_UNKNOWN_VERB = "UNKNOWN_VERB"
+ERR_BAD_PAYLOAD = "BAD_PAYLOAD"
+ERR_INTERNAL = "INTERNAL"
+# Returned when a known, gated verb's *execution* leg is not yet wired — used by
+# the t822_11 modal handshakes whose kill-old-pane + relaunch-agent orchestration
+# is deferred until the applink workflow launch policy lands. Additive error code
+# per protocol.md §Versioning (clients ignore unknown codes).
+ERR_NOT_IMPLEMENTED = "NOT_IMPLEMENTED"
+
+# Connection-state labels not already in sessions.py (transport-level).
+STATE_DISCOVERING = "Discovering"
+STATE_PAIRING = "Pairing"
+STATE_CONNECTED = "Connected"
+STATE_SUSPENDED = "Suspended"
+STATE_DISCONNECTED = "Disconnected"
+
+# Verbs executed by THIS listener (control plane + data-plane control). Each is
+# profile-gated.
+IMPLEMENTED_COMMAND_VERBS = frozenset({
+    "send_enter", "send_keys", "forward_key", "focus", "cycle_compare_mode",
+    "kill_pane", "kill_window", "spawn_tui", "task_detail",
+    # Data-plane control verbs (t822_8): mutate the per-connection Subscription;
+    # the actual binary pushes are driven by server's pusher.PushScheduler.
+    "subscribe", "request_keyframe",
+    # Scrollback pull (history RPC, Stage 5 / t1057): queues a one-shot
+    # negative-row-id keyframe on the Subscription; pusher._drain_history serves
+    # it on the data plane. Gated at read_only like subscribe / request_keyframe.
+    "history",
+    # Connection-level self-throttle (t1055): halt this connection's
+    # PushScheduler until `resume`. Gated at read_only like subscribe /
+    # request_keyframe — it steers the client's own stream, not the agent.
+    "pause",
+    # Workflow modal handshakes (t822_11): the suggest/choose + idle-gated confirm
+    # round-trips are served here; their final kill+relaunch execution is deferred
+    # (returns NOT_IMPLEMENTED) until the applink launch policy lands.
+    "pick_next_sibling", "restart_task",
+})
+
+# Destructive / workflow verbs that use the pull-model confirm handshake
+# (first call returns details, a re-send with `confirmed:true` executes).
+CONFIRM_VERBS = frozenset({"kill_pane", "kill_window", "restart_task"})
+
+# Recognized-but-deferred verbs. `snapshot` is the push-direction read-capability
+# token (gated in profiles, never pulled).
+DEFERRED_VERBS = frozenset({
+    "snapshot",
+})
+
+# Session-management verbs (not profile-gated).
+SESSION_VERBS = frozenset({"pair", "resume", "bye"})
+
+# The full canonical verb namespace — used by the profile validator to confirm
+# every allowed_verbs entry names a real verb (not necessarily one served yet).
+KNOWN_VERBS = (
+    SESSION_VERBS | IMPLEMENTED_COMMAND_VERBS | DEFERRED_VERBS
+)
+
+
+def _iso8601(epoch: float) -> str:
+    """UTC ISO-8601 timestamp (``2026-05-25T18:30:00Z``) for an epoch second."""
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch))
+
+
+def _tag(bearer) -> str:
+    """Short, non-reversible bearer tag for audit log lines (never the full token)."""
+    if not isinstance(bearer, str) or not bearer:
+        return "<none>"
+    return f"{bearer[:8]}…"
+
+
+def error_frame(msg_id, verb, code, message, detail=None):
+    """Build an ``err`` envelope. Public so the transport can reply to frames
+    that never reach the router (e.g. undecodable JSON)."""
+    err = {"code": code, "message": message}
+    if detail is not None:
+        err["detail"] = detail
+    return {"v": PROTOCOL_VERSION, "id": msg_id, "kind": "err", "verb": verb, "payload": err}
+
+
+def result_frame(msg_id, verb, payload):
+    """Build a ``res`` envelope."""
+    return {"v": PROTOCOL_VERSION, "id": msg_id, "kind": "res", "verb": verb, "payload": payload}
+
+
+class DeferredReply:
+    """A reply the transport must produce later (t2037_4).
+
+    ``run`` is a zero-argument coroutine function returning the reply frame
+    (``res`` or ``err``); it never raises for the request's own failure. The
+    transport awaits it in a task of its own — never in the connection's read
+    loop — and sends what it returns."""
+
+    __slots__ = ("run", "msg_id", "verb")
+
+    def __init__(self, run, *, msg_id, verb) -> None:
+        self.run = run
+        self.msg_id = msg_id
+        self.verb = verb
+
+
+class ConnState:
+    """Per-connection state the router reads and mutates.
+
+    ``close_requested`` is the router's signal to the transport that the socket
+    should be closed (after an auth failure or an explicit ``bye``).
+    """
+
+    def __init__(self) -> None:
+        self.state = STATE_PAIRING
+        self.bearer: str | None = None
+        self.session = None
+        self.close_requested = False
+        # Data-plane subscription (None until the first `subscribe`). Mutated by
+        # the router; consumed by server's per-connection PushScheduler (t822_8).
+        self.subscription: Subscription | None = None
+        # Data plane halted by a `pause` verb until `resume` (t1055). The
+        # subscription is preserved (no state lost — content_transport.md
+        # §Back-pressure); PushScheduler skips every push while this is set.
+        self.paused: bool = False
+
+    def bind(self, session) -> None:
+        self.bearer = session.bearer
+        self.session = session
+
+
+class FrameRouter:
+    def __init__(
+        self,
+        session_table,
+        profile_gate,
+        monitor,
+        *,
+        pair_profile: str = "monitor_control",
+        task_resolver=None,
+        audit=None,
+        own_pane: str | None = None,
+    ) -> None:
+        self._sessions = session_table
+        self._gate = profile_gate
+        self._monitor = monitor
+        # This server's own tmux pane (t2034_2). The producer no longer excludes
+        # it, and applink never marks its pane as a companion, so the client does:
+        # see `_is_own_pane`. None (stubs, headless without tmux) = no filter.
+        self._own_pane = own_pane or None
+        self._pair_profile = pair_profile
+        self._tasks = task_resolver
+        # Security audit logger (auth/permission/pairing/reject events). Defaults
+        # to the package logger; unit tests inject a captured logger. Unconfigured
+        # it simply has no handlers, so the router stays I/O-free under test.
+        self._audit = audit if audit is not None else logging.getLogger("applink.audit")
+
+    def set_pair_profile(self, profile: str) -> None:
+        self._pair_profile = profile
+
+    def set_monitor(self, monitor) -> None:
+        """Point dispatch at ``monitor`` (t2037_4): the server swaps in its
+        ``MonitorClient`` while a phone streams, and its plain ``TmuxMonitor``
+        otherwise."""
+        self._monitor = monitor
+
+    # -- Entry point -----------------------------------------------------------
+
+    def handle(self, env, conn: ConnState):
+        if not isinstance(env, dict):
+            return self._err(None, None, ERR_BAD_PAYLOAD, "frame is not a JSON object")
+        msg_id = env.get("id")
+        verb = env.get("verb")
+        if env.get("kind") != "req" or not isinstance(verb, str) or not isinstance(msg_id, str):
+            return self._err(
+                msg_id if isinstance(msg_id, str) else None,
+                verb if isinstance(verb, str) else None,
+                ERR_BAD_PAYLOAD, "missing or invalid envelope fields (id, kind, verb)",
+            )
+        # Bound the envelope strings so an oversized id/verb can't be used to
+        # exhaust parser/log memory (the verb is also membership-checked below).
+        if len(verb) > _MAX_STR or len(msg_id) > _MAX_STR:
+            return self._err(
+                msg_id if len(msg_id) <= _MAX_STR else None, None,
+                ERR_BAD_PAYLOAD, "envelope field too long",
+            )
+        payload = env.get("payload")
+        if payload is None:
+            payload = {}
+        if not isinstance(payload, dict):
+            return self._err(msg_id, verb, ERR_BAD_PAYLOAD, "payload must be an object")
+
+        # Pairing is the only frame allowed without a bearer.
+        if verb == "pair":
+            return self._do_pair(msg_id, conn, payload)
+
+        # Everything else requires a valid bearer.
+        session = self._sessions.lookup(env.get("auth"))
+        if session is None:
+            conn.close_requested = True
+            self._audit.warning(
+                "AUTH_FAILED verb=%s bearer=%s", verb, _tag(env.get("auth")),
+            )
+            return self._err(msg_id, verb, ERR_AUTH_FAILED, "missing or invalid bearer")
+        conn.bind(session)
+
+        if verb == "resume":
+            self._sessions.set_state(session.bearer, STATE_CONNECTED)
+            conn.state = STATE_CONNECTED
+            # resume doubles as the un-pause: clear any `pause` self-throttle so
+            # the PushScheduler resumes streaming (t1055).
+            conn.paused = False
+            return self._res(msg_id, verb, {"profile": session.profile})
+        if verb == "bye":
+            self._sessions.revoke(session.bearer)
+            conn.state = STATE_DISCONNECTED
+            conn.close_requested = True
+            return self._res(msg_id, verb, {"ok": True})
+
+        if verb in IMPLEMENTED_COMMAND_VERBS:
+            if not self._gate.is_allowed(session.profile, verb):
+                self._audit.warning(
+                    "PERMISSION_DENIED verb=%s profile=%s device=%s bearer=%s",
+                    verb, session.profile, session.device_name or "?",
+                    _tag(session.bearer),
+                )
+                return self._err(
+                    msg_id, verb, ERR_PERMISSION_DENIED,
+                    f"verb '{verb}' is not permitted for profile '{session.profile}'",
+                    detail={"required_profile": self._gate.required_profile(verb)},
+                )
+            return self._dispatch(msg_id, verb, payload, conn)
+
+        if verb in DEFERRED_VERBS:
+            return self._err(
+                msg_id, verb, ERR_UNKNOWN_VERB,
+                f"verb '{verb}' is not served by the v1 control listener",
+                detail={"reason": "deferred"},
+            )
+        return self._err(msg_id, verb, ERR_UNKNOWN_VERB, f"unknown verb '{verb}'")
+
+    # -- Pairing ---------------------------------------------------------------
+
+    def _do_pair(self, msg_id, conn, payload):
+        device = payload.get("device")
+        device_name = ""
+        platform = ""
+        location = ""
+        if isinstance(device, dict):
+            device_name = str(device.get("name", ""))[:_MAX_STR]
+            platform = str(device.get("platform", ""))[:_MAX_STR]
+            # Optional, additive: a coarse locality string the phone may send.
+            location = str(device.get("location", ""))[:_MAX_STR]
+        token = payload.get("token")
+        if not isinstance(token, str) or not self._sessions.validate_and_consume_token(token):
+            conn.close_requested = True
+            # Never log the token bytes — just that a pairing attempt failed.
+            self._audit.warning(
+                "PAIR_FAILED device=%s reason=invalid_or_expired_token",
+                device_name or "?",
+            )
+            return self._err(msg_id, "pair", ERR_AUTH_FAILED, "invalid or expired pairing token")
+        session = self._sessions.issue_bearer(
+            self._pair_profile,
+            device_name=device_name, platform=platform, location=location,
+        )
+        conn.bind(session)
+        conn.state = STATE_CONNECTED
+        self._audit.info(
+            "PAIR_SUCCESS device=%s profile=%s bearer=%s",
+            device_name or "?", session.profile, _tag(session.bearer),
+        )
+        return self._res(msg_id, "pair", {
+            "bearer": session.bearer,
+            "profile": session.profile,
+            "expires_at": _iso8601(session.expires_at),
+        })
+
+    # -- Command dispatch ------------------------------------------------------
+
+    def _dispatch(self, msg_id, verb, payload, conn):
+        if verb == "send_enter":
+            pane_id = self._req_pane_id(payload)
+            if pane_id is None:
+                return self._bad_field(msg_id, verb, "pane_id")
+            return self._res(msg_id, verb, {"ok": bool(self._monitor.send_enter(pane_id))})
+
+        if verb == "send_keys":
+            pane_id = self._req_pane_id(payload)
+            keys = payload.get("keys")
+            if pane_id is None or not isinstance(keys, str) or len(keys) > _MAX_STR:
+                return self._bad_field(msg_id, verb, "pane_id/keys")
+            literal = bool(payload.get("literal", False))
+            ok = self._monitor.send_keys(pane_id, keys, literal=literal)
+            return self._res(msg_id, verb, {"ok": bool(ok)})
+
+        if verb == "forward_key":
+            pane_id = self._req_pane_id(payload)
+            key = self._req_str(payload, "key")
+            if pane_id is None or key is None or len(key) > _MAX_STR:
+                return self._bad_field(msg_id, verb, "pane_id/key")
+            ok = self._monitor.forward_key(pane_id, key)
+            return self._res(msg_id, verb, {"ok": bool(ok)})
+
+        if verb == "focus":
+            pane_id = self._req_pane_id(payload)
+            if pane_id is None:
+                return self._bad_field(msg_id, verb, "pane_id")
+            prefer = bool(payload.get("prefer_companion", False))
+            # Own pane: the cache miss `switch_to_pane` returned while excluded.
+            ok = (False if self._is_own_pane(pane_id)
+                  else self._monitor.switch_to_pane(pane_id, prefer_companion=prefer))
+            # Raise this pane's data-plane cadence (single focused pane). Read-only
+            # clients cannot reach this verb (it is monitor_control+); they raise
+            # cadence by subscribing to the pane with a fast cadence instead.
+            if conn.subscription is not None:
+                conn.subscription.set_focus(pane_id)
+            return self._res(msg_id, verb, {"ok": bool(ok)})
+
+        if verb == "subscribe":
+            panes = payload.get("panes")
+            if panes is not None and not isinstance(panes, list):
+                return self._bad_field(msg_id, verb, "panes")
+            # content_panes (t1045): the roster-vs-content split selector. Validate
+            # AND bound it exactly like `panes` (non-list rejected; over-_MAX_PANES
+            # rejected) so a malformed/hostile payload cannot force the model to
+            # iterate a huge array before the intersection shrinks it. Per-entry
+            # %N validation is unnecessary — the model intersects with the
+            # already-validated roster and content_panes reaches no shell sink.
+            cp = payload.get("content_panes")
+            if cp is not None and (not isinstance(cp, list) or len(cp) > _MAX_PANES):
+                return self._bad_field(msg_id, verb, "content_panes")
+            # An *explicit* non-empty list is validated entry-by-entry; an
+            # empty/absent list keeps its "all currently-discovered panes"
+            # meaning. Distinguishing the two matters: an explicit list whose
+            # entries are all invalid must subscribe to NOTHING, not silently
+            # fall through to "all".
+            explicit = isinstance(panes, list) and len(panes) > 0
+            payload = dict(payload)
+            if explicit:
+                # Reject (not truncate) an over-long list so the client learns;
+                # entries must be real pane ids (%N), same as the single-pane
+                # verbs — keeps the pane-id contract uniform and bounds
+                # Subscription.panes + the push loop.
+                if len(panes) > _MAX_PANES:
+                    return self._bad_field(msg_id, verb, "panes")
+                # The own pane never enters a subscription (t2034_2): it was never
+                # in the producer cache, so a live push or `history` pull for it
+                # could not happen, and must not start to now.
+                payload["panes"] = [
+                    p for p in panes
+                    if isinstance(p, str) and _PANE_ID_RE.match(p)
+                    and not self._is_own_pane(p)
+                ]
+            else:
+                # Empty or absent `panes` means "all currently-discovered panes"
+                # (roster subscribe). The mobile client (aitasks_mobile
+                # MonitorSessionMediator) sends `panes: []` intending "all"; without
+                # this expansion it would subscribe to nothing and the data plane
+                # would stay silent. See aidocs/applink/protocol.md §Subscription and
+                # content_transport.md §subscribe. Point-in-time: panes discovered now.
+                payload["panes"] = self._discover_pane_ids()
+            if conn.subscription is None:
+                conn.subscription = Subscription()
+            accepted = conn.subscription.apply_subscribe(payload)
+            reply = {"ok": True, "panes": sorted(accepted)}
+            # Echo the accepted content set so the client can confirm the split was
+            # applied — only when active, keeping the legacy res shape unchanged.
+            if not conn.subscription.content_all:
+                reply["content_panes"] = sorted(conn.subscription.content_panes)
+            return self._res(msg_id, verb, reply)
+
+        if verb == "request_keyframe":
+            pane_id = self._req_pane_id(payload)
+            if pane_id is None:
+                return self._bad_field(msg_id, verb, "pane_id")
+            # A keyframe is a content-recovery frame, so it only means something for
+            # a pane the client is actually streaming (t1045). Reject panes that are
+            # not effective content panes — mirrors the `history` verb's
+            # not_subscribed rejection. Without this, requesting a keyframe for a
+            # status-only (or unsubscribed) pane would be a silent no-op: the seed
+            # would be discarded at the pusher's content gate and no frame sent.
+            if conn.subscription is None or not conn.subscription.streams_content(pane_id):
+                return self._err(
+                    msg_id, verb, ERR_BAD_PAYLOAD,
+                    f"pane '{pane_id}' is not a content pane",
+                    detail={"reason": "not_content_pane"},
+                )
+            conn.subscription.request_keyframe(pane_id)
+            return self._res(msg_id, verb, {"ok": True})
+
+        if verb == "history":
+            pane_id = self._req_pane_id(payload)
+            before_line = self._req_int(payload, "before_line")
+            count = self._req_int(payload, "count")
+            if (pane_id is None or before_line is None
+                    or count is None or count < 1 or count > _MAX_HISTORY_ROWS):
+                return self._bad_field(msg_id, verb, "pane_id/before_line/count")
+            # History serves scrollback for a pane the client is actively
+            # streaming. Requiring a live subscription that already contains the
+            # pane guarantees it was discovered + cached (capture needs
+            # _pane_cache); a never-subscribed pane is rejected here. The returned
+            # token acks acceptance, NOT delivery — pusher._drain_history sends no
+            # keyframe when the pane is absent from the drain-time capture
+            # (content_transport.md §Scrollback).
+            if conn.subscription is None or pane_id not in conn.subscription.panes:
+                return self._err(
+                    msg_id, verb, ERR_BAD_PAYLOAD,
+                    f"pane '{pane_id}' is not subscribed",
+                    detail={"reason": "not_subscribed"},
+                )
+            token = conn.subscription.request_history(pane_id, before_line, count)
+            return self._res(msg_id, verb, {"ok": True, "token": token})
+
+        if verb == "pause":
+            # Self-throttle: halt this connection's PushScheduler until `resume`.
+            # No pane arg; the subscription is preserved so no state is lost
+            # (content_transport.md §Back-pressure). `resume` clears the flag.
+            conn.paused = True
+            return self._res(msg_id, verb, {"ok": True})
+
+        if verb == "cycle_compare_mode":
+            pane_id = self._req_pane_id(payload)
+            if pane_id is None:
+                return self._bad_field(msg_id, verb, "pane_id")
+            cycle_async = getattr(self._monitor, "cycle_compare_mode_async", None)
+            if callable(cycle_async):
+                # A MonitorClient (chosen by type, never by its mode): the
+                # server owns the shared override, so its answer is the
+                # authoritative one. Off the read loop — see DeferredReply.
+                return self._deferred_compare(msg_id, verb, cycle_async, pane_id)
+            mode, following = self._monitor.cycle_compare_mode(pane_id)
+            return self._res(msg_id, verb, {"mode": mode, "following_default": bool(following)})
+
+        if verb == "spawn_tui":
+            tui_name = self._req_str(payload, "tui_name")
+            if tui_name is None:
+                return self._bad_field(msg_id, verb, "tui_name")
+            # SECURITY (t985): spawn_tui interpolates tui_name into a tmux
+            # shell command. Reject anything outside the canonical TUI registry
+            # here (and audit the attempt) so a hostile name never reaches the
+            # monitor; monitor_core.spawn_tui re-checks as defense-in-depth.
+            if tui_name not in TUI_NAMES:
+                self._audit.warning(
+                    "SPAWN_TUI_REJECTED tui_name=%r device=%s bearer=%s",
+                    tui_name[:64],
+                    getattr(conn.session, "device_name", "") or "?",
+                    _tag(getattr(conn.session, "bearer", None)),
+                )
+                return self._bad_field(msg_id, verb, "tui_name")
+            return self._res(msg_id, verb, {"ok": bool(self._monitor.spawn_tui(tui_name))})
+
+        if verb == "kill_pane":
+            return self._kill_pane(msg_id, payload)
+
+        if verb == "kill_window":
+            return self._kill_window(msg_id, payload)
+
+        if verb == "restart_task":
+            return self._restart_task(msg_id, payload)
+
+        if verb == "pick_next_sibling":
+            return self._pick_next_sibling(msg_id, payload)
+
+        if verb == "task_detail":
+            task_id = self._req_str(payload, "task_id")
+            if task_id is None:
+                return self._bad_field(msg_id, verb, "task_id")
+            return self._task_detail(msg_id, task_id)
+
+        # Should be unreachable (verb membership checked by the caller).
+        return self._err(msg_id, verb, ERR_INTERNAL, f"no dispatcher for '{verb}'")
+
+    def _deferred_compare(self, msg_id, verb, cycle_async, pane_id) -> DeferredReply:
+        async def run():
+            try:
+                mode, following = await cycle_async(pane_id)
+            except Exception as exc:  # noqa: BLE001 - RequestFailed, ConnectionLost,
+                # a request timeout, ReplayReadOnly: the request failed, the
+                # connection lives on. (CancelledError is not an Exception.)
+                self._audit.warning("COMPARE_MODE_FAILED pane=%s reason=%s",
+                                    pane_id, type(exc).__name__)
+                return self._err(msg_id, verb, ERR_INTERNAL,
+                                 "compare mode request failed",
+                                 detail={"reason": type(exc).__name__})
+            return self._res(msg_id, verb,
+                             {"mode": mode, "following_default": bool(following)})
+        return DeferredReply(run, msg_id=msg_id, verb=verb)
+
+    # -- Modal-dialog handshakes (t822_11) -------------------------------------
+
+    def _two_phase(self, msg_id, verb, payload, *, build_details, execute):
+        """Pull-model confirm round-trip shared by kill/restart.
+
+        ``build_details`` returns either a ``dict`` of detail fields for the
+        ``confirm_required`` reply, or an ``err`` frame (``kind == "err"``) that
+        short-circuits **both** phases (e.g. a ``not_idle`` / ``not_found``
+        rejection). The client re-sends the same verb with ``confirmed:true`` to
+        run ``execute``; the server never blocks waiting for a reply, so the
+        action stays client-initiated and idempotent.
+        """
+        details = build_details()
+        if isinstance(details, dict) and details.get("kind") == "err":
+            return details
+        if not payload.get("confirmed"):
+            reply = {"confirm_required": True}
+            reply.update(details)
+            return self._res(msg_id, verb, reply)
+        return execute()
+
+    def _resolve_pane_task(self, pane_id):
+        """Resolve ``(pane, task_id, session_name)`` from a pane id.
+
+        Uses the monitor's cached pane metadata (no live capture) and the task
+        resolver. ``session_name`` is threaded into every downstream task-cache
+        call so a pane owned by another project/session resolves against the
+        right task family (mirrors the desktop's ``snap.pane.session_name``
+        plumbing). Returns ``(None, None, "")`` when the pane is unknown.
+        """
+        pane = self._cached_pane(pane_id)
+        if pane is None:
+            return None, None, ""
+        session_name = getattr(pane, "session_name", "") or ""
+        task_id = None
+        if self._tasks is not None:
+            task_id = self._tasks.get_task_id_for_pane(pane)
+        return pane, task_id, session_name
+
+    def _pane_target(self, pane_id):
+        """Confirm-dialog target for a pane: ``{pane_id, window_name?, task?}``.
+
+        Degrades to just ``pane_id`` when the pane is not in the monitor cache
+        (the design table marks ``window_name``/``task`` optional)."""
+        target = {"pane_id": pane_id}
+        pane, task_id, _session = self._resolve_pane_task(pane_id)
+        if pane is not None:
+            window_name = getattr(pane, "window_name", "") or ""
+            if window_name:
+                target["window_name"] = window_name
+        if task_id:
+            target["task"] = task_id
+        return target
+
+    def _kill_pane(self, msg_id, payload):
+        pane_id = self._req_pane_id(payload)
+        if pane_id is None:
+            return self._bad_field(msg_id, "kill_pane", "pane_id")
+
+        def build_details():
+            # `_two_phase` runs this in BOTH phases — in the confirmed one
+            # immediately before `execute` — so this one call refuses up front
+            # AND re-checks at execution time (t2065).
+            refusal = self._kill_refusal(msg_id, "kill_pane", pane_id)
+            if refusal is not None:
+                return refusal
+            return {"target": self._pane_target(pane_id)}
+
+        def execute():
+            if self._is_own_pane(pane_id):
+                # The cache-miss route of `kill_agent_pane_smart` (t2034_2): a
+                # plain pane kill, never the window collapse, and the bound-helper
+                # sweep still runs after a successful kill.
+                ok, killed_window = self._monitor.kill_agent_pane_smart(
+                    pane_id, cache_miss=True)
+            else:
+                ok, killed_window = self._monitor.kill_agent_pane_smart(pane_id)
+            return self._res(msg_id, "kill_pane",
+                             {"ok": bool(ok), "killed_window": bool(killed_window)})
+
+        return self._two_phase(msg_id, "kill_pane", payload,
+                               build_details=build_details, execute=execute)
+
+    def _kill_refusal(self, msg_id, verb, pane_id):
+        """err frame when ``pane_id`` is not proven live, else ``None`` (t2065).
+
+        ``kill_agent_pane_smart``'s frozen path is an unleased kill-then-drop
+        that deletes the capture — the only copy of the agent's output. A
+        remote client never sees the desktop's capture-loss warning, so a
+        frozen pane is refused here rather than routed to the drop; it is
+        retired from a desktop monitor's ``k`` (the leased, warned drop).
+
+        Two reads. The discovery cache first, because that is where the smart
+        kill reads the record id it drops, and a restore can clear the live
+        stamp before discovery refreshes it. Then the live ``@aitask_frozen``
+        option, because the cache can be a tick stale the other way. An
+        unreadable option — including a pane that is gone — fails closed.
+        """
+        from monitor.monitor_core import FROZEN_OPTION
+
+        frozen = self._err(
+            msg_id, verb, ERR_BAD_PAYLOAD,
+            "pane holds a frozen agent; drop it from a desktop monitor (k)",
+            detail={"reason": "frozen"})
+        cached = self._cached_pane(pane_id)
+        if cached is not None and cached.frozen_record:
+            return frozen
+        ok, value = self._monitor.get_pane_option_sync(pane_id, FROZEN_OPTION)
+        if not ok:
+            return self._err(msg_id, verb, ERR_BAD_PAYLOAD,
+                             "could not confirm pane is live",
+                             detail={"reason": "unverified"})
+        if value:
+            return frozen
+        return None
+
+    def _kill_window(self, msg_id, payload):
+        window_id = self._req_window_id(payload)
+        if window_id is None:
+            return self._bad_field(msg_id, "kill_window", "window_id")
+
+        def build_details():
+            return {"target": {"window_id": window_id}}
+
+        def execute():
+            return self._res(msg_id, "kill_window",
+                             {"ok": bool(self._monitor.kill_window(window_id))})
+
+        return self._two_phase(msg_id, "kill_window", payload,
+                               build_details=build_details, execute=execute)
+
+    def _restart_task(self, msg_id, payload):
+        """Idle-gated restart confirm (gate: full). Execution is deferred."""
+        # Validate even though execution is deferred — the build_details phase
+        # still reaches tmux via capture_pane(pane_id).
+        pane_id = self._req_pane_id(payload)
+        if pane_id is None:
+            return self._bad_field(msg_id, "restart_task", "pane_id")
+
+        def build_details():
+            # Own pane: the cache miss `capture_pane` returned while excluded.
+            snap = None if self._is_own_pane(pane_id) else self._status_snapshot(pane_id)
+            if snap is None:
+                return self._err(msg_id, "restart_task", ERR_BAD_PAYLOAD,
+                                 f"pane '{pane_id}' not found",
+                                 detail={"reason": "not_found"})
+            if not getattr(snap, "is_idle", False):
+                return self._err(msg_id, "restart_task", ERR_BAD_PAYLOAD,
+                                 "pane is not idle", detail={"reason": "not_idle"})
+            pane = snap.pane
+            session_name = getattr(pane, "session_name", "") or ""
+            task_id = None
+            if self._tasks is not None:
+                task_id = self._tasks.get_task_id_for_pane(pane)
+            if not task_id:
+                return self._err(msg_id, "restart_task", ERR_BAD_PAYLOAD,
+                                 "pane has no resolvable task id",
+                                 detail={"reason": "no_task"})
+            title, status = "", ""
+            if self._tasks is not None:
+                self._tasks.invalidate(task_id, session_name)
+                info = self._tasks.get_task_info(task_id, session_name)
+                if info is not None:
+                    title, status = info.title, info.status
+            return {
+                "task_id": task_id, "title": title, "status": status,
+                "idle_seconds": getattr(snap, "idle_seconds", 0),
+            }
+
+        def execute():
+            _pane, task_id, _session = self._resolve_pane_task(pane_id)
+            return self._err(msg_id, "restart_task", ERR_NOT_IMPLEMENTED,
+                             "restart execution is deferred (no launch policy yet)",
+                             detail={"reason": "deferred", "task_id": task_id})
+
+        return self._two_phase(msg_id, "restart_task", payload,
+                               build_details=build_details, execute=execute)
+
+    def _pick_next_sibling(self, msg_id, payload):
+        """Suggest/choose sibling round-trip (gate: full). Execution deferred."""
+        # Validate even though execution is deferred — the suggest phase still
+        # reaches tmux via _resolve_pane_task(pane_id).
+        pane_id = self._req_pane_id(payload)
+        if pane_id is None:
+            return self._bad_field(msg_id, "pick_next_sibling", "pane_id")
+        pane, task_id, session_name = self._resolve_pane_task(pane_id)
+        if pane is None:
+            return self._err(msg_id, "pick_next_sibling", ERR_BAD_PAYLOAD,
+                             f"pane '{pane_id}' not found",
+                             detail={"reason": "not_found"})
+        if not task_id:
+            return self._err(msg_id, "pick_next_sibling", ERR_BAD_PAYLOAD,
+                             "pane has no resolvable task id",
+                             detail={"reason": "no_task"})
+
+        sibling_id = payload.get("sibling_id")
+        if isinstance(sibling_id, str) and sibling_id:
+            # Choose phase — the kill+relaunch execution is deferred.
+            return self._err(msg_id, "pick_next_sibling", ERR_NOT_IMPLEMENTED,
+                             "sibling launch is deferred (no launch policy yet)",
+                             detail={"reason": "deferred", "sibling_id": sibling_id})
+
+        if self._tasks is None:
+            return self._err(msg_id, "pick_next_sibling", ERR_INTERNAL,
+                             "task resolver unavailable")
+        # Suggest phase — force-refresh current task info, then suggest + list.
+        self._tasks.invalidate(task_id, session_name)
+        info = self._tasks.get_task_info(task_id, session_name)
+        current_title = info.title if info is not None else ""
+        current_status = info.status if info is not None else "Done"
+        suggested = self._tasks.find_next_sibling(task_id, session_name)
+        ready = self._tasks.find_ready_siblings(task_id, session_name)
+        parent_id = self._tasks.get_parent_id(task_id) or task_id
+        # `followup_kind` is null (not "") when the task is not an auto-spawned
+        # follow-up, so a client can tell "no provenance" from a value without
+        # having to know the empty string is a sentinel (t1468_5).
+        suggested_payload = None
+        if suggested is not None:
+            sug_id, sug_title, sug_kind = suggested
+            suggested_payload = {"id": sug_id, "title": sug_title,
+                                 "followup_kind": sug_kind or None}
+        ready_payload = [
+            {"id": sid, "title": stitle, "blocked_by": list(blocked),
+             "followup_kind": kind or None}
+            for (sid, stitle, blocked, kind) in ready
+        ]
+        return self._res(msg_id, "pick_next_sibling", {
+            "suggested": suggested_payload,
+            "current": {"id": task_id, "title": current_title, "status": current_status},
+            "parent_id": parent_id,
+            "ready_siblings": ready_payload,
+        })
+
+    def _task_detail(self, msg_id, task_id):
+        if self._tasks is None:
+            return self._err(msg_id, "task_detail", ERR_INTERNAL, "task resolver unavailable")
+        # Force-refresh, matching the desktop force-refresh on task-detail open.
+        self._tasks.invalidate(task_id)
+        info = self._tasks.get_task_info(task_id)
+        if info is None:
+            return self._err(
+                msg_id, "task_detail", ERR_BAD_PAYLOAD,
+                f"task '{task_id}' not found", detail={"reason": "not_found"},
+            )
+        return self._res(msg_id, "task_detail", {
+            "task_id": info.task_id,
+            "task_file": info.task_file,
+            "title": info.title,
+            "priority": info.priority,
+            "effort": info.effort,
+            "issue_type": info.issue_type,
+            "status": info.status,
+            "body": info.body,
+            "plan_content": info.plan_content,
+        })
+
+    # -- Data-plane helpers ----------------------------------------------------
+
+    def _is_own_pane(self, pane_id) -> bool:
+        """Whether ``pane_id`` is this server's own pane (t2034_2).
+
+        The admission rule: the own pane is admissible exactly on the routes
+        that never consulted the producer's pane cache (``send_enter`` /
+        ``send_keys`` / ``forward_key`` / ``cycle_compare_mode``). Every
+        cache-backed route treats it as the cache miss it was while the producer
+        excluded it — so removing that exclusion opens nothing new.
+        """
+        return self._own_pane is not None and pane_id == self._own_pane
+
+    def _status_snapshot(self, pane_id):
+        """The pane's idle verdict as applink's view shows it (t2037_4).
+
+        A ``MonitorClient`` answers from the status server's idle clock
+        (``status_snapshot``); its local instance never scans while subscribed,
+        so a local ``capture_pane`` there would always read "not idle". A plain
+        ``TmuxMonitor`` (in-process) keeps today's live ``capture_pane``. Then
+        the same projection the push loop applies (``status_view``), so the
+        gate and the phone's badge agree about a parked agent."""
+        getter = getattr(self._monitor, "status_snapshot", None)
+        snap = getter(pane_id) if callable(getter) else self._monitor.capture_pane(pane_id)
+        if snap is None:
+            return None
+        from status_view import view_snapshots  # noqa: PLC0415 - lazy, like FROZEN_OPTION
+        return view_snapshots(self._monitor, {pane_id: snap},
+                              own_pane=self._own_pane).get(pane_id)
+
+    def _cached_pane(self, pane_id):
+        """``monitor.get_pane`` as this client may see it: never the own pane."""
+        if self._is_own_pane(pane_id):
+            return None
+        get_pane = getattr(self._monitor, "get_pane", None)
+        if not callable(get_pane):
+            return None
+        return get_pane(pane_id)
+
+    def _discover_pane_ids(self) -> list[str]:
+        """Pane ids (``%N``) for every currently-discovered pane — the expansion of
+        an empty/absent ``subscribe``. Degrades to ``[]`` if the monitor cannot
+        enumerate panes, so a stub / limited monitor keeps the old empty-subscribe
+        behavior (subscribe-to-nothing) rather than raising."""
+        discover = getattr(self._monitor, "discover_panes", None)
+        if not callable(discover):
+            return []
+        return [
+            p.pane_id for p in discover()
+            if getattr(p, "pane_id", None) and not self._is_own_pane(p.pane_id)
+        ]
+
+    # -- Frame builders --------------------------------------------------------
+
+    @staticmethod
+    def _req_str(payload: dict, key: str) -> str | None:
+        value = payload.get(key)
+        if isinstance(value, str) and value and len(value) <= _MAX_STR:
+            return value
+        return None
+
+    @staticmethod
+    def _req_int(payload: dict, key: str):
+        """A required integer field, else None. Rejects bools (``True``/``False``
+        are ``int`` subclasses in Python) and non-int JSON values (e.g. floats)."""
+        value = payload.get(key)
+        if isinstance(value, bool) or not isinstance(value, int):
+            return None
+        return value
+
+    def _req_pane_id(self, payload: dict, key: str = "pane_id") -> str | None:
+        """A required, format-validated tmux pane id (``%N``), else None.
+
+        Constrains the value to an explicit unique pane id, removing the rich
+        tmux target-spec surface ({mouse}, =sess:win.pane, …) and any
+        leading-dash value before it reaches the monitor / tmux.
+        """
+        value = self._req_str(payload, key)
+        return value if value is not None and _PANE_ID_RE.match(value) else None
+
+    def _req_window_id(self, payload: dict, key: str = "window_id") -> str | None:
+        """A required, format-validated tmux window id (``@N``), else None."""
+        value = self._req_str(payload, key)
+        return value if value is not None and _WINDOW_ID_RE.match(value) else None
+
+    def _bad_field(self, msg_id, verb, field):
+        return self._err(msg_id, verb, ERR_BAD_PAYLOAD, f"missing or invalid field: {field}")
+
+    _res = staticmethod(result_frame)
+    _err = staticmethod(error_frame)

@@ -1,0 +1,2605 @@
+#!/usr/bin/env bash
+
+# aitask_update.sh - Update existing AI tasks
+# Supports interactive mode (fzf) and batch mode (CLI parameters)
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/terminal_compat.sh
+source "$SCRIPT_DIR/lib/terminal_compat.sh"
+source "$SCRIPT_DIR/lib/task_utils.sh"
+# shellcheck source=lib/atomic_write.sh
+source "$SCRIPT_DIR/lib/atomic_write.sh"
+# shellcheck source=lib/followup_kinds_sh.sh
+source "$SCRIPT_DIR/lib/followup_kinds_sh.sh"
+
+TASK_DIR="aitasks"
+# Consumed by labels_file_path() in lib/task_utils.sh; also staged by variable
+# at the commit sites, so the assignment must stay (see aitask_create.sh).
+LABELS_FILE="${TASK_DIR}/metadata/labels.txt"
+# Set by the interactive label editor when it appends to the vocabulary; read at
+# the interactive commit to decide whether labels.txt joins the commit.
+LABELS_VOCAB_DIRTY=false
+TASK_TYPES_FILE="aitasks/metadata/task_types.txt"
+
+# Batch mode variables
+BATCH_MODE=false
+BATCH_TASK_NUM=""
+BATCH_PRIORITY=""
+# risk is a planning output (set later by the risk-evaluation step), not a
+# creation input — it enters the framework here in update, never in create.
+# Stored as two independent dimensions: code-health and goal-achievement.
+BATCH_RISK_CODE_HEALTH=""
+BATCH_RISK_CODE_HEALTH_SET=false
+BATCH_RISK_GOAL_ACHIEVEMENT=""
+BATCH_RISK_GOAL_ACHIEVEMENT_SET=false
+BATCH_RISK_MITIGATION_TASKS=""
+BATCH_RISK_MITIGATION_TASKS_SET=false
+# gates: declared gate set (list, replaces-all). Registered for durability —
+# without parse+serialize here, `ait update` would silently drop the field
+# from any gated task (t635_1).
+BATCH_GATES=""
+BATCH_GATES_SET=false
+# also_blocks_dependents: per-task extra gates required before dependents unblock
+# (list, replaces-all). Registered for durability alongside gates: (t635_3).
+BATCH_ALSO_BLOCKS_DEPENDENTS=""
+BATCH_ALSO_BLOCKS_DEPENDENTS_SET=false
+# active_gates tuple (t635_33): derived enforcement state written by
+# `aitask_gate.sh materialize-active`. The four flags form an ATOMIC unit —
+# validate_active_tuple_flags hard-rejects a strict subset (all four or none),
+# so a partial invocation can never persist a mixed tuple.
+BATCH_ACTIVE_GATES=""
+BATCH_ACTIVE_GATES_SET=false
+BATCH_ACTIVE_GATES_FILTERED=""
+BATCH_ACTIVE_GATES_FILTERED_SET=false
+BATCH_ACTIVE_GATES_PROFILE=""
+BATCH_ACTIVE_GATES_PROFILE_SET=false
+BATCH_ACTIVE_GATES_DIGEST=""
+BATCH_ACTIVE_GATES_DIGEST_SET=false
+# --clear-active-gates removes the whole tuple (grouped deletion — the only
+# other legitimate tuple state besides all-four-present). Used by
+# materialize-active's failure path so a stale snapshot from a previous
+# profile can never silently keep governing after a failed re-derivation.
+BATCH_CLEAR_ACTIVE_GATES=false
+BATCH_EFFORT=""
+BATCH_STATUS=""
+BATCH_TYPE=""
+BATCH_DEPS=""
+BATCH_DEPS_SET=false
+BATCH_XDEPS=""
+BATCH_XDEPS_SET=false
+BATCH_XDEPREPO=""
+BATCH_XDEPREPO_SET=false
+BATCH_VERIFIES=""
+BATCH_VERIFIES_SET=false
+BATCH_ADD_VERIFIES=()
+BATCH_REMOVE_VERIFIES=()
+BATCH_LABELS=""
+BATCH_LABELS_SET=false
+BATCH_ADD_LABELS=()
+BATCH_REMOVE_LABELS=()
+BATCH_ADD_FILE_REFS=()
+BATCH_REMOVE_FILE_REFS=()
+BATCH_DESC=""
+BATCH_DESC_FILE=""
+BATCH_NAME=""
+BATCH_SILENT=false
+BATCH_ADD_CHILD=""
+BATCH_REMOVE_CHILD=""
+BATCH_CHILDREN=""
+BATCH_CHILDREN_SET=false
+BATCH_ASSIGNED_TO=""
+BATCH_ASSIGNED_TO_SET=false
+BATCH_ANCHOR=""
+BATCH_ANCHOR_SET=false
+BATCH_FOLLOWUP_KIND=""
+BATCH_FOLLOWUP_KIND_SET=false
+BATCH_VERIFICATION_BASELINE=""
+BATCH_VERIFICATION_BASELINE_SET=false
+BATCH_PLAN_APPROVED_AT=""
+BATCH_PLAN_APPROVED_AT_SET=false
+BATCH_PREMISE_BASELINE=""
+BATCH_PREMISE_BASELINE_SET=false
+BATCH_BOARDCOL=""
+BATCH_BOARDCOL_SET=false
+BATCH_BOARDIDX=""
+BATCH_BOARDIDX_SET=false
+BATCH_BOARDGROUP=""
+BATCH_BOARDGROUP_SET=false
+BATCH_ISSUE=""
+BATCH_ISSUE_SET=false
+BATCH_PULL_REQUEST=""
+BATCH_PULL_REQUEST_SET=false
+BATCH_CONTRIBUTOR=""
+BATCH_CONTRIBUTOR_SET=false
+BATCH_CONTRIBUTOR_EMAIL=""
+BATCH_CONTRIBUTOR_EMAIL_SET=false
+BATCH_FOLDED_TASKS=""
+BATCH_FOLDED_TASKS_SET=false
+BATCH_FOLDED_INTO=""
+BATCH_FOLDED_INTO_SET=false
+BATCH_IMPLEMENTED_WITH=""
+BATCH_IMPLEMENTED_WITH_SET=false
+BATCH_COMMIT=false
+
+# Current values (parsed from file)
+CURRENT_PRIORITY=""
+CURRENT_RISK_CODE_HEALTH=""
+CURRENT_RISK_GOAL_ACHIEVEMENT=""
+CURRENT_RISK_MITIGATION_TASKS=""
+CURRENT_GATES=""
+CURRENT_ALSO_BLOCKS_DEPENDENTS=""
+CURRENT_EFFORT=""
+CURRENT_DEPS=""
+CURRENT_XDEPS=""
+CURRENT_XDEPREPO=""
+CURRENT_VERIFIES=""
+CURRENT_TYPE=""
+CURRENT_STATUS=""
+CURRENT_LABELS=""
+CURRENT_CREATED_AT=""
+CURRENT_DESCRIPTION=""
+CURRENT_CHILDREN_TO_IMPLEMENT=""
+CURRENT_ASSIGNED_TO=""
+CURRENT_ANCHOR=""
+CURRENT_FOLLOWUP_KIND=""
+CURRENT_BOARDCOL=""
+CURRENT_BOARDIDX=""
+# Presence is tracked separately from value: `boardgroup: ""` is a TOMBSTONE
+# (explicitly ungrouped), which is NOT the same as the key being absent.
+CURRENT_BOARDGROUP=""
+CURRENT_BOARDGROUP_PRESENT=false
+CURRENT_ISSUE=""
+CURRENT_PULL_REQUEST=""
+CURRENT_CONTRIBUTOR=""
+CURRENT_CONTRIBUTOR_EMAIL=""
+CURRENT_FOLDED_TASKS=""
+CURRENT_FOLDED_INTO=""
+CURRENT_IMPLEMENTED_WITH=""
+CURRENT_FILE_REFERENCES=""
+CURRENT_VERIFICATION_BASELINE=""
+CURRENT_PLAN_APPROVED_AT=""
+CURRENT_PREMISE_BASELINE=""
+
+# --- Helper Functions ---
+
+show_help() {
+    cat << 'EOF'
+Usage: aitask_update.sh [OPTIONS] [TASK_NUMBER]
+
+Update an existing AI task file.
+
+Interactive mode (default):
+  Run without --batch for interactive task selection and editing with fzf.
+  If TASK_NUMBER is provided, skip task selection and edit that task directly.
+
+Batch mode (for automation):
+  --batch                Enable batch mode (non-interactive)
+  TASK_NUMBER            Task number to update (required in batch mode)
+
+Metadata options (batch mode):
+  --priority, -p LEVEL   Priority: high, medium, low
+  --risk-code-health LEVEL
+                         Code-health risk: high, medium, low (planning output;
+                         use "" to clear). Display-only — not a sort dimension.
+  --risk-goal-achievement LEVEL
+                         Goal-achievement risk: high, medium, low (planning
+                         output; use "" to clear). Display-only.
+  --risk-mitigation-tasks IDS
+                         Risk-mitigation task IDs (comma-separated, replaces
+                         all; use "" to clear). Written by the risk-mitigation
+                         procedure via read-modify-write.
+  --effort, -e LEVEL     Effort: low, medium, high
+  --status, -s STATUS    Status: Ready, Editing, Implementing, Postponed, Done, Folded
+  --type TYPE            Issue type (see aitasks/metadata/task_types.txt)
+  --deps DEPS            Dependencies (comma-separated task numbers, replaces all)
+  --xdeps DEPS           Cross-repo dependencies (comma-separated task numbers,
+                         replaces all). Requires --xdeprepo. Pass "" to clear
+                         both fields.
+  --xdeprepo NAME        Cross-repo project name (resolved via the registry)
+                         that --xdeps numbers refer to. Required when --xdeps
+                         is set; both must be cleared together.
+
+Verifies options (batch mode; usually manual-verification tasks, but any
+issue_type may carry a verifies list):
+  --verifies VERIFIES    Verifies list (comma-separated task IDs, replaces all)
+  --add-verifies ID      Add a task ID to verifies (can be repeated)
+  --remove-verifies ID   Remove a task ID from verifies (can be repeated)
+  --verification-baseline VALUE
+                         Commit a manual-verification checklist is known to
+                         match, as "<sha> @ <YYYY-MM-DD HH:MM>" (use "" to
+                         clear). Read by aitask_verification_stale.sh to decide
+                         whether the checklist may have gone stale.
+
+Deferred-plan marker (batch mode):
+  --plan-approved-at TS  Marks the task as "plan approved, implementation
+                         deliberately deferred", as "<YYYY-MM-DD HH:MM>". Pass
+                         the literal "now" to stamp the current time, or "" to
+                         clear (the marker is invalidated whenever the approved
+                         plan stops being implementation-ready). Written by the
+                         task-workflow Approved-Plan Stop Sequence; read by
+                         `ait ls -v` / --plan-approved and by the planning
+                         step's existing-plan prompt. Display and prompting
+                         only -- it never routes the workflow.
+
+Premise baseline (batch mode):
+  --premise-baseline VALUE
+                         Commit at which the task's premise was last known
+                         valid, as "<sha> @ <YYYY-MM-DD HH:MM>". A bare <sha>
+                         is stamped with the current time; "" clears. <sha>
+                         must be a full 40- or 64-hex commit id that exists in
+                         this repository -- symbolic revisions (HEAD, a branch,
+                         an abbreviation) are rejected, never resolved; pass
+                         the output of `git rev-parse --verify <rev>^{commit}`.
+                         Read by aitask_premise_stale.sh.
+
+Label options (batch mode):
+  --labels, -l LABELS    Labels (comma-separated, replaces all existing labels).
+                         Sanitized, and any new label is registered in
+                         aitasks/metadata/labels.txt and committed with the task
+                         — same as --add-label, so both ways of naming a label
+                         grow the vocabulary identically.
+  --add-label LABEL      Add a label (can be repeated). Sanitized and registered
+                         in aitasks/metadata/labels.txt.
+  --remove-label LABEL   Remove a label (can be repeated). Matched verbatim
+                         against the current frontmatter so legacy raw labels
+                         stay removable; never unregisters from labels.txt.
+
+Gate options (batch mode):
+  --gates GATES          Declared gate set (comma-separated names, replaces all;
+                         empty clears it). See aitasks/metadata/gates.yaml.
+  --also-blocks-dependents GATES
+                         Per-task extra gates required before dependents unblock
+                         (comma-separated, replaces all; empty clears it).
+                         Augments the registry's blocks_dependents defaults.
+  --active-gates CSV, --active-gates-filtered CSV,
+  --active-gates-profile NAME, --active-gates-digest DIGEST
+                         The derived active-gates tuple (t635_33), written by
+                         `aitask_gate.sh materialize-active` — not intended for
+                         manual use. ATOMIC: pass all four or none (a strict
+                         subset is rejected with no file change). An empty
+                         --active-gates CSV persists the load-bearing
+                         `active_gates: []` (fully profile-filtered task).
+  --clear-active-gates   Remove the whole active-gates tuple (grouped deletion;
+                         raw `gates:` then governs). Mutually exclusive with
+                         the --active-gates* flags. Used by materialize-active's
+                         failure path to drop a stale snapshot.
+
+Description options (batch mode):
+  --description, -d DESC New description text (replaces existing)
+  --desc-file FILE       Read description from file (use - for stdin)
+
+Board options (batch mode):
+  --boardcol COL           Board column ID (e.g., now, next, backlog)
+  --boardidx IDX           Board sort index (integer)
+  --boardgroup SLUG        In-column board group slug ([a-z0-9_]+); "" clears
+
+Issue tracking options (batch mode):
+  --issue URL              Issue tracker URL (e.g., GitHub issue URL; use "" to clear)
+
+Assignment options (batch mode):
+  --assigned-to, -a EMAIL  Email of assigned person (use "" to clear)
+  --anchor ID            Topic-anchor task id / group key (use "" to clear).
+                         Accepts N / N_M (leading "t" stripped); validated to
+                         exist when non-empty.
+  --followup-kind KIND   Auto-spawned follow-up provenance (use "" to clear).
+                         One of: manual_verification, risk_mitigation,
+                         upstream_defect, verification_failure, carry_over,
+                         qa_test_gap, review_finding, docs_gap.
+                         "manual_verification" requires issue_type
+                         "manual_verification" (checked on the RESULTING pair).
+
+Agent tracking options (batch mode):
+  --implemented-with STR Agent string that implemented this task (e.g., "claudecode/opus4_6"; use "" to clear)
+
+Folded task options (batch mode):
+  --folded-tasks TASKS   Folded task IDs (comma-separated, e.g., "106,129_5"; use "" to clear)
+  --folded-into NUM      Task number this task was folded into (use "" to clear)
+
+Child task options (batch mode):
+  --add-child CHILD_ID   Add child to children_to_implement list
+  --remove-child CHILD_ID Remove child from children_to_implement list
+  --children CHILDREN    Set children_to_implement (comma-separated, replaces all)
+
+File reference options (batch mode):
+  --file-ref REF         Append a file reference; repeatable. REF format:
+                         PATH | PATH:N | PATH:N-M | PATH:N-M^N-M^... (^ joins ranges).
+                         Dedup is exact-string only (order-sensitive).
+  --remove-file-ref REF  Remove a file reference by exact-string match; repeatable.
+
+Cross-repo options (batch mode only):
+  --project NAME         Update a task in a sibling aitasks project resolved
+                         via the per-user registry (~/.config/aitasks/projects.yaml).
+                         Requires --batch. Only administrative fields can be
+                         updated cross-repo: --xdeps, --xdeprepo, --labels,
+                         --add-label, --remove-label, --priority, --effort,
+                         --deps, --assigned-to, --boardcol, --boardidx, and
+                         --status (Ready|Editing|Postponed only).
+                         Refused cross-repo: --name (rename), --status
+                         Implementing|Done|Folded (workflow transitions go
+                         through the cross-repo project's own /aitask-pick).
+                         A lock-check inside the cross-repo project refuses
+                         the update if the task is locked by a different
+                         host/owner.
+
+Other options:
+  --name, -n NAME        Rename task (changes filename, sanitizes input)
+  --commit               Automatically commit changes to git
+  --silent               Output only filename on success (batch mode)
+  --help, -h             Show this help
+
+Examples:
+  # Interactive mode - select task with fzf
+  ./aitask_update.sh
+
+  # Interactive mode - edit specific task
+  ./aitask_update.sh 25
+
+  # Batch mode - update priority
+  ./aitask_update.sh --batch 25 --priority high
+
+  # Batch mode - update multiple fields
+  ./aitask_update.sh --batch 25 -p low -e high -s Editing
+
+  # Batch mode - replace all labels
+  ./aitask_update.sh --batch 25 --labels "ui,backend"
+
+  # Batch mode - add/remove individual labels
+  ./aitask_update.sh --batch 25 --add-label "urgent" --remove-label "low-priority"
+
+  # Batch mode - update description
+  ./aitask_update.sh --batch 25 -d "New description text"
+
+  # Batch mode - rename task
+  ./aitask_update.sh --batch 25 --name "new_task_name"
+
+  # Batch mode - add child to parent's children_to_implement
+  ./aitask_update.sh --batch 10 --add-child t10_1
+
+  # Batch mode - remove child (when child is completed)
+  ./aitask_update.sh --batch 10 --remove-child t10_1
+
+  # Batch mode - update child task (use parent_child format)
+  ./aitask_update.sh --batch 10_1 --status Done
+EOF
+}
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --batch) BATCH_MODE=true; shift ;;
+            --priority|-p) BATCH_PRIORITY="$2"; shift 2 ;;
+            --risk-code-health) BATCH_RISK_CODE_HEALTH="$2"; BATCH_RISK_CODE_HEALTH_SET=true; shift 2 ;;
+            --risk-goal-achievement) BATCH_RISK_GOAL_ACHIEVEMENT="$2"; BATCH_RISK_GOAL_ACHIEVEMENT_SET=true; shift 2 ;;
+            --risk-mitigation-tasks) BATCH_RISK_MITIGATION_TASKS="$2"; BATCH_RISK_MITIGATION_TASKS_SET=true; shift 2 ;;
+            --gates) BATCH_GATES="$2"; BATCH_GATES_SET=true; shift 2 ;;
+            --also-blocks-dependents) BATCH_ALSO_BLOCKS_DEPENDENTS="$2"; BATCH_ALSO_BLOCKS_DEPENDENTS_SET=true; shift 2 ;;
+            --active-gates) BATCH_ACTIVE_GATES="$2"; BATCH_ACTIVE_GATES_SET=true; shift 2 ;;
+            --active-gates-filtered) BATCH_ACTIVE_GATES_FILTERED="$2"; BATCH_ACTIVE_GATES_FILTERED_SET=true; shift 2 ;;
+            --active-gates-profile) BATCH_ACTIVE_GATES_PROFILE="$2"; BATCH_ACTIVE_GATES_PROFILE_SET=true; shift 2 ;;
+            --active-gates-digest) BATCH_ACTIVE_GATES_DIGEST="$2"; BATCH_ACTIVE_GATES_DIGEST_SET=true; shift 2 ;;
+            --clear-active-gates) BATCH_CLEAR_ACTIVE_GATES=true; shift ;;
+            --effort|-e) BATCH_EFFORT="$2"; shift 2 ;;
+            --status|-s) BATCH_STATUS="$2"; shift 2 ;;
+            --type) BATCH_TYPE="$2"; shift 2 ;;
+            --deps) BATCH_DEPS="$2"; BATCH_DEPS_SET=true; shift 2 ;;
+            --xdeps) BATCH_XDEPS="$2"; BATCH_XDEPS_SET=true; shift 2 ;;
+            --xdeprepo) BATCH_XDEPREPO="$2"; BATCH_XDEPREPO_SET=true; shift 2 ;;
+            --verifies) BATCH_VERIFIES="$2"; BATCH_VERIFIES_SET=true; shift 2 ;;
+            --add-verifies) BATCH_ADD_VERIFIES+=("$2"); shift 2 ;;
+            --remove-verifies) BATCH_REMOVE_VERIFIES+=("$2"); shift 2 ;;
+            --labels|-l) BATCH_LABELS="$2"; BATCH_LABELS_SET=true; shift 2 ;;
+            --add-label) BATCH_ADD_LABELS+=("$2"); shift 2 ;;
+            --remove-label) BATCH_REMOVE_LABELS+=("$2"); shift 2 ;;
+            --file-ref) validate_file_ref "$2"; BATCH_ADD_FILE_REFS+=("$2"); shift 2 ;;
+            --remove-file-ref) validate_file_ref "$2"; BATCH_REMOVE_FILE_REFS+=("$2"); shift 2 ;;
+            --description|-d) BATCH_DESC="$2"; shift 2 ;;
+            --desc-file) BATCH_DESC_FILE="$2"; shift 2 ;;
+            --name|-n) BATCH_NAME="$2"; shift 2 ;;
+            --add-child) BATCH_ADD_CHILD="$2"; shift 2 ;;
+            --remove-child) BATCH_REMOVE_CHILD="$2"; shift 2 ;;
+            --children) BATCH_CHILDREN="$2"; BATCH_CHILDREN_SET=true; shift 2 ;;
+            --assigned-to|-a) BATCH_ASSIGNED_TO="$2"; BATCH_ASSIGNED_TO_SET=true; shift 2 ;;
+            --anchor) BATCH_ANCHOR="$2"; BATCH_ANCHOR_SET=true; shift 2 ;;
+            --followup-kind) BATCH_FOLLOWUP_KIND="$2"; BATCH_FOLLOWUP_KIND_SET=true; shift 2 ;;
+            --verification-baseline) BATCH_VERIFICATION_BASELINE="$2"; BATCH_VERIFICATION_BASELINE_SET=true; shift 2 ;;
+            --plan-approved-at) BATCH_PLAN_APPROVED_AT="$2"; BATCH_PLAN_APPROVED_AT_SET=true; shift 2 ;;
+            --premise-baseline) BATCH_PREMISE_BASELINE="$2"; BATCH_PREMISE_BASELINE_SET=true; shift 2 ;;
+            --boardcol) BATCH_BOARDCOL="$2"; BATCH_BOARDCOL_SET=true; shift 2 ;;
+            --boardidx) BATCH_BOARDIDX="$2"; BATCH_BOARDIDX_SET=true; shift 2 ;;
+            --boardgroup) BATCH_BOARDGROUP="$2"; BATCH_BOARDGROUP_SET=true; shift 2 ;;
+            --issue) BATCH_ISSUE="$2"; BATCH_ISSUE_SET=true; shift 2 ;;
+            --pull-request) BATCH_PULL_REQUEST="$2"; BATCH_PULL_REQUEST_SET=true; shift 2 ;;
+            --contributor) BATCH_CONTRIBUTOR="$2"; BATCH_CONTRIBUTOR_SET=true; shift 2 ;;
+            --contributor-email) BATCH_CONTRIBUTOR_EMAIL="$2"; BATCH_CONTRIBUTOR_EMAIL_SET=true; shift 2 ;;
+            --folded-tasks) BATCH_FOLDED_TASKS="$2"; BATCH_FOLDED_TASKS_SET=true; shift 2 ;;
+            --folded-into) BATCH_FOLDED_INTO="$2"; BATCH_FOLDED_INTO_SET=true; shift 2 ;;
+            --implemented-with) BATCH_IMPLEMENTED_WITH="$2"; BATCH_IMPLEMENTED_WITH_SET=true; shift 2 ;;
+            --commit) BATCH_COMMIT=true; shift ;;
+            --silent) BATCH_SILENT=true; shift ;;
+            --help|-h) show_help; exit 0 ;;
+            -*)
+                die "Unknown option: $1"
+                ;;
+            *)
+                # Positional argument - task number or child task ID
+                # Support formats: 25 (parent), 25_1 (child), t25_1 (child with prefix)
+                if [[ "$1" =~ ^t?[0-9]+(_[0-9]+)?$ ]]; then
+                    BATCH_TASK_NUM="${1#t}"  # Remove leading 't' if present
+                    shift
+                else
+                    die "Invalid task number: $1 (use format: 25, 25_1, or t25_1)"
+                fi
+                ;;
+        esac
+    done
+}
+
+# --- Task Resolution ---
+
+resolve_task_file() {
+    local task_id="$1"
+    local files
+
+    # Check if it's a child task ID (e.g., "10_1" or "t10_1")
+    if [[ "$task_id" =~ ^([0-9]+)_([0-9]+)$ ]]; then
+        local parent_num="${BASH_REMATCH[1]}"
+        local child_num="${BASH_REMATCH[2]}"
+        local child_dir="$TASK_DIR/t${parent_num}"
+
+        files=$(ls "$child_dir"/t${parent_num}_${child_num}_*.md 2>/dev/null || true)
+
+        if [[ -z "$files" ]]; then
+            die "No child task file found for t${parent_num}_${child_num}"
+        fi
+    else
+        # Regular task
+        files=$(ls "$TASK_DIR"/t${task_id}_*.md 2>/dev/null || true)
+
+        if [[ -z "$files" ]]; then
+            die "No task file found for task number $task_id"
+        fi
+    fi
+
+    local count
+    count=$(echo "$files" | wc -l)
+
+    if [[ "$count" -gt 1 ]]; then
+        die "Multiple task files found for task $task_id. Run 'ait setup' to initialize the atomic task ID counter and prevent future duplicates."
+    fi
+
+    echo "$files"
+}
+
+# --- YAML Parsing ---
+
+parse_yaml_frontmatter() {
+    local file_path="$1"
+
+    # Reset current values
+    CURRENT_PRIORITY="medium"
+    # risk has NO default — absent means unset (omit-by-default).
+    CURRENT_RISK_CODE_HEALTH=""
+    CURRENT_RISK_GOAL_ACHIEVEMENT=""
+    CURRENT_RISK_MITIGATION_TASKS=""
+    CURRENT_GATES=""
+    # gates: is presence-tracked too (t635_33): an explicit `gates: []` is a
+    # deliberate opt-out (never backfilled from a profile, and a resolve input
+    # authenticated by the tuple's gates-half digest) — dropping the key on an
+    # unrelated rewrite would both revoke the opt-out at the next resolve and
+    # instantly stale every freshly written tuple.
+    CURRENT_GATES_PRESENT=false
+    CURRENT_ALSO_BLOCKS_DEPENDENTS=""
+    # Active-gates tuple (t635_33). Presence-tracked: an explicit
+    # `active_gates: []` is load-bearing (fully profile-filtered task) and must
+    # survive unrelated rewrites — value emptiness cannot express that.
+    CURRENT_ACTIVE_GATES=""
+    CURRENT_ACTIVE_GATES_FILTERED=""
+    CURRENT_ACTIVE_GATES_PROFILE=""
+    CURRENT_ACTIVE_GATES_DIGEST=""
+    CURRENT_ACTIVE_TUPLE_PRESENT=false
+    CURRENT_EFFORT="medium"
+    CURRENT_DEPS=""
+    CURRENT_XDEPS=""
+    CURRENT_XDEPREPO=""
+    CURRENT_TYPE="feature"
+    CURRENT_STATUS="Ready"
+    CURRENT_LABELS=""
+    CURRENT_CREATED_AT=""
+    CURRENT_DESCRIPTION=""
+    CURRENT_CHILDREN_TO_IMPLEMENT=""
+    CURRENT_ASSIGNED_TO=""
+    CURRENT_ANCHOR=""
+    CURRENT_FOLLOWUP_KIND=""
+    CURRENT_BOARDCOL=""
+    CURRENT_BOARDIDX=""
+    CURRENT_BOARDGROUP=""
+    CURRENT_BOARDGROUP_PRESENT=false
+    CURRENT_ISSUE=""
+    CURRENT_FOLDED_TASKS=""
+    CURRENT_FOLDED_INTO=""
+    CURRENT_IMPLEMENTED_WITH=""
+    CURRENT_FILE_REFERENCES=""
+    CURRENT_VERIFICATION_BASELINE=""
+    CURRENT_PLAN_APPROVED_AT=""
+    CURRENT_PREMISE_BASELINE=""
+
+    # Read entire file content
+    local file_content
+    file_content=$(cat "$file_path")
+
+    local first_line
+    first_line=$(echo "$file_content" | head -n 1)
+
+    # Check if it's YAML front matter
+    if [[ "$first_line" != "---" ]]; then
+        # No YAML front matter, entire file is description
+        CURRENT_DESCRIPTION="$file_content"
+        return
+    fi
+
+    # Find the end of YAML front matter (second ---)
+    local yaml_end_line
+    yaml_end_line=$(echo "$file_content" | tail -n +2 | grep -n "^---$" | head -1 | cut -d: -f1)
+
+    if [[ -z "$yaml_end_line" ]]; then
+        # No closing ---, treat as description
+        CURRENT_DESCRIPTION="$file_content"
+        return
+    fi
+
+    # Extract YAML content (between first and second ---)
+    local yaml_content
+    yaml_content=$(echo "$file_content" | head -n $((yaml_end_line + 1)) | tail -n +2 | head -n $((yaml_end_line - 1)))
+
+    # Parse YAML key-value pairs. join_yaml_flow_lists first rejoins any
+    # flow-sequence value (children_to_implement, depends, labels, ...) that
+    # the board wrapped across multiple lines — otherwise the continuation
+    # lines fail the key regex below and their entries are silently dropped.
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^([a-z_]+):(.*)$ ]]; then
+            local key="${BASH_REMATCH[1]}"
+            local value="${BASH_REMATCH[2]}"
+            # Trim leading/trailing whitespace
+            value=$(echo "$value" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+
+            case "$key" in
+                priority) CURRENT_PRIORITY="$value" ;;
+                risk_code_health) CURRENT_RISK_CODE_HEALTH="$value" ;;
+                risk_goal_achievement) CURRENT_RISK_GOAL_ACHIEVEMENT="$value" ;;
+                risk_mitigation_tasks)
+                    CURRENT_RISK_MITIGATION_TASKS=$(parse_yaml_list "$value")
+                    CURRENT_RISK_MITIGATION_TASKS=$(normalize_task_ids "$CURRENT_RISK_MITIGATION_TASKS")
+                    ;;
+                effort) CURRENT_EFFORT="$value" ;;
+                depends)
+                    CURRENT_DEPS=$(parse_yaml_list "$value")
+                    CURRENT_DEPS=$(normalize_task_ids "$CURRENT_DEPS")
+                    ;;
+                xdeps)
+                    CURRENT_XDEPS=$(parse_yaml_list "$value")
+                    CURRENT_XDEPS=$(normalize_task_ids "$CURRENT_XDEPS")
+                    ;;
+                xdeprepo) CURRENT_XDEPREPO="$value" ;;
+                verifies)
+                    CURRENT_VERIFIES=$(parse_yaml_list "$value")
+                    CURRENT_VERIFIES=$(normalize_task_ids "$CURRENT_VERIFIES")
+                    ;;
+                issue_type) CURRENT_TYPE="$value" ;;
+                status) CURRENT_STATUS="$value" ;;
+                labels)
+                    CURRENT_LABELS=$(parse_yaml_list "$value")
+                    ;;
+                gates)
+                    CURRENT_GATES=$(parse_yaml_list "$value")
+                    CURRENT_GATES_PRESENT=true
+                    ;;
+                also_blocks_dependents)
+                    CURRENT_ALSO_BLOCKS_DEPENDENTS=$(parse_yaml_list "$value")
+                    ;;
+                active_gates)
+                    CURRENT_ACTIVE_GATES=$(parse_yaml_list "$value")
+                    CURRENT_ACTIVE_TUPLE_PRESENT=true
+                    ;;
+                active_gates_filtered)
+                    CURRENT_ACTIVE_GATES_FILTERED=$(parse_yaml_list "$value")
+                    ;;
+                active_gates_profile) CURRENT_ACTIVE_GATES_PROFILE="$value" ;;
+                active_gates_digest) CURRENT_ACTIVE_GATES_DIGEST="$value" ;;
+                children_to_implement)
+                    CURRENT_CHILDREN_TO_IMPLEMENT=$(parse_yaml_list "$value")
+                    CURRENT_CHILDREN_TO_IMPLEMENT=$(normalize_task_ids "$CURRENT_CHILDREN_TO_IMPLEMENT")
+                    ;;
+                created_at) CURRENT_CREATED_AT="$value" ;;
+                assigned_to) CURRENT_ASSIGNED_TO="$value" ;;
+                anchor) CURRENT_ANCHOR="$value" ;;
+                followup_kind) CURRENT_FOLLOWUP_KIND="$value" ;;
+                boardcol) CURRENT_BOARDCOL="$value" ;;
+                boardidx) CURRENT_BOARDIDX="$value" ;;
+                boardgroup)
+                    CURRENT_BOARDGROUP="$value"
+                    CURRENT_BOARDGROUP_PRESENT=true
+                    ;;
+                issue) CURRENT_ISSUE="$value" ;;
+                pull_request) CURRENT_PULL_REQUEST="$value" ;;
+                contributor) CURRENT_CONTRIBUTOR="$value" ;;
+                contributor_email) CURRENT_CONTRIBUTOR_EMAIL="$value" ;;
+                folded_tasks)
+                    CURRENT_FOLDED_TASKS=$(parse_yaml_list "$value")
+                    ;;
+                folded_into) CURRENT_FOLDED_INTO="$value" ;;
+                implemented_with) CURRENT_IMPLEMENTED_WITH="$value" ;;
+                file_references)
+                    # Captured below from the UNJOINED text, verbatim.
+                    ;;
+                verification_baseline) CURRENT_VERIFICATION_BASELINE="$value" ;;
+                plan_approved_at) CURRENT_PLAN_APPROVED_AT="$value" ;;
+                premise_baseline) CURRENT_PREMISE_BASELINE="$value" ;;
+            esac
+        fi
+    done < <(printf '%s\n' "$yaml_content" | join_yaml_flow_lists)
+
+    # file_references: is carried as its ORIGINAL physical lines (t2209), so an
+    # update that does not touch file refs leaves it byte-identical -- quoting,
+    # wrapping and comments included. Re-serializing it from a parsed value used
+    # to strip quotes and spaces (`["a,b.py"]` -> `[a, b.py]`). A field whose
+    # value is empty or `[]` is still dropped, as before.
+    CURRENT_FILE_REFERENCES=$(printf '%s\n' "$yaml_content" | yaml_field_block file_references)
+    if [[ "$CURRENT_FILE_REFERENCES" != *$'\n'* ]]; then
+        local _fr_value="${CURRENT_FILE_REFERENCES#file_references:}"
+        _fr_value="${_fr_value#"${_fr_value%%[![:space:]]*}"}"
+        _fr_value="${_fr_value%"${_fr_value##*[![:space:]]}"}"
+        if [[ -z "$_fr_value" || "$_fr_value" =~ ^\[[[:space:]]*\]$ ]]; then
+            CURRENT_FILE_REFERENCES=""
+        fi
+    fi
+
+    # Extract description (everything after YAML block)
+    local total_lines
+    total_lines=$(echo "$file_content" | wc -l)
+    local desc_start=$((yaml_end_line + 2))
+
+    if [[ $desc_start -le $total_lines ]]; then
+        # Get content after YAML and remove leading blank lines
+        CURRENT_DESCRIPTION=$(echo "$file_content" | tail -n +$desc_start | sed -n '/./,$p')
+    fi
+}
+
+# --- Name Sanitization ---
+
+sanitize_name() {
+    local name="$1"
+    # Convert to lowercase, replace spaces with underscores, remove special chars
+    echo "$name" | tr '[:upper:]' '[:lower:]' | tr ' ' '_' | tr -cd 'a-z0-9_' | sed 's/__*/_/g' | sed 's/^_//;s/_$//' | cut -c1-60
+}
+
+get_timestamp() {
+    date '+%Y-%m-%d %H:%M'
+}
+
+# --- File Writing ---
+
+# extract_frontmatter_block <file> <field> -- print the raw lines of a top-level
+# frontmatter block field (the `<field>:` header plus its indented body), or
+# nothing if absent. Used to PRESERVE fields write_task_file does not model
+# (notably `attachments:`, a block list-of-mappings from t1030, and `artifacts:`
+# from t1076_2) across a rewrite — without this, any aitask_update on a task
+# bearing those fields would silently drop them.
+extract_frontmatter_block() {
+    local file="$1" field="$2"
+    [[ -f "$file" ]] || return 0
+    awk -v field="$field" '
+        NR==1 && $0=="---" { infm=1; next }
+        infm==1 && $0=="---" { exit }
+        infm==1 {
+            if ($0 ~ /^[^[:space:]]/) {           # a top-level key line
+                capturing = ($0 ~ ("^" field ":")) ? 1 : 0
+            }
+            if (capturing) print
+        }
+    ' "$file"
+}
+
+write_task_file() {
+    # The choke point. Guarding only the two run_*_mode entry points would leave
+    # a future caller of this function unguarded; guarding here cannot be
+    # bypassed (t1725_2). Both entry points ALSO guard, so a wedged worktree is
+    # refused before any of the work below.
+    assert_task_data_writable
+    local file_path="$1"
+    local priority="$2"
+    local effort="$3"
+    local deps="$4"
+    local issue_type="$5"
+    local status="$6"
+    local labels="$7"
+    local created_at="$8"
+    local description="$9"
+    local children_to_implement="${10:-}"
+    local assigned_to="${11:-}"
+    local boardcol="${12:-}"
+    local boardidx="${13:-}"
+    local issue="${14:-}"
+    local folded_tasks="${15:-}"
+    local folded_into="${16:-}"
+    local pull_request="${17:-}"
+    local contributor="${18:-}"
+    local contributor_email="${19:-}"
+    local implemented_with="${20:-}"
+    local file_references="${21:-}"
+    local verifies="${22:-}"
+    local xdeps="${23:-}"
+    local xdeprepo="${24:-}"
+    local risk_code_health="${25:-}"
+    local risk_goal_achievement="${26:-}"
+    local risk_mitigation_tasks="${27:-}"
+    local gates="${28:-}"
+    local also_blocks_dependents="${29:-}"
+    local anchor="${30:-}"
+    # APPENDED at the end rather than placed beside boardcol/boardidx: inserting
+    # mid-list would silently renumber all 18 positional reads above.
+    # `boardgroup_present` is what distinguishes the `""` tombstone (write the
+    # key) from an absent key (write nothing) -- omit != clear.
+    local boardgroup="${31:-}"
+    local boardgroup_present="${32:-false}"
+    # Appended for the same reason as boardgroup above (t1468_1). No
+    # `_present` companion: followup_kind has no tombstone -- clearing it
+    # removes the key, so empty means absent and the emit below skips it.
+    local followup_kind="${33:-}"
+    # Appended for the same reason (t1555_1). Same no-tombstone shape as
+    # followup_kind: `--verification-baseline ""` removes the key.
+    local verification_baseline="${34:-}"
+    # Appended for the same reason (t1595). Same no-tombstone shape again:
+    # `--plan-approved-at ""` removes the key, and an absent key is exactly
+    # "no deferred approved plan".
+    local plan_approved_at="${35:-}"
+    # Appended for the same reason (t1663_2). Same no-tombstone shape:
+    # `--premise-baseline ""` removes the key, and an absent key is exactly "no
+    # stored premise baseline" (aitask_premise_stale.sh reads SKIP).
+    local premise_baseline="${36:-}"
+
+    # Preserve the `attachments:` (t1030) and `artifacts:` (t1076_2) blocks
+    # verbatim: write_task_file rebuilds frontmatter from a fixed field set and
+    # would otherwise drop them. Capture them from the file BEFORE the rewrite
+    # below replaces it. (The rewrite is atomic since t1379, so this no longer
+    # races a truncation window — but the read must still come first, because
+    # the rewrite renames a freshly rendered file over the original.)
+    local preserved_attachments preserved_artifacts
+    preserved_attachments="$(extract_frontmatter_block "$file_path" attachments)"
+    preserved_artifacts="$(extract_frontmatter_block "$file_path" artifacts)"
+
+    local updated_at
+    updated_at=$(get_timestamp)
+
+    local deps_yaml
+    deps_yaml=$(format_yaml_list "$deps")
+
+    local labels_yaml
+    labels_yaml=$(format_yaml_list "$labels")
+
+    # Write the file with YAML front matter.
+    #
+    # The body is a renderer for ait_atomic_render (lib/atomic_write.sh), which
+    # stages it beside the target and renames it into place, so a concurrent
+    # reader never sees a truncated task file. Renderer contract: it must NOT
+    # rely on `set -e` — the calling context disables errexit inside it. Every
+    # command below is an `echo` or a `[[ ]]` test, and the only way an `echo`
+    # fails is a broken output fd, which fails the trailing one too. Any command
+    # added here that can fail on its own needs an explicit `|| return 1`.
+    _ait_write_task_file_body() {
+        echo "---"
+        echo "priority: $priority"
+        # Only write risk fields if present (planning output; omitted by
+        # default). Two independent dimensions, code-health then goal-achievement.
+        if [[ -n "$risk_code_health" ]]; then
+            echo "risk_code_health: $risk_code_health"
+        fi
+        if [[ -n "$risk_goal_achievement" ]]; then
+            echo "risk_goal_achievement: $risk_goal_achievement"
+        fi
+        echo "effort: $effort"
+        echo "depends: $deps_yaml"
+        # Cross-repo fields. As of t832_10, `xdeprepo:` may appear alone
+        # (intent-only mode); `xdeps:` still requires `xdeprepo:`
+        # (enforced by validate_xdeps_pair).
+        if [[ -n "$xdeps" ]]; then
+            local xdeps_yaml
+            xdeps_yaml=$(format_yaml_list "$xdeps")
+            echo "xdeps: $xdeps_yaml"
+        fi
+        if [[ -n "$xdeprepo" ]]; then
+            echo "xdeprepo: $xdeprepo"
+        fi
+        echo "issue_type: $issue_type"
+        echo "status: $status"
+        echo "labels: $labels_yaml"
+        # gates: is presence-tracked (t635_33): a non-empty set always emits;
+        # an explicit empty `gates: []` (deliberate opt-out, and a resolve
+        # input authenticated by the tuple's gates-half digest) is preserved
+        # via CURRENT_GATES_PRESENT. Only a truly absent key emits nothing.
+        if [[ -n "$gates" ]]; then
+            local gates_yaml
+            gates_yaml=$(format_yaml_list "$gates")
+            echo "gates: $gates_yaml"
+        elif [[ "$CURRENT_GATES_PRESENT" == true ]]; then
+            echo "gates: []"
+        fi
+        # Only write also_blocks_dependents if present (per-task extra unblock
+        # gates; absent/empty means "registry defaults only", so never emit []).
+        if [[ -n "$also_blocks_dependents" ]]; then
+            local abd_yaml
+            abd_yaml=$(format_yaml_list "$also_blocks_dependents")
+            echo "also_blocks_dependents: $abd_yaml"
+        fi
+        # Active-gates tuple (t635_33): derived enforcement state, emitted as a
+        # UNIT from the CURRENT_ACTIVE_* globals (parse_yaml_frontmatter fills
+        # them; the batch --active-gates* path overrides them). PRESENCE-tracked,
+        # NOT the `gates:` never-emit-[] pattern: `active_gates: []` is
+        # load-bearing (a fully profile-filtered task) — dropping it on an
+        # unrelated rewrite would fall enforcement back to raw `gates:` and
+        # convert a filtered task back into a gated one.
+        if [[ "$CURRENT_ACTIVE_TUPLE_PRESENT" == true ]]; then
+            echo "active_gates: $(format_yaml_list "$CURRENT_ACTIVE_GATES")"
+            echo "active_gates_filtered: $(format_yaml_list "$CURRENT_ACTIVE_GATES_FILTERED")"
+            echo "active_gates_profile: $CURRENT_ACTIVE_GATES_PROFILE"
+            echo "active_gates_digest: $CURRENT_ACTIVE_GATES_DIGEST"
+        fi
+        # Only write verifies if present
+        if [[ -n "$verifies" ]]; then
+            local verifies_yaml
+            verifies_yaml=$(format_yaml_list "$verifies")
+            echo "verifies: $verifies_yaml"
+        fi
+        # Only write verification_baseline if present (t1555_1). The commit a
+        # manual-verification checklist is known to match, as "<sha> @ <ts>".
+        # Omit-by-default, no tombstone: clearing removes the key.
+        if [[ -n "$verification_baseline" ]]; then
+            echo "verification_baseline: $verification_baseline"
+        fi
+        # Only write plan_approved_at if present (t1595). The moment an approved
+        # plan was deliberately deferred; absent means there is no such plan.
+        # Omit-by-default, no tombstone: clearing removes the key.
+        if [[ -n "$plan_approved_at" ]]; then
+            echo "plan_approved_at: $plan_approved_at"
+        fi
+        # Only write premise_baseline if present (t1663_2). The commit at which
+        # the task's premise was last known valid, as "<sha> @ <ts>" -- the value
+        # main() validated. Omit-by-default, no tombstone: clearing removes the key.
+        if [[ -n "$premise_baseline" ]]; then
+            echo "premise_baseline: $premise_baseline"
+        fi
+        # Only write risk_mitigation_tasks if present (list; omitted by default,
+        # dropped on fold by aitask_fold_mark.sh)
+        if [[ -n "$risk_mitigation_tasks" ]]; then
+            local risk_mitigation_yaml
+            risk_mitigation_yaml=$(format_yaml_list "$risk_mitigation_tasks")
+            echo "risk_mitigation_tasks: $risk_mitigation_yaml"
+        fi
+        # Only write file_references if present. The argument is the complete
+        # field text (t2209): the original lines passed through, or a freshly
+        # formatted `file_references: [...]` line -- printed as-is.
+        if [[ -n "$file_references" ]]; then
+            printf '%s\n' "$file_references"
+        fi
+        # Only write children_to_implement if present
+        if [[ -n "$children_to_implement" ]]; then
+            local children_yaml
+            children_yaml=$(format_yaml_list "$children_to_implement")
+            echo "children_to_implement: $children_yaml"
+        fi
+        # Only write folded_tasks if present
+        if [[ -n "$folded_tasks" ]]; then
+            local folded_yaml
+            folded_yaml=$(format_yaml_list "$folded_tasks")
+            echo "folded_tasks: $folded_yaml"
+        fi
+        # Only write folded_into if present
+        if [[ -n "$folded_into" ]]; then
+            echo "folded_into: $folded_into"
+        fi
+        # Only write assigned_to if present
+        if [[ -n "$assigned_to" ]]; then
+            echo "assigned_to: $assigned_to"
+        fi
+        # Only write anchor (topic group key) if present
+        if [[ -n "$anchor" ]]; then
+            echo "anchor: $anchor"
+        fi
+        # Only write followup_kind (auto-spawned follow-up provenance) if present
+        if [[ -n "$followup_kind" ]]; then
+            echo "followup_kind: $followup_kind"
+        fi
+        # Only write issue if present
+        if [[ -n "$issue" ]]; then
+            echo "issue: $issue"
+        fi
+        if [[ -n "$pull_request" ]]; then
+            echo "pull_request: $pull_request"
+        fi
+        if [[ -n "$contributor" ]]; then
+            echo "contributor: $contributor"
+        fi
+        if [[ -n "$contributor_email" ]]; then
+            echo "contributor_email: $contributor_email"
+        fi
+        if [[ -n "$implemented_with" ]]; then
+            echo "implemented_with: $implemented_with"
+        fi
+        # Preserve any existing attachments block verbatim (t1030).
+        if [[ -n "$preserved_attachments" ]]; then
+            printf '%s\n' "$preserved_attachments"
+        fi
+        # Preserve any existing artifacts block verbatim (t1076_2).
+        if [[ -n "$preserved_artifacts" ]]; then
+            printf '%s\n' "$preserved_artifacts"
+        fi
+        echo "created_at: $created_at"
+        echo "updated_at: $updated_at"
+        # Board fields always written last
+        if [[ -n "$boardcol" ]]; then
+            echo "boardcol: $boardcol"
+        fi
+        if [[ -n "$boardidx" ]]; then
+            echo "boardidx: $boardidx"
+        fi
+        # A bare `echo "boardgroup: $v"` with an empty $v emits
+        # `boardgroup: `, which the YAML loader reads back as None -- NOT
+        # the empty string the tombstone contract requires. Emit the quoted
+        # literal so "cleared" round-trips as a str.
+        if [[ -n "$boardgroup" ]]; then
+            echo "boardgroup: $boardgroup"
+        elif [[ "$boardgroup_present" == true ]]; then
+            echo 'boardgroup: ""'
+        fi
+        echo "---"
+        echo ""
+        echo "$description"
+    }
+    ait_atomic_render "$file_path" _ait_write_task_file_body \
+        || die "could not write task file: $file_path"
+}
+
+# --- Label Management ---
+#
+# sanitize_label / ensure_labels_file / get_existing_labels / add_label_to_file
+# / normalize_labels_csv / add_labels_csv_to_file live in lib/task_utils.sh —
+# do not re-define them here.
+
+# --- Task Types Management ---
+
+ensure_task_types_file() {
+    local dir
+    dir=$(dirname "$TASK_TYPES_FILE")
+    mkdir -p "$dir"
+    touch "$TASK_TYPES_FILE"
+}
+
+# Write-path wrapper: keeps the ensure_task_types_file side effect, delegates
+# the read to lib/task_utils.sh::read_valid_task_types.
+get_valid_task_types() {
+    ensure_task_types_file
+    read_valid_task_types "$TASK_TYPES_FILE"
+}
+
+validate_task_type() {
+    local type="$1"
+    if ! grep -qFx "$type" <(get_valid_task_types); then
+        local valid
+        valid=$(get_valid_task_types | tr '\n' ', ' | sed 's/,$//')
+        die "Invalid type: $type (must be one of: $valid)"
+    fi
+}
+
+# PURE frontmatter-list math: computes the resulting label list and nothing
+# else. It runs inside command substitution at both call sites, so any
+# vocabulary bookkeeping done here would be invisible to the caller (the
+# AIT_LABELS_* globals die with the subshell) — registration and staging are
+# the caller's job.
+process_label_operations() {
+    local current_labels="$1"
+    local new_labels="$2"
+    local -n add_labels_ref=$3
+    local -n remove_labels_ref=$4
+    local labels_flag_set="${5:-false}"
+
+    # If --labels was specified, use it as base (replaces all)
+    # This works even when new_labels is empty (to clear all labels)
+    if [[ "$labels_flag_set" == true ]]; then
+        current_labels="$new_labels"
+    fi
+
+    # Convert to array for manipulation
+    local -a labels_array=()
+    if [[ -n "$current_labels" ]]; then
+        IFS=',' read -ra labels_array <<< "$current_labels"
+    fi
+
+    # Add labels
+    for label in "${add_labels_ref[@]}"; do
+        local found=false
+        for existing in "${labels_array[@]}"; do
+            if [[ "$existing" == "$label" ]]; then
+                found=true
+                break
+            fi
+        done
+        if [[ "$found" == false ]]; then
+            labels_array+=("$label")
+        fi
+    done
+
+    # Remove labels
+    local -a new_array=()
+    for existing in "${labels_array[@]}"; do
+        local should_remove=false
+        for label in "${remove_labels_ref[@]}"; do
+            if [[ "$existing" == "$label" ]]; then
+                should_remove=true
+                break
+            fi
+        done
+        if [[ "$should_remove" == false ]]; then
+            new_array+=("$existing")
+        fi
+    done
+
+    # Convert back to comma-separated string
+    local IFS=','
+    echo "${new_array[*]}"
+}
+
+# --- Verifies Management ---
+
+process_verifies_operations() {
+    local current_verifies="$1"
+    local new_verifies="$2"
+    local -n add_verifies_ref=$3
+    local -n remove_verifies_ref=$4
+    local verifies_flag_set="${5:-false}"
+
+    # If --verifies was specified, use it as base (replaces all)
+    if [[ "$verifies_flag_set" == true ]]; then
+        current_verifies="$new_verifies"
+    fi
+
+    local -a verifies_array=()
+    if [[ -n "$current_verifies" ]]; then
+        IFS=',' read -ra verifies_array <<< "$current_verifies"
+    fi
+
+    # Add ids (dedup)
+    for vid in "${add_verifies_ref[@]}"; do
+        local norm
+        norm="${vid#t}"
+        [[ -z "$norm" ]] && continue
+        local found=false
+        for existing in "${verifies_array[@]}"; do
+            if [[ "$existing" == "$norm" ]]; then
+                found=true
+                break
+            fi
+        done
+        [[ "$found" == false ]] && verifies_array+=("$norm")
+    done
+
+    # Remove ids
+    local -a new_array=()
+    for existing in "${verifies_array[@]}"; do
+        local should_remove=false
+        for vid in "${remove_verifies_ref[@]}"; do
+            local norm
+            norm="${vid#t}"
+            if [[ "$existing" == "$norm" ]]; then
+                should_remove=true
+                break
+            fi
+        done
+        [[ "$should_remove" == false ]] && new_array+=("$existing")
+    done
+
+    # Normalize (strip leading 't' on any remaining, ensure consistent CSV)
+    local joined
+    local IFS=','
+    joined="${new_array[*]}"
+    normalize_task_ids "$joined"
+}
+
+# --- Children Management ---
+
+process_children_operations() {
+    local current_children="$1"
+    local new_children="$2"
+    local add_child="$3"
+    local remove_child="$4"
+    local children_flag_set="${5:-false}"
+
+    # If --children was specified, use it as base (replaces all)
+    if [[ "$children_flag_set" == true ]]; then
+        current_children="$new_children"
+    fi
+
+    # Convert to array
+    local -a children_array=()
+    if [[ -n "$current_children" ]]; then
+        IFS=',' read -ra children_array <<< "$current_children"
+    fi
+
+    # Add child if specified
+    if [[ -n "$add_child" ]]; then
+        local found=false
+        for existing in "${children_array[@]}"; do
+            if [[ "$existing" == "$add_child" ]]; then
+                found=true
+                break
+            fi
+        done
+        if [[ "$found" == false ]]; then
+            children_array+=("$add_child")
+        fi
+    fi
+
+    # Remove child if specified
+    if [[ -n "$remove_child" ]]; then
+        local -a new_array=()
+        for existing in "${children_array[@]}"; do
+            if [[ "$existing" != "$remove_child" ]]; then
+                new_array+=("$existing")
+            fi
+        done
+        children_array=("${new_array[@]}")
+    fi
+
+    local IFS=','
+    echo "${children_array[*]}"
+}
+
+# --- File References Management ---
+
+# process_file_references_operations <current-entries> <add-array> <remove-array>
+# Entries are NEWLINE-separated in and out (an entry may hold a comma).
+process_file_references_operations() {
+    local current_refs="$1"
+    local -n add_refs_ref=$2
+    local -n remove_refs_ref=$3
+
+    # Convert current to array
+    local -a refs_array=()
+    local _line
+    if [[ -n "$current_refs" ]]; then
+        while IFS= read -r _line; do
+            [[ -n "$_line" ]] && refs_array+=("$_line")
+        done <<< "$current_refs"
+    fi
+
+    # Append (exact-string dedup)
+    local ref
+    for ref in "${add_refs_ref[@]}"; do
+        local found=false
+        local existing
+        for existing in "${refs_array[@]}"; do
+            if [[ "$existing" == "$ref" ]]; then
+                found=true
+                break
+            fi
+        done
+        if [[ "$found" == false ]]; then
+            refs_array+=("$ref")
+        fi
+    done
+
+    # Remove (exact-string match)
+    if [[ ${#remove_refs_ref[@]} -gt 0 ]]; then
+        local -a new_array=()
+        local existing
+        for existing in "${refs_array[@]}"; do
+            local should_remove=false
+            local r
+            for r in "${remove_refs_ref[@]}"; do
+                if [[ "$existing" == "$r" ]]; then
+                    should_remove=true
+                    break
+                fi
+            done
+            if [[ "$should_remove" == false ]]; then
+                new_array+=("$existing")
+            fi
+        done
+        refs_array=("${new_array[@]}")
+    fi
+
+    [[ ${#refs_array[@]} -gt 0 ]] || return 0
+    printf '%s\n' "${refs_array[@]}"
+}
+
+# Handle child task completion - update parent's children_to_implement
+handle_child_task_completion() {
+    local task_id="$1"
+    local new_status="$2"
+
+    # Check if this is a child task
+    if [[ ! "$task_id" =~ ^([0-9]+)_([0-9]+)$ ]]; then
+        return  # Not a child task
+    fi
+
+    if [[ "$new_status" != "Done" ]]; then
+        return  # Not completing
+    fi
+
+    local parent_num="${BASH_REMATCH[1]}"
+    local child_id="t${task_id}"
+
+    # Find parent file
+    local parent_file
+    parent_file=$(ls "$TASK_DIR"/t${parent_num}_*.md 2>/dev/null | head -1 || true)
+
+    if [[ -z "$parent_file" || ! -f "$parent_file" ]]; then
+        warn "Parent task t$parent_num not found - cannot update children_to_implement"
+        return
+    fi
+
+    # Parse parent file
+    local saved_priority="$CURRENT_PRIORITY"
+    local saved_risk_code_health="$CURRENT_RISK_CODE_HEALTH"
+    local saved_risk_goal_achievement="$CURRENT_RISK_GOAL_ACHIEVEMENT"
+    local saved_risk_mitigation="$CURRENT_RISK_MITIGATION_TASKS"
+    local saved_gates="$CURRENT_GATES"
+    local saved_gates_present="$CURRENT_GATES_PRESENT"
+    local saved_abd="$CURRENT_ALSO_BLOCKS_DEPENDENTS"
+    local saved_active_gates="$CURRENT_ACTIVE_GATES"
+    local saved_active_filtered="$CURRENT_ACTIVE_GATES_FILTERED"
+    local saved_active_profile="$CURRENT_ACTIVE_GATES_PROFILE"
+    local saved_active_digest="$CURRENT_ACTIVE_GATES_DIGEST"
+    local saved_active_present="$CURRENT_ACTIVE_TUPLE_PRESENT"
+    local saved_effort="$CURRENT_EFFORT"
+    local saved_deps="$CURRENT_DEPS"
+    local saved_xdeps="$CURRENT_XDEPS"
+    local saved_xdeprepo="$CURRENT_XDEPREPO"
+    local saved_type="$CURRENT_TYPE"
+    local saved_status="$CURRENT_STATUS"
+    local saved_labels="$CURRENT_LABELS"
+    local saved_created="$CURRENT_CREATED_AT"
+    local saved_desc="$CURRENT_DESCRIPTION"
+    local saved_children="$CURRENT_CHILDREN_TO_IMPLEMENT"
+    local saved_assigned_to="$CURRENT_ASSIGNED_TO"
+    local saved_boardcol="$CURRENT_BOARDCOL"
+    local saved_boardidx="$CURRENT_BOARDIDX"
+    local saved_boardgroup="$CURRENT_BOARDGROUP"
+    local saved_boardgroup_present="$CURRENT_BOARDGROUP_PRESENT"
+    local saved_issue="$CURRENT_ISSUE"
+    local saved_folded_tasks="$CURRENT_FOLDED_TASKS"
+    local saved_folded_into="$CURRENT_FOLDED_INTO"
+    local saved_implemented_with="$CURRENT_IMPLEMENTED_WITH"
+    local saved_verification_baseline="$CURRENT_VERIFICATION_BASELINE"
+    local saved_plan_approved_at="$CURRENT_PLAN_APPROVED_AT"
+    local saved_premise_baseline="$CURRENT_PREMISE_BASELINE"
+
+    parse_yaml_frontmatter "$parent_file"
+
+    # Remove this child from parent's children_to_implement
+    local new_children
+    new_children=$(process_children_operations "$CURRENT_CHILDREN_TO_IMPLEMENT" "" "" "$child_id" false)
+
+    # Write updated parent file
+    write_task_file "$parent_file" "$CURRENT_PRIORITY" "$CURRENT_EFFORT" "$CURRENT_DEPS" \
+        "$CURRENT_TYPE" "$CURRENT_STATUS" "$CURRENT_LABELS" "$CURRENT_CREATED_AT" \
+        "$CURRENT_DESCRIPTION" "$new_children" "$CURRENT_ASSIGNED_TO" \
+        "$CURRENT_BOARDCOL" "$CURRENT_BOARDIDX" "$CURRENT_ISSUE" "$CURRENT_FOLDED_TASKS" \
+        "$CURRENT_FOLDED_INTO" "$CURRENT_PULL_REQUEST" "$CURRENT_CONTRIBUTOR" \
+        "$CURRENT_CONTRIBUTOR_EMAIL" "$CURRENT_IMPLEMENTED_WITH" "$CURRENT_FILE_REFERENCES" \
+        "$CURRENT_VERIFIES" "$CURRENT_XDEPS" "$CURRENT_XDEPREPO" \
+        "$CURRENT_RISK_CODE_HEALTH" "$CURRENT_RISK_GOAL_ACHIEVEMENT" "$CURRENT_RISK_MITIGATION_TASKS" \
+        "$CURRENT_GATES" "$CURRENT_ALSO_BLOCKS_DEPENDENTS" "$CURRENT_ANCHOR" \
+        "$CURRENT_BOARDGROUP" "$CURRENT_BOARDGROUP_PRESENT" \
+        "$CURRENT_FOLLOWUP_KIND" \
+        "$CURRENT_VERIFICATION_BASELINE" \
+        "$CURRENT_PLAN_APPROVED_AT" \
+        "$CURRENT_PREMISE_BASELINE"
+
+    if [[ -z "$new_children" ]]; then
+        success "All children of t$parent_num are complete! Parent can now be completed."
+    else
+        info "Updated parent t$parent_num - remaining children: $new_children"
+    fi
+
+    # Restore original values
+    CURRENT_PRIORITY="$saved_priority"
+    CURRENT_RISK_CODE_HEALTH="$saved_risk_code_health"
+    CURRENT_RISK_GOAL_ACHIEVEMENT="$saved_risk_goal_achievement"
+    CURRENT_RISK_MITIGATION_TASKS="$saved_risk_mitigation"
+    CURRENT_GATES="$saved_gates"
+    CURRENT_GATES_PRESENT="$saved_gates_present"
+    CURRENT_ALSO_BLOCKS_DEPENDENTS="$saved_abd"
+    CURRENT_ACTIVE_GATES="$saved_active_gates"
+    CURRENT_ACTIVE_GATES_FILTERED="$saved_active_filtered"
+    CURRENT_ACTIVE_GATES_PROFILE="$saved_active_profile"
+    CURRENT_ACTIVE_GATES_DIGEST="$saved_active_digest"
+    CURRENT_ACTIVE_TUPLE_PRESENT="$saved_active_present"
+    CURRENT_EFFORT="$saved_effort"
+    CURRENT_DEPS="$saved_deps"
+    CURRENT_XDEPS="$saved_xdeps"
+    CURRENT_XDEPREPO="$saved_xdeprepo"
+    CURRENT_ASSIGNED_TO="$saved_assigned_to"
+    CURRENT_TYPE="$saved_type"
+    CURRENT_STATUS="$saved_status"
+    CURRENT_LABELS="$saved_labels"
+    CURRENT_CREATED_AT="$saved_created"
+    CURRENT_DESCRIPTION="$saved_desc"
+    CURRENT_CHILDREN_TO_IMPLEMENT="$saved_children"
+    CURRENT_BOARDCOL="$saved_boardcol"
+    CURRENT_BOARDIDX="$saved_boardidx"
+    CURRENT_BOARDGROUP="$saved_boardgroup"
+    CURRENT_BOARDGROUP_PRESENT="$saved_boardgroup_present"
+    CURRENT_ISSUE="$saved_issue"
+    CURRENT_FOLDED_TASKS="$saved_folded_tasks"
+    CURRENT_FOLDED_INTO="$saved_folded_into"
+    CURRENT_IMPLEMENTED_WITH="$saved_implemented_with"
+    CURRENT_VERIFICATION_BASELINE="$saved_verification_baseline"
+    CURRENT_PLAN_APPROVED_AT="$saved_plan_approved_at"
+    CURRENT_PREMISE_BASELINE="$saved_premise_baseline"
+}
+
+# Validate that parent cannot be completed with pending children
+validate_parent_completion() {
+    local task_id="$1"
+    local new_status="$2"
+    local children="$3"
+
+    # Only check for parent tasks being set to Done
+    if [[ "$new_status" != "Done" ]]; then
+        return 0
+    fi
+
+    # Check if this is a parent task (has children)
+    if [[ -n "$children" ]]; then
+        die "Cannot complete parent task: children_to_implement still contains: $children"
+    fi
+
+    return 0
+}
+
+# --- Interactive Mode ---
+
+interactive_select_task() {
+    local tasks
+    tasks=$("$SCRIPT_DIR/aitask_ls.sh" -v -s all 99 2>/dev/null || echo "")
+
+    if [[ -z "$tasks" ]]; then
+        die "No tasks found in $TASK_DIR"
+    fi
+
+    local selected
+    selected=$(echo "$tasks" | fzf --prompt="Select task to update: " --height=20 --no-info --header="Select a task to update")
+
+    if [[ -z "$selected" ]]; then
+        die "No task selected"
+    fi
+
+    # Extract task number from selection (format: t10_name.md [...])
+    echo "$selected" | grep -oE '^t[0-9]+' | sed 's/t//'
+}
+
+interactive_select_field() {
+    local priority="$1"
+    local effort="$2"
+    local status="$3"
+    local issue_type="$4"
+    local deps="$5"
+    local labels="$6"
+    local risk_code_health="$7"
+    local risk_goal_achievement="$8"
+
+    local options="priority              [current: $priority]
+risk_code_health      [current: ${risk_code_health:-unset}]
+risk_goal_achievement [current: ${risk_goal_achievement:-unset}]
+effort                [current: $effort]
+status                [current: $status]
+issue_type            [current: $issue_type]
+dependencies          [current: ${deps:-None}]
+labels                [current: ${labels:-None}]
+description           [edit in editor]
+rename                [change filename]
+---
+Done - save changes
+Exit - discard changes"
+
+    local selected
+    selected=$(echo "$options" | fzf --prompt="Select field to update: " --height=18 --no-info --header="Select a field to update, Done to save, or Exit to discard")
+
+    # Extract just the field name (before the bracket or spaces)
+    echo "$selected" | sed 's/[[:space:]]*\[.*//' | sed 's/[[:space:]]*$//'
+}
+
+interactive_update_priority() {
+    local current="$1"
+    task_levels_lines | fzf --prompt="Priority (current: $current): " --height=10 --no-info --header="Select new priority"
+}
+
+interactive_update_risk_code_health() {
+    local current="$1"
+    task_levels_lines | fzf --prompt="Code-health risk (current: ${current:-unset}): " --height=10 --no-info --header="Select code-health risk level"
+}
+
+interactive_update_risk_goal_achievement() {
+    local current="$1"
+    task_levels_lines | fzf --prompt="Goal-achievement risk (current: ${current:-unset}): " --height=10 --no-info --header="Select goal-achievement risk level"
+}
+
+interactive_update_effort() {
+    local current="$1"
+    task_levels_lines_asc | fzf --prompt="Effort (current: $current): " --height=10 --no-info --header="Select new effort level"
+}
+
+interactive_update_status() {
+    local current="$1"
+    echo -e "Ready\nEditing\nImplementing\nPostponed\nDone\nFolded" | fzf --prompt="Status (current: $current): " --height=12 --no-info --header="Select new status"
+}
+
+interactive_update_type() {
+    local current="$1"
+    get_valid_task_types | fzf --prompt="Type (current: $current): " --height=10 --no-info --header="Select issue type"
+}
+
+interactive_update_deps() {
+    local current="$1"
+    local exclude_task="$2"  # Task number to exclude (the task being updated)
+
+    local tasks
+    tasks=$("$SCRIPT_DIR/aitask_ls.sh" -v -s all 99 2>/dev/null || echo "")
+
+    if [[ -z "$tasks" ]]; then
+        echo ""
+        return
+    fi
+
+    # Filter out the current task from the list
+    if [[ -n "$exclude_task" ]]; then
+        tasks=$(echo "$tasks" | grep -v "^t${exclude_task}_")
+    fi
+
+    if [[ -z "$tasks" ]]; then
+        echo ""
+        return
+    fi
+
+    info "Current dependencies: ${current:-None}" >&2
+
+    local options
+    options=$(echo -e "Clear all dependencies\n$tasks")
+
+    local selected
+    selected=$(echo "$options" | fzf --multi --prompt="Dependencies (Tab to select): " --height=15 --no-info --header="Select task dependencies (Tab=select, Enter=confirm)")
+
+    if [[ -z "$selected" ]] || echo "$selected" | grep -q "^Clear all"; then
+        echo ""
+        return
+    fi
+
+    # Extract task numbers
+    echo "$selected" | grep -oE '^t[0-9]+' | sed 's/t//' | tr '\n' ',' | sed 's/,$//'
+}
+
+interactive_update_labels() {
+    local current="$1"
+
+    set +e  # Disable exit-on-error for fzf operations
+
+    local -a labels_array=()
+    if [[ -n "$current" ]]; then
+        IFS=',' read -ra labels_array <<< "$current"
+    fi
+
+    info "Current labels: ${current:-None}" >&2
+
+    while true; do
+        local existing_labels
+        existing_labels=$(get_existing_labels)
+
+        local available_labels=""
+        if [[ -n "$existing_labels" ]]; then
+            while IFS= read -r lbl; do
+                local is_selected=false
+                for sel in "${labels_array[@]}"; do
+                    if [[ "$sel" == "$lbl" ]]; then
+                        is_selected=true
+                        break
+                    fi
+                done
+                if [[ "$is_selected" == "false" ]]; then
+                    if [[ -n "$available_labels" ]]; then
+                        available_labels="${available_labels}"$'\n'"${lbl}"
+                    else
+                        available_labels="$lbl"
+                    fi
+                fi
+            done <<< "$existing_labels"
+        fi
+
+        local options=">> Done with labels"$'\n'">> Clear all labels"$'\n'">> Add new label"
+        if [[ -n "$available_labels" ]]; then
+            options="$options"$'\n'"$available_labels"
+        fi
+
+        # Show currently selected
+        if [[ ${#labels_array[@]} -gt 0 ]]; then
+            local IFS=','
+            info "Selected: ${labels_array[*]}" >&2
+        fi
+
+        local selected
+        selected=$(printf "%s" "$options" | fzf --prompt="Select label: " --height=15 --no-info --header="Manage labels")
+
+        if [[ -z "$selected" || "$selected" == ">> Done with labels" ]]; then
+            break
+        elif [[ "$selected" == ">> Clear all labels" ]]; then
+            labels_array=()
+            info "Cleared all labels" >&2
+        elif [[ "$selected" == ">> Add new label" ]]; then
+            local new_label
+            read -rp "Enter new label: " new_label
+            if [[ -n "$new_label" ]]; then
+                local sanitized
+                sanitized=$(sanitize_label "$new_label")
+                if [[ -n "$sanitized" ]]; then
+                    # Selection only — this function runs inside command
+                    # substitution, so the vocabulary write is deferred to the
+                    # caller (which can then stage labels.txt). Consequence: a
+                    # label minted here does not reappear in this session's
+                    # picker; it is still selected and echoed.
+                    labels_array+=("$sanitized")
+                    success "Added: $sanitized" >&2
+                else
+                    warn "'$new_label' is not a valid label (no usable characters, or a word YAML reads as a non-string such as on / null / 010)"
+                fi
+            fi
+        else
+            labels_array+=("$selected")
+            success "Added: $selected" >&2
+        fi
+    done
+
+    set -e  # Re-enable exit-on-error
+
+    local IFS=','
+    echo "${labels_array[*]}"
+}
+
+# Global variable for description result (set by interactive_update_description_direct)
+UPDATED_DESCRIPTION=""
+
+# Direct call version - does NOT use stdout for result
+interactive_update_description_direct() {
+    local current="$1"
+
+    echo ""
+    info "Current description:"
+    echo "---"
+    echo "$current"
+    echo "---"
+    echo ""
+
+    # fzf needs explicit terminal access when called from within case statement
+    local choice
+    exec 3<&0  # save stdin
+    exec 0</dev/tty  # redirect stdin from tty
+    choice=$(printf "Open in editor\nSkip (keep current)" | fzf --prompt="Edit description? " --height=8 --no-info 2>/dev/tty)
+    exec 0<&3  # restore stdin
+    exec 3<&-  # close fd 3
+
+    if [[ "$choice" == "Open in editor" ]]; then
+        # Create temp file with current description
+        local tmpfile
+        tmpfile=$(mktemp_suffixed "${TMPDIR:-/tmp}/aitask_XXXXXX.md")
+
+        # Write content
+        printf '%s' "$current" > "$tmpfile"
+
+        # Determine editor and run with proper wait flag for GUI editors
+        local editor="${EDITOR:-vim}"
+
+        # Handle common GUI editors that need --wait flag
+        case "$editor" in
+            code|code-insiders)
+                "$editor" --wait "$tmpfile"
+                ;;
+            subl|sublime_text)
+                "$editor" --wait "$tmpfile"
+                ;;
+            atom)
+                "$editor" --wait "$tmpfile"
+                ;;
+            gedit)
+                "$editor" --wait "$tmpfile"
+                ;;
+            *)
+                # For terminal editors and unknown editors, run normally
+                "$editor" "$tmpfile"
+                ;;
+        esac
+
+        # Read back the edited content into global variable
+        UPDATED_DESCRIPTION=$(cat "$tmpfile")
+        rm "$tmpfile"
+    else
+        UPDATED_DESCRIPTION="$current"
+    fi
+}
+
+interactive_rename() {
+    local current_file="$1"
+    local current_name
+    current_name=$(basename "$current_file" .md | sed 's/^t[0-9]*_//')
+
+    echo "" >&2
+    info "Current name: $current_name" >&2
+
+    local new_name
+    read -rp "Enter new name (or press Enter to keep current): " new_name
+
+    if [[ -n "$new_name" ]]; then
+        sanitize_name "$new_name"
+    else
+        echo ""
+    fi
+}
+
+run_interactive_mode() {
+    local task_num="$BATCH_TASK_NUM"
+
+    # FIRST, before the fzf dependency check and the task picker. Interactive mode
+    # always ends in a write, so refusing up front beats making the user choose a
+    # task and fill in a field for an edit that cannot land (t1725_2). It also
+    # keeps the guard reachable without a terminal, which is what lets the writer
+    # table cover this entry point.
+    assert_task_data_writable
+
+    # Check terminal capabilities (warn on incapable terminals)
+    ait_warn_if_incapable_terminal
+
+    # Check dependencies
+    command -v fzf &>/dev/null || die "fzf is required but not installed"
+
+    # Select task if not provided
+    if [[ -z "$task_num" ]]; then
+        task_num=$(interactive_select_task)
+    fi
+
+    # Resolve task file
+    local file_path
+    file_path=$(resolve_task_file "$task_num")
+
+    info "Updating: $file_path"
+    echo ""
+
+    # Parse current values
+    parse_yaml_frontmatter "$file_path"
+
+    # New values (start with current)
+    local new_priority="$CURRENT_PRIORITY"
+    local new_risk_code_health="$CURRENT_RISK_CODE_HEALTH"
+    local new_risk_goal_achievement="$CURRENT_RISK_GOAL_ACHIEVEMENT"
+    local new_effort="$CURRENT_EFFORT"
+    local new_status="$CURRENT_STATUS"
+    local new_type="$CURRENT_TYPE"
+    local new_deps="$CURRENT_DEPS"
+    local new_labels="$CURRENT_LABELS"
+    local new_description="$CURRENT_DESCRIPTION"
+    local new_name=""
+    local changes_made=false
+
+    # Main editing loop
+    while true; do
+        echo ""
+        local field
+        field=$(interactive_select_field "$new_priority" "$new_effort" "$new_status" "$new_type" "$new_deps" "$new_labels" "$new_risk_code_health" "$new_risk_goal_achievement")
+
+        case "$field" in
+            "Exit - discard changes"|"Exit")
+                info "Exiting without saving."
+                return
+                ;;
+            "Done - save changes"|"Done"|"---"|"")
+                break
+                ;;
+            priority)
+                local result
+                result=$(interactive_update_priority "$new_priority")
+                if [[ -n "$result" ]]; then
+                    new_priority="$result"
+                    changes_made=true
+                    success "Priority updated to: $new_priority"
+                fi
+                ;;
+            risk_code_health)
+                local result
+                result=$(interactive_update_risk_code_health "$new_risk_code_health")
+                if [[ -n "$result" ]]; then
+                    new_risk_code_health="$result"
+                    changes_made=true
+                    success "Code-health risk updated to: $new_risk_code_health"
+                fi
+                ;;
+            risk_goal_achievement)
+                local result
+                result=$(interactive_update_risk_goal_achievement "$new_risk_goal_achievement")
+                if [[ -n "$result" ]]; then
+                    new_risk_goal_achievement="$result"
+                    changes_made=true
+                    success "Goal-achievement risk updated to: $new_risk_goal_achievement"
+                fi
+                ;;
+            effort)
+                local result
+                result=$(interactive_update_effort "$new_effort")
+                if [[ -n "$result" ]]; then
+                    new_effort="$result"
+                    changes_made=true
+                    success "Effort updated to: $new_effort"
+                fi
+                ;;
+            status)
+                local result
+                result=$(interactive_update_status "$new_status")
+                if [[ -n "$result" ]]; then
+                    new_status="$result"
+                    changes_made=true
+                    success "Status updated to: $new_status"
+                fi
+                ;;
+            issue_type)
+                local result
+                result=$(interactive_update_type "$new_type")
+                if [[ -n "$result" ]]; then
+                    new_type="$result"
+                    changes_made=true
+                    success "Type updated to: $new_type"
+                fi
+                ;;
+            dependencies)
+                new_deps=$(interactive_update_deps "$new_deps" "$task_num")
+                changes_made=true
+                success "Dependencies updated to: ${new_deps:-None}"
+                ;;
+            labels)
+                new_labels=$(interactive_update_labels "$new_labels")
+                # Register outside the subshell so the vocabulary write is
+                # visible here and labels.txt can be staged with the task.
+                add_labels_csv_to_file "$new_labels"
+                new_labels="$AIT_LABELS_NORMALIZED"
+                # The picker replays existing vocabulary entries and the task's
+                # current labels unsanitized, so normalization can drop a legacy
+                # word YAML misreads. Say so instead of dropping it silently.
+                if (( ${#AIT_LABELS_DROPPED[@]} > 0 )); then
+                    warn "dropped invalid label(s): $(IFS=','; printf '%s' "${AIT_LABELS_DROPPED[*]}")"
+                fi
+                if (( ${#AIT_LABELS_ADDED[@]} > 0 )); then
+                    # Sticky-OR: the menu loops, and an earlier iteration may
+                    # already have appended.
+                    LABELS_VOCAB_DIRTY=true
+                fi
+                changes_made=true
+                success "Labels updated to: ${new_labels:-None}"
+                ;;
+            description)
+                # Call directly (not in subshell) so editor can access terminal
+                interactive_update_description_direct "$new_description"
+                new_description="$UPDATED_DESCRIPTION"
+                changes_made=true
+                success "Description updated"
+                ;;
+            rename)
+                local result
+                result=$(interactive_rename "$file_path")
+                if [[ -n "$result" ]]; then
+                    new_name="$result"
+                    changes_made=true
+                    success "Will rename to: t${task_num}_${new_name}.md"
+                fi
+                ;;
+        esac
+    done
+
+    # Check if any changes were made
+    if [[ "$changes_made" == false ]]; then
+        info "No changes made."
+        return
+    fi
+
+    # Handle rename
+    local final_path="$file_path"
+    if [[ -n "$new_name" ]]; then
+        local new_filename="t${task_num}_${new_name}.md"
+        final_path="$TASK_DIR/$new_filename"
+
+        if [[ "$file_path" != "$final_path" ]]; then
+            mv "$file_path" "$final_path"
+            success "Renamed to: $new_filename"
+        fi
+    fi
+
+    # Validate parent completion
+    validate_parent_completion "$task_num" "$new_status" "$CURRENT_CHILDREN_TO_IMPLEMENT"
+
+    # Cross-field invariant on the RESULTING pair (t1468_1), same rule the batch
+    # path applies. Interactive mode can edit issue_type but not followup_kind,
+    # so the type-only violation is the reachable one here: retyping a task that
+    # carries followup_kind: manual_verification would otherwise persist the
+    # forbidden pair. The kind is whatever the file already holds.
+    enforce_manual_verification_kind_invariant "$new_type" "$CURRENT_FOLLOWUP_KIND"
+
+    # Write updated file (preserve children_to_implement, assigned_to, board fields, issue, folded_tasks)
+    write_task_file "$final_path" "$new_priority" "$new_effort" "$new_deps" \
+        "$new_type" "$new_status" "$new_labels" "$CURRENT_CREATED_AT" "$new_description" \
+        "$CURRENT_CHILDREN_TO_IMPLEMENT" "$CURRENT_ASSIGNED_TO" \
+        "$CURRENT_BOARDCOL" "$CURRENT_BOARDIDX" "$CURRENT_ISSUE" "$CURRENT_FOLDED_TASKS" \
+        "$CURRENT_FOLDED_INTO" "$CURRENT_PULL_REQUEST" "$CURRENT_CONTRIBUTOR" \
+        "$CURRENT_CONTRIBUTOR_EMAIL" "$CURRENT_IMPLEMENTED_WITH" "$CURRENT_FILE_REFERENCES" \
+        "$CURRENT_VERIFIES" "$CURRENT_XDEPS" "$CURRENT_XDEPREPO" \
+        "$new_risk_code_health" "$new_risk_goal_achievement" "$CURRENT_RISK_MITIGATION_TASKS" \
+        "$CURRENT_GATES" "$CURRENT_ALSO_BLOCKS_DEPENDENTS" "$CURRENT_ANCHOR" \
+        "$CURRENT_BOARDGROUP" "$CURRENT_BOARDGROUP_PRESENT" \
+        "$CURRENT_FOLLOWUP_KIND" \
+        "$CURRENT_VERIFICATION_BASELINE" \
+        "$CURRENT_PLAN_APPROVED_AT" \
+        "$CURRENT_PREMISE_BASELINE"
+
+    # Handle child task completion
+    if [[ "$new_status" == "Done" ]]; then
+        handle_child_task_completion "$task_num" "$new_status"
+    fi
+
+    echo ""
+    success "Task updated successfully!"
+    echo ""
+    echo "Updated values:"
+    echo "  Priority:     $new_priority"
+    echo "  CH-risk:      ${new_risk_code_health:-unset}"
+    echo "  GA-risk:      ${new_risk_goal_achievement:-unset}"
+    echo "  Effort:       $new_effort"
+    echo "  Status:       $new_status"
+    echo "  Type:         $new_type"
+    echo "  Dependencies: ${new_deps:-None}"
+    echo "  Labels:       ${new_labels:-None}"
+    if [[ -n "$CURRENT_CHILDREN_TO_IMPLEMENT" ]]; then
+        echo "  Children:     $CURRENT_CHILDREN_TO_IMPLEMENT"
+    fi
+    if [[ -n "$CURRENT_ISSUE" ]]; then
+        echo "  Issue:        $CURRENT_ISSUE"
+    fi
+    echo "  File:         $final_path"
+
+    # Git commit
+    read -rp "Commit to git? [Y/n] " commit_choice
+    if [[ "$commit_choice" != "n" && "$commit_choice" != "N" ]]; then
+        local humanized_name
+        humanized_name=$(basename "$final_path" .md | sed -E 's/^t[0-9]*_([0-9]*_)?//' | tr '_' ' ')
+        # The pathspec must inherit the staging gate, not just the `add`:
+        # `commit -- <paths>` commits WORKTREE content, so naming labels.txt
+        # unconditionally would carry a concurrent session's append even when this
+        # update did not touch the vocabulary (t1599_4).
+        local -a commit_paths=( "$final_path" )
+        if [[ "$LABELS_VOCAB_DIRTY" == true ]]; then
+            commit_paths+=( "$LABELS_FILE" )
+        fi
+        local crc=0
+        task_git_commit_scoped "ait: Update task t${task_num}: ${humanized_name}" \
+            "${commit_paths[@]}" || crc=$?
+        if [[ "$crc" -eq 0 ]]; then
+            local commit_hash
+            commit_hash=$(task_git rev-parse --short HEAD)
+            success "Committed: $commit_hash"
+        elif [[ "$crc" -eq 2 ]]; then
+            warn "nothing to commit for t${task_num}"
+        else
+            die "commit failed for t${task_num}"
+        fi
+    fi
+}
+
+# --- Batch Mode ---
+
+run_batch_mode() {
+    # Validate task number
+    [[ -z "$BATCH_TASK_NUM" ]] && die "Batch mode requires a task number"
+
+    # Cross-repo lock-check guard (t832_7). Only fires when this invocation
+    # was re-exec'd from a remote --project caller (sentinel env var set in
+    # main()). Plain local invocations skip the lock-fetch cost — local
+    # callers go through aitask_pick_own.sh which already owns the lock.
+    if [[ "${AIT_CROSS_REPO_REEXEC:-}" == "1" ]]; then
+        local lock_state lock_exit=0
+        lock_state=$("$SCRIPT_DIR/aitask_lock.sh" --check "$BATCH_TASK_NUM" 2>/dev/null) || lock_exit=$?
+        if [[ "$lock_exit" -eq 0 && -n "$lock_state" ]]; then
+            local locked_by locked_at locked_host
+            locked_by=$(echo "$lock_state" | grep '^locked_by:' | sed 's/locked_by: *//' | head -1)
+            locked_at=$(echo "$lock_state" | grep '^locked_at:' | sed 's/locked_at: *//' | head -1)
+            locked_host=$(echo "$lock_state" | grep '^hostname:' | sed 's/hostname: *//' | head -1)
+            local my_host my_email=""
+            my_host=$(hostname 2>/dev/null || echo "unknown")
+            if [[ -f "aitasks/metadata/userconfig.yaml" ]]; then
+                my_email=$(grep '^email:' aitasks/metadata/userconfig.yaml | sed 's/^email: *//' | head -1)
+            fi
+            # Refuse only when a DIFFERENT host or DIFFERENT owner holds the
+            # lock. Same-host + same-owner is fine (local administrative
+            # update while picking is allowed).
+            if [[ "$locked_host" != "$my_host" || ( -n "$my_email" && "$locked_by" != "$my_email" ) ]]; then
+                die "cross-repo task t${BATCH_TASK_NUM} is locked by ${locked_by}@${locked_host} (since ${locked_at}); cannot update from this host. Pick the task there to release, or wait."
+            fi
+        fi
+    fi
+
+    # Refuse early on a wedged data worktree: batch mode always intends a write,
+    # so failing here costs nothing and avoids doing the work first (t1725_2).
+    assert_task_data_writable
+
+    # Resolve task file
+    local file_path
+    file_path=$(resolve_task_file "$BATCH_TASK_NUM")
+
+    # Parse current values
+    parse_yaml_frontmatter "$file_path"
+
+    # Check that at least one update is specified
+    local has_update=false
+    [[ -n "$BATCH_PRIORITY" ]] && has_update=true
+    [[ "$BATCH_RISK_CODE_HEALTH_SET" == true ]] && has_update=true
+    [[ "$BATCH_RISK_GOAL_ACHIEVEMENT_SET" == true ]] && has_update=true
+    [[ "$BATCH_RISK_MITIGATION_TASKS_SET" == true ]] && has_update=true
+    [[ "$BATCH_GATES_SET" == true ]] && has_update=true
+    [[ "$BATCH_ALSO_BLOCKS_DEPENDENTS_SET" == true ]] && has_update=true
+    [[ -n "$BATCH_EFFORT" ]] && has_update=true
+    [[ -n "$BATCH_STATUS" ]] && has_update=true
+    [[ -n "$BATCH_TYPE" ]] && has_update=true
+    [[ "$BATCH_DEPS_SET" == true ]] && has_update=true
+    [[ "$BATCH_XDEPS_SET" == true ]] && has_update=true
+    [[ "$BATCH_XDEPREPO_SET" == true ]] && has_update=true
+    [[ "$BATCH_VERIFIES_SET" == true ]] && has_update=true
+    [[ ${#BATCH_ADD_VERIFIES[@]} -gt 0 ]] && has_update=true
+    [[ ${#BATCH_REMOVE_VERIFIES[@]} -gt 0 ]] && has_update=true
+    [[ "$BATCH_LABELS_SET" == true ]] && has_update=true
+    [[ ${#BATCH_ADD_LABELS[@]} -gt 0 ]] && has_update=true
+    [[ ${#BATCH_REMOVE_LABELS[@]} -gt 0 ]] && has_update=true
+    [[ -n "$BATCH_DESC" || -n "$BATCH_DESC_FILE" ]] && has_update=true
+    [[ -n "$BATCH_NAME" ]] && has_update=true
+    [[ -n "$BATCH_ADD_CHILD" ]] && has_update=true
+    [[ -n "$BATCH_REMOVE_CHILD" ]] && has_update=true
+    [[ "$BATCH_CHILDREN_SET" == true ]] && has_update=true
+    [[ "$BATCH_ASSIGNED_TO_SET" == true ]] && has_update=true
+    [[ "$BATCH_ANCHOR_SET" == true ]] && has_update=true
+    [[ "$BATCH_FOLLOWUP_KIND_SET" == true ]] && has_update=true
+    [[ "$BATCH_VERIFICATION_BASELINE_SET" == true ]] && has_update=true
+    [[ "$BATCH_PLAN_APPROVED_AT_SET" == true ]] && has_update=true
+    [[ "$BATCH_PREMISE_BASELINE_SET" == true ]] && has_update=true
+    [[ "$BATCH_BOARDCOL_SET" == true ]] && has_update=true
+    [[ "$BATCH_BOARDIDX_SET" == true ]] && has_update=true
+    [[ "$BATCH_BOARDGROUP_SET" == true ]] && has_update=true
+    [[ "$BATCH_ISSUE_SET" == true ]] && has_update=true
+    [[ "$BATCH_PULL_REQUEST_SET" == true ]] && has_update=true
+    [[ "$BATCH_CONTRIBUTOR_SET" == true ]] && has_update=true
+    [[ "$BATCH_CONTRIBUTOR_EMAIL_SET" == true ]] && has_update=true
+    [[ "$BATCH_FOLDED_TASKS_SET" == true ]] && has_update=true
+    [[ "$BATCH_FOLDED_INTO_SET" == true ]] && has_update=true
+    [[ "$BATCH_IMPLEMENTED_WITH_SET" == true ]] && has_update=true
+    [[ ${#BATCH_ADD_FILE_REFS[@]} -gt 0 ]] && has_update=true
+    [[ ${#BATCH_REMOVE_FILE_REFS[@]} -gt 0 ]] && has_update=true
+    # Any tuple flag counts (atomicity is validated separately at parse time).
+    [[ "$BATCH_ACTIVE_GATES_SET" == true ]] && has_update=true
+    [[ "$BATCH_CLEAR_ACTIVE_GATES" == true ]] && has_update=true
+
+    if [[ "$has_update" == false ]]; then
+        die "No update parameters specified. Use --help for usage."
+    fi
+
+    # Validate enum values
+    if [[ -n "$BATCH_PRIORITY" ]]; then
+        is_valid_task_level "$BATCH_PRIORITY" \
+            || die "Invalid priority: $BATCH_PRIORITY (must be high, medium, or low)"
+    fi
+
+    # Validate risk fields only when a non-empty value is supplied ("" clears).
+    if [[ "$BATCH_RISK_CODE_HEALTH_SET" == true && -n "$BATCH_RISK_CODE_HEALTH" ]]; then
+        is_valid_task_level "$BATCH_RISK_CODE_HEALTH" \
+            || die "Invalid risk-code-health: $BATCH_RISK_CODE_HEALTH (must be high, medium, or low)"
+    fi
+    if [[ "$BATCH_RISK_GOAL_ACHIEVEMENT_SET" == true && -n "$BATCH_RISK_GOAL_ACHIEVEMENT" ]]; then
+        is_valid_task_level "$BATCH_RISK_GOAL_ACHIEVEMENT" \
+            || die "Invalid risk-goal-achievement: $BATCH_RISK_GOAL_ACHIEVEMENT (must be high, medium, or low)"
+    fi
+
+    if [[ -n "$BATCH_EFFORT" ]]; then
+        is_valid_task_level "$BATCH_EFFORT" \
+            || die "Invalid effort: $BATCH_EFFORT (must be low, medium, or high)"
+    fi
+
+    if [[ -n "$BATCH_STATUS" ]]; then
+        case "$BATCH_STATUS" in
+            Ready|Editing|Implementing|Postponed|Done|Folded) ;;
+            *) die "Invalid status: $BATCH_STATUS (must be Ready, Editing, Implementing, Postponed, Done, or Folded)" ;;
+        esac
+    fi
+
+    if [[ -n "$BATCH_TYPE" ]]; then
+        validate_task_type "$BATCH_TYPE"
+    fi
+
+    # Handle description from file
+    if [[ -n "$BATCH_DESC_FILE" ]]; then
+        if [[ "$BATCH_DESC_FILE" == "-" ]]; then
+            BATCH_DESC=$(cat)
+        else
+            [[ -f "$BATCH_DESC_FILE" ]] || die "Description file not found: $BATCH_DESC_FILE"
+            BATCH_DESC=$(cat "$BATCH_DESC_FILE")
+        fi
+    fi
+
+    # Apply updates (use current value if not specified)
+    local new_priority="${BATCH_PRIORITY:-$CURRENT_PRIORITY}"
+    local new_effort="${BATCH_EFFORT:-$CURRENT_EFFORT}"
+
+    # Risk: two scalar planning outputs. Use a BATCH value only when its flag
+    # was passed (even if empty, to allow clearing); otherwise preserve current.
+    local new_risk_code_health="$CURRENT_RISK_CODE_HEALTH"
+    if [[ "$BATCH_RISK_CODE_HEALTH_SET" == true ]]; then
+        new_risk_code_health="$BATCH_RISK_CODE_HEALTH"
+    fi
+    local new_risk_goal_achievement="$CURRENT_RISK_GOAL_ACHIEVEMENT"
+    if [[ "$BATCH_RISK_GOAL_ACHIEVEMENT_SET" == true ]]; then
+        new_risk_goal_achievement="$BATCH_RISK_GOAL_ACHIEVEMENT"
+    fi
+
+    # Risk-mitigation tasks: list, replaces-all. read-modify-write friendly for
+    # t884_4 (caller reads current list, appends, passes the full set back).
+    local new_risk_mitigation_tasks="$CURRENT_RISK_MITIGATION_TASKS"
+    if [[ "$BATCH_RISK_MITIGATION_TASKS_SET" == true ]]; then
+        new_risk_mitigation_tasks="$BATCH_RISK_MITIGATION_TASKS"
+    fi
+    new_risk_mitigation_tasks=$(normalize_task_ids "$new_risk_mitigation_tasks")
+
+    # gates: list, replaces-all (batch). Defaults to current → preserved when
+    # --gates is not passed (INCLUDING an explicit empty `gates: []` opt-out,
+    # via CURRENT_GATES_PRESENT). `--gates ""` keeps its documented contract:
+    # it clears the key entirely (presence false).
+    local new_gates="$CURRENT_GATES"
+    if [[ "$BATCH_GATES_SET" == true ]]; then
+        new_gates="$BATCH_GATES"
+        if [[ -n "$BATCH_GATES" ]]; then
+            CURRENT_GATES_PRESENT=true
+        else
+            CURRENT_GATES_PRESENT=false
+        fi
+    fi
+    # active_gates tuple (t635_33): atomic replace-all. validate_active_tuple_flags
+    # (called at parse time) guarantees the four flags arrive together, so a
+    # single presence check suffices. Not passed → the parsed CURRENT_ACTIVE_*
+    # values flow through write_task_file untouched (preserve-by-default, incl.
+    # an explicit empty tuple).
+    if [[ "$BATCH_ACTIVE_GATES_SET" == true ]]; then
+        CURRENT_ACTIVE_GATES="$BATCH_ACTIVE_GATES"
+        CURRENT_ACTIVE_GATES_FILTERED="$BATCH_ACTIVE_GATES_FILTERED"
+        CURRENT_ACTIVE_GATES_PROFILE="$BATCH_ACTIVE_GATES_PROFILE"
+        CURRENT_ACTIVE_GATES_DIGEST="$BATCH_ACTIVE_GATES_DIGEST"
+        CURRENT_ACTIVE_TUPLE_PRESENT=true
+    elif [[ "$BATCH_CLEAR_ACTIVE_GATES" == true ]]; then
+        # Grouped deletion: the merged result has NO tuple (raw gates: governs).
+        CURRENT_ACTIVE_GATES=""
+        CURRENT_ACTIVE_GATES_FILTERED=""
+        CURRENT_ACTIVE_GATES_PROFILE=""
+        CURRENT_ACTIVE_GATES_DIGEST=""
+        CURRENT_ACTIVE_TUPLE_PRESENT=false
+    fi
+    # also_blocks_dependents: list, replaces-all (batch). Same preserve-by-default
+    # semantics as gates: (t635_3).
+    local new_abd="$CURRENT_ALSO_BLOCKS_DEPENDENTS"
+    if [[ "$BATCH_ALSO_BLOCKS_DEPENDENTS_SET" == true ]]; then
+        new_abd="$BATCH_ALSO_BLOCKS_DEPENDENTS"
+    fi
+    local new_status="${BATCH_STATUS:-$CURRENT_STATUS}"
+    local new_type="${BATCH_TYPE:-$CURRENT_TYPE}"
+    local new_deps="${BATCH_DEPS:-$CURRENT_DEPS}"
+    local new_description="${BATCH_DESC:-$CURRENT_DESCRIPTION}"
+
+    # Special handling: if --deps was passed, use BATCH_DEPS even if empty
+    if [[ "$BATCH_DEPS_SET" == true ]]; then
+        new_deps="$BATCH_DEPS"
+    fi
+    new_deps=$(normalize_task_ids "$new_deps")
+
+    # Cross-repo deps (xdeps + xdeprepo) — both-or-neither, replaces-all
+    local new_xdeps="$CURRENT_XDEPS"
+    local new_xdeprepo="$CURRENT_XDEPREPO"
+    if [[ "$BATCH_XDEPS_SET" == true ]]; then
+        new_xdeps="$BATCH_XDEPS"
+    fi
+    if [[ "$BATCH_XDEPREPO_SET" == true ]]; then
+        new_xdeprepo="$BATCH_XDEPREPO"
+    fi
+    new_xdeps=$(normalize_task_ids "$new_xdeps")
+    # Validate both-or-neither + cross-repo ID existence when either flag was
+    # set in this invocation. Skip when neither flag is set (preserves existing
+    # values without re-validating cross-repo on unrelated updates).
+    if [[ "$BATCH_XDEPS_SET" == true || "$BATCH_XDEPREPO_SET" == true ]]; then
+        # validate_xdeps_pair reads BATCH_XDEPS / BATCH_XDEPREPO globals. Point
+        # those at the resolved new_* values for the duration of the call so
+        # explicit "" clears (both flags set to empty) validate as a no-op.
+        local _saved_batch_xdeps="$BATCH_XDEPS"
+        local _saved_batch_xdeprepo="$BATCH_XDEPREPO"
+        BATCH_XDEPS="$new_xdeps"
+        BATCH_XDEPREPO="$new_xdeprepo"
+        validate_xdeps_pair
+        BATCH_XDEPS="$_saved_batch_xdeps"
+        BATCH_XDEPREPO="$_saved_batch_xdeprepo"
+    fi
+
+    # Process verifies
+    local new_verifies
+    new_verifies=$(process_verifies_operations "$CURRENT_VERIFIES" "$BATCH_VERIFIES" BATCH_ADD_VERIFIES BATCH_REMOVE_VERIFIES "$BATCH_VERIFIES_SET")
+
+    # Process labels.
+    #
+    # Normalize the *supplied* labels first so the frontmatter this write emits
+    # and the vocabulary it registers can never disagree. --remove-label args
+    # are deliberately left verbatim: they are matched against the current
+    # frontmatter, and removing a legacy raw label must keep working.
+    local _supplied_labels=""
+    if [[ "$BATCH_LABELS_SET" == true && -n "$BATCH_LABELS" ]]; then
+        local _label_dropped
+        _label_dropped=$(normalize_labels_csv "$BATCH_LABELS" 2>&1 >/dev/null)
+        BATCH_LABELS=$(normalize_labels_csv "$BATCH_LABELS" 2>/dev/null)
+        [[ -n "$_label_dropped" ]] && warn "dropped invalid label(s): ${_label_dropped#DROPPED:}"
+        _supplied_labels="$BATCH_LABELS"
+    fi
+    if (( ${#BATCH_ADD_LABELS[@]} > 0 )); then
+        local -a _clean_add=()
+        local _raw_add _clean
+        for _raw_add in "${BATCH_ADD_LABELS[@]}"; do
+            _clean=$(sanitize_label "$_raw_add")
+            if [[ -z "$_clean" ]]; then
+                warn "dropped invalid label: $_raw_add"
+                continue
+            fi
+            _clean_add+=("$_clean")
+        done
+        BATCH_ADD_LABELS=(${_clean_add[@]+"${_clean_add[@]}"})
+        if (( ${#BATCH_ADD_LABELS[@]} > 0 )); then
+            _supplied_labels="${_supplied_labels:+$_supplied_labels,}$(IFS=','; printf '%s' "${BATCH_ADD_LABELS[*]}")"
+        fi
+    fi
+
+    local new_labels
+    new_labels=$(process_label_operations "$CURRENT_LABELS" "$BATCH_LABELS" BATCH_ADD_LABELS BATCH_REMOVE_LABELS "$BATCH_LABELS_SET")
+
+    # Register the supplied labels in the vocabulary — never the whole resulting
+    # list, so a bare `--status Done` (every gate transition / board move) can
+    # not drag a task's pre-existing labels into labels.txt.
+    local _stage_labels=false
+    if [[ -n "$_supplied_labels" ]]; then
+        add_labels_csv_to_file "$_supplied_labels"
+        if (( ${#AIT_LABELS_ADDED[@]} > 0 )); then
+            _stage_labels=true
+            info "Added to label vocabulary: $(IFS=','; echo "${AIT_LABELS_ADDED[*]}")" >&2
+        fi
+    fi
+
+    # Process children_to_implement
+    local new_children
+    new_children=$(process_children_operations "$CURRENT_CHILDREN_TO_IMPLEMENT" "$BATCH_CHILDREN" "$BATCH_ADD_CHILD" "$BATCH_REMOVE_CHILD" "$BATCH_CHILDREN_SET")
+    new_children=$(normalize_task_ids "$new_children")
+
+    # Process assigned_to
+    local new_assigned_to="$CURRENT_ASSIGNED_TO"
+    if [[ "$BATCH_ASSIGNED_TO_SET" == true ]]; then
+        new_assigned_to="$BATCH_ASSIGNED_TO"
+    fi
+
+    # Process anchor (topic group key). BATCH_ANCHOR was already normalized to a
+    # bare id and validated to exist (or left empty to clear) after parse_args.
+    local new_anchor="$CURRENT_ANCHOR"
+    if [[ "$BATCH_ANCHOR_SET" == true ]]; then
+        new_anchor="$BATCH_ANCHOR"
+    fi
+
+    # Process followup_kind (auto-spawned follow-up provenance). Clearing is key
+    # removal -- there is no tombstone, so `--followup-kind ""` simply yields an
+    # empty value and the emit omits the line.
+    local new_followup_kind="$CURRENT_FOLLOWUP_KIND"
+    if [[ "$BATCH_FOLLOWUP_KIND_SET" == true ]]; then
+        new_followup_kind="$BATCH_FOLLOWUP_KIND"
+    fi
+
+    # Process verification_baseline (the commit a manual-verification checklist
+    # is known to match). Like followup_kind, clearing is key removal -- there is
+    # no tombstone, so `--verification-baseline ""` yields an empty value and the
+    # emit omits the line.
+    local new_verification_baseline="$CURRENT_VERIFICATION_BASELINE"
+    if [[ "$BATCH_VERIFICATION_BASELINE_SET" == true ]]; then
+        new_verification_baseline="$BATCH_VERIFICATION_BASELINE"
+    fi
+
+    # Process plan_approved_at (the deferred-approved-plan marker, t1595). Like
+    # followup_kind, clearing is key removal -- `--plan-approved-at ""` yields an
+    # empty value and the emit omits the line. The literal "now" is resolved here
+    # rather than by the caller so the timestamp format has exactly one home
+    # (get_timestamp, which also stamps created_at/updated_at); any other value
+    # must already be in that format, and is rejected rather than coerced -- a
+    # malformed marker would be displayed verbatim by `ait ls -v` and parsed by
+    # future consumers.
+    local new_plan_approved_at="$CURRENT_PLAN_APPROVED_AT"
+    if [[ "$BATCH_PLAN_APPROVED_AT_SET" == true ]]; then
+        if [[ "$BATCH_PLAN_APPROVED_AT" == "now" ]]; then
+            new_plan_approved_at=$(get_timestamp)
+        elif [[ -z "$BATCH_PLAN_APPROVED_AT" ]]; then
+            new_plan_approved_at=""
+        elif [[ "$BATCH_PLAN_APPROVED_AT" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}\ [0-9]{2}:[0-9]{2}$ ]]; then
+            new_plan_approved_at="$BATCH_PLAN_APPROVED_AT"
+        else
+            die "Invalid --plan-approved-at value: '$BATCH_PLAN_APPROVED_AT' (expected \"now\", \"\" to clear, or \"YYYY-MM-DD HH:MM\")"
+        fi
+    fi
+
+    # Process premise_baseline (t1663_2). main() already validated and
+    # canonicalised the flag value (normalize_premise_baseline), so it is taken
+    # as-is here. Clearing is key removal, like plan_approved_at.
+    local new_premise_baseline="$CURRENT_PREMISE_BASELINE"
+    if [[ "$BATCH_PREMISE_BASELINE_SET" == true ]]; then
+        new_premise_baseline="$BATCH_PREMISE_BASELINE"
+    fi
+
+    # Cross-field invariant on the RESULTING pair (t1468_1). It MUST be checked
+    # here rather than beside the flag validation in main(): new_type is not
+    # computed until this function runs, so a check up there cannot see the
+    # resulting issue_type and would miss the type-only violation -- changing
+    # only --type on a task that already carries followup_kind:
+    # manual_verification, which orphans the kind.
+    enforce_manual_verification_kind_invariant "$new_type" "$new_followup_kind"
+
+    # Process board fields
+    local new_boardcol="$CURRENT_BOARDCOL"
+    if [[ "$BATCH_BOARDCOL_SET" == true ]]; then
+        new_boardcol="$BATCH_BOARDCOL"
+    fi
+    local new_boardidx="$CURRENT_BOARDIDX"
+    if [[ "$BATCH_BOARDIDX_SET" == true ]]; then
+        new_boardidx="$BATCH_BOARDIDX"
+    fi
+    # Setting the field -- including clearing it to "" -- makes the key present
+    # from now on, so a clear persists as a tombstone instead of vanishing.
+    local new_boardgroup="$CURRENT_BOARDGROUP"
+    local new_boardgroup_present="$CURRENT_BOARDGROUP_PRESENT"
+    if [[ "$BATCH_BOARDGROUP_SET" == true ]]; then
+        new_boardgroup="$BATCH_BOARDGROUP"
+        new_boardgroup_present=true
+    fi
+
+    # Process issue
+    local new_issue="$CURRENT_ISSUE"
+    if [[ "$BATCH_ISSUE_SET" == true ]]; then
+        new_issue="$BATCH_ISSUE"
+    fi
+
+    # Process pull_request
+    local new_pull_request="$CURRENT_PULL_REQUEST"
+    if [[ "$BATCH_PULL_REQUEST_SET" == true ]]; then
+        new_pull_request="$BATCH_PULL_REQUEST"
+    fi
+
+    # Process contributor
+    local new_contributor="$CURRENT_CONTRIBUTOR"
+    if [[ "$BATCH_CONTRIBUTOR_SET" == true ]]; then
+        new_contributor="$BATCH_CONTRIBUTOR"
+    fi
+
+    # Process contributor_email
+    local new_contributor_email="$CURRENT_CONTRIBUTOR_EMAIL"
+    if [[ "$BATCH_CONTRIBUTOR_EMAIL_SET" == true ]]; then
+        new_contributor_email="$BATCH_CONTRIBUTOR_EMAIL"
+    fi
+
+    # Process folded_tasks
+    local new_folded_tasks="$CURRENT_FOLDED_TASKS"
+    if [[ "$BATCH_FOLDED_TASKS_SET" == true ]]; then
+        new_folded_tasks="$BATCH_FOLDED_TASKS"
+    fi
+
+    # Process folded_into
+    local new_folded_into="$CURRENT_FOLDED_INTO"
+    if [[ "$BATCH_FOLDED_INTO_SET" == true ]]; then
+        new_folded_into="$BATCH_FOLDED_INTO"
+    fi
+
+    # Process implemented_with
+    local new_implemented_with="$CURRENT_IMPLEMENTED_WITH"
+    if [[ "$BATCH_IMPLEMENTED_WITH_SET" == true ]]; then
+        new_implemented_with="$BATCH_IMPLEMENTED_WITH"
+    fi
+
+    # Process file_references. Untouched -> the original lines pass through.
+    # With --file-ref / --remove-file-ref the current list is read AS YAML
+    # (get_file_references) and refused when it cannot be: re-writing a list we
+    # could not read would silently drop or mangle entries.
+    local new_file_references="$CURRENT_FILE_REFERENCES"
+    if [[ ${#BATCH_ADD_FILE_REFS[@]} -gt 0 || ${#BATCH_REMOVE_FILE_REFS[@]} -gt 0 ]]; then
+        local current_refs refs_rc=0 new_refs
+        current_refs="$(get_file_references "$file_path")" || refs_rc=$?
+        if [[ $refs_rc -ne 0 ]]; then
+            local refs_why="it is not a list of path strings, or the frontmatter does not parse"
+            [[ $refs_rc -eq 3 ]] && refs_why="no usable python (PyYAML) is available to read it"
+            die "file_references: in $file_path cannot be read ($refs_why); fix it by hand before --file-ref/--remove-file-ref"
+        fi
+        new_refs=$(process_file_references_operations "$current_refs" BATCH_ADD_FILE_REFS BATCH_REMOVE_FILE_REFS)
+        new_file_references=""
+        if [[ -n "$new_refs" ]]; then
+            new_file_references="file_references: $(format_yaml_path_list "$new_refs")" \
+                || die "could not format file_references for $file_path"
+        fi
+    fi
+
+    # Validate parent completion (cannot complete parent with pending children)
+    validate_parent_completion "$BATCH_TASK_NUM" "$new_status" "$new_children"
+
+    # Handle rename
+    local final_path="$file_path"
+    if [[ -n "$BATCH_NAME" ]]; then
+        local sanitized_name
+        sanitized_name=$(sanitize_name "$BATCH_NAME")
+        [[ -z "$sanitized_name" ]] && die "Invalid task name after sanitization"
+
+        local new_filename="t${BATCH_TASK_NUM}_${sanitized_name}.md"
+        local parent_dir
+        parent_dir=$(dirname "$file_path")
+        final_path="$parent_dir/$new_filename"
+
+        if [[ "$file_path" != "$final_path" ]]; then
+            mv "$file_path" "$final_path"
+        fi
+    fi
+
+    # Write updated file
+    write_task_file "$final_path" "$new_priority" "$new_effort" "$new_deps" \
+        "$new_type" "$new_status" "$new_labels" "$CURRENT_CREATED_AT" "$new_description" \
+        "$new_children" "$new_assigned_to" "$new_boardcol" "$new_boardidx" "$new_issue" \
+        "$new_folded_tasks" "$new_folded_into" "$new_pull_request" "$new_contributor" \
+        "$new_contributor_email" "$new_implemented_with" "$new_file_references" \
+        "$new_verifies" "$new_xdeps" "$new_xdeprepo" \
+        "$new_risk_code_health" "$new_risk_goal_achievement" "$new_risk_mitigation_tasks" \
+        "$new_gates" "$new_abd" "$new_anchor" \
+        "$new_boardgroup" "$new_boardgroup_present" \
+        "$new_followup_kind" \
+        "$new_verification_baseline" \
+        "$new_plan_approved_at" \
+        "$new_premise_baseline"
+
+    # Handle child task completion (update parent if needed)
+    if [[ "$new_status" == "Done" ]]; then
+        handle_child_task_completion "$BATCH_TASK_NUM" "$new_status"
+    fi
+
+    # Git commit if requested
+    if [[ "$BATCH_COMMIT" == true ]]; then
+        local humanized_name
+        humanized_name=$(basename "$final_path" .md | sed -E 's/^t[0-9]*_([0-9]*_)?//' | tr '_' ' ')
+        # Only when this update actually appended to the vocabulary — otherwise
+        # labels.txt would be left dirty for an unrelated commit to sweep up.
+        # The same gate drives the PATHSPEC: `commit -- <paths>` commits worktree
+        # content, so an unconditional labels.txt would re-open that hole (t1599_4).
+        local -a commit_paths=( "$final_path" )
+        if [[ "$_stage_labels" == true ]]; then
+            commit_paths+=( "$LABELS_FILE" )
+        fi
+        local crc=0
+        task_git_commit_scoped "ait: Update task t${BATCH_TASK_NUM}: ${humanized_name}" \
+            "${commit_paths[@]}" || crc=$?
+        if [[ "$crc" -eq 2 ]]; then
+            warn "nothing to commit for t${BATCH_TASK_NUM}"
+        elif [[ "$crc" -ne 0 ]]; then
+            die "commit failed for t${BATCH_TASK_NUM}"
+        fi
+    fi
+
+    # Output
+    if [[ "$BATCH_SILENT" == true ]]; then
+        echo "$final_path"
+    else
+        echo "Updated: $final_path"
+    fi
+}
+
+# --- Main ---
+
+# Active-gates tuple atomicity guard (t635_33): the four --active-gates* flags
+# must be passed together (all four) or not at all — a strict subset would let
+# a caller persist a mixed tuple (e.g. a new active set under a stale digest),
+# which the outputs-half digest could then only classify as corrupt after the
+# fact. Rejecting at the CLI makes the atomicity structural, not a convention.
+validate_active_tuple_flags() {
+    local n=0
+    [[ "$BATCH_ACTIVE_GATES_SET" == true ]] && n=$((n + 1))
+    [[ "$BATCH_ACTIVE_GATES_FILTERED_SET" == true ]] && n=$((n + 1))
+    [[ "$BATCH_ACTIVE_GATES_PROFILE_SET" == true ]] && n=$((n + 1))
+    [[ "$BATCH_ACTIVE_GATES_DIGEST_SET" == true ]] && n=$((n + 1))
+    if [[ $n -gt 0 && $n -lt 4 ]]; then
+        die "--active-gates* flags form an atomic tuple: pass all four (--active-gates, --active-gates-filtered, --active-gates-profile, --active-gates-digest) or none — task file unchanged"
+    fi
+    if [[ "$BATCH_CLEAR_ACTIVE_GATES" == true && $n -gt 0 ]]; then
+        die "--clear-active-gates cannot be combined with the --active-gates* tuple flags — task file unchanged"
+    fi
+}
+
+# Validate and canonicalise --premise-baseline in place (t1663_2). Sets
+# BATCH_PREMISE_BASELINE to "<lowercase oid> @ <YYYY-MM-DD HH:MM>" or dies.
+# Call it as a plain statement, never inside $( ): die must end the process.
+#
+# The value is checked, not accepted. aitask_premise_stale.sh reads anything but
+# a full commit id as SKIP/invalid_baseline, and it reads a full id that names no
+# commit as SKIP/history_rewritten -- either way the task would be silently never
+# checked. A symbolic revision is rejected rather than resolved: callers must
+# write the revision the evidence was checked against (the CHECKED: sha), never
+# whatever HEAD happens to be at write time.
+normalize_premise_baseline() {
+    local raw="$BATCH_PREMISE_BASELINE"
+    local oid_re='^([0-9a-fA-F]{40}|[0-9a-fA-F]{64})$'
+    local ts_re='^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}$'
+    local oid ts
+    if [[ "$raw" == *" @ "* ]]; then
+        oid="${raw%% @ *}"
+        ts="${raw#* @ }"
+        [[ "$ts" =~ $ts_re ]] || oid=""
+    else
+        oid="$raw"
+        ts=$(get_timestamp)
+    fi
+    if [[ ! "$oid" =~ $oid_re ]]; then
+        die "Invalid --premise-baseline value: '$raw' (expected a full 40- or 64-hex commit id, optionally followed by ' @ YYYY-MM-DD HH:MM', or \"\" to clear; resolve a revision with: git rev-parse --verify <rev>^{commit})"
+    fi
+    oid=$(printf '%s' "$oid" | tr 'A-F' 'a-f')
+    if ! git cat-file -e "${oid}^{commit}" 2>/dev/null; then
+        die "Invalid --premise-baseline value: '$oid' is not a commit in this repository"
+    fi
+    BATCH_PREMISE_BASELINE="$oid @ $ts"
+}
+
+main() {
+    # Cross-repo redirect (t832_7): if `--project <name>` appears, resolve
+    # the name to a sibling aitasks project root, then re-exec that
+    # project's own aitask_update.sh with `--project <name>` stripped.
+    # Mirrors aitask_create.sh:1778-1838. Requires --batch; refuses
+    # workflow-state transitions (Implementing/Done/Folded) and rename
+    # (--name) cross-repo.
+    local project_name=""
+    local has_batch=false
+    local has_name=false
+    local cross_status=""
+    local forwarded=()
+    local _i=0
+    local _argv=("$@")
+    while [[ $_i -lt ${#_argv[@]} ]]; do
+        case "${_argv[$_i]}" in
+            --project)
+                project_name="${_argv[$_i+1]:-}"
+                [[ -n "$project_name" ]] || die "--project requires a value"
+                _i=$((_i + 2))
+                ;;
+            --batch)
+                has_batch=true
+                forwarded+=("${_argv[$_i]}")
+                _i=$((_i + 1))
+                ;;
+            --name|-n)
+                has_name=true
+                forwarded+=("${_argv[$_i]}" "${_argv[$_i+1]:-}")
+                _i=$((_i + 2))
+                ;;
+            --status|-s)
+                cross_status="${_argv[$_i+1]:-}"
+                forwarded+=("${_argv[$_i]}" "${_argv[$_i+1]:-}")
+                _i=$((_i + 2))
+                ;;
+            *)
+                forwarded+=("${_argv[$_i]}")
+                _i=$((_i + 1))
+                ;;
+        esac
+    done
+
+    if [[ -n "$project_name" ]]; then
+        [[ "$has_batch" == true ]] || die "--project requires --batch"
+        [[ "$has_name" == false ]] || die "--project cannot be combined with --name (rename is not supported cross-repo)"
+        case "$cross_status" in
+            Implementing|Done)
+                die "cross-repo status transition to '$cross_status' must go through '$project_name's own /aitask-pick workflow (lock acquisition + plan externalization happen there)."
+                ;;
+            Folded)
+                die "folding requires reading both task bodies and is not supported cross-repo."
+                ;;
+        esac
+
+        local resolved
+        resolved=$("$SCRIPT_DIR/aitask_project_resolve.sh" "$project_name")
+        case "$resolved" in
+            RESOLVED:*)
+                local root="${resolved#RESOLVED:}"
+                local target_script="$root/.aitask-scripts/aitask_update.sh"
+                [[ -x "$target_script" ]] || die "Resolved $project_name → $root, but $target_script is missing or not executable"
+                cd "$root"
+                AIT_CROSS_REPO_REEXEC=1 exec "$target_script" "${forwarded[@]}"
+                ;;
+            STALE:*)
+                die "Project '$project_name' is registered but its path is stale: ${resolved#STALE:}"
+                ;;
+            NOT_FOUND:*)
+                die "Project '$project_name' is not registered. Run \`cd /path/to/$project_name && ait projects add\`."
+                ;;
+            *)
+                die "Resolver returned unexpected output: $resolved"
+                ;;
+        esac
+    fi
+
+    # Store original args for detecting --deps flag
+    ORIGINAL_ARGS=("$@")
+
+    parse_args "$@"
+
+    # Active-gates tuple atomicity (t635_33): the four --active-gates* flags
+    # are all-or-nothing — reject a strict subset BEFORE any file is touched,
+    # so a partial invocation can never persist a mixed tuple.
+    validate_active_tuple_flags
+
+    # Normalize + validate --anchor (topic group key): strip an optional leading
+    # t, assert the id shape, and confirm the target exists. An empty value
+    # (--anchor "") clears the field and skips validation. Mirrors create.sh.
+    if [[ "$BATCH_ANCHOR_SET" == true && -n "$BATCH_ANCHOR" ]]; then
+        BATCH_ANCHOR=$(normalize_anchor_id "$BATCH_ANCHOR")
+    fi
+
+    # Validate --followup-kind against the framework vocabulary. REJECT, never
+    # coerce: the value is provenance identity. `--followup-kind ""` clears the
+    # field and skips validation. The manual_verification cross-field invariant
+    # is NOT checked here -- it needs the resulting issue_type (see
+    # run_batch_mode).
+    if [[ "$BATCH_FOLLOWUP_KIND_SET" == true && -n "$BATCH_FOLLOWUP_KIND" ]]; then
+        if ! is_valid_followup_kind "$BATCH_FOLLOWUP_KIND"; then
+            die "Invalid followup_kind: $BATCH_FOLLOWUP_KIND (must be one of: $(followup_kinds_pipe 2>/dev/null | tr '|' ' '))"
+        fi
+    fi
+
+    # Validate --premise-baseline (t1663_2). Same placement rule as above: after
+    # parse_args, before any file (task file or labels.txt) is touched, so a
+    # rejected value changes nothing. `--premise-baseline ""` clears the field
+    # and skips validation.
+    if [[ "$BATCH_PREMISE_BASELINE_SET" == true && -n "$BATCH_PREMISE_BASELINE" ]]; then
+        normalize_premise_baseline
+    fi
+
+    # Validate --boardcol against the configured columns (t1377_1). An unknown
+    # id used to be written verbatim, leaving the task in no column at all. Same
+    # placement rule as --anchor above: after parse_args, before any file is
+    # touched. `--boardcol ""` still clears the field and skips validation.
+    #
+    # Note this runs only in the process that owns the task tree: the cross-repo
+    # `--project` redirect near the top of main() re-execs the sibling's own
+    # aitask_update.sh, so a cross-repo update validates against the TARGET
+    # project's board_config.json, not this one's.
+    # Validate --boardgroup (t1243_8). Same placement rule as --boardcol above.
+    # REJECT, never coerce: group identity IS the slug, so lowercasing or
+    # replacing separators would silently collapse two distinct inputs into one
+    # group — and merging groups is a destructive act the design requires to be
+    # confirmed, never silent. The board's group-create UI normalizes before
+    # calling. `--boardgroup ""` is the tombstone and skips validation.
+    if [[ "$BATCH_BOARDGROUP_SET" == true && -n "$BATCH_BOARDGROUP" ]]; then
+        if [[ ! "$BATCH_BOARDGROUP" =~ ^[a-z0-9_]+$ ]]; then
+            die "boardgroup '$BATCH_BOARDGROUP' is not a valid slug (expected [a-z0-9_]+)."
+        fi
+    fi
+
+    if [[ "$BATCH_BOARDCOL_SET" == true && -n "$BATCH_BOARDCOL" ]]; then
+        BATCH_BOARDCOL=$(normalize_board_column "$BATCH_BOARDCOL")
+    fi
+
+    if [[ "$BATCH_MODE" == true ]]; then
+        run_batch_mode
+    else
+        run_interactive_mode
+    fi
+}
+
+main "$@"

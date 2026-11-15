@@ -1,0 +1,851 @@
+#!/usr/bin/env python3
+"""Calculate and display AI task completion statistics.
+
+Supports text output and CSV export. Pure data extraction lives in
+`lib/stats_data.py` and is shared with the stats TUI (`ait stats-tui`); the
+shared backlog row axis lives in `lib/backlog_view.py` (t1586). What remains
+here is CLI presentation: pipe-table formatting, the truncating label cell, the
+width-adaptive numeric cells, and the flow table's own row-membership rule.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import io
+import os
+import statistics
+import sys
+
+# Make the stats package and the base layer importable regardless of how this
+# script is launched. `stats_data` moved from stats/ to lib/ in t1235.
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _SCRIPT_DIR)
+sys.path.insert(0, os.path.join(_SCRIPT_DIR, "lib"))
+
+from collections import Counter
+from datetime import date, datetime, timedelta
+from pathlib import Path
+from typing import Dict, List, Sequence, Tuple
+
+from stats_data import (
+    AGENT_DISPLAY_NAMES,
+    ARCHIVE_DIR,
+    BACKLOG_WEEKS_DEFAULT,
+    DAY_FULL_NAMES,
+    DAY_NAMES,
+    ImplementationInfo,
+    InflightData,
+    LEGACY_IMPLEMENTED_WITH_CLI_IDS,
+    PhaseTimings,
+    StatsData,
+    TASK_DIR,
+    TASK_TYPES_FILE,
+    TaskRecord,
+    UsageModelEntry,
+    UsageRankingData,
+    VerifiedModelEntry,
+    VerifiedRankingData,
+    WINDOW_KEYS,
+    backlog_week_offsets,
+    bucket_avg,
+    build_chart_title,
+    canonical_model_id,
+    chart_totals,
+    codeagent_display_name,
+    collect_inflight,
+    collect_stats,
+    format_duration,
+    get_valid_task_types,
+    is_child_task,
+    iter_active_markdown_files,
+    iter_archived_markdown_files,
+    load_model_cli_ids,
+    load_usage_rankings,
+    load_verified_rankings,
+    model_display_from_cli_id,
+    model_key_from_cli_id,
+    normalize_implemented_with,
+    parse_completed_date,
+    resolve_completion_date,
+    parse_frontmatter,
+    parse_labels,
+    recent_aggregate,
+    slugify_key,
+    sorted_weekly_keys,
+    titleize_words,
+    week_end_for_offset,
+    week_offset_for,
+    week_start_display_name,
+    week_start_for,
+)
+from task_category import category_display_name, type_display_name
+
+# The shared backlog row axis (t1586). Lifted out of this file once
+# `stats/panes/backlog.py` became a real second consumer -- see that module's
+# docstring for the split between what is shared and what stays per-surface.
+from backlog_view import (
+    BACKLOG_TASK_EXCLUSION_REASONS,
+    BacklogAxis,
+    aggregate_all,
+    backlog_columns,
+    build_backlog_axis,
+    order_categories,
+)
+
+# Re-exports (kept at module scope so existing tests and call sites that
+# reference `aitask_stats.X` continue to work after the data layer split, and
+# after the t1586 backlog-axis split).
+__all__ = [
+    "AGENT_DISPLAY_NAMES",
+    "ARCHIVE_DIR",
+    "BACKLOG_TASK_EXCLUSION_REASONS",
+    "BacklogAxis",
+    "DAY_FULL_NAMES",
+    "DAY_NAMES",
+    "ImplementationInfo",
+    "InflightData",
+    "LEGACY_IMPLEMENTED_WITH_CLI_IDS",
+    "PhaseTimings",
+    "StatsData",
+    "TASK_DIR",
+    "TASK_TYPES_FILE",
+    "TaskRecord",
+    "UsageModelEntry",
+    "UsageRankingData",
+    "VerifiedModelEntry",
+    "VerifiedRankingData",
+    "WINDOW_KEYS",
+    "aggregate_all",
+    "backlog_columns",
+    "bucket_avg",
+    "build_backlog_axis",
+    "build_chart_title",
+    "canonical_model_id",
+    "chart_totals",
+    "codeagent_display_name",
+    "collect_stats",
+    "get_valid_task_types",
+    "is_child_task",
+    "iter_archived_markdown_files",
+    "load_model_cli_ids",
+    "load_usage_rankings",
+    "load_verified_rankings",
+    "model_display_from_cli_id",
+    "model_key_from_cli_id",
+    "normalize_implemented_with",
+    "order_categories",
+    "parse_completed_date",
+    "resolve_completion_date",
+    "collect_inflight",
+    "format_duration",
+    "iter_active_markdown_files",
+    "parse_frontmatter",
+    "parse_labels",
+    "recent_aggregate",
+    "slugify_key",
+    "sorted_weekly_keys",
+    "titleize_words",
+    "week_offset_for",
+    "week_start_display_name",
+    "week_start_for",
+]
+
+
+def parse_args(argv: Sequence[str]) -> argparse.Namespace:
+    def parse_days_arg(raw: str) -> int:
+        # Be tolerant to accidental trailing dot, e.g. "--days 7."
+        value = raw.strip()
+        if value.endswith("."):
+            value = value[:-1]
+        try:
+            parsed = int(value)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(f"invalid int value: '{raw}'") from exc
+        if parsed <= 0:
+            raise argparse.ArgumentTypeError("days must be > 0")
+        return parsed
+
+    def parse_backlog_weeks_arg(raw: str) -> int:
+        try:
+            parsed = int(raw.strip().rstrip("."))
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(f"invalid int value: '{raw}'") from exc
+        # 0 would make backlog_week_offsets() return [], i.e. a header row with
+        # no data columns. The upper bound is derived, not taste: the week
+        # header cell is 4 characters, so `W-99` fits and `W-100` would widen
+        # the header past every data cell.
+        if parsed < 1 or parsed > BACKLOG_WEEKS_MAX:
+            raise argparse.ArgumentTypeError(f"backlog-weeks must be between 1 and {BACKLOG_WEEKS_MAX}")
+        return parsed
+
+    parser = argparse.ArgumentParser(
+        prog="aitask_stats.sh",
+        description="Calculate and display AI task completion statistics.",
+    )
+    parser.add_argument(
+        "-d",
+        "--days",
+        type=parse_days_arg,
+        default=7,
+        help="Show daily breakdown for last N days",
+    )
+    parser.add_argument(
+        "-w",
+        "--week-start",
+        default="mon",
+        help="First day of week (e.g., mon, sun, tue). Default: Monday",
+    )
+    parser.add_argument(
+        "-v", "--verbose", action="store_true", help="Show individual task IDs in daily breakdown"
+    )
+    parser.add_argument(
+        "--csv",
+        nargs="?",
+        const="aitask_stats.csv",
+        default=None,
+        metavar="FILE",
+        help="Export raw data to CSV (default: aitask_stats.csv)",
+    )
+    parser.add_argument(
+        "--backlog-weeks",
+        type=parse_backlog_weeks_arg,
+        default=BACKLOG_WEEKS_DEFAULT,
+        metavar="N",
+        help=(
+            f"Weeks of backlog history to render (default: {BACKLOG_WEEKS_DEFAULT}, max {BACKLOG_WEEKS_MAX}). "
+            "The table widens by 7 characters per week."
+        ),
+    )
+    parser.add_argument(
+        "--csv-backlog",
+        nargs="?",
+        const="aitask_backlog.csv",
+        default=None,
+        metavar="FILE",
+        help="Export the weekly backlog series to CSV (default: aitask_backlog.csv)",
+    )
+    args = parser.parse_args(argv)
+
+    # Preflight, BEFORE collect_stats and before either handle is opened: the
+    # two writers run at the end of main(), so a collision caught there would
+    # already have destroyed the first export. Compare resolved paths, never the
+    # raw strings -- `out.csv` and `./out.csv` are different strings naming one
+    # file, and resolve() also collapses `$PWD/`, `..` segments and symlinks.
+    if args.csv is not None and args.csv_backlog is not None:
+        if Path(args.csv).resolve() == Path(args.csv_backlog).resolve():
+            parser.error(f"--csv and --csv-backlog resolve to the same file: {Path(args.csv).resolve()}")
+    return args
+
+
+def resolve_week_start(value: str) -> int:
+    value = (value or "").strip().lower()
+    if not value:
+        return 1
+
+    day_names = [
+        "monday",
+        "tuesday",
+        "wednesday",
+        "thursday",
+        "friday",
+        "saturday",
+        "sunday",
+    ]
+    matches = [idx + 1 for idx, name in enumerate(day_names) if name.startswith(value)]
+
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) == 0:
+        print(
+            f"Warning: '{value}' does not match any day of the week. Using default (Monday).",
+            file=sys.stderr,
+        )
+    else:
+        names = ", ".join(day_names[m - 1] for m in matches)
+        print(
+            f"Warning: '{value}' is ambiguous (matches: {names}). Using default (Monday).",
+            file=sys.stderr,
+        )
+    return 1
+
+
+def avg(num: int, denom: int) -> str:
+    if denom <= 0:
+        return "0.0"
+    return f"{num / float(denom):.1f}"
+
+
+def get_type_display_name(raw: str) -> str:
+    """Issue-type display name. Thin delegator; the map lives in task_category.
+
+    Delegates to ``type_display_name``, **never** to ``category_display_name``.
+    The map has no entry for `manual_verification` or `enhancement`, so they
+    render through ``raw.capitalize()`` as ``Manual_verification`` /
+    ``Enhancement`` -- which is what ``ait stats`` prints today. A kind-first
+    resolver would turn the first into ``manual verification`` and change
+    existing output.
+    """
+    return type_display_name(raw)
+
+
+#: Label column width for both backlog tables. The widest live category label
+#: (`verification failure`) is exactly this long, and `resolve_category`'s
+#: `type:` fallback applies no vocabulary clamp -- a hand-edited `issue_type`
+#: would otherwise widen one row silently. The `.20` precision below TRUNCATES,
+#: which is what makes misalignment structurally impossible (t1544_4).
+BACKLOG_LABEL_W = 20
+
+#: Upper bound for `--backlog-weeks`, derived from the 4-character week header
+#: cell: `W-99` fits, `W-100` does not.
+BACKLOG_WEEKS_MAX = 99
+
+#: Minimum numeric cell width. Cells widen past it when a value does not fit;
+#: they never truncate, because a wrong number is worse than a wide table.
+BACKLOG_MIN_CELL_W = 4
+
+def _backlog_table_row(label: str, cells: Sequence[str], cell_w: int) -> str:
+    body = "".join(f" {c:>{cell_w}} |" for c in cells)
+    return f"| {label:<{BACKLOG_LABEL_W}.{BACKLOG_LABEL_W}} |{body}"
+
+
+def _backlog_table_sep(n_cols: int, cell_w: int) -> str:
+    return "|" + "-" * (BACKLOG_LABEL_W + 2) + "|" + ("-" * (cell_w + 2) + "|") * n_cols
+
+
+def _render_backlog_exclusions(data: StatsData, out: io.StringIO, clamped_cells: int) -> None:
+    """The exclusion tally, printed on BOTH the populated and the empty path.
+
+    On the empty path it is not a footnote of a table -- it is the explanation
+    for the table's absence, and `main()`'s `has_backlog` predicate admits a repo
+    precisely because these counters are non-empty. Dropping it there would
+    capture the diagnostic without surfacing it.
+    """
+    reasons = [(r, data.backlog_excluded.get(r, 0)) for r in BACKLOG_TASK_EXCLUSION_REASONS]
+    present = [(r, n) for r, n in reasons if n]
+    if present:
+        detail = ", ".join(f"{r}: {n}" for r, n in present)
+        print(f"_Excluded from the backlog series: {sum(n for _, n in present)} task(s) ({detail})._", file=out)
+    if clamped_cells:
+        # Cells, not tasks -- never summed into the total above.
+        print(f"_Clamped negative level cells: {clamped_cells} (data-quality signal)._", file=out)
+
+
+def render_backlog_level(axis: BacklogAxis, data: StatsData, out: io.StringIO, today: date, week_start_dow: int) -> None:
+    """Weekly open-task level by category (t1544_4).
+
+    Columns run chronologically, oldest first, with `Now` (offset 0) LAST -- the
+    same layout as the net-flow section, so the two tables align column for
+    column and can be read stacked. Offset 0 is a *stock* here and is correct
+    as-of-now, which is why it carries no `*` partial marker: unlike a flow, a
+    level is not distorted by the current week being incomplete.
+    """
+    weeks = len(axis.offsets)
+    print(f"### Backlog Level (Open Tasks) - Weekly (Last {weeks} Weeks)", file=out)
+
+    if not axis.has_rows:
+        if any(data.backlog_excluded.get(r, 0) for r in BACKLOG_TASK_EXCLUSION_REASONS):
+            print("No open tasks could be placed in the backlog series.", file=out)
+        else:
+            print("No open tasks found.", file=out)
+        _render_backlog_exclusions(data, out, axis.clamped_cells)
+        print(file=out)
+        return
+
+    columns, headers = backlog_columns(axis.offsets, "Now")
+
+    def level_cells(source: Counter, key: str) -> List[str]:
+        return [str(source.get((key, o), 0)) for o in columns]
+
+    rows: List[Tuple[str, List[str]]] = []
+    for block, subtotal_label in ((axis.followup_rows, "-- follow-ups"), (axis.genuine_rows, "-- genuine")):
+        if not block:
+            # No categories in this half -- an all-zero subtotal of nothing is
+            # noise, and TOTAL OPEN still accounts for the other half.
+            continue
+        for cat in block:
+            rows.append((category_display_name(cat), level_cells(axis.levels, cat)))
+        rows.append(
+            (
+                subtotal_label,
+                [str(sum(axis.levels.get((c, o), 0) for c in block)) for o in columns],
+            )
+        )
+    rows.append(("TOTAL OPEN", level_cells(axis.total_levels, "all")))
+    rows.append(("of which parents", level_cells(axis.scope_levels, "parent")))
+    rows.append(("of which children", level_cells(axis.scope_levels, "child")))
+
+    cell_w = max(BACKLOG_MIN_CELL_W, *(len(c) for _, cells in rows for c in cells), *(len(h) for h in headers))
+    print(_backlog_table_row("Category", headers, cell_w), file=out)
+    print(_backlog_table_sep(len(columns), cell_w), file=out)
+    for label, cells in rows:
+        print(_backlog_table_row(label, cells, cell_w), file=out)
+
+    _render_backlog_exclusions(data, out, axis.clamped_cells)
+    print("_Postponed tasks count as open; Folded tasks are excluded._", file=out)
+    print(
+        "_`bug` here is net of `upstream defect` follow-ups; `### By Task Type` counts it gross._",
+        file=out,
+    )
+    print(
+        "_Backlog uses `completed_at` (falling back to `updated_at` for Done); the other sections "
+        "prefer gate-ledger stamps -- the same set of completed tasks, a small number bucketed "
+        "one week apart._",
+        file=out,
+    )
+    print(file=out)
+
+
+def render_backlog_netflow(
+    axis: BacklogAxis, data: StatsData, out: io.StringIO, today: date, week_start_dow: int
+) -> None:
+    """Weekly arrivals minus departures by category (t1544_4).
+
+    Row MEMBERSHIP is computed here rather than reused from the level table: a
+    category can have real flow inside the window and a level of zero at every
+    offset (measured live: `kind:docs_gap`, 3 arrivals and 3 departures), and an
+    all-zero-*level* test would suppress exactly the row a flow table exists to
+    show. Only the ORDERING is shared.
+
+    Columns run chronologically with the current week LAST, because offset 0 is
+    partial by construction -- on the first day of a week every category reads
+    zero, and `Now`-first would put that column in the headline position.
+    """
+    weeks = len(axis.offsets)
+    print(f"### Backlog Net Flow (Arrivals - Departures) - Weekly (Last {weeks} Weeks)", file=out)
+
+    def net(cat: str, offset: int) -> int:
+        return data.backlog_arrivals.get((cat, offset), 0) - data.backlog_departures.get((cat, offset), 0)
+
+    categories = {c for c, _ in data.backlog_arrivals} | {c for c, _ in data.backlog_departures}
+    rows_src = [
+        c
+        for c in categories
+        if any(data.backlog_arrivals.get((c, o), 0) or data.backlog_departures.get((c, o), 0) for o in axis.offsets)
+    ]
+    # Same ordering rule as the level table (follow-ups first, then current
+    # level descending, name as tie-break) over a DIFFERENT membership -- which
+    # is exactly why only the ordering is shared (t1586) and the membership
+    # predicate above stays here.
+    rows_src = order_categories(rows_src, axis.levels, followups_first=True)
+
+    if not rows_src:
+        print("No backlog arrivals or departures in this window.", file=out)
+        print(file=out)
+        return
+
+    columns, headers = backlog_columns(axis.offsets, "Now*")
+
+    rows: List[Tuple[str, List[str]]] = [
+        (category_display_name(c), [f"{net(c, o):+d}" if net(c, o) else "0" for o in columns]) for c in rows_src
+    ]
+    arrivals = [sum(data.backlog_arrivals.get((c, o), 0) for c in rows_src) for o in columns]
+    departures = [sum(data.backlog_departures.get((c, o), 0) for c in rows_src) for o in columns]
+    rows.append(("ARRIVALS", [str(n) for n in arrivals]))
+    rows.append(("DEPARTURES", [str(n) for n in departures]))
+    rows.append(("NET", [f"{a - d:+d}" if a - d else "0" for a, d in zip(arrivals, departures)]))
+
+    cell_w = max(BACKLOG_MIN_CELL_W, *(len(c) for _, cells in rows for c in cells), *(len(h) for h in headers))
+    print(_backlog_table_row("Category", headers, cell_w), file=out)
+    print(_backlog_table_sep(len(columns), cell_w), file=out)
+    for label, cells in rows:
+        print(_backlog_table_row(label, cells, cell_w), file=out)
+
+    # A flow covers a SPAN, so the marker names a range, not an "as of" instant.
+    span_start = week_start_for(today, week_start_dow)
+    span_end = min(today, week_end_for_offset(today, week_start_dow, 0))
+    print(f"_Now* covers {span_start.isoformat()}..{span_end.isoformat()} (partial week)._", file=out)
+    print(file=out)
+
+
+def render_pipeline_timing(data: StatsData, out: io.StringIO) -> None:
+    """Time-in-phase aggregate from the gate ledger (t635_20 D-3).
+
+    Spans use ledger timestamps only (no archival fallback); each row reports its
+    own sample N, which legitimately differ — e.g. current-branch tasks count
+    toward Implement but never Review→Merge (they record no merge_approved).
+    """
+    pt = data.phase_timings
+    rows = [
+        ("Implement (plan→review)", pt.implement_hours if pt else []),
+        ("Review→Merge (review→merge)", pt.review_merge_hours if pt else []),
+    ]
+    print("### Pipeline Timing (gated tasks)", file=out)
+    if not any(samples for _, samples in rows):
+        print("No gated tasks with ledger timing yet.", file=out)
+        print(file=out)
+        return
+    print("| Span                        | Median | Mean   | N    |", file=out)
+    print("|-----------------------------|--------|--------|------|", file=out)
+    for label, samples in rows:
+        if samples:
+            median = format_duration(statistics.median(samples))
+            mean = format_duration(statistics.fmean(samples))
+            n = str(len(samples))
+        else:
+            median = mean = n = "—"
+        print(f"| {label:<27} | {median:<6} | {mean:<6} | {n:<4} |", file=out)
+    print(file=out)
+
+
+def render_text_report(
+    data: StatsData,
+    days: int,
+    verbose: bool,
+    week_start_dow: int,
+    today: date,
+    backlog_weeks: int = BACKLOG_WEEKS_DEFAULT,
+) -> str:
+    out = io.StringIO()
+
+    print("## Task Completion Statistics", file=out)
+    print(file=out)
+    print(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}", file=out)
+    print(file=out)
+
+    print("### Summary", file=out)
+    print("| Metric                    | Count |", file=out)
+    print("|---------------------------|-------|", file=out)
+    print(f"| Total Tasks Completed     | {data.total_tasks:<5} |", file=out)
+    print(f"| Completed (Last 7 days)   | {data.tasks_7d:<5} |", file=out)
+    print(f"| Completed (Last 30 days)  | {data.tasks_30d:<5} |", file=out)
+    print(file=out)
+    # In-flight is a SEPARATE series (never summed into the archived totals
+    # above) — implementation done but archival held by a pending gate (t635_20).
+    inflight_n = data.inflight.count if data.inflight else 0
+    print(f"_In flight (implementation done, awaiting gates): {inflight_n}_", file=out)
+    print(file=out)
+
+    # Backlog sits directly under the summary rather than after the ~450 lines
+    # of label tables: "is the backlog growing faster than we burn it down" is
+    # the standing-state question this report could not answer before (t1544).
+    # The axis is built ONCE and shared -- see BacklogAxis for why.
+    backlog_axis = build_backlog_axis(data, backlog_week_offsets(backlog_weeks))
+    render_backlog_level(backlog_axis, data, out, today, week_start_dow)
+    render_backlog_netflow(backlog_axis, data, out, today, week_start_dow)
+
+    print(f"### Daily Completions (Last {days} Days)", file=out)
+    if verbose:
+        print("| Date       | Day | Count | Tasks |", file=out)
+        print("|------------|-----|-------|-------|", file=out)
+    else:
+        print("| Date       | Day | Count |", file=out)
+        print("|------------|-----|-------|", file=out)
+
+    for i in range(days):
+        d = today - timedelta(days=i)
+        count = data.daily_counts.get(d, 0)
+        if verbose:
+            tasks = ",".join(data.daily_tasks.get(d, []))
+            print(f"| {d.isoformat()} | {DAY_NAMES[d.isoweekday()]:<3} | {count:<5} | {tasks} |", file=out)
+        else:
+            print(f"| {d.isoformat()} | {DAY_NAMES[d.isoweekday()]:<3} | {count:<5} |", file=out)
+    print(file=out)
+
+    print("### Average Completions by Day of Week", file=out)
+    print("| Day       | This Week | Last 30d Avg | All-time Avg |", file=out)
+    print("|-----------|-----------|--------------|--------------|", file=out)
+
+    dow_occurrences_30d = Counter((today - timedelta(days=i)).isoweekday() for i in range(30))
+
+    first_date = min(data.daily_counts.keys()) if data.daily_counts else today
+    total_days = (today - first_date).days + 1
+    total_weeks = max(1, (total_days + 6) // 7)
+    current_dow = today.isoweekday()
+
+    for j in range(7):
+        dow = ((week_start_dow - 1 + j) % 7) + 1
+        this_week = data.dow_counts_thisweek.get(dow, 0)
+        count_30d = data.dow_counts_30d.get(dow, 0)
+        count_total = data.dow_counts_total.get(dow, 0)
+        occurrences = dow_occurrences_30d.get(dow, 1)
+
+        thisweek_display = str(this_week)
+        today_offset = (current_dow - week_start_dow + 7) % 7
+        day_offset = (dow - week_start_dow + 7) % 7
+        if day_offset > today_offset:
+            thisweek_display = "-"
+
+        print(
+            f"| {DAY_FULL_NAMES[dow]:<9} | {thisweek_display:<9} | {avg(count_30d, occurrences):<12} | {avg(count_total, total_weeks):<12} |",
+            file=out,
+        )
+    print(file=out)
+
+    render_pipeline_timing(data, out)
+
+    print("### Completions by Label - Weekly Trend (Last 4 Weeks)", file=out)
+    print("| Label          | Total | W-3 | W-2 | W-1 | This Week |", file=out)
+    print("|----------------|-------|-----|-----|-----|-----------|", file=out)
+
+    sorted_labels = sorted(data.all_labels, key=lambda lbl: (-data.label_counts_total.get(lbl, 0), lbl))
+    for label in sorted_labels:
+        print(
+            f"| {label:<14} | {data.label_counts_total.get(label, 0):<5} | "
+            f"{data.label_week_counts.get((label, 3), 0):<3} | {data.label_week_counts.get((label, 2), 0):<3} | "
+            f"{data.label_week_counts.get((label, 1), 0):<3} | {data.label_week_counts.get((label, 0), 0):<9} |",
+            file=out,
+        )
+    print(file=out)
+
+    print("### Label Avg by Day of Week (Last 30 Days)", file=out)
+    header_days = [DAY_NAMES[((week_start_dow - 1 + j) % 7) + 1] for j in range(7)]
+    print("| Label        | " + " | ".join(header_days) + " |", file=out)
+    print("|--------------|" + "-----|" * 7, file=out)
+
+    for label in sorted_labels:
+        cells = []
+        for j in range(7):
+            dow = ((week_start_dow - 1 + j) % 7) + 1
+            count = data.label_dow_counts_30d.get((label, dow), 0)
+            occurrences = dow_occurrences_30d.get(dow, 1)
+            cells.append(f"{avg(count, occurrences):<3}")
+        print(f"| {label:<12} | " + " | ".join(cells) + " |", file=out)
+    print(file=out)
+
+    print("### By Task Type - Weekly Trend (Last 4 Weeks)", file=out)
+    print("| Type           | Total | W-3 | W-2 | W-1 | This Week |", file=out)
+    print("|----------------|-------|-----|-----|-----|-----------|", file=out)
+
+    for t in ["parent", "child"] + get_valid_task_types():
+        total = sum(data.type_week_counts.get((t, wk), 0) for wk in range(4))
+        print(
+            f"| {get_type_display_name(t):<14} | {total:<5} | {data.type_week_counts.get((t, 3), 0):<3} | "
+            f"{data.type_week_counts.get((t, 2), 0):<3} | {data.type_week_counts.get((t, 1), 0):<3} | "
+            f"{data.type_week_counts.get((t, 0), 0):<9} |",
+            file=out,
+        )
+    print(file=out)
+
+    print("### By Issue Type per Label - Weekly Trend (Last 4 Weeks)", file=out)
+    print("| Label        | Type                | Total | W-3 | W-2 | W-1 | This Week |", file=out)
+    print("|--------------|---------------------|-------|-----|-----|-----|-----------|", file=out)
+
+    for label in sorted_labels:
+        if label == "(unlabeled)":
+            continue
+        for issue_type in get_valid_task_types():
+            total = sum(data.label_type_week_counts.get((label, issue_type, wk), 0) for wk in range(4))
+            if total == 0:
+                continue
+            print(
+                f"| {label:<12} | {get_type_display_name(issue_type):<19} | {total:<5} | "
+                f"{data.label_type_week_counts.get((label, issue_type, 3), 0):<3} | "
+                f"{data.label_type_week_counts.get((label, issue_type, 2), 0):<3} | "
+                f"{data.label_type_week_counts.get((label, issue_type, 1), 0):<3} | "
+                f"{data.label_type_week_counts.get((label, issue_type, 0), 0):<9} |",
+                file=out,
+            )
+    print(file=out)
+
+    print("### By Code Agent - Weekly Trend (Last 4 Weeks)", file=out)
+    print("| Code Agent   | Total | W-3 | W-2 | W-1 | This Week |", file=out)
+    print("|--------------|-------|-----|-----|-----|-----------|", file=out)
+
+    for codeagent in sorted_weekly_keys(data.all_codeagents, data.codeagent_week_counts, codeagent_display_name):
+        total = sum(data.codeagent_week_counts.get((codeagent, wk), 0) for wk in range(4))
+        print(
+            f"| {codeagent_display_name(codeagent):<12} | {total:<5} | "
+            f"{data.codeagent_week_counts.get((codeagent, 3), 0):<3} | "
+            f"{data.codeagent_week_counts.get((codeagent, 2), 0):<3} | "
+            f"{data.codeagent_week_counts.get((codeagent, 1), 0):<3} | "
+            f"{data.codeagent_week_counts.get((codeagent, 0), 0):<9} |",
+            file=out,
+        )
+    print(file=out)
+
+    print("### By LLM Model - Weekly Trend (Last 4 Weeks)", file=out)
+    print("| LLM Model    | Total | W-3 | W-2 | W-1 | This Week |", file=out)
+    print("|--------------|-------|-----|-----|-----|-----------|", file=out)
+
+    for model in sorted_weekly_keys(
+        data.all_models, data.model_week_counts, lambda key: data.model_display_names.get(key, "Unknown")
+    ):
+        total = sum(data.model_week_counts.get((model, wk), 0) for wk in range(4))
+        print(
+            f"| {data.model_display_names.get(model, 'Unknown'):<12} | {total:<5} | "
+            f"{data.model_week_counts.get((model, 3), 0):<3} | "
+            f"{data.model_week_counts.get((model, 2), 0):<3} | "
+            f"{data.model_week_counts.get((model, 1), 0):<3} | "
+            f"{data.model_week_counts.get((model, 0), 0):<9} |",
+            file=out,
+        )
+    print(file=out)
+
+    return out.getvalue()
+
+
+def render_verified_rankings(vdata: VerifiedRankingData) -> str:
+    """Render verified model score rankings as a text report section."""
+    if not vdata.operations:
+        return ""
+
+    out = io.StringIO()
+    print("### Verified Model Rankings\n", file=out)
+
+    for op in vdata.operations:
+        op_data = vdata.by_window.get(op, {})
+        ap = op_data.get("all_providers", {})
+        at_entries = ap.get("all_time", [])
+        if not at_entries:
+            continue
+
+        print(f"#### {op}\n", file=out)
+
+        # Build month lookup for all_providers
+        mo_entries = ap.get("month", [])
+        mo_lookup: Dict[str, VerifiedModelEntry] = {e.display_name: e for e in mo_entries}
+
+        # Main table: all_providers all_time top 5
+        print("| Model | Score | Runs | This month |", file=out)
+        print("|-------|-------|------|------------|", file=out)
+        for entry in at_entries[:5]:
+            mo = mo_lookup.get(entry.display_name)
+            mo_cell = f"{mo.score} ({mo.runs})" if mo else "-"
+            print(f"| {entry.display_name} | {entry.score} | {entry.runs} | {mo_cell} |", file=out)
+        print(file=out)
+
+        # Per-provider breakdown (only when >1 provider has data)
+        providers_with_data = [
+            p for p in sorted(op_data.keys())
+            if p != "all_providers" and op_data[p].get("all_time")
+        ]
+        if len(providers_with_data) > 1:
+            print("By provider:", file=out)
+            for prov in providers_with_data:
+                prov_display = AGENT_DISPLAY_NAMES.get(prov, prov)
+                prov_entries = op_data[prov]["all_time"][:3]
+                parts = [f"{e.display_name} {e.score} ({e.runs} runs)" for e in prov_entries]
+                print(f"  {prov_display}: {' · '.join(parts)}", file=out)
+            print(file=out)
+
+    return out.getvalue()
+
+
+def write_csv(path: Path, rows: Sequence[Sequence[str]]) -> None:
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(
+            [
+                "date",
+                "day_of_week",
+                "week_offset",
+                "task_id",
+                "labels",
+                "issue_type",
+                "task_type",
+                "implemented_with",
+                "codeagent",
+                "llm_model",
+                # Appended in lockstep with the csv_rows producer in
+                # lib/stats_data.py. `category` is empty under
+                # collect_stats(with_backlog=False), which classifies nothing.
+                "created_at",
+                "category",
+            ]
+        )
+        for row in sorted(rows, key=lambda x: x[0], reverse=True):
+            writer.writerow(row)
+
+
+def write_backlog_csv(
+    path: Path,
+    data: StatsData,
+    axis: BacklogAxis,
+    today: date,
+    week_start_dow: int,
+) -> None:
+    """Export the weekly backlog series -- the surface where it is reproducible.
+
+    Emits real categories only: the report's `-- follow-ups` / `TOTAL OPEN` rows
+    are synthetic, and mixing them in would make a naive pivot SUM() double
+    count. Zero cells ARE emitted so the grid is dense and plottable, and
+    `week_ending` is the canonical UNCLAMPED week end -- clamping it to `today`
+    would export the same calendar week under two different dates on two
+    different days, silently breaking joins.
+
+    `open[w] - open[w+1] == net[w]` holds whenever no level was clamped (`open`
+    is clamped at 0, `net` is not), for every offset except the oldest rendered
+    one (there is no cell past the horizon to subtract).
+    """
+    categories = sorted({c for c, _ in data.backlog_arrivals} | {c for c, _ in data.backlog_departures})
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["week_ending", "category", "open", "arrived", "departed", "net"])
+        # Oldest week first, so the row order is itself a stable series.
+        for offset in axis.offsets:
+            week_ending = week_end_for_offset(today, week_start_dow, offset).isoformat()
+            for category in categories:
+                arrived = data.backlog_arrivals.get((category, offset), 0)
+                departed = data.backlog_departures.get((category, offset), 0)
+                writer.writerow(
+                    [
+                        week_ending,
+                        category,
+                        axis.levels.get((category, offset), 0),
+                        arrived,
+                        departed,
+                        arrived - departed,
+                    ]
+                )
+
+
+def main(argv: Sequence[str]) -> int:
+    args = parse_args(argv)
+
+    week_start_dow = resolve_week_start(args.week_start)
+    today = date.today()
+    # The archive guard MOVED below this call (t1544_4). total_tasks counts
+    # archived tasks only, so a young repo with hundreds of open tasks and no
+    # archive -- precisely the repo that most needs a backlog report -- used to
+    # exit before rendering anything. Both archive iterators guard on .exists(),
+    # so collecting with no archive directory is safe.
+    data = collect_stats(today=today, week_start_dow=week_start_dow)
+    # Positive predicate, not `not data.backlog_arrivals`: a repo whose open
+    # tasks all lack created_at has no arrivals but a populated exclusion tally,
+    # and that tally is the actionable output.
+    has_backlog = bool(data.backlog_arrivals or data.backlog_excluded)
+
+    if not ARCHIVE_DIR.exists() and not has_backlog:
+        print(f"No archived tasks found in {ARCHIVE_DIR}")
+        return 0
+
+    if data.total_tasks == 0 and not has_backlog:
+        print("No completed tasks found.")
+        return 0
+
+    report = render_text_report(
+        data,
+        days=args.days,
+        verbose=args.verbose,
+        week_start_dow=week_start_dow,
+        today=today,
+        backlog_weeks=args.backlog_weeks,
+    )
+    print(report, end="")
+
+    vdata = load_verified_rankings(today=today)
+    if vdata.operations:
+        print(render_verified_rankings(vdata), end="")
+
+    if args.csv is not None:
+        csv_path = Path(args.csv)
+        write_csv(csv_path, data.csv_rows)
+        print(f"CSV exported to: {csv_path}")
+
+    if args.csv_backlog is not None:
+        backlog_path = Path(args.csv_backlog)
+        write_backlog_csv(
+            backlog_path,
+            data,
+            build_backlog_axis(data, backlog_week_offsets(args.backlog_weeks)),
+            today,
+            week_start_dow,
+        )
+        print(f"Backlog CSV exported to: {backlog_path}")
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

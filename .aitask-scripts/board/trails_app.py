@@ -1,0 +1,1048 @@
+"""`ait trails` — the stand-alone By-Trail TUI (t1794_6).
+
+Hosts ``TrailScreenMixin`` (board_trail_screen.py) over ``TaskManager``
+(board_task_manager.py), the trail cards / lanes / modals (board_trail_view.py)
+and the widget layer (board_widgets.py) **without importing ``aitask_board``**
+or any Kanban render path. It is the read-only trail reader: select a trail,
+walk its waves, open the entry detail and summary, refresh locally, re-check
+drift, watch the artifact, and launch ``/aitask-trail`` or ``/aitask-pick`` for
+a live member (an agent launch: the launched skill writes, this TUI never). The
+board's ``z`` view stays embedded and unchanged; the two hand off through the
+TUI switcher (``j`` → ``i`` from the board, ``j`` → ``b`` back).
+
+Tabs (t1895): this host is ``_TRAIL_TABBED``. Every trail the user explicitly
+opens keeps its own in-memory session (``TrailSession``) and gets a tab in
+``TrailTabStrip``; switching tabs re-renders from memory — no subprocess, no
+task reload, no drift re-run — and restores the tab's last focused card. ``s``
+re-scans every time — cheap once warm, because discovery is backed by an
+on-disk, content-keyed cache (lib/trail_discovery_cache.py) — and a drift,
+reload or watch result for a background tab updates only that tab and marks it
+``•``. Tabs are session-only, never persisted (the t1210_4 rule).
+
+Opening a trail by name (t1957_2): ``--trail <handle>`` opens that trail at
+boot instead of the selector, and a running instance takes later requests from
+its own pane's tmux mailbox (``launch_or_focus_trails`` in agent_launch_utils
+writes it). The App stamps its pane as a receiver only once it has recorded
+the request already sitting there — so nothing left by an earlier instance is
+replayed — polls that one pane, never clears it, and applies each new request
+id once; the latest request wins, including over one held back by a modal or
+still waiting on a rescan.
+
+Showing a task in a trail (t2211_10): ``--task <id>`` (with ``--trail``) and a
+mailbox request ``<handle> <task id>`` also focus that member's card once the
+trail is active. The task form is written only to an App that advertises it
+with ``@aitask_trails_card_focus <its pid>`` (stamped before the receiver
+stamp), because an older App refuses it as malformed. The card request is
+resumable: it survives a modal and is cancelled only by success, a reported
+outcome (not a member, card not visible, trail not loaded), a newer request,
+or the active trail changing to another one (``_trail_active`` is a property
+for exactly that).
+
+Shortcut ownership (parent plan C10): this App registers under scope
+``"board"`` and declares the SAME ``TRAIL_BINDINGS`` objects the board does —
+plus the shared ``PICK_BINDING`` (``p``, t1946) — so a
+``shortcuts.board.<action>`` override rebinds both surfaces at once.
+``M`` (wave move) and ``S`` (task-data sync) are therefore *declared* here but
+hidden and non-dispatching: ``check_action`` refuses them and none of the
+``TRAIL_ACTION_CAPABILITIES`` members exist on this class, so the mixin's own
+capability guard stops the action even from a remapped key.
+
+The four arrow rows are board rows too — identical ``(action, key,
+description)`` — because card focus is what every card-scoped key (``enter``,
+``T``) is gated on, and the trail modals rely on the App's ``nav_up`` /
+``nav_down`` to cycle their focus.
+
+Contracts (board/__init__.py): C1 — bare-name sibling imports, never
+``aitask_board``; C2 — no task directory resolved anywhere in this module
+(``main()`` takes ``--tasks-dir`` from the launcher, which applies the
+``TASK_DIR`` rule in shell); C7 — ``TRAIL_CSS`` and ``WIDGET_CSS`` are
+interpolated, never copied.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import os
+import shlex
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+# Own directory too (C1): sibling board modules are imported by bare name.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from module_shadow_guard import assert_lib_not_shadowed  # noqa: E402
+assert_lib_not_shadowed(Path(__file__).resolve().parent.parent / "lib")
+
+from rich.cells import cell_len, set_cell_size
+from textual import work
+from textual.app import App
+from textual.binding import Binding
+from textual.containers import HorizontalScroll, VerticalScroll
+from textual.css.query import NoMatches
+from textual.screen import ModalScreen, Screen
+from rich.text import Text
+from textual.widgets import DataTable, Header, Input, SelectionList, Static
+
+from agent_command_screen import build_pick_screen
+from agent_launch_utils import (
+    BOARD_TASK_ID_RE, TmuxLaunchConfig, focus_existing_agent_window,
+    launch_in_tmux, mark_trails_card_focus, mark_trails_receiver,
+    maybe_spawn_minimonitor, pane_on_gateway_server, parse_trails_focus_target,
+    read_trails_focus_request, unmark_trails_card_focus, unmark_trails_receiver,
+)
+from artifact_manifest import HANDLE_RE
+from board_task_manager import TaskManager
+from board_trail_screen import (
+    CODEAGENT_SCRIPT, PICK_BINDING, TRAIL_BINDINGS, TrailScreenMixin,
+)
+from board_trail_view import (
+    TRAIL_CSS, TrailColumn, TrailSelectScreen, TrailTaskCard,
+    trail_ref_to_local_id,
+)
+from board_widgets import WIDGET_CSS, TaskCard
+from multirow_footer import MultiRowFooter
+from shortcuts_mixin import ShortcutsMixin
+from topic_semantics import task_own_id
+from tui_switcher import TuiSwitcherMixin, TuiSwitcherOverlay
+
+
+class TrailsScreen(Screen):
+    """Default screen with Textual's auto-focus off (the board's `BoardScreen`
+    idiom, t1491) and a resume hook that re-anchors focus on a card.
+
+    Auto-focus would hand the keyboard to the first focusable widget — a scroll
+    container — before `on_mount` runs. And when a modal is dismissed Textual
+    restores whatever the base screen had focused, which after the selector on
+    boot is nothing, or a `TrailColumn` if the lanes were rebuilt underneath the
+    dialog. Either way no card is focused, and every card-gated key is dead
+    until the user clicks. The resume hook runs the same rescue `apply_filter`
+    performs after a render, so focus lands on a card by itself.
+    """
+
+    AUTO_FOCUS = ""
+
+    def on_screen_resume(self) -> None:
+        self.app.call_after_refresh(self.app.apply_filter)
+        # A trail request held back by the modal that just closed.
+        self.app.call_after_refresh(self.app._drain_trail_focus)
+
+
+#: Tab keys — trails-only rows under the shared `board` scope (C10): the board
+#: declares none of these actions and binds none of these keys, so a rebind
+#: here changes nothing there. The digits stay out of the footer; the tab
+#: labels carry the index, which is the discoverability surface for them.
+TRAIL_TAB_BINDINGS = [
+    Binding("[", "trail_tab_prev", "Prev Tab"),
+    Binding("]", "trail_tab_next", "Next Tab"),
+    Binding("ctrl+w", "trail_tab_close", "Close Tab"),
+    *(Binding(str(n), f"trail_tab_{n}", f"Tab {n}", show=False)
+      for n in range(1, 10)),
+]
+
+#: Widest a tab title may render before it is elided (cells).
+TAB_TITLE_CELLS = 24
+
+#: Seconds between reads of this App's own pane mailbox (t1957_2).
+TRAIL_FOCUS_POLL_SECONDS = 1.0
+
+
+def trail_tab_label(index: int, session) -> str:
+    """`<index> <title> <glyph>[ •]` for one open trail.
+
+    The glyph is the tab's freshness: ✗ the trail failed to load, ⟳ the drift
+    check is pending, ✓ current, ⚠ stale, ? drift unavailable. `•` marks a
+    background tab whose state changed since it was last shown."""
+    title = str((session.doc or {}).get("title") or session.handle)
+    if cell_len(title) > TAB_TITLE_CELLS:
+        title = set_cell_size(title, TAB_TITLE_CELLS - 1) + "…"
+    if session.error or session.doc is None:
+        glyph = "✗"
+    elif session.drift is None:
+        glyph = "⟳"
+    elif session.drift[0] == "CURRENT":
+        glyph = "✓"
+    elif session.drift[0] == "STALE":
+        glyph = "⚠"
+    else:
+        glyph = "?"
+    dot = " •" if session.updated else ""
+    return f"{index} {title} {glyph}{dot}"
+
+
+class TrailTabStrip(Static):
+    """One row of tabs, rendered synchronously from the App's sessions.
+
+    Deliberately not Textual's ``Tabs``: its add / remove are asynchronous and
+    it posts its own activation messages (auto-activating a first tab,
+    re-activating a neighbour on removal), which would make the widget a second
+    source of truth racing the session model. This strip only draws; a click is
+    mapped through the cell spans recorded at render time."""
+
+    DEFAULT_CSS = """
+    TrailTabStrip {
+        height: 1;
+        width: 100%;
+        background: $panel;
+        text-wrap: nowrap;
+        text-overflow: ellipsis;
+    }
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__("", markup=False, **kwargs)
+        self.can_focus = False
+        self._spans: list[tuple[int, int, str]] = []
+
+    def set_tabs(self, rows: list[tuple[str, str, bool]]) -> None:
+        """``rows``: ``(handle, label, is_active)`` in tab order."""
+        text = Text()
+        spans = []
+        for handle, label, active in rows:
+            if text.cell_len:
+                text.append("│", style="dim")
+            start = text.cell_len
+            text.append(f" {label} ",
+                        style="bold reverse" if active else "")
+            spans.append((start, text.cell_len, handle))
+        self._spans = spans
+        self.update(text)
+        self.display = bool(rows)
+
+    def handle_at(self, x: int) -> str | None:
+        return next((h for start, end, h in self._spans if start <= x < end),
+                    None)
+
+    def on_click(self, event) -> None:
+        handle = self.handle_at(event.x)
+        if handle is not None:
+            event.stop()
+            self.app._select_trail_tab(handle)
+
+
+class TrailsApp(TuiSwitcherMixin, ShortcutsMixin, TrailScreenMixin, App):
+    """The stand-alone trail reader. A `TrailHost` (see board_trail_screen.py)."""
+
+    _shortcuts_scope = "board"
+    # `?` must not execute the board just to list the Kanban rows this App
+    # never dispatches (C1: nothing here loads aitask_board — pressing a key
+    # included). The editor therefore lists the `board` rows THIS App declares
+    # (the trail keys, navigation, quit) plus the shared scopes; a Kanban-only
+    # row is edited from `ait board` or Settings → Shortcuts, and because the
+    # trail Binding objects are shared, an edit made anywhere reaches both.
+    # The board's task editor (`board.detail`, board_detail_screen.py) is
+    # excluded for the same reason: this App never pushes it.
+    _shortcuts_exclude_sources = ("aitask_board", "board_detail_screen")
+    TITLE = "aitasks trails"
+    # Multi-trail sessions, one tab each, and a cache-first selector (t1895).
+    _TRAIL_TABBED = True
+
+    CSS = WIDGET_CSS + """
+    Screen { align: center middle; }
+    #board_container { height: 1fr; }
+    .trail-empty { padding: 1 2; color: $text-muted; }
+    .trail-error { padding: 1 2; color: $error; }
+    """ + TRAIL_CSS
+
+    BINDINGS = [
+        *TuiSwitcherMixin.SWITCHER_BINDINGS,
+        *ShortcutsMixin.SHORTCUTS_MIXIN_BINDINGS,
+        Binding("q", "quit", "Quit"),
+        # Card navigation — the board's rows verbatim (same action, key and
+        # description), so the `(board, nav_*)` registry defaults are unchanged.
+        Binding("up", "nav_up", "Up", show=False, priority=True),
+        Binding("down", "nav_down", "Down", show=False, priority=True),
+        Binding("left", "nav_left", "Left", show=False, priority=True),
+        Binding("right", "nav_right", "Right", show=False, priority=True),
+        # The shared trail keys — the SAME objects the board declares (C10).
+        *TRAIL_BINDINGS,
+        # `p` — the board's own pick row, the same object (C10, t1946).
+        PICK_BINDING,
+        # Tab keys — this App's own rows (see TRAIL_TAB_BINDINGS).
+        *TRAIL_TAB_BINDINGS,
+    ]
+
+    # --- The active trail is a property (t2211_10) ---------------------------
+    #
+    # A pending card request ("focus t<id> in trail <h>") is cancelled when the
+    # user moves to another trail. Every route that changes the active trail --
+    # tab clicks, `[` / `]`, the number keys, `ctrl+w` (close), the
+    # `active_trail_handle` setter and a fresh activation -- assigns
+    # `_trail_active`, while only some go through `_activate_trail`. So the
+    # cancellation lives on the assignment itself: one rule for every route.
+
+    @property
+    def _trail_active(self):
+        return self.__dict__.get("_trail_active_slot")
+
+    @_trail_active.setter
+    def _trail_active(self, session) -> None:
+        pending = self.__dict__.get("_pending_card")
+        if pending is not None:
+            handle = session.handle if session is not None else None
+            if handle != pending[1]:
+                self.__dict__["_pending_card"] = None
+        self.__dict__["_trail_active_slot"] = session
+
+    def __init__(self, *, tasks_dir: Path, metadata_file: Path,
+                 gates_registry_file: Path, initial_trail: str | None = None,
+                 initial_task: str | None = None,
+                 focus_pane: str | None = None, focus_tmux_env: str = ""):
+        """``initial_trail`` opens that trail at boot instead of the selector,
+        and ``initial_task`` (a bare task id) then focuses that member's card.
+        ``focus_pane`` / ``focus_tmux_env`` are this process's ``$TMUX_PANE`` /
+        ``$TMUX``, passed in by ``main()`` (never read here, so a test App
+        cannot stamp the pane of the terminal running the suite); without a
+        pane there is no mailbox."""
+        # A card request waiting for its trail and card (t2211_10):
+        # ``(seq, handle, task)`` or None. Set before the mixin's state init,
+        # which assigns `_trail_active` (the property above reads this).
+        self.__dict__["_pending_card"] = None
+        super().__init__()
+        self.current_tui_name = "trails"
+        self._tasks_dir = Path(tasks_dir)
+        # The mixin keys every branch on this; the stand-alone is By-Trail only.
+        self.base_filter = "bytrail"
+        # Read-only host: never creates the metadata directory nor first-ships
+        # board_config.json (persist_on_init=False), and calls no manager writer.
+        self.manager = TaskManager(
+            tasks_dir=self._tasks_dir, metadata_file=Path(metadata_file),
+            gates_registry_file=Path(gates_registry_file),
+            on_warning=self.notify, persist_on_init=False)
+        self._init_trail_state()
+        # Lane-render epoch: bumped on every re-mount. A deferred refocus is
+        # owned by the render that queued it and drops itself once a newer
+        # render exists (t1895: A→B→A switches would otherwise let a restore
+        # queued for A's first visit land on A's second).
+        self._render_seq = 0
+        # --- Open-by-name: `--trail` and the pane mailbox (t1957_2) ---
+        self._initial_trail = initial_trail
+        self._initial_task = initial_task or None
+        self._focus_pane = focus_pane or None
+        self._focus_tmux_env = focus_tmux_env or ""
+        # Id of the last mailbox request seen (the boot baseline included).
+        self._seen_focus_id: str | None = None
+        self._focus_stamped = False      # our receiver stamp is on the pane
+        self._focus_timer = None
+        self._focus_poll_busy = False    # one mailbox read in flight at most
+        # Every accepted request draws a fresh number; an older one — held by
+        # a modal, or waiting on its rescan — is dropped once it is not current.
+        self._focus_delivery_seq = 0
+        #: ``(seq, handle, task | None)`` held by the selector or a modal.
+        self._pending_trail_focus: tuple[int, str, str | None] | None = None
+
+    # --- Composition -------------------------------------------------------
+
+    def compose(self):
+        header = Header()
+        header.can_focus = False
+        yield header
+        tabs = TrailTabStrip(id="trail_tabs")
+        tabs.display = False
+        yield tabs
+        container = HorizontalScroll(id="board_container")
+        container.can_focus = False
+        yield container
+        # Summary pane: same shape and rules as the board's (t1505_1) — a
+        # fixed-height FLOW child, never `dock: bottom`; hidden until
+        # `_refresh_trail_summary` has text; markup off for free-form prose.
+        summary = VerticalScroll(
+            Static("", id="trail_summary_body", markup=False),
+            id="trail_summary")
+        summary.display = False
+        summary.can_focus = False
+        yield summary
+        footer = MultiRowFooter(hint_action="open_shortcuts_editor")
+        footer.can_focus = False
+        yield footer
+
+    def get_default_screen(self) -> Screen:
+        return TrailsScreen()
+
+    def on_mount(self):
+        self.refresh_board()
+        if self._initial_trail:
+            self.call_after_refresh(self._deliver_trail_focus,
+                                    self._initial_trail, self._initial_task)
+        else:
+            # Boot straight into the selection flow, as the board does on `z`.
+            self.call_after_refresh(self._open_trail_select)
+        if self._focus_pane:
+            self._trail_focus_register_worker(self._focus_pane,
+                                              self._focus_tmux_env)
+
+    def on_unmount(self):
+        if self._focus_timer is not None:
+            self._focus_timer.stop()
+            self._focus_timer = None
+        if self._focus_stamped and self._focus_pane:
+            # Best effort; a stamp left by a crash is ignored by writers once
+            # its pid is gone. The request option itself is never unset. The
+            # receiver stamp goes first, so no writer targets the pane while
+            # it still advertises the task form.
+            unmark_trails_receiver(self._focus_pane)
+            unmark_trails_card_focus(self._focus_pane)
+            self._focus_stamped = False
+
+    # --- Open-by-name: `--trail` and the pane mailbox (t1957_2) -----------
+
+    @work(thread=True, group="trails_focus")
+    def _trail_focus_register_worker(self, pane: str, tmux_env: str):
+        """Become a receiver: verify the pane, read the baseline, THEN stamp.
+
+        The pane must be the gateway server's (a ``$TMUX_PANE`` from another
+        tmux server names some unrelated pane there). The baseline read comes
+        before the stamp because writers only target stamped panes: anything
+        written after the stamp is newer than the baseline, and anything
+        already there — a request left by an earlier instance in this pane —
+        is recorded as seen, never replayed. A failed read stops here (fail
+        closed): with no baseline there is no telling a leftover from new."""
+        if not pane_on_gateway_server(pane, tmux_env):
+            return
+        baseline = read_trails_focus_request(pane)
+        if baseline is None:
+            return
+        # The task-form capability BEFORE the receiver stamp (t2211_10): a
+        # writer that finds the stamp then also finds the capability. A failed
+        # capability write leaves an ordinary receiver (bare handles only).
+        mark_trails_card_focus(pane)
+        stamped = mark_trails_receiver(pane)
+        self.call_from_thread(self._on_trail_focus_registered, baseline,
+                              stamped)
+
+    def _on_trail_focus_registered(self, baseline: str, stamped: bool):
+        parsed = parse_trails_focus_target(baseline)
+        self._seen_focus_id = parsed[0] if parsed else None
+        if not stamped:
+            return          # no writer targets an unstamped pane: nothing to poll
+        self._focus_stamped = True
+        self._focus_timer = self.set_interval(TRAIL_FOCUS_POLL_SECONDS,
+                                              self._poll_trail_focus)
+
+    def _poll_trail_focus(self):
+        # Skip while a read is in flight, so reads stay strictly sequential and
+        # a slow older read can never land after a newer one.
+        if self._focus_poll_busy or not self._focus_stamped:
+            return
+        self._focus_poll_busy = True
+        self._trail_focus_poll_worker(self._focus_pane)
+
+    @work(thread=True, group="trails_focus")
+    def _trail_focus_poll_worker(self, pane: str):
+        """Read this App's own pane mailbox — read-only, never another pane's."""
+        self.call_from_thread(self._on_trail_focus_value,
+                              read_trails_focus_request(pane))
+
+    def _on_trail_focus_value(self, value: str | None):
+        self._focus_poll_busy = False
+        parsed = parse_trails_focus_target(value)
+        if parsed is None:
+            return          # read failed, or no request
+        request_id, target = parsed
+        if request_id == self._seen_focus_id:
+            return
+        self._seen_focus_id = request_id
+        if target is None:
+            # Untrusted input: recorded as seen (never retried), not echoed.
+            self.notify("Ignored a malformed trail request", severity="warning")
+            return
+        self._deliver_trail_focus(*target)
+
+    def _deliver_trail_focus(self, handle: str, task: str | None = None):
+        """Accept a request to open ``handle`` (and focus member ``task``'s
+        card); it supersedes every older one."""
+        self._focus_delivery_seq += 1
+        self._pending_trail_focus = None
+        self._pending_card = None
+        self._apply_trail_focus(self._focus_delivery_seq, handle, task)
+
+    def _apply_trail_focus(self, seq: int, handle: str, task: str | None = None,
+                           *, announce: bool = True):
+        if seq != self._focus_delivery_seq:
+            return          # a newer request was accepted since
+        if isinstance(self.screen, TrailSelectScreen):
+            # The selector is a question the request answers: close it, and the
+            # base screen's resume hook applies the request.
+            self._pending_trail_focus = (seq, handle, task)
+            self.screen.dismiss(None)
+            return
+        if self._modal_is_active():
+            self._pending_trail_focus = (seq, handle, task)
+            if announce:
+                self.notify(f"Trail {handle} opens when this dialog closes")
+            return
+        self._pending_trail_focus = None
+        # The card request rides along until its trail is active and the card
+        # is focused or reported (see `_focus_trail_member`).
+        self._pending_card = (seq, handle, task) if task else None
+        self._open_trail_by_handle(
+            handle, is_current=lambda: seq == self._focus_delivery_seq)
+
+    def _drain_trail_focus(self):
+        """`TrailsScreen.on_screen_resume`: apply a request a modal held back,
+        else resume a card request a modal interrupted (t2211_10)."""
+        pending = self._pending_trail_focus
+        if pending is not None:
+            self._apply_trail_focus(*pending, announce=False)
+            return
+        card = self._pending_card
+        if card is not None and card[1] == self.active_trail_handle:
+            self._schedule_card_focus()
+
+    # --- Focus a member's card (t2211_10) ----------------------------------
+    #
+    # `_pending_card` is RESUMABLE state, not a one-shot callback: it is
+    # cleared only when the card is focused, an outcome is reported, a newer
+    # request supersedes it, or the active trail changes to another handle
+    # (the `_trail_active` setter). A modal never consumes it -- the resume
+    # hook above re-schedules it however long the modal stays open.
+
+    def _activate_trail(self, handle: str):
+        super()._activate_trail(handle)
+        card = self._pending_card
+        if (card is not None and card[1] == handle
+                and card[0] == self._focus_delivery_seq):
+            self._schedule_card_focus()
+
+    def _schedule_card_focus(self) -> None:
+        card = self._pending_card
+        if card is not None:
+            self.call_after_refresh(self._focus_trail_member, card[0],
+                                    self._MOUNT_HOPS)
+
+    def _trail_member_ids(self) -> set:
+        """Bare local ids of the active trail's members (canonical refs of
+        this project; the board's `trail_ref_to_local_id` rule)."""
+        local = self._get_local_project()
+        ids = set()
+        for wave in (self._trail_doc or {}).get("waves") or []:
+            for entry in wave.get("entries") or []:
+                local_id = trail_ref_to_local_id(entry.get("task"), local)
+                if local_id:
+                    ids.add(local_id)
+        return ids
+
+    def _card_of_member(self, task: str):
+        local = self._get_local_project()
+        for card in self.query(TaskCard):
+            entry = getattr(card, "trail_entry", None)
+            if (entry is not None and card.is_attached
+                    and trail_ref_to_local_id(entry.get("task"), local) == task):
+                return card
+        return None
+
+    def _focus_trail_member(self, seq: int, hops: int) -> None:
+        card_req = self._pending_card
+        if card_req is None or card_req[0] != seq:
+            return              # done, reported, superseded or cancelled
+        if seq != self._focus_delivery_seq:
+            self._pending_card = None
+            return
+        if self._modal_is_active():
+            return              # kept: the resume hook re-schedules it
+        _seq, handle, task = card_req
+        if self.active_trail_handle != handle:
+            # The `_trail_active` setter clears on every move away; an attempt
+            # is only scheduled while `handle` is active, so this is the user
+            # having left. Defensive clear.
+            self._pending_card = None
+            return
+        if self._trail_error or self._trail_doc is None:
+            self._pending_card = None
+            self.notify(f"t{task} not shown: trail {handle} did not load",
+                        severity="warning", markup=False)
+            return
+        if task not in self._trail_member_ids():
+            self._pending_card = None
+            self.notify(f"t{task} is not in trail {handle} (any more) — trail opened",
+                        severity="warning", markup=False)
+            return
+        card = self._card_of_member(task)
+        if card is not None and self._focused_card() is card:
+            # Verified: the target card of the CURRENT render holds the focus.
+            # It may have held it all along with its column scrolled away (a
+            # request for the card the user is on), so reveal it here too.
+            self._pending_card = None
+            card.scroll_visible(animate=False)
+            session = self._trail_active
+            if session is not None:
+                session.focus_filename = card.task_data.filename
+                session.focus_col_id = card.column_id
+            return
+        if card is None:
+            if hops > 0:
+                self.call_after_refresh(self._focus_trail_member, seq, hops - 1)
+                return
+            self._pending_card = None
+            self.notify(f"t{task} is in trail {handle} but its card is not visible",
+                        severity="warning", markup=False)
+            return
+        # `focus()` lands on a later refresh, and right after an activation the
+        # card found may still belong to the outgoing render (removal is
+        # asynchronous; the startup rescue then focuses the first card). So
+        # focusing is not success: the next attempt VERIFIES and re-focuses
+        # while the budget lasts.
+        card.focus()
+        card.scroll_visible(animate=False)
+        if hops > 0:
+            self.call_after_refresh(self._focus_trail_member, seq, hops - 1)
+        else:
+            self._pending_card = None       # last attempt: best effort, unverified
+
+    def on_resize(self, event):
+        # The banner is budgeted against the header width (t1278).
+        self._refresh_subtitle()
+
+    # --- TrailHost surface -------------------------------------------------
+
+    @property
+    def tasks_dir(self) -> Path:
+        return self._tasks_dir
+
+    def refresh_board(self, refocus_filename: str = "", *args, **kwargs):
+        """Re-mount the lanes from the manager's in-memory state."""
+        refocus_col_id = self._get_focused_col_id() or ""
+        self._render_seq += 1
+        container = self.query_one("#board_container")
+        container.remove_children()
+        self._render_bytrail(container)
+        self.call_after_refresh(self.apply_filter)
+        self._queue_refocus(refocus_filename, refocus_col_id)
+
+    #: Refresh hops a deferred refocus / rescue waits for the lanes' cards to
+    #: be mounted before giving up (the board's `_SCROLL_LAYOUT_HOPS` idiom).
+    _MOUNT_HOPS = 5
+
+    def apply_filter(self, cols=None, hops: int = _MOUNT_HOPS) -> None:
+        """No filters here — this is the card-focus rescue.
+
+        Runs after every render and on every base-screen resume. The predicate
+        is "no ATTACHED `TaskCard` is focused", NOT "nothing is focused": a
+        `TrailColumn` is a focusable `VerticalScroll`, so Textual can leave one
+        of them holding the keyboard after a modal closes; and a lane re-render
+        (the drift callback's `_rerender_trail`) can leave `screen.focused`
+        pointing at a card it just REMOVED — a detached widget whose binding
+        chain no longer reaches the App, so every key is dead until something
+        re-anchors focus. Never touches focus while a modal is up. Re-queues
+        itself, bounded, while the re-mounted cards are not queryable yet.
+        """
+        if self._modal_is_active() or self._focused_card() is not None:
+            return
+        target = self._first_card()
+        if target is not None:
+            target.focus()
+        elif hops > 0 and self.active_trail_handle:
+            self.call_after_refresh(self.apply_filter, None, hops - 1)
+
+    def _focused_card(self):
+        """The focused card, or None — a card that has been removed from the
+        DOM does not count, whatever `screen.focused` still says."""
+        focused = self.screen.focused
+        if isinstance(focused, TaskCard) and focused.is_attached:
+            return focused
+        return None
+
+    def _modal_is_active(self) -> bool:
+        return isinstance(self.screen, ModalScreen)
+
+    def _get_focused_col_id(self):
+        focused = self._focused_card()
+        return focused.column_id if focused else None
+
+    def _rerender_trail(self, refocus_filename: str = ""):
+        self._render_seq += 1
+        super()._rerender_trail(refocus_filename)
+
+    def _queue_refocus(self, refocus_filename: str = "",
+                       refocus_col_id: str = "") -> None:
+        if refocus_filename or refocus_col_id:
+            self.call_after_refresh(self._refocus, refocus_filename,
+                                    refocus_col_id, self._MOUNT_HOPS,
+                                    self._render_seq)
+
+    def _refocus(self, filename: str, col_id: str,
+                 hops: int = _MOUNT_HOPS, seq: int | None = None) -> None:
+        if seq is not None and seq != self._render_seq:
+            # A newer render owns focus now; this restore names a card of a
+            # render that is gone (possibly another tab sharing the member).
+            return
+        cards = list(self.query(TaskCard))
+        if not cards and hops > 0:
+            # The re-render's mount has not landed yet (it is asynchronous);
+            # come back after the next refresh rather than refocus nothing.
+            self.call_after_refresh(self._refocus, filename, col_id, hops - 1,
+                                    seq)
+            return
+        for card in cards:
+            if filename and card.task_data.filename == filename:
+                card.focus()
+                return
+        if col_id:
+            in_col = [c for c in cards if c.column_id == col_id]
+            if in_col:
+                in_col[0].focus()
+
+    def _banner_budget(self) -> int:
+        """Cells available to `sub_title` on the header row (0 = unknown);
+        the board's rule, read off the live HeaderTitle."""
+        try:
+            usable = self.query_one("HeaderTitle").content_region.width
+        except Exception:
+            return 0
+        return max(0, usable - cell_len(str(self.title)) - 3)
+
+    def _after_dialog_command(self, refocus_filename: str = "") -> None:
+        """`run_dialog_command` suspend-path hook: reload tasks and re-render."""
+        self._load_trail_tasks()
+        self.refresh_board(refocus_filename=refocus_filename)
+
+    @contextlib.contextmanager
+    def _suspend_sync_guard(self, what: str):
+        """`run_dialog_command` suspend-path guard: always proceed.
+
+        This app never runs a task-data sync (its `S` is refused by the
+        capability guard), so there is nothing for a suspended launch to
+        overlap (t1955).
+        """
+        yield True
+
+    def _live_member_id(self) -> str:
+        """The focused live local member's own id, or "" — a ghost (archived /
+        cross-repo / deleted) card, or no focus, has none. The one rule `T` and
+        `p` launch for."""
+        focused = self._focused_card()
+        if isinstance(focused, TrailTaskCard) and not focused.is_ghost:
+            return task_own_id(focused.task_data) or ""
+        return ""
+
+    def _trail_task_target(self) -> str | None:
+        """`T` policy (C10): the focused live local member's own id, else a
+        visible refusal and no launch. Silent only under a modal."""
+        if self._modal_is_active():
+            return None
+        target = self._live_member_id()
+        if not target:
+            self.notify("T needs a live local task under focus",
+                        severity="warning")
+            return None
+        return target
+
+    def action_pick_task(self):
+        """`p` (t1946): open the board's `/aitask-pick <N>` launch dialog for
+        the focused live member, or switch to its running agent window.
+
+        Hidden by `check_action` on a ghost card or with nothing focused; a
+        remapped key or the command palette can still reach it, so the refusal
+        is visible here too (silent only under a modal). The TUI writes nothing:
+        the launched skill claims the task after its own confirmations. The
+        result policy is this host's — `run` goes through `run_dialog_command`
+        (whose `_after_dialog_command` reloads), a successful tmux launch
+        re-renders, and a cancel changes nothing."""
+        if self._modal_is_active():
+            return
+        target = self._live_member_id()
+        if not target:
+            self.notify("Pick needs a live local task under focus",
+                        severity="warning")
+            return
+        filename = self._focused_card().task_data.filename
+        root = Path(".")
+        if focus_existing_agent_window(target, root):
+            self.notify(f"Switched to existing agent window for t{target}")
+            return
+        screen = build_pick_screen(root, target)
+        if screen is None:
+            # The `T` fallback's shape: still a real agent launch, no dialog.
+            self.notify("Could not resolve agent command — launching directly")
+            self.run_dialog_command(
+                shlex.join([str(CODEAGENT_SCRIPT), "invoke", "pick", target]),
+                refocus_filename=filename)
+            return
+
+        def on_pick_result(result):
+            if result == "run":
+                self.run_dialog_command(screen.full_command,
+                                        refocus_filename=filename)
+            elif isinstance(result, TmuxLaunchConfig):
+                _pid, err = launch_in_tmux(screen.full_command, result)
+                if err:
+                    self.notify(err, severity="error")
+                    return
+                if result.new_window:
+                    maybe_spawn_minimonitor(result.session, result.window)
+                self.refresh_board(refocus_filename=filename)
+
+        self.push_screen(screen, on_pick_result)
+
+    def _refresh_subtitle(self):
+        """No active trail → say so; the mixin's fallback prints the board's
+        `Auto-refresh: …`, which this App has no timer for. The tab strip is
+        repainted with it, so the active tab's glyph moves with the banner."""
+        self._refresh_trail_tabs()
+        if self.active_trail_handle:
+            super()._refresh_subtitle()
+            return
+        self._refresh_trail_summary()
+        self.sub_title = "no trail selected — press s"
+
+    # --- Tabs (t1895) -----------------------------------------------------
+
+    def _refresh_trail_tabs(self) -> None:
+        try:
+            strip = self.query_one("#trail_tabs", TrailTabStrip)
+        except NoMatches:
+            return          # before the first compose
+        active = self._trail_active
+        strip.set_tabs([
+            (s.handle, trail_tab_label(i, s), s is active)
+            for i, s in enumerate(self._trail_sessions.values(), start=1)])
+
+    def _select_trail_tab(self, handle: str) -> None:
+        """Click path: switch to ``handle``'s tab."""
+        if self._modal_is_active():
+            return
+        self._switch_trail_session(handle)
+
+    def _step_trail_tab(self, step: int) -> None:
+        handles = list(self._trail_sessions)
+        if self._modal_is_active() or len(handles) < 2:
+            return
+        idx = handles.index(self.active_trail_handle) if (
+            self.active_trail_handle in handles) else 0
+        self._switch_trail_session(handles[(idx + step) % len(handles)])
+
+    def _goto_trail_tab(self, n: int) -> None:
+        handles = list(self._trail_sessions)
+        if self._modal_is_active() or not 1 <= n <= len(handles):
+            return
+        self._switch_trail_session(handles[n - 1])
+
+    def action_trail_tab_prev(self):
+        self._step_trail_tab(-1)
+
+    def action_trail_tab_next(self):
+        self._step_trail_tab(1)
+
+    def action_trail_tab_close(self):
+        if self._modal_is_active() or not self.active_trail_handle:
+            return
+        self._close_trail_session(self.active_trail_handle)
+
+    def action_trail_tab_1(self):
+        self._goto_trail_tab(1)
+
+    def action_trail_tab_2(self):
+        self._goto_trail_tab(2)
+
+    def action_trail_tab_3(self):
+        self._goto_trail_tab(3)
+
+    def action_trail_tab_4(self):
+        self._goto_trail_tab(4)
+
+    def action_trail_tab_5(self):
+        self._goto_trail_tab(5)
+
+    def action_trail_tab_6(self):
+        self._goto_trail_tab(6)
+
+    def action_trail_tab_7(self):
+        self._goto_trail_tab(7)
+
+    def action_trail_tab_8(self):
+        self._goto_trail_tab(8)
+
+    def action_trail_tab_9(self):
+        self._goto_trail_tab(9)
+
+    # --- Widget hooks reached through `self.app` ---------------------------
+
+    def toggle_column_collapse(self, col_id: str) -> None:
+        """Wave lanes do not collapse; the header button is inert here."""
+
+    def action_view_details(self):
+        focused = self._focused_card()
+        if focused is None:
+            return
+        self._open_trail_entry_detail(focused)
+
+    # --- Card navigation ---------------------------------------------------
+
+    def _columns(self) -> list:
+        return list(self.query(TrailColumn))
+
+    def _column_cards(self, col_id: str) -> list:
+        return [c for c in self.query(TaskCard) if c.column_id == col_id]
+
+    def _first_card(self):
+        for col in self._columns():
+            cards = self._column_cards(col.col_id)
+            if cards:
+                return cards[0]
+        return None
+
+    def _nav_vertical(self, step: int) -> None:
+        if self._modal_is_active():
+            if step < 0:
+                self.screen.focus_previous()
+            else:
+                self.screen.focus_next()
+            return
+        focused = self._focused_card()
+        if focused is None:
+            self.apply_filter()
+            return
+        cards = self._column_cards(focused.column_id)
+        idx = next((i for i, c in enumerate(cards) if c is focused), -1)
+        if 0 <= idx + step < len(cards):
+            cards[idx + step].focus()
+
+    def _nav_lateral(self, direction: int) -> None:
+        if self._modal_is_active():
+            return
+        focused = self._focused_card()
+        if focused is None:
+            self.apply_filter()
+            return
+        cols = [c.col_id for c in self._columns()]
+        if focused.column_id not in cols:
+            return
+        old_cards = self._column_cards(focused.column_id)
+        pos = next((i for i, c in enumerate(old_cards) if c is focused), 0)
+        idx = cols.index(focused.column_id) + direction
+        while 0 <= idx < len(cols):
+            cards = self._column_cards(cols[idx])
+            if cards:
+                cards[min(pos, len(cards) - 1)].focus()
+                return
+            idx += direction
+
+    def action_nav_up(self):
+        self._nav_vertical(-1)
+
+    def action_nav_down(self):
+        self._nav_vertical(1)
+
+    def action_nav_left(self):
+        self._nav_lateral(-1)
+
+    def action_nav_right(self):
+        self._nav_lateral(1)
+
+    # --- Footer / dispatch gating ------------------------------------------
+
+    def check_action(self, action: str, parameters) -> bool | None:
+        # Modal widgets that own their arrow keys (the board's rules).
+        if action in ("nav_up", "nav_down", "nav_left", "nav_right"):
+            if isinstance(self.screen, TuiSwitcherOverlay):
+                return False
+            # The task-description viewer the trail detail opens (t2111) owns
+            # its arrows (minimap rows, content scroll). Type-name check, as on
+            # the board, to keep section_viewer a lazy import.
+            if type(self.screen).__name__ == "SectionViewerScreen":
+                return False
+            if isinstance(self.app.focused, (Input, SelectionList, DataTable)):
+                return False
+            if action in ("nav_left", "nav_right") and len(self.screen_stack) > 1:
+                return False
+            if action in ("nav_up", "nav_down"):
+                from textual.widgets._select import SelectOverlay
+                if isinstance(self.app.focused, SelectOverlay):
+                    return False
+            return True
+        if action.startswith("trail_tab_"):
+            tabs = len(self._trail_sessions)
+            if action in ("trail_tab_prev", "trail_tab_next"):
+                return tabs >= 2
+            if action == "trail_tab_close":
+                return tabs >= 1
+            suffix = action[len("trail_tab_"):]
+            return suffix.isdigit() and int(suffix) <= tabs
+        if action in ("trail_move_wave", "trail_sync"):
+            # Declared for shortcut ownership (C10), never live here: the
+            # board-only machinery they reach does not exist in this App.
+            return False
+        if action == "toggle_children":
+            # No such binding and no children to expand; the base
+            # TaskCard.on_click consults this gate (t2089).
+            return False
+        if action in ("trail_refresh_local", "trail_refresh_drift",
+                      "trail_refresh_agent"):
+            if not self.active_trail_handle:
+                return False
+            if action == "trail_refresh_agent" and self._trail_launch_pending:
+                return False
+        elif action == "trail_summary_expand":
+            from board_trail_view import trail_summary_text
+            if not trail_summary_text(self._trail_doc):
+                return False
+        elif action == "trail_linked":
+            # A search needs a loaded trail's members (t1957_4).
+            if not self._trail_link_ready():
+                return False
+        elif action in ("trail_task", "view_details"):
+            if not self._focused_card():
+                return False
+        elif action == "pick_task":
+            # Live local members only (t1946): hidden on a ghost and unfocused.
+            if not self._live_member_id():
+                return False
+        return True
+
+
+def main(argv: list[str] | None = None) -> None:
+    """Launcher entry point. The task directory arrives as an ARGUMENT
+    (`aitask_trails.sh` exports `TASK_DIR="${TASK_DIR:-aitasks}"` and passes
+    `--tasks-dir "$TASK_DIR"` last), so this module never resolves it itself —
+    C2 holds for the whole file, not just its import time — while trail
+    discovery and the artifact / agent subprocesses, which read `TASK_DIR`
+    from the environment, see the same directory.
+
+    `--tasks-dir` is therefore the launcher's flag, not a user override: two
+    different values on one command line (a user's plus the launcher's) mean
+    the manager and discovery would read different trees, and the app refuses
+    to start rather than let either silently win. Set `TASK_DIR` instead.
+
+    `--trail <handle>` is a user flag (and the cold path of
+    `launch_or_focus_trails`): validated as an artifact handle here, it opens
+    that trail at boot. `--task <id>` (only with `--trail`; a `t` prefix is
+    accepted and dropped) then focuses that member's card. `$TMUX_PANE` / `$TMUX` are read here and only here, so
+    the pane mailbox exists only for a real launch."""
+    import argparse
+
+    parser = argparse.ArgumentParser(description="aitasks implementation-trails TUI")
+    # Default is the framework's literal default, so a bare `python
+    # trails_app.py` (the footprint measurement, run with TASK_DIR unset)
+    # reads `aitasks/` — the same tree discovery's own default names.
+    parser.add_argument("--tasks-dir", action="append", type=Path,
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--trail", metavar="HANDLE",
+                        help="open this trail (art:...) instead of the selector")
+    parser.add_argument("--task", metavar="TASK_ID",
+                        help="with --trail: focus this member's card (12, t12, 12_3)")
+    args = parser.parse_args(argv)
+    if args.trail is not None and not HANDLE_RE.match(args.trail):
+        parser.error(f"invalid trail handle {args.trail!r}: expected art:<id>")
+    task = None
+    if args.task is not None:
+        if args.trail is None:
+            parser.error("--task needs --trail (the trail to show the task in)")
+        task = args.task[1:] if args.task.startswith("t") else args.task
+        if not BOARD_TASK_ID_RE.match(task):
+            parser.error(f"invalid task id {args.task!r}: expected 12, t12 or 12_3")
+    given = list(dict.fromkeys(args.tasks_dir or []))
+    if len(given) > 1:
+        parser.error("conflicting --tasks-dir values "
+                     f"{[str(p) for p in given]}: the launcher sets this "
+                     "flag from TASK_DIR — set TASK_DIR instead of passing it")
+    tasks = given[0] if given else Path("aitasks")
+    TrailsApp(tasks_dir=tasks,
+              metadata_file=tasks / "metadata" / "board_config.json",
+              gates_registry_file=tasks / "metadata" / "gates.yaml",
+              initial_trail=args.trail,
+              initial_task=task,
+              focus_pane=os.environ.get("TMUX_PANE") or None,
+              focus_tmux_env=os.environ.get("TMUX", "")).run()
+
+
+if __name__ == "__main__":
+    main()

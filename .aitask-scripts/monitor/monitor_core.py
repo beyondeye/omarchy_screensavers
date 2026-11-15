@@ -1,0 +1,6597 @@
+"""monitor_core - Headless core for the monitor pipeline (no Textual).
+
+The non-UI half of `ait monitor` / `ait minimonitor`: tmux pane discovery,
+content capture, idle/awaiting-input detection, pane categorization, the
+persistent `tmux -C` control-mode client, and the task-metadata cache. Shared
+by both Textual TUIs and the future `ait applink` WebSocket listener — so it
+carries **no Textual / rich imports**.
+
+tmux execution is delegated to the gateway `lib/tmux_exec.py`
+(`TmuxClient.run_via_control` / `run_async_via_control`); this module does not
+re-own the control-client-vs-subprocess dispatch (t952_3).
+
+Extracted from `tmux_monitor.py`, `tmux_control.py`, and `monitor_shared.py`
+in t822_6; those modules now re-export from here for backwards compatibility.
+"""
+from __future__ import annotations
+
+import asyncio
+import collections
+import contextlib
+import enum
+import os
+import re
+import secrets
+import shlex
+import subprocess
+import sys
+import threading
+import time
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass, field
+from enum import Enum
+from pathlib import Path
+from typing import NamedTuple, Optional
+
+_SCRIPTS_DIR = Path(__file__).resolve().parent.parent
+# `lib/` holds the gateway + launch/registry helpers and task_yaml (the
+# frontmatter parser used by TaskInfoCache, moved there in t1217).
+for _extra_path in (_SCRIPTS_DIR / "lib",):
+    if str(_extra_path) not in sys.path:
+        sys.path.insert(0, str(_extra_path))
+from tui_registry import BRAINSTORM_PREFIX, TUI_NAMES  # noqa: E402
+from tmux_exec import (  # noqa: E402  (gateway: exec-strategy dispatch + socket flag + text model)
+    TMUX_CLIENT_FLAGS,
+    TmuxClient,
+    decode_tmux_output,
+    encode_tmux_argv,
+    encode_tmux_wire,
+    session_target,
+    tmux_os_path,
+    tmux_socket_args,
+)
+from agent_launch_utils import (  # noqa: E402
+    AitasksSession,
+    TmuxLaunchConfig,
+    attach_companion_cleanup_hook,
+    discover_aitasks_sessions,
+    discover_aitasks_sessions_async,
+    launch_split_pane,
+    launch_window_pane,
+    maybe_spawn_minimonitor,
+    resolve_dry_run_command,
+    switch_to_pane_anywhere,
+    tmux_session_scope_target,
+    tmux_window_target,
+    unique_window_name,
+    window_companion_pane,
+    # The one bounded-flock primitive (`_companion_spawn_lock`'s), reused by the
+    # sitrep spawn lock rather than re-implemented (t2175_4).
+    _flock_until,
+)
+from followup_kinds import normalize_followup_kind  # noqa: E402
+# The companion pane marker + its liveness rule (t1451). Imported from the
+# module that OWNS the rule, not via agent_launch_utils' re-export: it is
+# stdlib-only, and discovery must consult the same single implementation the
+# single-instance guards and aitask_companion_cleanup.sh already use (t1686).
+from monitor_marker import MONITOR_KIND_OPTION, monitor_marker_alive  # noqa: E402
+# The bound-helper rule (t2073_3): the helper-target options and the one
+# predicate over them. Re-exported from here so existing
+# `from monitor.monitor_core import SHADOW_TARGET_OPTION` sites keep working.
+from helper_panes import (  # noqa: E402,F401  (re-export)
+    BOUND_HELPER_TARGET_OPTIONS,
+    SCRATCHPAD_STORE_OPTION,
+    SCRATCHPAD_TARGET_OPTION,
+    SHADOW_TARGET_OPTION,
+    SITREP_ROOT_OPTION,
+    SITREP_TUI_ROOT_OPTION,
+    all_of,
+    bound_helper_sweep_format,
+    helpers_bound_to,
+    is_bound_helper,
+    is_sitrep_tui_pane,
+    kill_bound_helpers,
+    READBACK_FORMAT,
+    readback_state,
+    run_identity_condition,
+)
+from task_yaml import parse_frontmatter  # noqa: E402
+import gate_ledger  # noqa: E402  (shared gate-ledger parser; single derivation path)
+import dep_resolution  # noqa: E402  (shared local-`depends:` decision core, t1527)
+import workflow_phase  # noqa: E402  (advisory phase seam, t1420 — never a gate)
+
+try:
+    from .prompt_patterns import (
+        AGENT_KEYS,
+        PromptPattern,
+        agent_key_from_pane,
+        all_patterns,
+        scope_patterns,
+    )
+    from .ansi_utils import strip_ansi
+    from .concern_parser import (
+        contains_block_evidence,
+        parse_block_meta,
+        parse_reviewed_at_epoch,
+    )
+except ImportError:  # imported top-level (tests put MONITOR_DIR on PYTHONPATH)
+    from prompt_patterns import (  # noqa: E402
+        AGENT_KEYS,
+        PromptPattern,
+        agent_key_from_pane,
+        all_patterns,
+        scope_patterns,
+    )
+    from ansi_utils import strip_ansi  # noqa: E402
+    from concern_parser import (  # noqa: E402
+        contains_block_evidence,
+        parse_block_meta,
+        parse_reviewed_at_epoch,
+    )
+
+
+# Abstract key name → tmux send-keys argument (for special keys). Lives here in
+# the headless core (not monitor_app) so both the desktop preview-zone key
+# forwarding and the applink `forward_key` verb translate identically
+# server-side (t822_7). monitor_app re-exports this name for back-compat.
+_TEXTUAL_TO_TMUX = {
+    "enter": "Enter",
+    "escape": "Escape",
+    "backspace": "BSpace",
+    "up": "Up",
+    "down": "Down",
+    "left": "Left",
+    "right": "Right",
+    "space": "Space",
+    "delete": "DC",
+    "home": "Home",
+    "end": "End",
+    "pageup": "PPage",
+    "pagedown": "NPage",
+    "insert": "IC",
+    "f1": "F1",
+    "f2": "F2",
+    "f3": "F3",
+    "f4": "F4",
+    "f5": "F5",
+    "f6": "F6",
+    "f7": "F7",
+    "f8": "F8",
+    "f9": "F9",
+    "f10": "F10",
+    "f11": "F11",
+    "f12": "F12",
+}
+
+
+def translate_key(key: str, character: str | None = None) -> tuple[str, bool] | None:
+    """Translate an abstract key name into tmux ``send-keys`` arguments.
+
+    Returns ``(keys, literal)`` suitable for :meth:`TmuxMonitor.send_keys`, or
+    ``None`` when the key cannot be mapped. Shared by the desktop key-forward
+    path (``monitor_app._forward_key_to_tmux``) and the applink ``forward_key``
+    verb so both sides resolve keys identically:
+
+      * special keys (``up``, ``escape``, ``f5`` …) → the tmux key name, non-literal
+      * ``ctrl+x`` → ``C-x``, non-literal
+      * a single printable character → sent literally
+
+    ``character`` is the desktop ``event.character`` (the resolved glyph for
+    keys whose abstract name is not itself the character, e.g. ``!`` arrives as
+    ``exclamation_mark``); mobile clients pass only ``key`` (the literal glyph
+    for plain characters) and leave ``character`` as ``None``.
+    """
+    if key in _TEXTUAL_TO_TMUX:
+        return _TEXTUAL_TO_TMUX[key], False
+    if key.startswith("ctrl+"):
+        return f"C-{key[5:]}", False
+    if character and len(character) == 1:
+        return character, True
+    if len(key) == 1:
+        return key, True
+    return None
+
+
+class PaneCategory(Enum):
+    AGENT = "agent"
+    TUI = "tui"
+    OTHER = "other"
+
+
+DEFAULT_AGENT_PREFIXES = ["agent-"]
+DEFAULT_TUI_NAMES = TUI_NAMES
+
+#: The ``tmux.monitor`` keys a per-session config published to a
+#: ``TmuxMonitor`` may carry — exactly the :func:`load_monitor_config` shape
+#: (t2037_1, ``TmuxMonitor.set_session_configs``).
+SESSION_CONFIG_KEYS = (
+    "capture_lines", "idle_threshold", "agent_prefixes", "tui_names",
+    "compare_mode_default",
+)
+
+
+def match_agent_prefix(window_name: str, prefixes) -> str | None:
+    """The agent prefix ``window_name`` starts with — the FIRST in list order,
+    not the longest — or ``None``. The one matcher behind both
+    :meth:`TmuxMonitor.classify_pane` and :func:`agent_display_name`, so a
+    display name can never be stripped by a rule the classifier did not use."""
+    for prefix in prefixes:
+        if window_name.startswith(prefix):
+            return prefix
+    return None
+
+
+def agent_display_name(window_name: str, prefixes) -> str:
+    """``window_name`` without the agent prefix that classified it (t1351).
+
+    Every row in an agent list carries that prefix — it is what put the row
+    there — so showing it spends the narrow minimonitor row on the one part of
+    the name that says nothing. Returned unchanged when no prefix matches, when
+    the match is empty, or when nothing would remain (a window named exactly
+    ``agent-``), so the result is never blank.
+    """
+    prefix = match_agent_prefix(window_name, prefixes)
+    if not prefix or len(prefix) >= len(window_name):
+        return window_name
+    return window_name[len(prefix):]
+
+# Idle-detection comparison modes.
+#   stripped — strip ANSI escape codes from captured pane content before
+#     equality check. Required to detect Codex CLI agents as idle: Codex
+#     animates the spinner color via SGR escape codes even while waiting
+#     on user input, so a raw byte-equal comparison declares the pane
+#     "changed" every refresh tick and idle is never reached. It cannot
+#     absorb a VISIBLE-glyph animation such as the Codex composer starfield
+#     (Braille dots); that one is disabled at launch instead, by the starfield
+#     keys only, never `tui.animations` (which also stops the Working timer) —
+#     see aidocs/framework/monitor_idle_and_prompt_detection.md, "Visible-glyph
+#     animation" (t1797, t1944).
+#   raw — compare the full captured bytes including escape codes. Legacy
+#     behavior; only useful as a fallback if a future agent renders idle
+#     UI by toggling escape codes that semantically matter.
+COMPARE_MODE_STRIPPED = "stripped"
+COMPARE_MODE_RAW = "raw"
+COMPARE_MODES = (COMPARE_MODE_STRIPPED, COMPARE_MODE_RAW)
+DEFAULT_COMPARE_MODE = COMPARE_MODE_STRIPPED
+
+# CSI escape stripping (`strip_ansi`) lives in `monitor/ansi_utils.py` — a pure,
+# dependency-free module so `concern_parser` can share this exact implementation
+# without importing this module's asyncio / subprocess / gateway graph (t1216_1).
+_PROMPT_DETECTION_TAIL_LINES = 6
+
+
+def _prompt_detection_text(s: str, *, skip_trailing_blank_rows: bool = False) -> str:
+    """Return the live bottom slice used for awaiting-input prompt matching.
+
+    ``skip_trailing_blank_rows`` drops whitespace-only rows from the end before
+    slicing — only for patterns that opt in via
+    ``PromptPattern.skip_trailing_blank_rows`` (t1522), because a top-aligned
+    pre-TUI screen leaves the plain bottom window entirely blank. The default
+    path is deliberately untouched: every other pattern, and the t1540/t1557
+    kind-by-pane-height contracts, are measured against it, and a global trim
+    was measured to break them.
+    """
+    lines = s.splitlines()
+    if skip_trailing_blank_rows:
+        while lines and not lines[-1].strip():
+            lines.pop()
+        return "\n".join(lines[-_PROMPT_DETECTION_TAIL_LINES:])
+    if len(lines) <= _PROMPT_DETECTION_TAIL_LINES:
+        return s
+    return "\n".join(lines[-_PROMPT_DETECTION_TAIL_LINES:])
+
+
+@dataclass
+class ClassifyResult:
+    """Pure result of off-loop content classification for one pane (t1111_4).
+
+    Carries only plain data so it can cross the ``asyncio.to_thread`` boundary.
+    Holds no ``TmuxMonitor`` state; the loop-side commit
+    (:meth:`TmuxMonitor.commit_snapshots`) turns it into the durable
+    ``_last_content`` / ``_last_change_time`` bookkeeping and a ``PaneSnapshot``.
+    """
+    compare_value: str
+    awaiting_input: bool = False
+    awaiting_input_kind: str = ""
+    # Resolution provenance (t1467). `scoped` is False whenever matching was NOT
+    # narrowed to a known agent — an unresolvable pane command, or a caller that
+    # passed no agent. False is the honest default: a result built by the
+    # fail-closed `except` path was not scoped and must not read as though it
+    # were. Consumers use these to tell the two regimes apart.
+    agent_key: str = ""
+    scoped: bool = False
+    #: True only for a pane that was deliberately NOT captured because it is
+    #: parked (t1685). It never comes out of `classify_content` — the parked
+    #: pane never reaches the classifier at all — so this is the marker
+    #: `capture_all_classified_async` uses to tell `commit_snapshots` "this is
+    #: an intentional skip", which must not be confused with the `None` result
+    #: that means "the capture failed".
+    parked: bool = False
+    #: True only for a pane that was deliberately NOT captured because it is a
+    #: frozen stand-in (t1705_7). Same "intentional skip, not a failed capture"
+    #: role as `parked` above, from a different source: the pane option
+    #: `@aitask_frozen`, carried in the discovery row, rather than an
+    #: App-published set. That difference is why no publish-down is needed.
+    frozen: bool = False
+
+
+def classify_content(
+    content: str,
+    mode: str,
+    prompt_patterns: list[PromptPattern],
+    category: PaneCategory,
+    agent: str = "",
+) -> ClassifyResult:
+    """Pure, module-level CPU work extracted from ``_finalize_capture`` (t1111_4).
+
+    Runs the ANSI strip (for the compare value) and the awaiting-input prompt
+    scan — the per-agent, per-tick regex work that used to run on the Textual
+    event loop. No ``self``, no shared-dict mutation, no widget access, so it is
+    safe to batch off-loop via ``asyncio.to_thread``. ``prompt_patterns`` is read
+    only. All ``_last_content`` / ``_last_change_time`` mutation stays loop-side.
+
+    Since t1467 matching is **scoped to the pane's own agent**: ``agent`` is a
+    resolved key from ``lib/agent_keys.agent_key_from_pane``, and patterns owned
+    by a different agent are dropped (``prompt_patterns.scope_patterns``). The
+    default ``""`` preserves the pre-t1467 flat-list behaviour, which is also
+    what an unresolvable pane command gets — so no caller is broken and no
+    working detection is lost.
+
+    The result carries the resolution outcome (``agent_key`` / ``scoped``) so
+    that "matched under scoped rules" and "matched from the unscoped flat list"
+    are distinguishable downstream instead of looking identical.
+
+    Each pattern searches the shared bottom window, except one that sets
+    ``skip_trailing_blank_rows`` (t1522), which searches the window taken after
+    dropping trailing blank rows. First-match-wins order is unchanged.
+    """
+    compare_value = strip_ansi(content) if mode == COMPARE_MODE_STRIPPED else content
+    agent_key = (agent or "").strip().lower()
+    scoped = agent_key in AGENT_KEYS
+    awaiting_input = False
+    awaiting_input_kind = ""
+    if category == PaneCategory.AGENT and prompt_patterns:
+        stripped_text = compare_value if mode == COMPARE_MODE_STRIPPED else strip_ansi(content)
+        prompt_text = _prompt_detection_text(stripped_text)
+        # Built lazily, only once a pattern that opts into it is reached, so a
+        # pane whose scoped list has none never pays for it.
+        trimmed_text: str | None = None
+        for p in scope_patterns(prompt_patterns, agent_key):
+            text = prompt_text
+            if p.skip_trailing_blank_rows:
+                if trimmed_text is None:
+                    trimmed_text = _prompt_detection_text(
+                        stripped_text, skip_trailing_blank_rows=True)
+                text = trimmed_text
+            if p.regex.search(text):
+                awaiting_input = True
+                awaiting_input_kind = p.name
+                break
+    return ClassifyResult(
+        compare_value=compare_value,
+        awaiting_input=awaiting_input,
+        awaiting_input_kind=awaiting_input_kind,
+        agent_key=agent_key if scoped else "",
+        scoped=scoped,
+    )
+
+
+def _classify_one(
+    content: str,
+    mode: str,
+    prompt_patterns: list[PromptPattern],
+    category: PaneCategory,
+    agent: str = "",
+) -> ClassifyResult:
+    """Fail-closed single-pane classify (invariant D): a raising regex/strip
+    degrades to raw content (never awaiting) so one bad pane never propagates."""
+    try:
+        return classify_content(content, mode, prompt_patterns, category, agent)
+    except Exception:
+        return ClassifyResult(compare_value=content)
+
+
+def _classify_batch(
+    items: list[tuple["TmuxPaneInfo", str, str]],
+    prompt_patterns: list[PromptPattern],
+) -> list[tuple["TmuxPaneInfo", str, ClassifyResult]]:
+    """Off-loop batch of :func:`classify_content`, fail-closed per pane (t1111_4).
+
+    ``items`` are ``(pane, content, mode)`` tuples read on the loop before the
+    hop. Runs inside a single ``asyncio.to_thread`` call; wrapping each pane
+    individually (via :func:`_classify_one`) means one malformed pane degrades to
+    raw content instead of dropping the whole refresh (invariant E: one batch per
+    cycle, not per-pane fan-out).
+    """
+    return [
+        (pane, content, _classify_one(content, mode, prompt_patterns, pane.category,
+                                      agent_key_from_pane(pane.current_command,
+                                                          pane.pane_pid,
+                                                          pane.pane_id)))
+        for pane, content, mode in items
+    ]
+
+
+_COMPANION_KEYWORDS = ("minimonitor", "monitor_app")
+
+# TTL for a memoized *positive* companion verdict (see
+# `TmuxMonitor._is_companion_pane`). Negative verdicts are never memoized, so
+# this bounds nothing user-visible — it exists purely so no verdict can be
+# cached for the lifetime of the process.
+_COMPANION_MEMO_TTL = 300.0
+
+
+def is_live_companion_marker(monitor_kind: str) -> bool:
+    """True when a pane's ``@aitask_monitor_kind`` proves a LIVE companion.
+
+    Pure, exactly like :func:`is_shadow_target`: it takes the already-read
+    option value, so the tmux read stays at the call site and this stays
+    unit-testable.
+
+    **The parse + liveness rule is not re-derived here.** It is
+    ``monitor_marker.monitor_marker_alive`` — the one implementation (t1451)
+    that the single-instance guards and ``aitask_companion_cleanup.sh`` already
+    consult. Two consequences follow from reusing its verdicts rather than
+    inventing local ones:
+
+    * a **stale** marker (recorded pid provably gone) is NOT a companion, so a
+      shell pane left behind by an exited minimonitor goes back to being an
+      ordinary pane immediately;
+    * a non-empty value that does not *parse* counts as present, per that
+      module's "unverifiable is not absence" rule.
+
+    ``.strip()`` runs first so a whitespace-only value reads as *absent* rather
+    than falling into the unparseable-⇒-present branch; tmux emits ``""`` for an
+    unset option, which ``monitor_marker_alive`` already reports as False.
+    """
+    return monitor_marker_alive(monitor_kind.strip())
+
+
+def _is_companion_process(pid: int) -> bool:
+    """Check if a process is a companion pane (minimonitor/monitor) via cmdline.
+
+    **The FALLBACK rung since t1686** — :func:`is_live_companion_marker` is the
+    primary signal, and this runs only when the pane carries no marker or a
+    stale one. It is still load-bearing: ``App.run_test()`` mounts deliberately
+    pass ``mark_pane=False``, and panes predating t1451 were never stamped.
+
+    Its blind spot is why the marker leads. The pid handed in is tmux's
+    ``#{pane_pid}`` — the pane's **top-level** process. A companion launched as
+    the pane's start command *is* that process, but one restarted from an
+    interactive shell inside the pane is a *child* of ``-bash``, and no keyword
+    in this pane's cmdline will ever match.
+    """
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            cmdline = f.read().decode("utf-8", errors="replace")
+        return any(kw in cmdline for kw in _COMPANION_KEYWORDS)
+    except (OSError, PermissionError):
+        pass
+    # Fallback for non-Linux (macOS)
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "args="],
+            capture_output=True, text=True, timeout=2,
+        )
+        if result.returncode == 0:
+            return any(kw in result.stdout for kw in _COMPANION_KEYWORDS)
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        pass
+    return False
+
+
+# -- Shadow companion panes (t986) --------------------------------------------
+#
+# A "shadow" is a second coding-agent CLI spawned in (by default) the same tmux
+# window as the agent it follows. Because splitting a window does not rename it,
+# a same-window shadow shares the *agent's* window name — so it cannot be told
+# apart by window name. Instead the spawner (t986_5) records the shadowed
+# agent's pane id in the pane-scoped tmux user option below. A pane carrying a
+# non-empty value is a shadow *helper*: excluded from agent lists exactly like
+# the minimonitor/monitor companion panes, and never resolved to a task. The
+# value also drives lifecycle cleanup — when the shadowed agent's pane dies,
+# `aitask_companion_cleanup.sh` kills the bound shadow.
+#
+# `SHADOW_TARGET_OPTION` itself is defined in `lib/helper_panes.py` (t2073_3),
+# beside the scratchpad's `SCRATCHPAD_TARGET_OPTION`: both are bound helpers and
+# follow one rule (`BOUND_HELPER_TARGET_OPTIONS` / `is_bound_helper`), imported
+# at the top of this module and re-exported.
+
+# Pane-scoped user-option a shadow stamps with the wall-clock epoch at which it
+# last read its followed agent (t1104). minimonitor compares it against when the
+# followed pane last changed to tell whether the shadow's feedback is still
+# current. A timestamp (not a content hash) is used because an exact snapshot
+# hash of a live terminal is too brittle. Set by aitask_shadow_capture.sh.
+SHADOW_ANALYZED_AT_OPTION = "@aitask_shadow_analyzed_at"
+
+# Pane-scoped user-option carrying the ADVISORY workflow-phase signal for the
+# followed agent (t1420), in ``workflow_phase.format_signal`` form. Written on
+# the SHADOW pane at spawn and re-stamped every tick by
+# :func:`refresh_shadow_phase_stamp`, so the shadow reads a value that is current
+# at every refetch rather than frozen at spawn — the property argv could not
+# offer. Advisory only: nothing may refuse an action because of what it holds.
+SHADOW_PHASE_OPTION = "@aitask_shadow_phase"
+
+# --- frozen code agents (t1705) ---------------------------------------------
+#
+# The pane-scoped join and lifecycle markers of the session store
+# (`lib/agent_sessions.py`). Mirrored for shell callers in
+# `lib/agent_sessions.sh` (`AIT_RECORD_OPTION` & co.) — the two spellings must
+# agree, which `tests/test_agent_sessions_stamp.sh` Test 6 pins by comparing
+# them. Two spellings of one option silently break the join: the stamper writes
+# one name, the reader looks for another, and the agent simply looks unrecorded.
+
+#: The pane-visible join to a store record. Stamped by whoever created the
+#: record (the SessionStart hook on the normal path, the freeze engine on its
+#: fallback path); cleared by `drop` and, implicitly, by pane death.
+RECORD_OPTION = "@aitask_record"
+
+#: Set by the freeze engine immediately before `respawn-pane`. THE authoritative
+#: "this pane is a frozen stand-in, not a live agent" classifier: a stand-in
+#: carries no helper marker and lives in an unchanged `agent-*` window, so
+#: nothing else distinguishes it.
+FROZEN_OPTION = "@aitask_frozen"
+
+#: Positive proof the stand-in viewer actually mounted. Stamped by the viewer
+#: ITSELF (the `mark_monitor_pane` rule — only an app stamps its own pane) and
+#: cleared by the freeze/restore coordinator before every respawn. It is the
+#: only signal separating "stamped, viewer up" from "stamped, agent still
+#: running", which is why reconcile treats its absence as indeterminate rather
+#: than as failure.
+STANDIN_READY_OPTION = "@aitask_standin_ready"
+
+#: The code-agent session id, recorded on `$TMUX_PANE` by the SessionStart hook
+#: (t1705_3). Read by the freeze engine when the store has no session id.
+AGENT_SESSION_OPTION = "@aitask_agent_session"
+
+#: Transient, coordinator-private evidence that a stamp-conditional respawn
+#: actually fired (t1773). `agent_frozen_ops.respawn_if_stamped` writes a fresh
+#: per-call token as the LAST command of its `if-shell` true branch and clears
+#: it as soon as it has read it back, so nothing else ever observes it: it is
+#: never classified, never part of `PANE_FACT_FORMAT`, and has no shell
+#: counterpart in `lib/agent_sessions.sh`. It lives here anyway because this
+#: file is the pane-option vocabulary — a name invented elsewhere is a name
+#: nobody can check for collisions.
+RESPAWN_TOKEN_OPTION = "@aitask_respawn_token"
+
+
+def is_shadow_target(shadow_target: str) -> bool:
+    """True when a pane's ``@aitask_shadow_target`` value marks it a shadow.
+
+    Pure: takes the already-read option value (empty/whitespace ⇒ not a
+    shadow), so the tmux read stays at the call site and this stays
+    unit-testable.
+    """
+    return bool(shadow_target.strip())
+
+
+def _pane_id_num(pane_id: str) -> int:
+    """Numeric sort key for a tmux pane id (``%7`` → 7); malformed → -1.
+
+    tmux assigns pane ids monotonically, so the largest number is the most
+    recently created pane. Used to pick the newest shadow deterministically
+    when more than one targets the same followed pane (an orphan that escaped
+    cleanup) — including by :func:`match_shadow_pane`, which used to carry its
+    own identical copy of this body in minimonitor (t1133, collapsed in t1216_1).
+    """
+    try:
+        return int(pane_id.lstrip("%"))
+    except (ValueError, AttributeError):
+        return -1
+
+
+def match_shadow_pane_info(
+    list_output: str, followed_pane_id: str
+) -> tuple[str, str, int] | None:
+    """Resolve the shadow pane bound to ``followed_pane_id``, its command, its pid.
+
+    Pure (no tmux): ``list_output`` is :func:`shadow_query_args` text —
+    ``#{pane_id}\t#{@aitask_shadow_target}\t#{pane_current_command}\t#{pane_pid}``.
+    Returns ``(pane_id, current_command, pane_pid)`` for the pane whose
+    ``@aitask_shadow_target`` equals ``followed_pane_id`` (the shadow pane
+    carries the followed pane's id — see ``shadow_agent.md``), or ``None``. An
+    empty target marks a non-shadow pane and is ignored (``is_shadow_target``).
+    A two- or three-field line (older format / test stubs) still resolves the
+    pane, with command ``""`` and/or pid ``0`` — the review loop reads a missing
+    command as an unknown shadow agent and refuses/disarms rather than guessing
+    (t1159_2), and a missing pid simply costs it the second resolution rung.
+
+    **The pid is what makes a Codex shadow resolvable at all** (t1509). Codex
+    installs as a node wrapper, so ``pane_current_command`` reports ``node``;
+    ``agent_keys.agent_key_from_command`` returns ``""`` for it and only the
+    pid-driven second rung of ``agent_key_from_pane`` can reach ``codex``.
+
+    Defense-in-depth: if more than one pane matches (an orphaned live shadow
+    that escaped cleanup — the launch guard in ``action_launch_shadow``
+    normally prevents this), return the **newest** (largest ``%N``)
+    deterministically. The caller may notify when ``> 1`` match is seen.
+    """
+    matches: list[tuple[str, str, int]] = []
+    for line in list_output.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 2:
+            continue
+        pane_id, target = parts[0].strip(), parts[1].strip()
+        command = parts[2].strip() if len(parts) > 2 else ""
+        raw_pid = parts[3].strip() if len(parts) > 3 else ""
+        pid = int(raw_pid) if raw_pid.isdigit() else 0
+        if not is_shadow_target(target):
+            continue
+        if target == followed_pane_id:
+            matches.append((pane_id, command, pid))
+    if not matches:
+        return None
+    return max(matches, key=lambda m: _pane_id_num(m[0]))
+
+
+def match_shadow_pane(list_output: str, followed_pane_id: str) -> str | None:
+    """Pane-id-only view of :func:`match_shadow_pane_info`.
+
+    Implemented on top of it so the two selection rules can never drift.
+    """
+    info = match_shadow_pane_info(list_output, followed_pane_id)
+    return info[0] if info else None
+
+
+# Hard ceiling for the shadow-pane tmux query + capture shell-out (seconds).
+# Keeps the picker hotkey and the refresh-tick auto-offer from ever blocking the
+# Textual event loop on a stalled tmux / helper (t1037_4).
+_SHADOW_CAPTURE_TIMEOUT = 3.0
+
+# One-shot deeper window for the EXPLICIT concern-picker hotkey when the default
+# plan-review depth still clipped the block's opening fence (t1187). Only the
+# user-initiated 'c' path pays for it, and only once per press — the per-tick
+# auto-offer never retries.
+_SHADOW_DEEP_RETRY_LINES = 1500
+
+# Shown when a concern block is present but its opening fence fell outside the
+# capture window. Distinguishes a too-shallow capture from a genuinely
+# concern-free shadow, which used to read identically ("no concerns") — the
+# silent false negative behind t1187.
+_SHADOW_TRUNCATED_MSG = (
+    "Shadow's concern block is cut off above the capture window "
+    "— increase SHADOW_PLAN_CAPTURE_LINES"
+)
+
+
+def shadow_query_args() -> list[str]:
+    """tmux argv listing every pane's id + @aitask_shadow_target + command + pid.
+
+    Shared by the sync and async reverse-lookups so the format never drifts.
+    The third and fourth fields feed the review loop's shadow-agent resolution
+    (:func:`match_shadow_pane_info`) at zero extra tmux round trips; shorter
+    parsers keep working (they read only the fields they know about).
+    """
+    return ["list-panes", "-a", "-F",
+            f"#{{pane_id}}\t#{{{SHADOW_TARGET_OPTION}}}\t"
+            "#{pane_current_command}\t#{pane_pid}"]
+
+
+def find_shadow_pane_status(
+    monitor, followed_pane_id: str
+) -> tuple[bool, str | None]:
+    """Sync reverse lookup that discriminates query failure from "no shadow".
+
+    Returns ``(ok, pane)``. ``ok`` is False when the query itself could not be
+    answered (no monitor, or ``list-panes`` returned non-zero) — distinct from
+    ``(True, None)``, which is a verified "this agent has no shadow".
+
+    :func:`find_shadow_pane` collapses both into ``None``, which is right for the
+    six *readers* (preview, key forwarding, concern picker) where a failed lookup
+    and an absent shadow are equally "nothing to show". It is wrong for a
+    **create** decision: an unverifiable state must not be read as permission to
+    spawn a second shadow, so the launch guards use this primitive and refuse on
+    ``ok is False`` (t1216_4).
+
+    ``monitor`` is duck-typed on the **gateway surface only** (``tmux_run`` ->
+    ``(rc, stdout)``), not on ``TmuxMonitor``: the sole thing needed is one
+    ``list-panes`` round-trip, and keeping the contract that narrow lets both
+    apps — and the test stubs — pass whatever they already hold (t1216_1).
+    """
+    if monitor is None:
+        return False, None
+    rc, out = monitor.tmux_run(shadow_query_args(), timeout=2)
+    if rc != 0:
+        return False, None
+    return True, match_shadow_pane(out, followed_pane_id)
+
+
+def find_shadow_pane(monitor, followed_pane_id: str) -> str | None:
+    """Sync reverse lookup of the shadow pane bound to ``followed_pane_id``.
+
+    Fail-open view of :func:`find_shadow_pane_status` for readers: a failed query
+    and a verified absence both read as ``None``. Do **not** use it to gate a
+    spawn — see that function's note.
+
+    The picker action and the refresh-tick auto-offer use
+    :func:`find_shadow_pane_async` so they never block the event loop.
+    """
+    ok, pane = find_shadow_pane_status(monitor, followed_pane_id)
+    return pane if ok else None
+
+
+async def find_shadow_pane_async(monitor, followed_pane_id: str) -> str | None:
+    """Async (event-loop safe) reverse lookup for the picker / auto-offer."""
+    _ok, pane, _command, _pid = await find_shadow_pane_info_async(
+        monitor, followed_pane_id
+    )
+    return pane
+
+
+async def find_shadow_pane_info_async(
+    monitor, followed_pane_id: str
+) -> tuple[bool, str | None, str, int]:
+    """Async reverse lookup with a success discriminator, the shadow's command
+    and its pid: ``(ok, pane, current_command, pane_pid)``.
+
+    ``ok`` is False when the query itself could not be answered (no monitor,
+    nonzero rc, timeout) — distinct from ``(True, None, "", 0)``, a verified
+    "this agent has no shadow". The review loop is a *decision* consumer
+    (auto-disarm destroys the user's armed state), so like the launch guards
+    (t1216_4) it must not consume the fail-open collapsed view: a transient
+    tmux failure pauses the loop, only a verified absence disarms it
+    (t1159_2). Readers keep using :func:`find_shadow_pane_async`.
+
+    ``pane_pid`` is ``0`` when unknown (older format / test stub). Callers pass
+    it to ``agent_keys.agent_key_from_pane``, which treats a falsy pid as "no
+    second rung" and degrades to the command-only answer (t1509).
+    """
+    if monitor is None:
+        return False, None, "", 0
+    rc, out = await monitor.tmux_run_async(
+        shadow_query_args(), timeout=_SHADOW_CAPTURE_TIMEOUT
+    )
+    if rc != 0:
+        return False, None, "", 0
+    info = match_shadow_pane_info(out, followed_pane_id)
+    if info is None:
+        return True, None, "", 0
+    return True, info[0], info[1], info[2]
+
+
+async def capture_raw_tail(
+    monitor, pane_id: str, *, lines: int = 15
+) -> str | None:
+    """Raw (ANSI-carrying) tail of a pane via the gateway; ``None`` on failure.
+
+    The review loop's shadow-readiness detector (t1159_2) must see raw
+    styling: Claude Code renders its composer *placeholder hint* as dim text
+    that ANSI-stripping makes indistinguishable from typed text, so the
+    cleaned :func:`capture_shadow_text` path cannot answer "is the composer
+    empty". Paid only while a loop is armed.
+
+    **``lines`` is a scrollback floor, NOT a window size** (measured, t1520 —
+    an earlier version of this docstring called it "deliberately tiny … the
+    prompt area, not the transcript", and detectors were written against that
+    belief). ``capture-pane -S -<n>`` carries no ``-E``, so it reads from *n*
+    lines back to the **bottom of the visible pane**. On an alternate-screen
+    pane (``alternate_on=1``, ``history_size=0``) there is no scrollback, so
+    this returns the **whole visible pane** for any ``lines`` value — 30 rows
+    at a 120x30 geometry, not 15. On an inline pane (Claude Code, and every
+    framework-launched Codex pane, launched with ``tui.alternate_screen=never``)
+    it returns up to ``lines`` history rows **plus** the whole visible pane, so
+    dismissed dialog text can sit in it (see
+    ``review_loop._codex_dialog_is_historical``).
+
+    Two consequences worth stating, because both have already bitten:
+    a marker is in scope whenever it is *on screen*, so "it renders too far up
+    to be captured" is not a valid assumption; and fixtures must be stored at
+    the extent production actually reads — trimming them to ``lines`` can drop
+    a load-bearing row that production would have seen.
+    """
+    if monitor is None:
+        return None
+    rc, out = await monitor.tmux_run_async(
+        ["capture-pane", "-p", "-e", "-t", pane_id, "-S", f"-{lines}"],
+        timeout=_SHADOW_CAPTURE_TIMEOUT,
+    )
+    if rc != 0:
+        return None
+    return out
+
+
+#: ``#{pane_in_mode}`` is a decimal count; anything else is not an answer.
+_PANE_MODE_DEPTH_RE = re.compile(r"[0-9]+")
+
+
+async def query_pane_mode(monitor, pane_id: str) -> tuple[bool | None, str]:
+    """Whether ``pane_id`` is in a tmux mode: ``(in_mode, mode_name)`` (t2001).
+
+    In a mode — copy-mode from a mouse-wheel scroll-back, view, tree, clock,
+    buffer … — ``send-keys`` is dispatched to the MODE's key table, not to the
+    application: a literal write runs copy-mode commands, nothing reaches the
+    agent, and tmux still returns rc 0. ``capture-pane`` reads the pane's
+    underlying screen either way, so no capture-based readiness check can see
+    it. This is the one read that can.
+
+    Measured on tmux 3.7c, and why the parse is shaped as it is:
+
+    * ``#{pane_in_mode}`` is the mode-stack DEPTH, not a flag — copy-mode
+      pushed over clock-mode reads ``2`` — so any count above zero is "in a
+      mode";
+    * a dead or never-existing pane answers **rc 0 with empty fields**, so the
+      ``#{pane_id}`` echo, not the rc, is what makes a missing pane fail.
+
+    ``in_mode`` is ``None`` when it could not be determined: no monitor, a
+    non-zero rc or timeout, or a reply that does not echo ``pane_id`` with a
+    decimal depth. A caller that AUTHORISES a keystroke must read ``None`` as
+    "do not send". ``mode_name`` (``#{pane_mode}``, the top of the stack) is
+    diagnostic only.
+    """
+    if monitor is None:
+        return None, ""
+    rc, out = await monitor.tmux_run_async(
+        ["display-message", "-p", "-t", pane_id,
+         "#{pane_id}\t#{pane_in_mode}\t#{pane_mode}"],
+        timeout=_SHADOW_CAPTURE_TIMEOUT,
+    )
+    if rc != 0:
+        return None, ""
+    lines = out.splitlines()
+    parts = lines[0].split("\t") if lines else []
+    if (len(parts) < 2 or parts[0] != pane_id
+            or not _PANE_MODE_DEPTH_RE.fullmatch(parts[1])):
+        return None, ""
+    return int(parts[1]) > 0, (parts[2] if len(parts) > 2 else "")
+
+
+async def capture_shadow_text(
+    shadow_pane: str, *, lines: int | None = None
+) -> str | None:
+    """Capture a shadow pane as clean, wrap-joined text, or ``None`` on failure.
+
+    Reuses ``aitask_shadow_capture.sh`` (the shadow skill's own capture path,
+    ``-J``-joined per the parser's capture-join contract) so cleaning never
+    diverges. Async with a hard timeout: a stalled tmux / helper degrades to
+    ``None`` rather than hanging the UI (t1037_4).
+
+    Module-level and monitor-free by design: the body touches no instance state,
+    so neither app needs a ``TmuxMonitor`` to read a shadow pane (t1216_1).
+
+    Always passes ``--deep``: what we are reading here IS plan-review output
+    (the shadow's concern list plus its fully-framed machine block), which is
+    exactly why the plan sub-procedures use that depth. At the narrow widths
+    a shadow pane runs at, the 200-line default can start *inside* the block
+    and clip its opening fence — which both parser entry points report as
+    "no concerns" (t1187).
+
+    ``lines`` overrides the deep depth for one call (``SHADOW_PLAN_CAPTURE_
+    LINES``), used by the explicit picker hotkey's single deeper retry.
+
+    Note this deliberately does NOT go through the tmux gateway: the ``-J``
+    wrap-join lives in ``aitask_shadow_capture.sh`` and is the parser's
+    contract, whereas the tick capture (:meth:`TmuxMonitor._capture_args`) is
+    ``-p -e`` with no ``-J``. The two captures cannot be served from one call.
+    """
+    script = _SCRIPTS_DIR / "aitask_shadow_capture.sh"
+    env = None
+    if lines is not None:
+        env = dict(os.environ, SHADOW_PLAN_CAPTURE_LINES=str(lines))
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            # ``--any-pane`` is the ONE sanctioned opt-out of the helper's
+            # wrong-pane refusal (t1319), for two independent reasons. (1) That
+            # guard exists to catch a pane id a *model* transcribed and may have
+            # truncated; ``shadow_pane`` here comes from ``find_shadow_pane``, so
+            # there is nothing for it to protect. (2) A TUI run from the user's
+            # personal tmux while the framework lives on ``-L ait`` is a
+            # cross-server caller, which the helper refuses — and because this
+            # call sends stderr to DEVNULL and returns None on a non-zero exit,
+            # that refusal would surface as a silent "no concerns" in the picker.
+            # Do not copy this flag to callers whose pane id is model-supplied.
+            str(script), "--deep", "--any-pane", shadow_pane,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+            env=env,
+        )
+    except OSError:
+        return None
+    try:
+        stdout_bytes, _ = await asyncio.wait_for(
+            proc.communicate(), timeout=_SHADOW_CAPTURE_TIMEOUT
+        )
+    except asyncio.TimeoutError:
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        with contextlib.suppress(Exception):
+            await proc.wait()
+        return None
+    if proc.returncode:
+        return None
+    return stdout_bytes.decode("utf-8", errors="replace")
+
+
+async def compute_shadow_staleness(
+    monitor, shadow_pane: str, followed_pane: str, eps: float
+) -> tuple[bool | None, float | None]:
+    """Is the shadow's feedback stale relative to the followed agent? (t1104)
+
+    Compares *times*, not content: the shadow stamps when it last read the
+    followed pane (``@aitask_shadow_analyzed_at``, epoch); if the followed pane
+    changed after that (per this module's change detection), the shadow has not
+    seen the newer output => stale. Robust to a live TUI settling by a character
+    (which an exact snapshot hash mis-reads as stale).
+
+    Returns ``(stale, analyzed_at)`` where ``stale`` is a **tri-state**:
+
+    ==========================================  ===================
+    Condition                                   Result
+    ==========================================  ===================
+    no monitor / no ``get_pane_option``         ``(None, None)``
+    ``get_pane_option`` raised                  ``(None, None)``
+    ``get_pane_option`` reported failure        ``(None, None)``
+    stamp empty (shadow never analyzed)         ``(False, None)``
+    stamp not a float                           ``(None, None)``
+    followed pane not observed yet              ``(None, None)``
+    ``last_change > analyzed_at + eps``         ``(True, analyzed_at)``
+    otherwise                                   ``(False, analyzed_at)``
+    ==========================================  ===================
+
+    ``None`` means **"preserve whatever the caller was showing"** — an
+    unreadable/malformed stamp or a not-yet-observed followed pane must never
+    clear a standing warning. Only an explicit ``False`` clears it. The caller
+    owns ``eps`` (one refresh tick, absorbing detection lag) and the banner.
+
+    A *failed* option read is *unverifiable*, never "the shadow has not analyzed
+    anything" (t1451). :meth:`TmuxMonitor.get_pane_option` used to collapse
+    ``rc != 0`` into ``""``, which landed on the empty-stamp row below and so
+    let a tmux timeout **clear** a standing staleness warning — the same
+    unverifiable-read-as-a-negative-verdict bug t1446 fixed in
+    ``discover_window_panes``. It now returns ``(ok, value)`` and only an
+    ``ok`` read reaches the stamp rows; ``-q`` still makes a genuinely *unset*
+    option a verified ``(True, "")``, which is what "never analyzed" means. A
+    shadow pane that vanished between discovery and the read is likewise a
+    failed read, not "never analyzed" (t1971): ``-q`` answers a missing pane
+    with rc 0 and no output, so ``get_pane_option`` confirms the pane before
+    calling an empty value verified. Preserving is right for it — clearing the
+    state of a shadow that is gone belongs to the caller's discovery branch,
+    which sees the absence on its next lookup.
+
+    The empty-stamp branch returns **before** the last-change lookup: that
+    ordering is a cost gate, not an accident — a shadow that never analyzed
+    anything must not provoke a followed-pane query every tick.
+    """
+    if monitor is None or not hasattr(monitor, "get_pane_option"):
+        return None, None
+    try:
+        # Unpacked INSIDE the try on purpose: a stub still returning a bare
+        # string raises here and lands on the preserve branch, which is the
+        # only safe direction — `None` never clears a standing warning.
+        ok, stamp = await monitor.get_pane_option(
+            shadow_pane, SHADOW_ANALYZED_AT_OPTION
+        )
+    except Exception:
+        return None, None  # option read failed — preserve prior state
+    if not ok:
+        return None, None  # tmux could not answer — preserve prior state
+    if not stamp:
+        # Shadow has not analyzed anything yet: nothing to warn about.
+        return False, None
+    try:
+        analyzed_at = float(stamp)
+    except ValueError:
+        return None, None  # malformed stamp — preserve prior state
+    last_change = None
+    if hasattr(monitor, "get_last_change_wall"):
+        last_change = monitor.get_last_change_wall(followed_pane)
+    if last_change is None:
+        return None, None  # followed pane not observed yet — preserve prior state
+    return (last_change > analyzed_at + eps), analyzed_at
+
+
+class BlockAge(NamedTuple):
+    """Verdict of the **block age** signal, with both comparison operands.
+
+    The third freshness signal (t1493), alongside *block identity*
+    (``concern_parser.concern_block_signature`` — has this block's text
+    changed?) and *read recency* (:func:`compute_shadow_staleness` — did the
+    shadow *look* after the agent's last change?). Block age asks the question
+    neither of those can: **was this block produced after the agent's last
+    change?** A shadow that re-reads the pane and then answers in prose restamps
+    its read stamp without emitting anything, which clears read recency while
+    leaving stale concerns on screen — the live defect this exists to catch.
+
+    ``applicable`` is **not** redundant with ``stale is None``. "There is no
+    block" and "there is a block whose age I cannot establish" are different
+    states, and only the second is uncertainty: collapsing them makes a shadow
+    used purely to explain the screen report "freshness unknown" forever, about
+    feedback that does not exist. The flag travels *with* the verdict so a
+    caller cannot pass the inapplicable case along as a bare ``None``.
+
+    Both operands of the comparison are carried because the banner reports how
+    far the block predates the change (``last_change_wall - reviewed_epoch``).
+    A tuple holding only ``reviewed_epoch`` would leave a formatter able to
+    compute nothing but ``now - reviewed_epoch``, which is the block's absolute
+    age — a different, plausible-looking, wrong number.
+    """
+
+    applicable: bool                # is there a block whose age could be asked?
+    stale: bool | None              # None = block present, age unknowable
+    reviewed_epoch: float | None    # when the block says it was produced
+    last_change_wall: float | None  # what that was compared against
+
+
+def compute_block_age_staleness(
+    capture_text: str, last_change_wall: float | None, eps: float
+) -> BlockAge:
+    """Does the newest concern block predate the followed agent's last change?
+
+    Pure and synchronous — no tmux, no I/O. Takes the **capture text** rather
+    than a pre-parsed ``BlockMeta`` so that this function, and only this
+    function, decides applicability; a caller handed a bare ``meta`` cannot tell
+    "no block" from "block without a header".
+
+    ================================================  ==========================
+    Condition                                         Result
+    ================================================  ==========================
+    no block evidence at all                          ``(False, None, None, None)``
+    block present, no ``Round:`` header (pre-t1159_1) ``(True, None, None, lcw)``
+    block present, header clipped by the window       ``(True, None, None, lcw)``
+    block present, ``Round:``-shaped but malformed    ``(True, None, None, lcw)``
+    header parses, ``reviewed_at`` empty/unparseable  ``(True, None, None, lcw)``
+    followed pane not observed yet                    ``(True, None, epoch, None)``
+    ``last_change_wall > epoch + eps``                ``(True, True, epoch, lcw)``
+    otherwise                                         ``(True, False, epoch, lcw)``
+    ================================================  ==========================
+
+    ``stale is None`` means **"cannot tell"** — a block is present but its age
+    is not establishable. It is fail-safe in the same direction
+    :func:`compute_shadow_staleness` is, but the rule is **not** the blanket
+    "preserve whatever the caller was showing" that function documents, and a
+    caller must not implement it that way:
+
+    - It must never *clear* a standing ``True`` — a false "stale" costs one
+      banner, a false "current" forwards advice the agent has already moved
+      past.
+    - It **must** be recorded over a ``False``. A pane that legitimately read
+      "current" and then grows a block whose age is unknowable has become *less*
+      certain, not more; preserving the ``False`` there hides the newly
+      unverifiable block as current, which is the precise failure this signal
+      exists to remove.
+
+    **This applies only to a caller that persists a verdict across ticks.** A
+    caller that computes the tri-state and presents it immediately — both
+    ``monitor_app`` sites, and the picker modal on either app — has no prior
+    state to preserve and simply renders what it got; ``None`` is its own
+    presentation there, not a decision. Minimonitor does retain a verdict (its
+    live banner), and centralizes every such write in
+    ``MiniMonitorApp._record_combined_staleness`` so the rule exists once.
+
+    ``eps`` is the caller's refresh epsilon — the same value the read-recency
+    compare uses, absorbing up-to-one-tick change-detection lag.
+    """
+    if not contains_block_evidence(capture_text):
+        return BlockAge(False, None, None, None)
+    meta = parse_block_meta(capture_text)
+    if meta is None:
+        return BlockAge(True, None, None, last_change_wall)
+    epoch = parse_reviewed_at_epoch(meta.reviewed_at)
+    if epoch is None:
+        return BlockAge(True, None, None, last_change_wall)
+    if last_change_wall is None:
+        return BlockAge(True, None, epoch, None)
+    return BlockAge(True, last_change_wall > epoch + eps, epoch, last_change_wall)
+
+
+def combine_staleness(read: bool | None, block: BlockAge) -> bool | None:
+    """Fail-safe join of read recency and block age (t1493).
+
+    Precedence: an inapplicable block age contributes **nothing** (the verdict
+    is read recency, unchanged — a pane with no concern block is not dragged
+    into uncertainty it has no reason to be in); otherwise ``True`` wins, then
+    ``None``, then ``False``.
+
+    So a *present* pre-header block with a clean read stamp resolves to ``None``
+    ("cannot tell"), never ``False`` — which is the whole point: before this
+    signal existed, exactly that case rendered as "current".
+
+    **This function is total and stateless**; it knows nothing about a prior
+    verdict, and most callers need none — they render the value they just
+    computed. Only a caller that *retains* a verdict between ticks (minimonitor's
+    live banner) has to decide whether a returned ``None`` may overwrite what is
+    already on screen; that decision preserves only a standing ``True`` — see
+    :func:`compute_block_age_staleness`. Such a caller must not be "improved"
+    into preserving any non-``None`` prior: recording ``None`` over ``False`` is
+    an escalation and is required.
+    """
+    if not block.applicable:
+        return read
+    if read is True or block.stale is True:
+        return True
+    if read is False and block.stale is False:
+        return False
+    return None
+
+
+#: The `list-panes` format behind the "does this window still hold a real agent?"
+#: decision, plus the two fields a frozen-aware caller needs to resolve its own
+#: target. Extracted from `kill_agent_pane_smart` in t1705_6 so the frozen-agent
+#: coordinator (`lib/agent_freeze.py drop`) can reach the SAME rule instead of
+#: growing a fourth copy of it — there are already three
+#: (`aitask_companion_cleanup.sh`, `kill_agent_pane_smart`, and the fixture in
+#: `tests/test_cleanup_rule_parity.sh`, which exists BECAUSE of that
+#: duplication).
+#:
+#: This format is its own — it does NOT share `_LIST_PANES_FORMAT` or
+#: `_LIST_PANES_ARITIES`, so its field count is pinned by the arity guard in
+#: `classify_window_panes` and nowhere else. Keep the two in step.
+#:
+#: The scratchpad target (t2073_3) is APPENDED, so the shadow field keeps its
+#: index. Both are bound-helper targets (`lib/helper_panes.py`). The sitrep TUI
+#: stamp (t2211_2) is APPENDED after it for the same reason; it is NOT a helper
+#: marker — it feeds `WindowPane.is_sitrep_tui`, which only the agent-LISTING
+#: callers read.
+FROZEN_AWARE_PANE_FORMAT = "\t".join([
+    "#{pane_id}", "#{pane_pid}", f"#{{{SHADOW_TARGET_OPTION}}}",
+    f"#{{{MONITOR_KIND_OPTION}}}", f"#{{{FROZEN_OPTION}}}", "#{pane_dead}",
+    f"#{{{SCRATCHPAD_TARGET_OPTION}}}", f"#{{{SITREP_TUI_ROOT_OPTION}}}",
+])
+_FROZEN_AWARE_ARITY = 8
+
+
+@dataclass
+class WindowPane:
+    """One row of :data:`FROZEN_AWARE_PANE_FORMAT`, classified."""
+
+    pane_id: str
+    pane_pid: int
+    frozen_record: str
+    dead: bool
+    #: True when this pane does NOT keep the window alive (companion, or a bound
+    #: helper: shadow / scratchpad). The retention rule.
+    is_helper: bool
+    #: True for the sitrep TUI pane (t2211_2, frozen first). It keeps the window
+    #: alive (`is_helper` is False) but is never an agent: callers that pick an
+    #: agent out of a window skip it; callers that count occupants must not.
+    is_sitrep_tui: bool = False
+
+
+def pane_is_helper(frozen: str, shadow_target: str, monitor_kind: str,
+                   scratch_target: str, pid: int) -> bool:
+    """The helper rule of :func:`classify_window_panes`, over already-read values.
+
+    A pane is a helper when it is NOT frozen and is a bound helper (shadow /
+    scratchpad), a live-marked companion, or a companion process (the cmdline
+    fallback for a companion still booting or never marked). Frozen FIRST: a
+    stand-in's retained markers never make it a helper. One rule, called by
+    `classify_window_panes` and the sitrep lookup (t2175_4) alike, so the two
+    cannot drift; `tests/test_cleanup_rule_parity.sh` pins it against the shell
+    copy in `aitask_companion_cleanup.sh`.
+    """
+    return not frozen.strip() and (
+        is_bound_helper(shadow_target, scratch_target)
+        or is_live_companion_marker(monitor_kind)
+        or _is_companion_process(pid)
+    )
+
+
+def classify_window_panes(stdout: str) -> list[WindowPane]:
+    """Parse + classify :data:`FROZEN_AWARE_PANE_FORMAT` rows.
+
+    The `is_helper` rule is the one `kill_agent_pane_smart` has always applied,
+    moved here verbatim so its callers cannot drift (`kill_agent_pane_smart`,
+    `agent_freeze._other_real_agents`, and rung 2 of minimonitor's
+    `_find_sibling_pane_id`, t1388):
+
+    A pane is a helper when it is a companion (marker first, cmdline second —
+    t1686) OR a bound helper — a shadow or scratchpad bound to an agent
+    (`is_bound_helper`, t2073_3). A `@aitask_frozen`-stamped pane is
+    **never** a helper (t1705_4): the window exists to hold that frozen agent's
+    stand-in viewer, so killing a live sibling beside it must not collapse the
+    window and destroy the only way back to a frozen session. The frozen check
+    comes FIRST so a stale companion marker — left on the pane by whatever ran
+    there before the respawn — cannot override it.
+
+    Today that also holds incidentally (a stand-in carries no helper target and
+    no live `@aitask_monitor_kind`), but incidental is
+    not pinned; `tests/test_cleanup_rule_parity.sh` is what keeps this rule and
+    `aitask_companion_cleanup.sh`'s copy of it in agreement. Change one and you
+    must change the other.
+
+    NOT `stdout.strip()`. The trailing field is empty on most panes, and a
+    whole-buffer strip removes the final tab — dropping the last record, which
+    if it happened to be the only other real agent makes the count 0 and kills a
+    window with a live agent still in it (t1686).
+    """
+    panes: list[WindowPane] = []
+    for line in stdout.splitlines():
+        if not line.strip():
+            continue          # blank lines are not records
+        parts = line.split("\t")
+        if len(parts) != _FROZEN_AWARE_ARITY:
+            continue
+        (pane_id, pid_str, shadow_target, monitor_kind, frozen, dead,
+         scratch_target, tui_root) = parts
+        try:
+            pid = int(pid_str)
+        except ValueError:
+            continue
+        is_helper = pane_is_helper(frozen, shadow_target, monitor_kind,
+                                   scratch_target, pid)
+        panes.append(WindowPane(
+            pane_id=pane_id, pane_pid=pid, frozen_record=frozen.strip(),
+            dead=dead.strip() == "1", is_helper=is_helper,
+            is_sitrep_tui=is_sitrep_tui_pane(frozen, tui_root),
+        ))
+    return panes
+
+
+def count_other_real_agents(
+    pane_records: Iterable[tuple[str, bool]], exclude_pane_id: str
+) -> int:
+    """Count panes that are *real* agents (not helper panes), excluding one.
+
+    ``pane_records`` is an iterable of ``(pane_id, is_helper)`` pairs. Helper
+    classification (companion process or shadow marker) is decided by the
+    caller, keeping this counting logic pure and import-free for unit tests.
+    Used by :meth:`TmuxMonitor.kill_agent_pane_smart` to decide whether the
+    window should collapse (no real agents left) or only the pane be killed.
+    """
+    return sum(
+        1
+        for pane_id, is_helper in pane_records
+        if pane_id != exclude_pane_id and not is_helper
+    )
+
+
+@dataclass
+class TmuxPaneInfo:
+    window_index: str
+    window_name: str
+    pane_index: str
+    pane_id: str        # e.g., %3
+    pane_pid: int
+    current_command: str
+    width: int
+    height: int
+    category: PaneCategory
+    session_name: str = ""   # populated by discovery; "" only when constructed outside a list-panes path
+    # Non-empty ⇒ this pane is a shadow companion (t986/t1133): the value is the
+    # FOLLOWED agent's pane id (from `@aitask_shadow_target`). Shadow panes are
+    # excluded from agent-facing discovery and from `_pane_cache`; they exist
+    # only in the shadow-status capture path (see `_parse_list_panes`).
+    shadow_target: str = ""
+    # Lines in the pane's scrollback history (`#{history_size}`), from
+    # discovery. A monotonic-growth signal for the review loop's work
+    # classifier (t1159_2): real output scrolls lines into history while
+    # in-place widget redraws do not (measured live — selection navigation
+    # leaves it unchanged, a plan revision grew it 28→61). None when the
+    # constructing path did not supply it (older stubs, hand-built infos).
+    history_size: int | None = None
+    # --- frozen code agents (t1705_4) ---------------------------------------
+    #
+    # Parsed and exposed here; no renderer reads them yet (the monitor /
+    # minimonitor frozen rows are t1705_7). Defaults match a pane that predates
+    # the fields, so a hand-built TmuxPaneInfo reads as an ordinary live agent.
+    #
+    # Non-empty ⇒ this pane is a frozen stand-in (`@aitask_frozen`), and the
+    # value is its store record id. Authoritative: a stand-in keeps the agent's
+    # window name and carries no helper marker, so nothing else tells it apart.
+    frozen_record: str = ""
+    # The pane's store record id (`@aitask_record`), whatever its state. Present
+    # on live agents too — it is the join, not a freeze marker.
+    record_id: str = ""
+    # `@aitask_standin_ready`: the record id the stand-in VIEWER stamped on
+    # itself after mounting. Empty means "not up (yet)", which reconcile treats
+    # as indeterminate rather than as failure.
+    standin_ready: str = ""
+    # `#{pane_dead}`: the pane's process exited but `remain-on-exit` kept the
+    # pane. A dead stand-in is what reconcile respawns.
+    pane_dead: bool = False
+
+
+#: Category ranks for the leading slot of :func:`tmux_index_key`. The category
+#: is a slot of its own rather than a large sentinel integer because **any**
+#: sentinel is itself a reachable decimal index: `1 << 30` would tie with the
+#: literal index "1073741824" and let every larger index sort *ahead* of
+#: non-numeric text, which is exactly the guarantee this key exists to make.
+INDEX_RANK_NUMERIC = 0
+INDEX_RANK_NON_NUMERIC = 1
+
+
+def tmux_index_key(value: object) -> tuple[int, int, str]:
+    """Numeric-first ordering key for a tmux window/pane index.
+
+    The indices are strings off the tmux gateway (``#{window_index}`` /
+    ``#{pane_index}``), so a plain comparison orders "10" before "2".
+    ``isdecimal()`` (not ``isdigit()``) is the predicate that matches exactly
+    what ``int()`` accepts; the category slot keeps every non-numeric index
+    after every numeric one **for all int values**, and the trailing text makes
+    the order total and deterministic among them. tmux always reports integers,
+    but nothing in :class:`TmuxPaneInfo` enforces it, so the key never raises.
+    """
+    text = "" if value is None else str(value)
+    if text.isdecimal():
+        return (INDEX_RANK_NUMERIC, int(text), text)
+    return (INDEX_RANK_NON_NUMERIC, 0, text)
+
+
+#: Category ranks for one run of :func:`natural_name_key`. Same discipline as
+#: `INDEX_RANK_*` above, and for the same reason: the slot is a category, never
+#: a sentinel integer, because any sentinel is itself a reachable digit run.
+NAME_RANK_NUMERIC = 0
+NAME_RANK_TEXT = 1
+
+#: One run of a window name: digits, or everything that is not digits.
+_NAME_RUN_RE = re.compile(r"\d+|\D+")
+
+
+def natural_name_key(value: object) -> tuple[tuple[int, int, str], ...]:
+    """Natural (numeric-aware) ordering key for a tmux window name.
+
+    Agent windows are named ``agent-(pick|qa|resume|explore|raw)-<id>``, so a
+    plain string compare orders ``agent-pick-10`` before ``agent-pick-2`` — the
+    same "jumps back to low numbers part-way down the list" symptom t1659
+    removed from the indices. The name is split into digit / non-digit runs and
+    each run becomes a ``(rank, number, text)`` triple, so digit runs compare
+    **numerically**. A child task's window (``agent-pick-100_1``) yields a
+    longer run tuple than its parent's (``agent-pick-100``) and therefore
+    follows it, while still preceding ``agent-pick-101``.
+
+    The rank slot is load-bearing, not decoration: the runs of two names need
+    not align by kind (``"10a"`` is digits-then-text, ``"a10"`` the reverse),
+    and it is what orders a digit run against a text run at the same position
+    without ever comparing an ``int`` to a ``str``. It is a category — never a
+    large sentinel integer — for the reason :func:`tmux_index_key` states.
+
+    ``isdecimal()`` (not ``isdigit()``) is the predicate that matches exactly
+    what ``int()`` accepts, so the key never raises; an empty or non-string
+    name still yields a totally ordered key. The raw run text is kept as the
+    third slot so ``agent-pick-007`` and ``agent-pick-7`` stay distinct.
+    """
+    text = "" if value is None else str(value)
+    return tuple(
+        (NAME_RANK_NUMERIC, int(run), run) if run.isdecimal()
+        else (NAME_RANK_TEXT, 0, run)
+        for run in _NAME_RUN_RE.findall(text)
+    )
+
+
+def pane_sort_key(pane) -> tuple:
+    """Display order for a discovered tmux pane: session, then window **name**
+    (naturally, t1679), then window index and pane index as tiebreaks (t1659).
+
+    Duck-typed on :class:`TmuxPaneInfo`'s four fields so it serves both a bare
+    ``TmuxPaneInfo`` (discovery) and a ``PaneSnapshot.pane`` (both TUIs'
+    ``_rebuild_pane_list``). It is the ONE definition of "pane order" — the
+    monitor and minimonitor lists must not be able to drift apart.
+
+    ``session_name`` still leads, so per-session grouping (and minimonitor's
+    session dividers in multi-session mode) is unchanged. The name replaced the
+    window index in the second slot because the index is only launch order,
+    while the name is what the cards actually show and what carries the task id.
+    The two indices survive as the tiebreak that keeps the order **total and
+    deterministic** when two windows share a name.
+
+    **This also changes discovery order, and that is deliberate.** The name is a
+    property of the WINDOW, so every pane in a window carries the same one — the
+    new slot therefore cannot reorder panes *within* a window, only move whole
+    windows relative to each other inside a session. That is what keeps
+    ``MiniMonitorApp._find_own_agent_snapshot`` (filters to one window, takes
+    the first match — the ``e`` / ``E`` and review-loop resolution seam)
+    invariant; ``tests/test_monitor_pane_sort_order.py``'s
+    ``WithinWindowOrderInvarianceTests`` pins it. Two consumers do observe the
+    change, both benignly and both still deterministic: ``MonitorApp``'s
+    auto-switch breaks exact ``idle_seconds`` ties by discovery order
+    (``monitor_app._maybe_auto_switch``), and
+    ``MiniMonitorApp._find_running_agent_line`` names the first pane running a
+    duplicated task id. In both the tie-break simply becomes name order.
+    """
+    return (
+        pane.session_name,
+        natural_name_key(pane.window_name),
+        tmux_index_key(pane.window_index),
+        tmux_index_key(pane.pane_index),
+    )
+
+
+def _parked_snapshot(pane: "TmuxPaneInfo", now: float) -> "PaneSnapshot":
+    """The minimal snapshot for a pane that was deliberately not captured.
+
+    Every observation-derived field is its "nothing was observed" value, and
+    that is not the same as its "nothing is happening" value: `is_idle=False`
+    means *no verdict*, so the renderer shows the parked placeholder instead of
+    a state dot. `idle_seconds=0.0` for the same reason — a growing number would
+    invite the row to be read as "idle this long".
+
+    Deliberately outside `TmuxMonitor._apply_bookkeeping`, which owns
+    `_last_content` / `_last_change_time` and must not see a pane with no
+    content.
+    """
+    return PaneSnapshot(
+        pane=pane,
+        content="",
+        timestamp=now,
+        idle_seconds=0.0,
+        is_idle=False,
+        awaiting_input=False,
+        parked=True,
+    )
+
+
+def _frozen_snapshot(pane: "TmuxPaneInfo", now: float) -> "PaneSnapshot":
+    """The minimal snapshot for a pane holding a frozen agent's stand-in.
+
+    The twin of :func:`_parked_snapshot`, and outside `_apply_bookkeeping` for
+    the identical reason: that method owns `_last_content` / `_last_change_time`
+    and must never see a pane with no content.
+
+    The stand-in is a viewer, not an agent — there is no agent process to have a
+    verdict about — so every observation-derived field is its "nothing was
+    observed" value. `frozen_record_id` is carried through from the pane option
+    so a renderer can reach the store record without a second tmux round-trip.
+    """
+    return PaneSnapshot(
+        pane=pane,
+        content="",
+        timestamp=now,
+        idle_seconds=0.0,
+        is_idle=False,
+        awaiting_input=False,
+        frozen=True,
+        frozen_record_id=pane.frozen_record,
+    )
+
+
+@dataclass
+class PaneSnapshot:
+    pane: TmuxPaneInfo
+    content: str            # last N lines of captured text
+    timestamp: float        # time.monotonic()
+    idle_seconds: float     # seconds since last content change
+    is_idle: bool           # idle_seconds > threshold (only meaningful for AGENT panes)
+    awaiting_input: bool = False
+    awaiting_input_kind: str = ""   # name of the first matching prompt pattern
+    # Resolution provenance for `awaiting_input_kind` (t1467). `scoped` False
+    # means the kind came from the UNSCOPED flat list because the pane's command
+    # did not resolve to a known agent — a common case, not an edge (a Codex
+    # pane reports `node`). Consumers must not present the two regimes alike.
+    agent_key: str = ""
+    scoped: bool = False
+    #: Parked (t1685): this pane was not captured this tick by request, so
+    #: `content` is empty and `is_idle` / `awaiting_input` are False because
+    #: nothing was observed — NOT because the agent is busy. Renderers must show
+    #: the parked placeholder rather than a state dot; a frozen ● would read as
+    #: a live verdict that is in fact arbitrarily stale.
+    parked: bool = False
+    #: Frozen (t1705_7): this pane holds a frozen agent's stand-in viewer, so
+    #: there is no agent process to observe. Same "nothing was observed" reading
+    #: as `parked` above, and it takes PRECEDENCE over it — the two can be true
+    #: of one pane (frozen coexists with the parked mark), and the capture
+    #: partition resolves that in `capture_all_classified_async`.
+    frozen: bool = False
+    #: The store record id from `@aitask_frozen`, so a renderer can look the
+    #: record up (`SessionsView.by_id`) without re-reading the pane option.
+    #: Empty whenever `frozen` is False.
+    frozen_record_id: str = ""
+
+
+# %begin / %end / %error <epoch> <cmd_id> <flags>
+# Flags is a bitmask; bit 1 means the block is the response to a command
+# issued via this control client. Server-emitted blocks (e.g., the implicit
+# attach acknowledgment) have bit 1 unset and must not be delivered to
+# pending callers.
+_HEAD_RE = re.compile(r"^%(begin|end|error)\s+\d+\s+(\d+)\s+(\d+)\s*$")
+_EXIT_RE = re.compile(r"^%exit(?:\s+.*)?$")
+# %session-changed <session-id> <name> — this client's attached session changed.
+# tmux sends one right after attach (the exact-match target) and another when it
+# moves the client onto a different session: `detach-on-destroy off` does that
+# instead of %exit when the attached session is destroyed, and so does a
+# `switch-client` of the control client. Only the id is captured: the name can
+# contain spaces and need not round-trip through the wire codec, while the id is
+# stable across `rename-session` (which sends %session-renamed instead).
+_SESSION_CHANGED_RE = re.compile(r"^%session-changed\s+(\$\d+)(?:\s.*)?$")
+
+_DEFAULT_STREAM_LIMIT = 4 * 1024 * 1024  # 4 MiB; default asyncio is 64 KiB
+_DEFAULT_CLOSE_TIMEOUT = 2.0
+
+
+def _quote_arg(arg: str) -> str:
+    """Quote one tmux command argument for the control-mode wire format.
+
+    tmux's command parser tokenizes on whitespace outside quotes; inside
+    `"..."` it interprets `\\\\`, `\\"`, and a few other escapes. We escape
+    only `\\` → `\\\\` and `"` → `\\"`. Literal tab bytes (`0x09`) inside
+    the quoted string are preserved — tmux's lexer accepts them, and this
+    matches the byte-for-byte wire format the existing subprocess path
+    passes via argv (notably the format string for `list-panes -F`).
+    """
+    return '"' + arg.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _control_line(args: list[str]) -> bytes:
+    """The control-mode wire line for one command (policy 5, t2236).
+
+    Each argument is quoted, then encoded ON ITS OWN with
+    :func:`tmux_exec.encode_tmux_wire` — the exact bytes it would get as a
+    subprocess argv element, so the control route and the subprocess route of
+    ``run_via_control`` send the same command. Encoding the joined line once is
+    wrong: a single argument the OS codec cannot represent (``=€:`` under a
+    Latin-1 locale) would push the whole line to UTF-8 and re-encode an
+    unrelated native OS-path argument beside it. ``_quote_arg`` adds only ASCII
+    quote / backslash characters, which encode identically under any codec.
+    """
+    return b" ".join(encode_tmux_wire(_quote_arg(a)) for a in args) + b"\n"
+
+
+class TmuxControlClient:
+    """Single persistent `tmux -C` control client."""
+
+    def __init__(
+        self,
+        session: str,
+        command_timeout: float = 5.0,
+        socket_args: list[str] | None = None,
+    ):
+        self.session = session
+        self.command_timeout = command_timeout
+        # Socket flag (``-L <name>`` or ``[]``) cached once — never re-read
+        # per request (this client serves the monitor refresh hot path). When
+        # not supplied, resolved from ``AITASKS_TMUX_SOCKET`` via the gateway so
+        # the control attach converges on the same socket as TmuxClient (t952_3).
+        self._socket_args = (
+            list(socket_args) if socket_args is not None else tmux_socket_args()
+        )
+        self._proc: Optional[asyncio.subprocess.Process] = None
+        self._reader_task: Optional[asyncio.Task] = None
+        self._pending: "collections.deque[asyncio.Future]" = collections.deque()
+        # (cmd_id, buf, deliver) — `deliver` is False for server-emitted
+        # blocks (flags bit 1 unset); their bodies are dropped at end/error.
+        self._capturing: Optional[tuple[int, list[str], bool]] = None
+        self._write_lock = asyncio.Lock()
+        self._alive = False
+        #: Set when tmux sent ``%exit`` (t2037_1): the server went away, or the
+        #: attached session was destroyed. Also set when tmux moved this client
+        #: onto a different session (t2245) — what destroying the attached
+        #: session does under ``detach-on-destroy off`` — so both settings of
+        #: that option end the client the same way. Read by the backend
+        #: supervisor and the shared status server, which tells the server-gone
+        #: and session-gone cases apart by probing.
+        self.saw_exit = False
+        #: Id (``$N``) of the session this client attached to, anchored by the
+        #: first ``%session-changed`` tmux sends after attach. A later one
+        #: naming another id means the client now serves another session.
+        self._session_id: Optional[str] = None
+
+    @property
+    def is_alive(self) -> bool:
+        return self._alive
+
+    def _attach_argv(self) -> list[str]:
+        """Build the ``tmux -C attach`` argv, with the socket flag threaded in.
+
+        The cached socket flag goes between ``"tmux"`` and ``"-C"`` so a
+        dedicated-socket move (``AITASKS_TMUX_SOCKET``) reaches the control
+        channel exactly as it reaches TmuxClient's subprocess path. Extracted as
+        a method so the argv is unit-testable without spawning a process.
+
+        The target is exact-match (``session_target`` → ``=<session>``, gateway
+        policy 2): with a bare name tmux prefix-matches, so a control client for
+        an absent ``aitasks`` would attach to a running ``aitasks_mob`` and serve
+        every query from the other project. Both the initial start and the
+        supervisor's reconnect build their argv here.
+        """
+        return [
+            "tmux", *TMUX_CLIENT_FLAGS, *self._socket_args, "-C", "attach",
+            "-t", session_target(self.session), "-f", "no-output,ignore-size",
+        ]
+
+    async def start(self) -> bool:
+        """Spawn `tmux -C attach` and start the reader task.
+
+        Returns False if `tmux` is not on PATH or the attach fails (e.g.,
+        the target session does not exist). Does not raise on those paths
+        — callers fall back to subprocess.
+        """
+        if self._proc is not None:
+            return self._alive
+        # The anchor belongs to one attachment: after close() this object can
+        # be started again, and the new process may attach to a recreated
+        # session with a different id. A stale anchor would read that new
+        # attachment's first %session-changed as a switch and end the client.
+        self._session_id = None
+        try:
+            self._proc = await asyncio.create_subprocess_exec(
+                *encode_tmux_argv(self._attach_argv()),
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+                limit=_DEFAULT_STREAM_LIMIT,
+            )
+        except (FileNotFoundError, OSError):
+            self._proc = None
+            return False
+
+        # Attach can fail asynchronously — give the child a brief moment to
+        # decide. If it has already exited by the time we look, the attach
+        # failed (typically: session does not exist). asyncio's Process
+        # exposes `returncode` which is non-None once exited.
+        await asyncio.sleep(0.05)
+        if self._proc.returncode is not None:
+            self._proc = None
+            return False
+
+        self._alive = True
+        self._reader_task = asyncio.create_task(self._reader_loop())
+        return True
+
+    async def _reader_loop(self) -> None:
+        assert self._proc is not None and self._proc.stdout is not None
+        try:
+            while True:
+                line_bytes = await self._proc.stdout.readline()
+                if not line_bytes:
+                    break  # EOF
+                line = decode_tmux_output(line_bytes)
+                if line.endswith("\n"):
+                    line = line[:-1]
+
+                if self._capturing is not None:
+                    cmd_id, buf, deliver = self._capturing
+                    m = _HEAD_RE.match(line)
+                    if m and m.group(1) in ("end", "error") and int(m.group(2)) == cmd_id:
+                        rc = 0 if m.group(1) == "end" else 1
+                        body = "\n".join(buf) + ("\n" if buf else "")
+                        self._capturing = None
+                        if deliver:
+                            self._resolve_next((rc, body))
+                        # Server-emitted block (e.g., attach ack): drop.
+                    else:
+                        buf.append(line)
+                    continue
+
+                m = _HEAD_RE.match(line)
+                if m and m.group(1) == "begin":
+                    deliver = (int(m.group(3)) & 1) != 0
+                    self._capturing = (int(m.group(2)), [], deliver)
+                elif _EXIT_RE.match(line):
+                    self.saw_exit = True
+                    break  # tmux server (or the attached session) is going away
+                elif (sc := _SESSION_CHANGED_RE.match(line)) and self._switched_away(
+                    sc.group(1)
+                ):
+                    # The attached session is gone (or this client was switched
+                    # off it): every later reply would come from another
+                    # session, possibly another project. Treat it like %exit.
+                    self.saw_exit = True
+                    self._detach_switched_client()
+                    break
+                # Any other %-line outside a Capturing block is an async
+                # event (filtered to `no-output`-only by the spawn flags,
+                # but tmux can still emit %sessions-changed, %client-detached,
+                # etc.). Discard.
+        except (asyncio.CancelledError, ConnectionResetError, OSError):
+            pass
+        finally:
+            self._teardown_pending()
+
+    def _switched_away(self, session_id: str) -> bool:
+        """Whether a ``%session-changed`` moves this client off its session.
+
+        The first notification, sent right after attach to the exact-match
+        target, anchors the id and is never a switch. A rename keeps the id.
+        """
+        if self._session_id is None:
+            self._session_id = session_id
+            return False
+        return session_id != self._session_id
+
+    def _detach_switched_client(self) -> None:
+        """End a ``tmux -C`` process that tmux switched to another session.
+
+        Unlike ``%exit``, the process is still running, now attached to the
+        other session, and the supervisor replaces a dead client without
+        ``close()``-ing it. Closing stdin makes tmux drop the control client.
+        Best-effort and synchronous: the reader task cannot await ``close()``,
+        which waits for the reader itself.
+        """
+        stdin = getattr(self._proc, "stdin", None)
+        if stdin is None:
+            return
+        with contextlib.suppress(Exception):
+            if not stdin.is_closing():
+                stdin.close()
+
+    def _resolve_next(self, result: tuple[int, str]) -> None:
+        if not self._pending:
+            return  # spurious response (no caller waiting); drop on the floor
+        fut = self._pending.popleft()
+        if not fut.done():
+            fut.set_result(result)
+
+    def _teardown_pending(self) -> None:
+        self._alive = False
+        # If a capture was in flight, drop it — the corresponding future is
+        # the leftmost in _pending and gets resolved with (-1, "") below.
+        self._capturing = None
+        while self._pending:
+            fut = self._pending.popleft()
+            if not fut.done():
+                fut.set_result((-1, ""))
+
+    async def request(
+        self, args: list[str], timeout: float | None = None
+    ) -> tuple[int, str]:
+        """Issue one tmux command; return `(rc, stdout_text)`.
+
+        rc semantics mirror `lib.tmux_exec.TmuxClient.run_async`:
+        - `0` on success
+        - `1` on tmux command error (`%error` reply)
+        - `-1` on transport failure (client dead, broken pipe, timeout)
+
+        On `-1`, the client is marked dead; the next `request()` will also
+        return `(-1, "")` until `start()` is called again.
+        """
+        if not self._alive or self._proc is None or self._proc.stdin is None:
+            return (-1, "")
+
+        cmd_line = _control_line(args)
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+
+        async with self._write_lock:
+            if not self._alive or self._proc.stdin is None:
+                return (-1, "")
+            self._pending.append(fut)
+            try:
+                self._proc.stdin.write(cmd_line)
+                await self._proc.stdin.drain()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                self._teardown_pending()
+                return (-1, "")
+
+        try:
+            effective_timeout = timeout if timeout is not None else self.command_timeout
+            return await asyncio.wait_for(fut, timeout=effective_timeout)
+        except asyncio.TimeoutError:
+            # We can't reliably correlate any future responses to in-flight
+            # callers anymore — mark dead and let everyone fall back.
+            self._teardown_pending()
+            return (-1, "")
+
+    async def close(self) -> None:
+        """Shut down the control client cleanly.
+
+        Closes stdin (tmux drops the control client on EOF), waits briefly
+        for `proc.wait()`, kills if it's still running, then cancels the
+        reader task. Resolves any remaining futures with `(-1, "")`.
+        Idempotent.
+        """
+        self._alive = False
+        proc = self._proc
+        if proc is None:
+            self._teardown_pending()
+            return
+
+        if proc.stdin is not None and not proc.stdin.is_closing():
+            with contextlib.suppress(Exception):
+                proc.stdin.close()
+
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=_DEFAULT_CLOSE_TIMEOUT)
+        except asyncio.TimeoutError:
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+            with contextlib.suppress(Exception):
+                await proc.wait()
+
+        if self._reader_task is not None and not self._reader_task.done():
+            self._reader_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._reader_task
+
+        self._teardown_pending()
+        self._proc = None
+        self._reader_task = None
+
+
+_BACKEND_READY_TIMEOUT = 2.0
+_BACKEND_START_TIMEOUT = 5.0
+_BACKEND_STOP_TIMEOUT = 3.0
+_BACKEND_THREAD_JOIN_TIMEOUT = 3.0
+
+# Supervisor / reconnect tuning. Backoffs are seconds between successive
+# reconnect attempts; the supervisor sleeps the backoff *before* each
+# attempt, so the first respawn is delayed by 0.5 s after the prior client
+# is observed dead. After `_RECONNECT_MAX_ATTEMPTS` consecutive failed
+# spawns the supervisor exits and the backend stays in `FALLBACK` for the
+# rest of its life. `_DEATH_POLL_INTERVAL` is the cadence at which the
+# supervisor polls `client.is_alive` while the channel is healthy — kept
+# tighter than the typical monitor refresh so the badge flips quickly when
+# the channel breaks.
+_RECONNECT_BACKOFFS = (0.5, 1.0, 2.0, 4.0, 8.0)
+_RECONNECT_MAX_ATTEMPTS = 5
+_DEATH_POLL_INTERVAL = 0.5
+
+
+class TmuxControlState(enum.Enum):
+    """Lifecycle state of a `TmuxControlBackend`'s control channel."""
+    CONNECTED = "connected"        # client attached and serving requests
+    RECONNECTING = "reconnecting"  # supervisor is respawning the client
+    FALLBACK = "fallback"          # max attempts exhausted; subprocess only
+    STOPPED = "stopped"            # backend.stop() called or never started
+
+
+class TmuxControlBackend:
+    """Owns a dedicated asyncio loop in a background thread that drives a
+    `TmuxControlClient`.
+
+    Provides sync (`request_sync`) and async (`request_async`) entry points;
+    both route through `asyncio.run_coroutine_threadsafe` so callers on any
+    thread/loop see consistent semantics. The backend exists so that sync
+    user-action call sites (Textual handlers, etc.) can reach the control
+    client without deadlocking the reader task — the reader runs on the
+    backend's bg loop, not on the calling thread's loop.
+
+    Subprocess fallback is the caller's responsibility: this class only
+    surfaces `(-1, "")` on transport failure.
+    """
+
+    def __init__(
+        self,
+        session: str,
+        command_timeout: float = 5.0,
+        socket_args: list[str] | None = None,
+    ):
+        self.session = session
+        self.command_timeout = command_timeout
+        # Cached socket flag, passed to every client this backend constructs
+        # (initial start + every supervisor reconnect) so a reconnected channel
+        # keeps the same socket. Resolved from AITASKS_TMUX_SOCKET when not
+        # supplied (unset env → dedicated `-L ait` socket, t953).
+        self._socket_args = (
+            list(socket_args) if socket_args is not None else tmux_socket_args()
+        )
+        self._client: Optional[TmuxControlClient] = None
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._thread: Optional[threading.Thread] = None
+        self._ready = threading.Event()
+        self._state: TmuxControlState = TmuxControlState.STOPPED
+        self._state_lock = threading.Lock()
+        self._reconnect_task: Optional[asyncio.Task] = None
+        self._stop_requested: bool = False
+        # Sticky: some client of this backend saw `%exit` (t2037_1). The
+        # supervisor swaps `_client` on reconnect, so the flag is copied here
+        # before the dead client is replaced.
+        self._exit_seen = threading.Event()
+
+    @property
+    def is_alive(self) -> bool:
+        return self._client is not None and self._client.is_alive
+
+    @property
+    def exit_seen(self) -> bool:
+        """Whether any client of this backend received ``%exit``."""
+        client = self._client
+        return self._exit_seen.is_set() or (client is not None and client.saw_exit)
+
+    @property
+    def state(self) -> TmuxControlState:
+        """Current channel state. Thread-safe; safe to call from the UI loop."""
+        with self._state_lock:
+            return self._state
+
+    def _set_state(self, s: TmuxControlState) -> None:
+        with self._state_lock:
+            self._state = s
+
+    def start(self) -> bool:
+        """Start bg thread + loop, then start the client on it.
+
+        Returns True iff the client successfully attached. Idempotent: a
+        second call while already started returns the current `is_alive`
+        without spawning a second thread.
+        """
+        if self._thread is not None:
+            return self.is_alive
+        self._stop_requested = False
+        self._ready.clear()
+        thread = threading.Thread(
+            target=self._thread_main, name="tmux-control-loop", daemon=True
+        )
+        thread.start()
+        if not self._ready.wait(timeout=_BACKEND_READY_TIMEOUT) or self._loop is None:
+            # Loop never came up — abandon the thread (daemon=True will clean
+            # it up at process exit). Reset state so a future start() retries.
+            self._thread = None
+            self._loop = None
+            return False
+        self._thread = thread
+        client = TmuxControlClient(
+            self.session, self.command_timeout, socket_args=self._socket_args
+        )
+        cf = asyncio.run_coroutine_threadsafe(client.start(), self._loop)
+        try:
+            ok = cf.result(timeout=_BACKEND_START_TIMEOUT)
+        except Exception:
+            ok = False
+        if ok:
+            self._client = client
+            self._set_state(TmuxControlState.CONNECTED)
+            self._spawn_supervisor()
+            return True
+        # Client did not attach. Tear down the thread so we don't leak it.
+        self.stop()
+        return False
+
+    def _spawn_supervisor(self) -> None:
+        """Schedule the reconnect supervisor on the bg loop (fire-and-forget).
+
+        Stores the resulting `asyncio.Task` in `self._reconnect_task` from
+        the bg loop's thread, so cancellation in `stop()` always reads a
+        consistent value.
+        """
+        loop = self._loop
+        if loop is None:
+            return
+
+        def _create_task() -> None:
+            self._reconnect_task = loop.create_task(self._supervisor_loop())
+
+        loop.call_soon_threadsafe(_create_task)
+
+    async def _supervisor_loop(self) -> None:
+        """Watch the active client; respawn on death with bounded backoff.
+
+        Runs on the bg loop. Polls `client.is_alive` at
+        `_DEATH_POLL_INTERVAL`; on death, attempts up to
+        `_RECONNECT_MAX_ATTEMPTS` reconnects spaced by `_RECONNECT_BACKOFFS`.
+        On success, swaps `self._client` to the fresh client and returns to
+        polling. On exhaustion, sets `FALLBACK` and exits — the backend
+        stays subprocess-only for the rest of its life.
+
+        Cooperative shutdown: `stop()` sets `_stop_requested = True` and
+        cancels the task. Both paths exit cleanly.
+        """
+        try:
+            while not self._stop_requested:
+                # Phase 1: wait for the current client to die.
+                while (
+                    self._client is not None
+                    and self._client.is_alive
+                    and not self._stop_requested
+                ):
+                    await asyncio.sleep(_DEATH_POLL_INTERVAL)
+                if self._stop_requested:
+                    return
+
+                # Phase 2: client is dead. Try to reconnect with backoff.
+                if self._client is not None and self._client.saw_exit:
+                    self._exit_seen.set()
+                self._set_state(TmuxControlState.RECONNECTING)
+                attempts = 0
+                reconnected = False
+                while (
+                    attempts < _RECONNECT_MAX_ATTEMPTS
+                    and not self._stop_requested
+                ):
+                    delay = _RECONNECT_BACKOFFS[
+                        min(attempts, len(_RECONNECT_BACKOFFS) - 1)
+                    ]
+                    await asyncio.sleep(delay)
+                    if self._stop_requested:
+                        return
+                    new_client = TmuxControlClient(
+                        self.session, self.command_timeout,
+                        socket_args=self._socket_args,
+                    )
+                    if await new_client.start():
+                        self._client = new_client
+                        self._set_state(TmuxControlState.CONNECTED)
+                        reconnected = True
+                        break
+                    attempts += 1
+
+                if not reconnected:
+                    self._set_state(TmuxControlState.FALLBACK)
+                    return
+        except asyncio.CancelledError:
+            # Cooperative shutdown — fall through. State is updated by stop().
+            return
+
+    def _thread_main(self) -> None:
+        loop = asyncio.new_event_loop()
+        self._loop = loop
+        asyncio.set_event_loop(loop)
+        self._ready.set()
+        try:
+            loop.run_forever()
+        finally:
+            try:
+                loop.run_until_complete(loop.shutdown_asyncgens())
+            except Exception:
+                pass
+            loop.close()
+
+    def stop(self) -> None:
+        """Close the client (on bg loop), stop the loop, join the thread.
+
+        Idempotent. Safe to call when start() failed partway through. Also
+        cancels the reconnect supervisor (if any) before tearing down the
+        client, so an in-flight reconnect attempt cannot create a new
+        `tmux -C attach` subprocess after `stop()` returns.
+        """
+        self._stop_requested = True
+        loop = self._loop
+        client = self._client
+        thread = self._thread
+        # Cancel the supervisor before closing the client so it can't
+        # respawn a fresh one in the gap between client.close() and the
+        # loop stopping.
+        if loop is not None and self._reconnect_task is not None:
+            with contextlib.suppress(Exception):
+                cf = asyncio.run_coroutine_threadsafe(
+                    self._cancel_reconnect_task(), loop
+                )
+                cf.result(timeout=1.0)
+        if loop is not None and client is not None:
+            with contextlib.suppress(Exception):
+                cf = asyncio.run_coroutine_threadsafe(client.close(), loop)
+                cf.result(timeout=_BACKEND_STOP_TIMEOUT)
+        if loop is not None and loop.is_running():
+            loop.call_soon_threadsafe(loop.stop)
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=_BACKEND_THREAD_JOIN_TIMEOUT)
+        self._client = None
+        self._loop = None
+        self._thread = None
+        self._reconnect_task = None
+        self._ready.clear()
+        self._set_state(TmuxControlState.STOPPED)
+
+    async def _cancel_reconnect_task(self) -> None:
+        """Cancel the supervisor task and wait for it to finish.
+
+        Runs on the bg loop. Reads `self._reconnect_task` from the same
+        loop that created it, so the read is consistent. Idempotent —
+        safe if the task already finished or was never created.
+        """
+        task = self._reconnect_task
+        if task is None or task.done():
+            return
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await task
+
+    def request_sync(
+        self, args: list[str], timeout: Optional[float] = None
+    ) -> tuple[int, str]:
+        """Issue a tmux command and block until the response arrives.
+
+        Returns `(rc, stdout)`. `(-1, "")` on transport failure (client
+        dead, loop unavailable, or future timeout). Safe to call from any
+        thread, including from inside an asyncio handler running on a
+        different loop than the backend.
+        """
+        loop = self._loop
+        client = self._client
+        if loop is None or client is None or not client.is_alive:
+            return (-1, "")
+        eff = timeout if timeout is not None else self.command_timeout
+        try:
+            cf = asyncio.run_coroutine_threadsafe(
+                client.request(args, timeout=eff), loop
+            )
+        except RuntimeError:
+            # Loop closed between the alive check and scheduling.
+            return (-1, "")
+        try:
+            return cf.result(timeout=eff + 1.0)
+        except Exception:
+            with contextlib.suppress(Exception):
+                cf.cancel()
+            return (-1, "")
+
+    async def request_async(
+        self, args: list[str], timeout: Optional[float] = None
+    ) -> tuple[int, str]:
+        """Issue a tmux command from an async caller on a different loop.
+
+        The caller awaits the result on its own loop; the request executes
+        on the backend's bg loop.
+        """
+        loop = self._loop
+        client = self._client
+        if loop is None or client is None or not client.is_alive:
+            return (-1, "")
+        eff = timeout if timeout is not None else self.command_timeout
+        try:
+            cf = asyncio.run_coroutine_threadsafe(
+                client.request(args, timeout=eff), loop
+            )
+        except RuntimeError:
+            return (-1, "")
+        try:
+            return await asyncio.wrap_future(cf)
+        except Exception:
+            return (-1, "")
+
+
+# -- Client view (t2034_2) -----------------------------------------------------
+#
+# The producer (`TmuxMonitor`) is client-agnostic: it scans every session, never
+# excludes a pane on a client's behalf, and returns what it captured. Everything
+# that depends on WHO is looking is applied by the client, through the pure
+# functions below, so one producer can serve many clients (t2037) and the
+# in-process single-client path uses exactly the same code.
+
+
+class _CapturePinAll:
+    """Sentinel type for :data:`CAPTURE_PIN_ALL` (a readable repr in tests)."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "CAPTURE_PIN_ALL"
+
+
+#: A client's capture-pin set meaning "I need live capture of every agent,
+#: parked or not". A minimonitor publishes it while its own identity is
+#: unconfirmed: subtracting a stale followed-agent name would freeze the panel
+#: the pane exists to show, so it fails safe by pinning everything (t1685 §7).
+CAPTURE_PIN_ALL = _CapturePinAll()
+
+
+def _pinned(pair: tuple, pins) -> bool:
+    return pins is CAPTURE_PIN_ALL or pair in pins
+
+
+def parked_capture_skip(global_parked, pin_sets) -> frozenset:
+    """The ``(session, window)`` pairs the producer must NOT capture.
+
+    ``global_parked`` is the store-derived parked set — global, identical for
+    every client (see ``agent_marks.parked_session_windows``). ``pin_sets`` is one
+    capture-pin set per client: agents that client needs captured live even
+    though they are parked (a minimonitor's followed agent). Any
+    :data:`CAPTURE_PIN_ALL` disables skipping entirely.
+
+    In-process there is one client, so this reproduces that client's published
+    set exactly; a shared server passes one pin set per subscriber.
+    """
+    skip = set(global_parked)
+    for pins in pin_sets:
+        if pins is CAPTURE_PIN_ALL:
+            return frozenset()
+        skip.difference_update(pins)
+    return frozenset(skip)
+
+
+def client_admits_pane(
+    pane: "TmuxPaneInfo", *, own_pane: str | None = None,
+    home_session: str | None = None, multi_session: bool = True,
+) -> bool:
+    """Whether a client's view shows this pane at all.
+
+    ``own_pane`` is the client's own tmux pane (its ``$TMUX_PANE``), which the
+    producer used to exclude on the client's behalf. ``multi_session=False`` is
+    the ``M`` toggle's single-session view: only ``home_session`` is shown.
+    """
+    if own_pane and getattr(pane, "pane_id", None) == own_pane:
+        return False
+    # An empty session name is a legacy/stub record of the home session — the
+    # same `("", home)` reading `_find_own_agent_snapshot` applies.
+    session = getattr(pane, "session_name", "")
+    if not multi_session and session and session != home_session:
+        return False
+    return True
+
+
+def client_view_snapshots(
+    snapshots: dict, *, own_pane: str | None = None,
+    home_session: str | None = None, multi_session: bool = True,
+    parked_pairs=frozenset(), pins=frozenset(), now: float | None = None,
+) -> dict:
+    """Project a producer snapshot dict into one client's view.
+
+    Drops what :func:`client_admits_pane` refuses, and turns a LIVE snapshot of
+    a parked agent this client does not pin into the parked placeholder. The
+    second half is a no-op in-process (the producer already skipped exactly
+    those panes), but under a shared producer another client's pin makes the
+    producer capture the agent live, and without the substitution that live
+    data would replace this client's parked row.
+
+    Frozen takes precedence, as in the capture partition: a frozen snapshot is
+    never rewritten to parked. Only AGENT panes are parked, matching
+    ``TmuxMonitor._is_parked_pane``.
+    """
+    stamp = time.monotonic() if now is None else now
+    out: dict = {}
+    for pane_id, snap in snapshots.items():
+        pane = snap.pane
+        if not client_admits_pane(
+            pane, own_pane=own_pane, home_session=home_session,
+            multi_session=multi_session,
+        ):
+            continue
+        if (
+            parked_pairs
+            and not getattr(snap, "frozen", False)
+            and not getattr(snap, "parked", False)
+            and getattr(pane, "category", None) == PaneCategory.AGENT
+            and (pane.session_name, pane.window_name) in parked_pairs
+            and not _pinned((pane.session_name, pane.window_name), pins)
+        ):
+            snap = _parked_snapshot(pane, stamp)
+        out[pane_id] = snap
+    return out
+
+
+class TmuxMonitor:
+    """The status PRODUCER: discovery, capture, classification, idle clock.
+
+    **Client-agnostic contract (t2034_2).** One instance must be able to serve
+    many clients (monitor, minimonitors, applink — t2037), so it holds no setting
+    that depends on which client is looking:
+
+    - **Own pane** — the producer excludes nothing on a client's behalf and never
+      reads ``$TMUX_PANE``. Each client drops its own pane with
+      :func:`client_view_snapshots` / :func:`client_admits_pane`. (Monitor and
+      minimonitor panes are dropped anyway by the companion filter; the client
+      filter covers an unmarked pane such as applink's.)
+    - **Multi-session** — the producer always scans every aitasks session. The
+      ``M`` toggle is client view state; the client filters by session.
+      ``all_sessions=False`` exists only as a construction-time scope for
+      one-shot callers (freeze-all's per-session discovery, the debug CLI,
+      benchmarks, tests) and is never flipped at runtime.
+    - **Parked agents** — WHICH agents are parked is global (the per-user marks
+      store plus the session→project map). Whether a parked agent is still
+      CAPTURED depends on clients' capture pins: the skip set the client publishes
+      through :meth:`set_parked_agents` is :func:`parked_capture_skip` of the
+      global set and the pins, and each client's view restores the placeholder
+      for a parked agent it does not pin.
+    - **Compare-mode override** — ONE shared per-pane setting owned here. Under a
+      shared producer, ``d`` in one client (or applink's ``cycle_compare_mode``)
+      changes that pane's idle verdict for every client: there is one idle clock.
+      Overrides are reaped by the producer's own discovery, never by a client's
+      view.
+    """
+
+    # Session-discovery cache TTL: `discover_aitasks_sessions()` runs `tmux
+    # list-sessions` plus a serial `list-panes -s` per session, which is
+    # wasteful to redo every refresh tick. Ten seconds keeps the view snappy
+    # without re-querying on every paint. (The `M` toggle no longer touches the
+    # producer — it is client view state since t2034_2 — so nothing
+    # invalidates this cache on it.)
+    _SESSIONS_CACHE_TTL = 10.0
+
+    def __init__(
+        self,
+        session: str,
+        capture_lines: int = 200,
+        idle_threshold: float = 5.0,
+        agent_prefixes: list[str] | None = None,
+        tui_names: set[str] | None = None,
+        all_sessions: bool = True,
+        compare_mode_default: str = DEFAULT_COMPARE_MODE,
+        prompt_patterns: list[PromptPattern] | None = None,
+    ):
+        self.session = session
+        self.capture_lines = capture_lines
+        self.idle_threshold = idle_threshold
+        self.agent_prefixes = agent_prefixes if agent_prefixes is not None else list(DEFAULT_AGENT_PREFIXES)
+        self.tui_names = tui_names if tui_names is not None else set(DEFAULT_TUI_NAMES)
+        # Construction-time scan scope (t2034_2) — see the class docstring.
+        # Never a client toggle: live clients keep the default and filter.
+        self.all_sessions = all_sessions
+        if compare_mode_default not in COMPARE_MODES:
+            compare_mode_default = DEFAULT_COMPARE_MODE
+        self.compare_mode_default = compare_mode_default
+        self.prompt_patterns = list(prompt_patterns) if prompt_patterns is not None else all_patterns()
+
+        self._last_content: dict[str, str] = {}
+        self._last_change_time: dict[str, float] = {}
+        # Monotonic capture generation (t1111_4). Reserved at the START of every
+        # async capture path and bumped by the sync `_finalize_capture` write.
+        # A guarded commit writes `_last_content` only if its reserved gen still
+        # equals this — so the capture with the latest reservation wins and no
+        # superseded (out-of-order) cycle corrupts the idle clock. Lives here,
+        # beside the state it guards, so every caller (monitor, minimonitor,
+        # pusher, applink router) is protected uniformly.
+        self._capture_generation: int = 0
+        # Agents whose capture is skipped this tick, as (session_name,
+        # window_name) — published by the App once per tick before it captures
+        # (t1685). See `set_parked_agents`.
+        self._parked_agents: frozenset = frozenset()
+        # Discovery-derived liveness facts (t1326), keyed by capture generation
+        # until that generation's commit wins. See _record_discovery_facts.
+        self._discovery_facts: dict[int, tuple[frozenset, frozenset, dict]] = {}
+        self._enumerated_sessions: frozenset[str] = frozenset()
+        self._discovered_agents: frozenset = frozenset()
+        # Per-window pane inventory from the same discovery (t1705_4). See
+        # :meth:`last_discovered_panes`.
+        self._discovered_panes: dict[tuple[str, str], list[tuple[str, int, bool]]] = {}
+        self._pane_cache: dict[str, TmuxPaneInfo] = {}
+        # Companion-verdict memo (t1382): pane_id → (pane_pid, session, cached_at)
+        # for panes CONFIRMED to be a monitor/minimonitor companion. Only
+        # *positive* verdicts are stored, and that asymmetry is the whole point:
+        # the launch chain execs in place (`ait` → `aitask_monitor.sh` →
+        # `exec python monitor/monitor_app.py`), so a companion's cmdline flips
+        # from a non-matching one to a matching one under an UNCHANGED pid. A
+        # cached negative would therefore keep listing a companion pane as an
+        # agent-facing pane — the exact symptom `_parse_list_panes` filters out.
+        # Negatives are re-probed every discovery pass, so that transition is
+        # picked up on the next refresh. See `_is_companion_pane`.
+        self._companion_memo: dict[str, tuple[int, str, float]] = {}
+        # Clock seam for the memo's TTL. An instance attribute (not a bound
+        # method) so tests can drive the TTL deterministically instead of
+        # sleeping — see aidocs/framework/testing_conventions.md.
+        self._monotonic = time.monotonic
+        # Shadow-status map (t1133): followed pane id → the bound shadow pane's
+        # latest PaneSnapshot. Rebuilt wholesale by every `commit_snapshots`
+        # (loop-side, generation-guarded — invariant B) and cleared by the sync
+        # `capture_all` path, so it can never go stale: absent, never frozen.
+        # Shadow panes themselves are NEVER in `_pane_cache` (cache-boundary
+        # invariant — applink `get_pane`/`capture_pane` stay shadow-blind).
+        self._shadow_snapshots: dict[str, PaneSnapshot] = {}
+        # Shadow WRITE ordering (t1216_1) — separate from `_capture_generation`
+        # so a single-shadow refresh can never supersede a full refresh. Both
+        # writers reserve from this one counter in the statement immediately
+        # before they issue their own shadow capture-pane, so the seq is a
+        # faithful proxy for READ order and every shadow write is totally
+        # ordered. `_shadow_snapshot_seq` records the seq each live entry was
+        # read at; `_full_shadow_seq` carries the running full refresh's
+        # reservation from its capture site to `commit_snapshots`.
+        self._shadow_write_seq: int = 0
+        self._shadow_snapshot_seq: dict[str, int] = {}
+        self._full_shadow_seq: tuple[int, int] | None = None
+        self._sessions_cache: tuple[float, list[AitasksSession]] | None = None
+        self._compare_mode_overrides: dict[str, str] = {}
+        # Per-session `tmux.monitor` config (t2037_1). Empty for every
+        # in-process client, so each lookup falls back to the instance
+        # attributes above; only the shared status server publishes it (one
+        # producer, many projects). See `set_session_configs` / `_cfg`.
+        self._session_configs: dict[str, dict] = {}
+        # pane id -> session name for EVERY discovered pane, agents and shadows
+        # alike (t2037_1), so `get_compare_mode(pane_id)` resolves a session's
+        # default without widening its id-only signature. Shadows are not in
+        # `_pane_cache` (cache-boundary invariant), hence a separate map.
+        self._pane_sessions: dict[str, str] = {}
+        self._backend: TmuxControlBackend | None = None
+        #: Bumped by every `close_control_client`, so a `start_control_client`
+        #: suspended in its `to_thread` hop can tell that the app tore down
+        #: underneath it and must not install what it just built (t1598).
+        self._backend_gen: int = 0
+        # Gateway owns the exec strategy (control-client-vs-subprocess dispatch)
+        # and the socket flag; tmux_run / _tmux_async delegate to it (t952_3).
+        self._tmux = TmuxClient()
+
+    async def start_control_client(self) -> bool:
+        """Start the persistent `tmux -C` backend on a dedicated bg thread.
+
+        The body is genuinely off-loop since t1598. `TmuxControlBackend.start()`
+        blocks on threading primitives for up to ~14s worst case
+        (`_BACKEND_READY_TIMEOUT` 2s + `_BACKEND_START_TIMEOUT` 5s, plus a failed
+        start's `stop()`: 1s + `_BACKEND_STOP_TIMEOUT` 3s +
+        `_BACKEND_THREAD_JOIN_TIMEOUT` 3s). On an async path that is the event
+        loop's own thread, which freezes painting as well as input — so it is
+        hopped to a worker thread here rather than at the five call sites, one of
+        which (`on_unmount`) is not a worker at all.
+
+        The hop creates an interleaving point that did not exist while the body
+        was synchronous: a teardown can now land between the `await` and the
+        install below. `_backend_gen` closes it — see `close_control_client`.
+        """
+        gen = self._backend_gen
+        backend = TmuxControlBackend(session=self.session)
+        if not await asyncio.to_thread(backend.start):
+            await asyncio.to_thread(backend.stop)
+            return False
+        if gen != self._backend_gen:
+            # Torn down while we were starting. Installing now would leave a live
+            # `tmux -C attach` and its thread attached to a closed app.
+            await asyncio.to_thread(backend.stop)
+            return False
+        self._backend = backend
+        return True
+
+    async def close_control_client(self) -> None:
+        # Bump FIRST, and unconditionally: this must invalidate an in-flight
+        # `start_control_client` even when nothing is installed yet, which is
+        # exactly the window a `self._backend is not None` check misses (t1598).
+        self._backend_gen += 1
+        backend, self._backend = self._backend, None
+        if backend is not None:
+            with contextlib.suppress(Exception):
+                await asyncio.to_thread(backend.stop)
+
+    def has_control_client(self) -> bool:
+        return self._backend is not None and self._backend.is_alive
+
+    def control_exit_seen(self) -> bool:
+        """Whether the current control backend received tmux's ``%exit``
+        (t2037_1). ``False`` with no backend; a backend started after
+        :meth:`close_control_client` starts clear."""
+        backend = self._backend
+        return backend is not None and backend.exit_seen
+
+    def control_state(self) -> TmuxControlState:
+        """Backend channel state, or `STOPPED` if no backend is attached."""
+        if self._backend is None:
+            return TmuxControlState.STOPPED
+        return self._backend.state
+
+    async def _tmux_async(
+        self, args: list[str], timeout: float = 5.0
+    ) -> tuple[int, str]:
+        # Thin delegation: the gateway owns the control-client-vs-subprocess
+        # dispatch (t952_3). Signature unchanged so all monitor call sites stay.
+        return await self._tmux.run_async_via_control(
+            self._backend, args, timeout=timeout
+        )
+
+    # -- Capture generation + offload seam (t1111_4) ---------------------------
+
+    def set_parked_agents(self, pairs) -> None:
+        """Publish the ``(session_name, window_name)`` pairs to skip capturing.
+
+        The value is a capture SKIP set — the global parked set minus every
+        client's capture pins (:func:`parked_capture_skip`, t2034_2) — not "the
+        parked set" itself. A pinned parked agent is captured live; each client's
+        view then restores the placeholder for parked agents it does not pin
+        (:func:`client_view_snapshots`).
+
+        The same publish-down shape as ``AgentMarksMixin._set_session_root_map``,
+        and for the same reason: marks live App-side, and the capture path must
+        not do a blocking tmux or filesystem round-trip to learn about them.
+
+        **Rebinds, never mutates in place** — a reader holding the previous
+        frozenset keeps a coherent view of the tick it started in.
+
+        The caller must publish this BEFORE awaiting
+        :meth:`capture_all_classified_async`. Publishing after it would leak one
+        capture of every already-parked agent on every launch.
+        """
+        self._parked_agents = frozenset(pairs or ())
+
+    #: See the module-level :data:`SESSION_CONFIG_KEYS`.
+    SESSION_CONFIG_KEYS = SESSION_CONFIG_KEYS
+
+    def set_session_configs(self, configs) -> None:
+        """Publish per-session ``tmux.monitor`` config (t2037_1).
+
+        ``configs`` maps a tmux session name to a :func:`load_monitor_config`
+        dict for that session's project. A session absent from the map — and
+        every session when nothing was ever published, which is every
+        in-process client — uses the instance attributes, so this seam changes
+        nothing until the shared status server publishes it. Only
+        :data:`SESSION_CONFIG_KEYS` are read; other keys are ignored.
+
+        **Rebinds, never mutates in place** — the same publish-down shape as
+        :meth:`set_parked_agents`, so a reader keeps a coherent view of the
+        tick it started in.
+        """
+        self._session_configs = dict(configs or {})
+
+    def _cfg(self, session_name: str | None, key: str):
+        """``key``'s value for ``session_name``: its published session config,
+        else the instance attribute. An empty or unknown session falls
+        through."""
+        if session_name:
+            cfg = self._session_configs.get(session_name)
+            if cfg is not None and key in cfg:
+                return cfg[key]
+        return getattr(self, key)
+
+    def _is_parked_pane(self, pane: "TmuxPaneInfo") -> bool:
+        """Whether this pane is an agent the App asked us not to capture."""
+        return (
+            pane.category == PaneCategory.AGENT
+            and (pane.session_name, pane.window_name) in self._parked_agents
+        )
+
+    def _is_frozen_pane(self, pane: "TmuxPaneInfo") -> bool:
+        """Whether this pane holds a frozen agent's stand-in viewer (t1705_7).
+
+        No `set_frozen_agents` publish-down exists, and none is needed: unlike
+        parked — an App-held set that can change between capture and commit —
+        the truth is the pane option `@aitask_frozen`, already parsed into
+        `frozen_record` on the discovery row. That makes it stable for the whole
+        generation by construction.
+
+        The `AGENT` guard is kept for the same reason parked keeps it: a
+        companion or shadow pane is never an agent slot, whatever it is stamped
+        with.
+        """
+        return (
+            pane.category == PaneCategory.AGENT
+            and pane.frozen_record != ""
+        )
+
+    def _next_generation(self) -> int:
+        """Reserve and return the next capture generation (see `__init__`)."""
+        self._capture_generation += 1
+        return self._capture_generation
+
+    # -- discovery-derived liveness facts (t1326) ------------------------------
+    #
+    # Published for the prioritized-agent mark purge, which must distinguish
+    # "this session was enumerated and the agent is gone" from "we could not see
+    # this session". Both answers come from DISCOVERY, never from the committed
+    # snapshots: a pane whose content capture failed is dropped by
+    # `commit_snapshots`, and treating that as a departed agent would delete a
+    # live mark.
+
+    def _record_discovery_facts(
+        self, gen: int, panes, shadows, enumerated=None
+    ) -> None:
+        """Stash this generation's discovery facts until its commit wins.
+
+        ``enumerated`` is the set of sessions whose ``list-panes`` returned
+        ``rc == 0``, reported by discovery independently of what survives
+        parsing and filtering. That independence is the point: a session whose
+        last agent has exited may retain only the excluded companion pane, so it
+        parses to ZERO panes while being perfectly observable. Inferring the set
+        from the surviving panes would call it unenumerated, leave it
+        un-sweepable, and strand the departed agent's mark until TTL expiry.
+
+        ``None`` means the caller could not supply it (a stubbed discovery in
+        tests); the pane-derived set is then the best available approximation.
+        """
+        if enumerated is None:
+            enumerated = frozenset(
+                p.session_name
+                for p in list(panes) + list(shadows)
+                if p.session_name
+            )
+        sessions = frozenset(enumerated)
+        agents = frozenset(
+            (p.session_name, p.window_name)
+            for p in panes
+            if p.category == PaneCategory.AGENT and p.session_name
+        )
+        # Per-window pane inventory (t1705_4). Shadows are INCLUDED: this feeds
+        # the session store's `PANE` observation rows, whose `dead_pane` purge
+        # rule asks "was this pane id present in the window at all", and a
+        # helper pane that is absent from the inventory would make a record
+        # pointing at it look dead. That is the opposite requirement to
+        # `agents` above, which is deliberately agent-facing only.
+        pane_map: dict[tuple[str, str], list[tuple[str, int, bool]]] = {}
+        for p in list(panes) + list(shadows):
+            if not p.session_name:
+                continue
+            pane_map.setdefault((p.session_name, p.window_name), []).append(
+                (p.pane_id, p.pane_pid, p.pane_dead)
+            )
+        self._discovery_facts[gen] = (sessions, agents, pane_map)
+        # Prune anything older than the live reservation; those batches can no
+        # longer commit, so their facts are unreachable.
+        for stale in [g for g in self._discovery_facts if g < gen]:
+            del self._discovery_facts[stale]
+
+    def _publish_discovery_facts(self, gen: int) -> None:
+        """Promote a winning generation's facts. Called only past the guard."""
+        facts = self._discovery_facts.pop(gen, None)
+        if facts is not None:
+            (
+                self._enumerated_sessions,
+                self._discovered_agents,
+                self._discovered_panes,
+            ) = facts
+
+    def last_enumerated_sessions(self) -> frozenset[str]:
+        """Sessions whose panes were listed in the last *committed* discovery.
+
+        A session absent here was not observed at all — not running, its
+        `list-panes` failed, or it lives on another tmux socket — and is
+        therefore never a valid basis for concluding an agent departed.
+        """
+        return self._enumerated_sessions
+
+    def last_discovered_agents(self) -> frozenset:
+        """``(session_name, window_name)`` for every agent window discovered in
+        the last committed cycle, including ones whose content capture failed."""
+        return self._discovered_agents
+
+    def last_discovered_panes(self) -> dict[tuple[str, str], list[tuple[str, int, bool]]]:
+        """``(session, window) -> [(pane_id, pane_pid, pane_dead), ...]`` from
+        the last committed discovery.
+
+        The pane-level sibling of :meth:`last_discovered_agents`, and
+        deliberately a SUPERSET of it: helper panes (companions, shadows) are
+        included, because this feeds the session store's ``PANE`` observation
+        rows and its ``dead_pane`` purge rule asks whether a record's pane id
+        was present in the window *at all*. Filtering helpers out would make a
+        record pointing at one look dead and get it dropped.
+
+        **No consumer in this task.** ``monitor_shared._write_observation_file``
+        grows its ``panes=`` argument in t1705_7; ``aitask_frozen.sh reconcile``
+        builds the same rows from its own ``list-panes`` pass so retirement does
+        not depend on a TUI being open. Published here so that wiring is a
+        one-line change rather than a second discovery pass.
+        """
+        return self._discovered_panes
+
+    @property
+    def capture_generation(self) -> int:
+        """Current capture generation; callers compare their reserved gen to this
+        to detect supersession without touching a private attr."""
+        return self._capture_generation
+
+    def _next_shadow_write_seq(self) -> int:
+        """Reserve the next shadow WRITE sequence number (t1216_1).
+
+        Deliberately NOT `_next_generation`: bumping the capture generation from
+        a single-shadow refresh would supersede an in-flight full refresh. Every
+        writer of `_shadow_snapshots` reserves from here in the statement
+        immediately before issuing its own shadow capture — see the class
+        docstring of :meth:`refresh_shadow_snapshot`.
+        """
+        self._shadow_write_seq += 1
+        return self._shadow_write_seq
+
+    def _clear_shadow_snapshots(self) -> None:
+        """Drop all shadow state as one unit (t1216_1).
+
+        `_shadow_snapshots` and `_shadow_snapshot_seq` are two halves of one
+        value — every read of the seq map assumes the matching snapshot exists.
+        Clearing them together in a single method keeps that invariant local
+        instead of leaving it to each call site to remember.
+        """
+        self._shadow_snapshots = {}
+        self._shadow_snapshot_seq = {}
+
+    async def _run_offloaded(self, fn):
+        """Run pure CPU work `fn` off the event loop (t1111_4).
+
+        The single injectable offload seam: production hops to a worker thread via
+        `asyncio.to_thread`; tests override this to run `fn` synchronously and to
+        control resolution order deterministically (invariant F — no sleep-based
+        timing). `fn` MUST be pure compute over plain data (invariant A).
+        """
+        return await asyncio.to_thread(fn)
+
+    def tmux_run(
+        self, args: list[str], timeout: float = 5.0
+    ) -> tuple[int, str]:
+        """Sync user-action wrapper — control-client when alive, subprocess fallback.
+
+        Returns `(rc, stdout)`. `rc` semantics:
+          * `0` on success
+          * `1` on tmux command error
+          * `-1` on transport failure or subprocess error.
+
+        Safe to call from sync Textual handlers because the control client
+        runs on a background loop; this method blocks the caller's thread,
+        not the bg loop's reader task. The dispatch itself lives in the gateway
+        (`TmuxClient.run_via_control`, t952_3); this is a thin delegation.
+        """
+        return self._tmux.run_via_control(self._backend, args, timeout=timeout)
+
+    async def tmux_run_async(
+        self, args: list[str], timeout: float = 5.0
+    ) -> tuple[int, str]:
+        """Async sibling of :meth:`tmux_run` — same ``(rc, stdout)`` contract.
+
+        Use from async Textual handlers / the refresh loop so a tmux stall never
+        blocks the event loop (the sync :meth:`tmux_run` would block the calling
+        thread, which on an async path is the loop thread). Thin public alias for
+        the internal :meth:`_tmux_async`.
+        """
+        return await self._tmux_async(args, timeout=timeout)
+
+    def tmux_run_input(
+        self, args: list[str], data: str, timeout: float = 5.0
+    ) -> tuple[int, str]:
+        """``tmux <args>`` with ``data`` on stdin (``TmuxClient.run_with_input``).
+
+        Always a subprocess, never the control client (it cannot carry stdin).
+        The guarded text dispatch (:func:`guarded_paste_text`) loads its buffer
+        this way so the text never meets a tmux parser (t2211_4).
+        """
+        return self._tmux.run_with_input(args, data, timeout=timeout)
+
+    async def get_pane_option(
+        self, pane_id: str, option: str, timeout: float = 2.0
+    ) -> tuple[bool, str]:
+        """Read a pane-scoped tmux user-option, discriminating failure from unset.
+
+        Gateway-routed (``show-options -pqv``) so all tmux access stays inside
+        the monitor per ``tmux_gateway.md``. ``-q`` keeps an unset option quiet
+        and ``-v`` prints just the value. Used by minimonitor's shadow-freshness
+        check (t1104).
+
+        Returns ``(ok, value)``. ``ok`` is ``False`` when tmux could not answer
+        (transport failure / timeout ``rc == -1``, or a tmux command error
+        ``rc == 1``) **or the pane does not exist** (t1971); ``(True, "")`` is a
+        *verified* "this option is not set". The pair mirrors
+        :func:`find_shadow_pane_status` and exists for the reason t1446's
+        ``(observed, panes)`` does: this used to return ``""`` on failure, and
+        :func:`compute_shadow_staleness` read that as "the shadow has never
+        analyzed anything: nothing to warn about", so a tmux failure *cleared* a
+        standing staleness banner (t1451). A 2-tuple cannot be consumed without
+        binding the flag, whereas ``""`` is silently falsy.
+
+        ``-q`` answers a MISSING pane exactly like an unset option — rc 0, no
+        output (measured on tmux 3.7c) — so an empty value is ambiguous and is
+        reported as verified only after ``display-message`` echoes ``pane_id``
+        back. The confirm runs **after** the read on purpose: pane ids are never
+        reused within a server, so a pane that exists now existed when it was
+        read; confirming first would let it vanish in between. A non-empty value
+        needs no confirm (tmux prints one only for a live pane), so the second
+        round trip is paid only on an empty value. The echo is compared
+        exactly, so ``pane_id`` must be a ``%N`` id — anything else reads an
+        empty value as a failed read, never as a verified one.
+
+        The read itself stays ``show-options -p``, not a ``#{@opt}`` format:
+        a format returns the *inherited* value (pane, then window, then
+        session), while this reads the pane-local one only.
+        """
+        rc, out = await self.tmux_run_async(
+            ["show-options", "-pqv", "-t", pane_id, option], timeout=timeout
+        )
+        if rc != 0:
+            return (False, "")
+        value = out.strip()
+        if value:
+            return (True, value)
+        rc, out = await self.tmux_run_async(
+            ["display-message", "-p", "-t", pane_id, "#{pane_id}"],
+            timeout=timeout,
+        )
+        if rc != 0 or out.strip() != pane_id:
+            return (False, "")
+        return (True, "")
+
+    def get_pane_option_sync(
+        self, pane_id: str, option: str, timeout: float = 2.0
+    ) -> tuple[bool, str]:
+        """Sync twin of :meth:`get_pane_option` — same argv, same contract.
+
+        For sync Textual callbacks that must read a pane option immediately
+        before acting on the pane: the pick flows' kill-time frozen re-check
+        (t2057), which runs in the same synchronous ``push_screen`` callback as
+        the equally blocking ``kill_agent_pane_smart``. Everything in
+        :meth:`get_pane_option`'s docstring applies verbatim — in particular an
+        empty value is ``(True, "")`` only once ``display-message`` echoes
+        ``pane_id`` back, because ``-q`` answers a MISSING pane exactly like an
+        unset option. Keep the two bodies in step; both are pinned by the same
+        contract tests (``tests/test_shadow_seam.py``,
+        ``tests/test_monitor_pane_option_live.py``).
+        """
+        rc, out = self.tmux_run(
+            ["show-options", "-pqv", "-t", pane_id, option], timeout=timeout
+        )
+        if rc != 0:
+            return (False, "")
+        value = out.strip()
+        if value:
+            return (True, value)
+        rc, out = self.tmux_run(
+            ["display-message", "-p", "-t", pane_id, "#{pane_id}"],
+            timeout=timeout,
+        )
+        if rc != 0 or out.strip() != pane_id:
+            return (False, "")
+        return (True, "")
+
+    def get_last_change_wall(self, pane_id: str) -> float | None:
+        """Wall-clock epoch (approx) when ``pane_id``'s content last changed.
+
+        Converts the monotonic ``_last_change_time`` (set in ``_finalize_capture``
+        when the captured content differs) into wall-clock so it can be compared
+        against another process's epoch stamp (the shadow's ``@aitask_shadow_
+        analyzed_at``). Returns ``None`` if the pane has not been observed yet.
+        The recorded instant is the *detection* tick, so it lags the real change
+        by up to one refresh interval — callers absorb that with an epsilon
+        (t1104).
+        """
+        mono = self._last_change_time.get(pane_id)
+        if mono is None:
+            return None
+        return time.time() - (time.monotonic() - mono)
+
+    def resize_pane(
+        self, pane: str, *, x: int | None = None, y: int | None = None,
+        timeout: float = 2.0,
+    ) -> tuple[int, str]:
+        """Resize a pane via the gateway's subprocess path.
+
+        ``resize-pane`` is still owned by ``TmuxClient.resize_pane`` so socket
+        selection and argv construction stay centralized. This intentionally
+        does not pass the control backend: minimonitor re-pinning happens from
+        Textual's resize handler, and tmux can lose immediate control-mode
+        resize commands during a window-growth reflow.
+        """
+        return self._tmux.resize_pane(pane, x=x, y=y, timeout=timeout)
+
+    def _discover_sessions_cached(self) -> list[AitasksSession]:
+        """Return the list of aitasks-like tmux sessions, memoized for TTL seconds."""
+        now = time.monotonic()
+        if self._sessions_cache is not None:
+            cached_at, sessions = self._sessions_cache
+            if now - cached_at < self._SESSIONS_CACHE_TTL:
+                return sessions
+        sessions = discover_aitasks_sessions()
+        self._sessions_cache = (now, sessions)
+        return sessions
+
+    async def _discover_sessions_cached_async(self) -> list[AitasksSession]:
+        """Async sibling of `_discover_sessions_cached` for refresh-loop use."""
+        now = time.monotonic()
+        if self._sessions_cache is not None:
+            cached_at, sessions = self._sessions_cache
+            if now - cached_at < self._SESSIONS_CACHE_TTL:
+                return sessions
+        sessions = await discover_aitasks_sessions_async()
+        self._sessions_cache = (now, sessions)
+        return sessions
+
+    def invalidate_sessions_cache(self) -> None:
+        """Force the next `_discover_sessions_cached` call to re-query tmux."""
+        self._sessions_cache = None
+
+    def get_session_to_project_mapping(self) -> dict[str, Path]:
+        """Map session_name → project_root for all discovered aitasks sessions.
+
+        Piggybacks on the `_discover_sessions_cached` TTL — no extra tmux
+        calls. Used by monitor TUIs to resolve task data from the project that
+        owns each codeagent's tmux session.
+        """
+        return {s.session: s.project_root for s in self._discover_sessions_cached()}
+
+    async def get_session_to_project_mapping_async(self) -> dict[str, Path]:
+        """Async sibling of `get_session_to_project_mapping` for refresh-loop use."""
+        sessions = await self._discover_sessions_cached_async()
+        return {s.session: s.project_root for s in sessions}
+
+    def classify_pane(
+        self, window_name: str, session_name: str | None = None,
+    ) -> PaneCategory:
+        """The window's category under ``session_name``'s config (t2037_1);
+        with no published session config, the instance prefixes/TUI names."""
+        prefixes = self._cfg(session_name, "agent_prefixes")
+        if match_agent_prefix(window_name, prefixes) is not None:
+            return PaneCategory.AGENT
+        if window_name in self._cfg(session_name, "tui_names"):
+            return PaneCategory.TUI
+        if window_name.startswith(BRAINSTORM_PREFIX):
+            return PaneCategory.TUI
+        return PaneCategory.OTHER
+
+    def _is_companion_pane(
+        self, pane_id: str, pane_pid: int, session: str, monitor_kind: str = "",
+    ) -> bool:
+        """Two-rung companion check for the discovery hot path.
+
+        **Rung 1 — the pane's own ``@aitask_monitor_kind`` marker (t1686).**
+        Primary, because the marker records the *app's own* pid, which is the
+        one ``#{pane_pid}`` cannot reach for a companion restarted inside an
+        interactive shell. Evaluated fresh on every tick and **deliberately not
+        memoized**: the memo exists to bound the cost of
+        :func:`_is_companion_process`' ``/proc`` (or ``ps``) read, whereas
+        :func:`is_live_companion_marker` is a single ``os.kill(pid, 0)``.
+        Caching it would open a window in which a companion that has exited —
+        marker now stale, shell pane still alive — stays hidden for the rest of
+        the TTL, which is precisely the staleness the marker exists to resolve.
+
+        **Rung 2 — cmdline identity, memoized.** Wraps
+        :func:`_is_companion_process` (which reads ``/proc`` on Linux and shells
+        out to ``ps`` everywhere else) so the per-refresh cost of the
+        now-unconditional filter in :meth:`_parse_list_panes` is bounded.
+
+        **Only positive verdicts are cached, deliberately.** A launcher pane
+        ``exec``s into ``monitor_app`` under an unchanged pid, so ``False`` can
+        become ``True`` for the same ``(pane_id, pane_pid)`` pair; caching that
+        negative would leave a companion pane listed until the pane died. The
+        reverse transition has no trigger — a running Textual companion does not
+        exec away, and once its process exits the pane either disappears (evicted
+        by the sweep in ``_parse_list_panes``) or lingers under
+        ``remain-on-exit``, where staying hidden is what we want anyway. The TTL
+        is a self-healing backstop, not a correctness mechanism.
+
+        ``session`` is stored so the eviction sweep can stay session-scoped:
+        ``_parse_list_panes`` runs once per session per tick, and an unscoped
+        sweep would evict the other sessions' live entries in multi-session mode.
+        """
+        if is_live_companion_marker(monitor_kind):
+            return True
+        now = self._monotonic()
+        hit = self._companion_memo.get(pane_id)
+        if (
+            hit is not None
+            and hit[0] == pane_pid
+            and now - hit[2] < _COMPANION_MEMO_TTL
+        ):
+            return True
+        if _is_companion_process(pane_pid):
+            self._companion_memo[pane_id] = (pane_pid, session, now)
+            return True
+        self._companion_memo.pop(pane_id, None)
+        return False
+
+    def _evict_companion_memo(self, session_name: str, seen: set[str]) -> None:
+        """Drop this session's memo entries for panes absent from ``seen``.
+
+        Session-scoped on purpose (see :meth:`_is_companion_pane`). Keeps the
+        memo bounded by the live pane set rather than growing for the lifetime
+        of the monitor.
+        """
+        for pane_id, (_pid, sess, _at) in list(self._companion_memo.items()):
+            if sess == session_name and pane_id not in seen:
+                del self._companion_memo[pane_id]
+
+    _LIST_PANES_FORMAT = "\t".join([
+        "#{window_index}", "#{window_name}", "#{pane_index}",
+        "#{pane_id}", "#{pane_pid}", "#{pane_current_command}",
+        "#{pane_width}", "#{pane_height}",
+        "#{@aitask_shadow_target}",   # shadow helper marker (t986); "" when unset
+        "#{history_size}",   # scrollback-growth work signal (t1159_2)
+        # Companion marker (t1686); "" when unset. APPENDED, never inserted
+        # beside @aitask_shadow_target: inserting would shift `history_size`
+        # and make every existing 10-field record parse its history value as a
+        # marker — a silent reinterpretation rather than a loud failure.
+        f"#{{{MONITOR_KIND_OPTION}}}",
+        # Frozen-agent fields (t1705_4). APPENDED as a block, for the same
+        # reason the marker above was: any insertion shifts `history_size` and
+        # every field after it, which parses cleanly and silently reports the
+        # wrong values (pinned as a negative control in
+        # `tests/test_list_panes_arity_characterization.py`).
+        f"#{{{FROZEN_OPTION}}}",          # frozen stand-in marker; "" when live
+        f"#{{{RECORD_OPTION}}}",          # store record id; "" when unrecorded
+        f"#{{{STANDIN_READY_OPTION}}}",   # viewer-mounted proof; "" until mount
+        "#{pane_dead}",   # "1" under remain-on-exit after the process exited
+        # Scratchpad bound-helper target (t2073_3); "" when unset. APPENDED for
+        # the same reason as every field above it.
+        f"#{{{SCRATCHPAD_TARGET_OPTION}}}",
+        # Sitrep TUI stamp (t2211_2); "" when unset. APPENDED likewise. Not a
+        # helper marker: the pane is dropped from discovery, never routed.
+        f"#{{{SITREP_TUI_ROOT_OPTION}}}",
+    ])
+
+    #: Accepted `list-panes` record arities. 17 = current (t2211_2 sitrep TUI
+    #: stamp); 16 = pre-TUI (t2073_3 scratchpad
+    #: target); 15 = pre-scratchpad (t1705_4's four frozen fields); 11 =
+    #: pre-frozen (t1686 marker); 10 = pre-marker; 9 = pre-`history_size`
+    #: (t1159_2). The set is CLOSED on purpose: an unexpected
+    #: arity is dropped whole, so a stub that drifts out of the set fails
+    #: loudly-by-absence instead of being reinterpreted field-by-field.
+    #:
+    #: **Extend this in the SAME change as any `_LIST_PANES_FORMAT` append.**
+    #: The closed set makes an un-extended append a TOTAL failure, not a partial
+    #: one: every record parses to a rejected arity, discovery returns nothing,
+    #: and monitor / minimonitor / board show no agents at all rather than
+    #: erroring. Pinned by `test_list_panes_arity_characterization.py`.
+    _LIST_PANES_ARITIES = (9, 10, 11, 15, 16, 17)
+
+    def _parse_list_panes(
+        self, stdout: str, session_name: str
+    ) -> tuple[list[TmuxPaneInfo], list[TmuxPaneInfo]]:
+        """Parse ``list-panes`` output into ``(agent_facing_panes, shadow_panes)``.
+
+        Shadow companion panes (t986) are helpers — kept OUT of the first list
+        so they never appear in agent lists, snapshots, or kill/sibling logic,
+        exactly like the minimonitor/monitor panes filtered below. The marker is
+        authoritative even for a same-window shadow, which shares the agent's
+        window name. Since t1133 they are returned separately (second list) so
+        the live capture pipeline can classify their state for the shadow-status
+        glyph. **Cache-boundary invariant:** only agent-facing panes enter
+        ``_pane_cache`` — shadows never do, so every cache-backed consumer
+        (``get_pane``, ``capture_pane``, compare-mode state, applink) stays
+        shadow-blind by construction.
+
+        Scratchpad panes (t2073_3) are the other bound helper and are dropped
+        ENTIRELY — returned in neither list. Routing them into ``shadows`` would
+        make ``commit_snapshots`` treat them as the bound agent's shadow, where
+        they would compete with the real one. The sitrep TUI pane (t2211_2) is
+        dropped the same way: it is not a helper, but it is not an agent either,
+        and its `agent-sitrep` window would otherwise list it as one.
+
+        **Frozen precedence (t2073_3).** None of the helper branches — the
+        scratchpad drop, the shadow routing, the companion filter — fires on a
+        ``@aitask_frozen`` stand-in. That is the same frozen-first rule
+        :func:`classify_window_panes` applies: a stand-in is never a helper,
+        even when a marker retained from whatever ran in the pane before the
+        respawn says otherwise. Dropping it here would hide the frozen session
+        from every agent list and let the minimonitor's own-window resolution
+        pick a LATER agent in the window as the one it follows.
+        """
+        panes: list[TmuxPaneInfo] = []
+        shadows: list[TmuxPaneInfo] = []
+        seen: set[str] = set()   # pane ids observed this pass, for the memo sweep
+        # NOT `stdout.strip()`: a record whose LAST field is empty (an unset
+        # @aitask_monitor_kind on the final pane) would lose its trailing tab to
+        # a whole-buffer strip and be dropped as a short record.
+        for line in stdout.splitlines():
+            parts = line.split("\t")
+            if len(parts) not in self._LIST_PANES_ARITIES:
+                continue
+            pane_id = parts[3]
+            try:
+                pane_pid = int(parts[4])
+                width = int(parts[6])
+                height = int(parts[7])
+            except ValueError:
+                continue
+            history_size: int | None = None
+            if len(parts) > 9:
+                try:
+                    history_size = int(parts[9])
+                except ValueError:
+                    history_size = None
+            # "" on a pre-t1686 record, and on every unmarked pane.
+            monitor_kind = parts[10] if len(parts) > 10 else ""
+            # Frozen-agent fields (t1705_4). Guarded per index in the same style
+            # as `history_size` / `monitor_kind` above, so every legacy arity in
+            # `_LIST_PANES_ARITIES` keeps parsing into the pre-frozen defaults.
+            frozen_record = parts[11].strip() if len(parts) > 11 else ""
+            record_id = parts[12].strip() if len(parts) > 12 else ""
+            standin_ready = parts[13].strip() if len(parts) > 13 else ""
+            # tmux renders `#{pane_dead}` as "1"/"0"; anything else (a legacy
+            # record with no such field) reads as alive. Compared as a string on
+            # purpose — `bool("0")` is True.
+            pane_dead = (parts[14].strip() == "1") if len(parts) > 14 else False
+            # "" on a pre-t2073_3 record, and on every pane that is not a pad.
+            scratch_target = parts[15].strip() if len(parts) > 15 else ""
+            # "" on a pre-t2211_2 record, and on every pane that is not the TUI.
+            tui_root = parts[16] if len(parts) > 16 else ""
+            window_name = parts[1]
+            seen.add(pane_id)
+            # Frozen first: a stand-in is never a helper (see the docstring).
+            is_frozen = bool(frozen_record)
+            if is_sitrep_tui_pane(frozen_record, tui_root):
+                continue    # the sitrep TUI: never an agent card (t2211_2)
+            if not is_frozen and scratch_target:
+                continue    # scratchpad helper: dropped, NEVER routed to `shadows`
+            if not is_frozen and is_shadow_target(parts[8]):
+                self._pane_sessions[pane_id] = session_name
+                # Category forced to AGENT: a shadow IS a coding-agent CLI, so
+                # the prompt scan + idle bookkeeping must apply regardless of
+                # its window name (a same-window shadow shares the agent's).
+                shadows.append(TmuxPaneInfo(
+                    window_index=parts[0],
+                    window_name=window_name,
+                    pane_index=parts[2],
+                    pane_id=pane_id,
+                    pane_pid=pane_pid,
+                    current_command=parts[5],
+                    width=width,
+                    height=height,
+                    category=PaneCategory.AGENT,
+                    session_name=session_name,
+                    shadow_target=parts[8].strip(),
+                    history_size=history_size,
+                    # The shadow branch populates these too. Easy to miss, and
+                    # missing them would make a shadow pane read as never-frozen
+                    # and never-dead regardless of what tmux reported.
+                    frozen_record=frozen_record,
+                    record_id=record_id,
+                    standin_ready=standin_ready,
+                    pane_dead=pane_dead,
+                ))
+                continue
+            category = self.classify_pane(window_name, session_name)
+            # Filter companion panes (minimonitor/monitor). UNCONDITIONAL by
+            # process identity (t1382), like the shadow-helper filter above and
+            # unlike the former `category == AGENT and …` form: renaming a window
+            # off the `agent-` prefix flips its panes to OTHER, and gating on the
+            # category meant the companion stopped being consulted and surfaced
+            # as a second card for the renamed window. A companion is a helper
+            # regardless of what its window is called.
+            #
+            # Identity is now the pane's own marker first and its cmdline second
+            # (t1686) — a companion restarted from an interactive shell inside
+            # the pane has `-bash` as its `#{pane_pid}`, so cmdline matching
+            # alone left it listed as a duplicate agent card.
+            #
+            # Not consulted for a frozen stand-in (t2073_3), whose retained
+            # marker would otherwise hide it — the frozen-first rule above.
+            if not is_frozen and self._is_companion_pane(
+                pane_id, pane_pid, session_name, monitor_kind
+            ):
+                continue
+            pane = TmuxPaneInfo(
+                window_index=parts[0],
+                window_name=window_name,
+                pane_index=parts[2],
+                pane_id=pane_id,
+                pane_pid=pane_pid,
+                current_command=parts[5],
+                width=width,
+                height=height,
+                category=category,
+                session_name=session_name,
+                history_size=history_size,
+                frozen_record=frozen_record,
+                record_id=record_id,
+                standin_ready=standin_ready,
+                pane_dead=pane_dead,
+            )
+            panes.append(pane)
+            self._pane_cache[pane_id] = pane
+            self._pane_sessions[pane_id] = session_name
+        self._evict_companion_memo(session_name, seen)
+        return panes, shadows
+
+    def _target_sessions(self) -> list[str]:
+        """Session names to enumerate in multi mode (sorted for stable display)."""
+        return sorted(s.session for s in self._discover_sessions_cached())
+
+    async def _target_sessions_async(self) -> list[str]:
+        """Async session names to enumerate in multi mode."""
+        sessions = await self._discover_sessions_cached_async()
+        return sorted(s.session for s in sessions)
+
+    _PANE_SORT_KEY = staticmethod(pane_sort_key)
+
+    def _discover_panes_multi(
+        self,
+    ) -> tuple[list[TmuxPaneInfo], list[TmuxPaneInfo], frozenset[str]]:
+        """``(panes, shadows, successfully_enumerated_sessions)``."""
+        panes: list[TmuxPaneInfo] = []
+        shadows: list[TmuxPaneInfo] = []
+        ok_sessions: set[str] = set()   # see the async sibling (t1326)
+        for sess in self._target_sessions():
+            rc, stdout = self.tmux_run([
+                "list-panes", "-s", "-t", tmux_session_scope_target(sess),
+                "-F", self._LIST_PANES_FORMAT,
+            ])
+            if rc != 0:
+                continue
+            ok_sessions.add(sess)
+            sess_panes, sess_shadows = self._parse_list_panes(stdout, sess)
+            panes.extend(sess_panes)
+            shadows.extend(sess_shadows)
+        panes.sort(key=self._PANE_SORT_KEY)
+        shadows.sort(key=self._PANE_SORT_KEY)
+        return panes, shadows, frozenset(ok_sessions)
+
+    async def _discover_panes_multi_async(
+        self,
+    ) -> tuple[list[TmuxPaneInfo], list[TmuxPaneInfo], frozenset[str]]:
+        """``(panes, shadows, successfully_enumerated_sessions)``."""
+        sessions = await self._target_sessions_async()
+        if not sessions:
+            return [], [], frozenset()
+        results = await asyncio.gather(*[
+            self._tmux_async([
+                "list-panes", "-s", "-t", tmux_session_scope_target(sess),
+                "-F", self._LIST_PANES_FORMAT,
+            ])
+            for sess in sessions
+        ])
+        panes: list[TmuxPaneInfo] = []
+        shadows: list[TmuxPaneInfo] = []
+        # Sessions whose `list-panes` SUCCEEDED, recorded independently of what
+        # survives parsing/filtering (t1326). A session can enumerate cleanly and
+        # still yield zero panes — e.g. its last agent exited and only the
+        # excluded companion pane remains — and that is a very different fact
+        # from "we could not see this session".
+        ok_sessions: set[str] = set()
+        for sess, (rc, stdout) in zip(sessions, results):
+            if rc != 0:
+                continue
+            ok_sessions.add(sess)
+            sess_panes, sess_shadows = self._parse_list_panes(stdout, sess)
+            panes.extend(sess_panes)
+            shadows.extend(sess_shadows)
+        panes.sort(key=self._PANE_SORT_KEY)
+        shadows.sort(key=self._PANE_SORT_KEY)
+        return panes, shadows, frozenset(ok_sessions)
+
+    def discover_panes(self) -> list[TmuxPaneInfo]:
+        """Agent-facing panes only (shadow companions excluded) — the public
+        discovery contract every non-shadow consumer relies on."""
+        if self.all_sessions:
+            return self._discover_panes_multi()[0]
+        rc, stdout = self.tmux_run([
+            "list-panes", "-s", "-t", tmux_session_scope_target(self.session),
+            "-F", self._LIST_PANES_FORMAT,
+        ])
+        if rc != 0:
+            return []
+        return self._parse_list_panes(stdout, self.session)[0]
+
+    async def discover_panes_async(self) -> list[TmuxPaneInfo]:
+        """Async sibling of :meth:`discover_panes` (agent-facing panes only)."""
+        return (await self.discover_panes_with_shadows_async())[0]
+
+    async def discover_panes_with_shadows_async(
+        self, *, enum_sink: list | None = None,
+    ) -> tuple[list[TmuxPaneInfo], list[TmuxPaneInfo]]:
+        """Discovery for the live capture pipeline (t1133): returns
+        ``(agent_facing_panes, shadow_panes)`` from the SAME ``list-panes``
+        output — shadow discovery costs zero extra tmux round-trips."""
+        if self.all_sessions:
+            panes, shadows, ok_sessions = await self._discover_panes_multi_async()
+        else:
+            rc, stdout = await self._tmux_async(
+                ["list-panes", "-s", "-t", tmux_session_scope_target(self.session),
+                 "-F", self._LIST_PANES_FORMAT],
+            )
+            if rc != 0:
+                panes, shadows, ok_sessions = [], [], frozenset()
+            else:
+                panes, shadows = self._parse_list_panes(stdout, self.session)
+                ok_sessions = frozenset({self.session})
+        # The successfully-enumerated session set is reported through a
+        # caller-owned sink rather than the return value (t1326): the 2-tuple
+        # return is a widely-stubbed seam, and binding the value to THIS call
+        # — instead of an instance attribute — is what stops an overlapping
+        # discovery from handing its answer to the wrong capture generation.
+        if enum_sink is not None:
+            enum_sink.append(ok_sessions)
+        return panes, shadows
+
+    #: The 8 fields both `discover_window_panes` siblings request. One
+    #: constant, because `_parse_window_panes` hard-codes the arity that
+    #: matches it — a format edited on only one side would silently flag every
+    #: record incomplete.
+    _WINDOW_PANES_FORMAT = "\t".join([
+        "#{window_index}", "#{window_name}", "#{pane_index}",
+        "#{pane_id}", "#{pane_pid}", "#{pane_current_command}",
+        "#{pane_width}", "#{pane_height}",
+    ])
+
+    def _parse_window_panes(
+        self, rc: int, stdout: str
+    ) -> tuple[bool, list[TmuxPaneInfo]]:
+        """The shared ``(observed, panes)`` decision for both siblings.
+
+        Extracted rather than duplicated precisely because ``observed=False``
+        means **unverifiable**, never **empty** (t1446). One copy of that rule,
+        so the async port cannot silently collapse it back into ``[]``.
+        """
+        if rc != 0:
+            return (False, [])
+
+        # Cleared by any dropped record — see `discover_window_panes`. Blank
+        # lines are not records and never clear it.
+        complete = True
+        panes: list[TmuxPaneInfo] = []
+        for line in stdout.strip().splitlines():
+            if not line.strip():
+                continue
+            parts = line.split("\t")
+            if len(parts) != 8:
+                complete = False
+                continue
+            try:
+                pane_pid = int(parts[4])
+                width = int(parts[6])
+                height = int(parts[7])
+            except ValueError:
+                complete = False
+                continue
+            window_name = parts[1]
+            pane = TmuxPaneInfo(
+                window_index=parts[0],
+                window_name=window_name,
+                pane_index=parts[2],
+                pane_id=parts[3],
+                pane_pid=pane_pid,
+                current_command=parts[5],
+                width=width,
+                height=height,
+                category=self.classify_pane(window_name, self.session),
+                session_name=self.session,
+            )
+            panes.append(pane)
+        return (complete, panes)
+
+    def discover_window_panes(
+        self, window_id: str
+    ) -> tuple[bool, list[TmuxPaneInfo]]:
+        """Discover panes in a specific window (not session-wide).
+
+        Uses 'tmux list-panes -t window_id' (no -s flag).
+        Does not update _pane_cache.
+
+        Returns ``(observed, panes)``. ``observed`` is ``True`` only when tmux
+        answered (``rc == 0``) **and** every non-blank record parsed. It is
+        ``False`` on a transport failure / timeout (``rc == -1``), on a tmux
+        command error (``rc == 1``), and on a listing with any unparseable
+        record — in which case the panes that *did* parse are still returned,
+        so a caller wanting a best-effort list can use them.
+
+        ``observed=False`` means **unverifiable**, never **empty** (t1446).
+        Collapsing the two is what let a 5-second tmux stall read as "no panes
+        left in my window" and quit every minimonitor companion at once; the
+        pair exists so no caller can make that mistake by omission. A dropped
+        record matters for the same reason: a truncated sibling row leaves a
+        listing that looks exactly like solitude.
+
+        See :meth:`discover_window_panes_async` for the refresh-path sibling.
+        """
+        rc, stdout = self.tmux_run(
+            ["list-panes", "-t", window_id, "-F", self._WINDOW_PANES_FORMAT]
+        )
+        return self._parse_window_panes(rc, stdout)
+
+    async def discover_window_panes_async(
+        self, window_id: str
+    ) -> tuple[bool, list[TmuxPaneInfo]]:
+        """Async sibling of :meth:`discover_window_panes` for refresh-loop use.
+
+        Identical contract, including ``observed=False`` meaning unverifiable
+        and never empty — both share :meth:`_parse_window_panes`. Added for
+        minimonitor's `_check_auto_close`, which ran the sync round-trip at the
+        default 5s timeout on the event-loop thread (t1598).
+        """
+        rc, stdout = await self.tmux_run_async(
+            ["list-panes", "-t", window_id, "-F", self._WINDOW_PANES_FORMAT]
+        )
+        return self._parse_window_panes(rc, stdout)
+
+    def get_compare_mode(self, pane_id: str) -> str:
+        """Effective idle-detection compare mode for a pane.
+
+        Returns the per-pane override if set, otherwise the default of the
+        pane's session (published session config, t2037_1), falling back to
+        ``compare_mode_default``.
+
+        The override is ONE shared per-pane setting (t2034_2): every client of
+        this producer reads the same value, because there is one idle clock. It
+        is reaped only when the producer's own discovery loses the pane
+        (`_clean_stale`), never because a client's view hides it.
+        """
+        return self._compare_mode_overrides.get(
+            pane_id,
+            self._cfg(self._pane_sessions.get(pane_id), "compare_mode_default"),
+        )
+
+    def is_compare_mode_overridden(self, pane_id: str) -> bool:
+        return pane_id in self._compare_mode_overrides
+
+    def set_compare_mode(self, pane_id: str, mode: str | None) -> str:
+        """Set per-pane compare mode override; pass None to clear and follow default.
+
+        Clears the stored last-content for the pane so the next capture
+        re-baselines under the new comparison form, avoiding one tick of
+        spurious "changed" right after the toggle.
+        """
+        if mode is None:
+            self._compare_mode_overrides.pop(pane_id, None)
+        else:
+            if mode not in COMPARE_MODES:
+                raise ValueError(f"unknown compare mode: {mode!r}")
+            self._compare_mode_overrides[pane_id] = mode
+        self._last_content.pop(pane_id, None)
+        return self.get_compare_mode(pane_id)
+
+    def cycle_compare_mode(self, pane_id: str) -> tuple[str, bool]:
+        """Cycle a pane through default → raw → stripped → default.
+
+        Returns (effective_mode, is_following_default).
+        """
+        current_override = self._compare_mode_overrides.get(pane_id)
+        if current_override is None:
+            new_override: str | None = COMPARE_MODE_RAW
+        elif current_override == COMPARE_MODE_RAW:
+            new_override = COMPARE_MODE_STRIPPED
+        else:
+            new_override = None
+        effective = self.set_compare_mode(pane_id, new_override)
+        return effective, (new_override is None)
+
+    def _apply_bookkeeping(
+        self,
+        pane: TmuxPaneInfo,
+        content: str,
+        result: ClassifyResult,
+        now: float,
+    ) -> PaneSnapshot:
+        """Loop/sync-side commit of a pre-computed :class:`ClassifyResult` into the
+        durable idle bookkeeping, returning the ``PaneSnapshot`` (t1111_4).
+
+        This is the ONLY writer of ``_last_content`` / ``_last_change_time`` and
+        must run on the event loop (or synchronously). Generation ownership is the
+        caller's job: the sync ``_finalize_capture`` reserved-at-write, the async
+        commits (:meth:`commit_snapshot` / :meth:`commit_snapshots`) checked their
+        reserved gen before calling here.
+        """
+        pane_id = pane.pane_id
+        prev = self._last_content.get(pane_id)
+        if prev is None or result.compare_value != prev:
+            self._last_content[pane_id] = result.compare_value
+            self._last_change_time[pane_id] = now
+
+        last_change = self._last_change_time.get(pane_id, now)
+        idle_seconds = now - last_change
+        is_idle = (
+            idle_seconds > self._cfg(pane.session_name, "idle_threshold")
+            if pane.category == PaneCategory.AGENT
+            else False
+        )
+        return PaneSnapshot(
+            pane=pane,
+            content=content,
+            timestamp=now,
+            idle_seconds=idle_seconds,
+            is_idle=is_idle,
+            awaiting_input=result.awaiting_input,
+            awaiting_input_kind=result.awaiting_input_kind,
+            agent_key=result.agent_key,
+            scoped=result.scoped,
+        )
+
+    def _finalize_capture(
+        self, pane: TmuxPaneInfo, content: str
+    ) -> PaneSnapshot:
+        """Synchronous capture finalize (behind :meth:`capture_pane`, the applink
+        router, and sync :meth:`capture_all`).
+
+        Fetch and write are atomic on the loop (no await between), so reservation
+        == write instant: it **bumps the generation as it writes**, both marking
+        itself the newest capture at that instant and refusing any older in-flight
+        async commit (t1111_4). The pure classification is delegated to
+        :func:`classify_content`; behaviour (return value + ``_last_content``
+        semantics) is unchanged for the direct callers/tests.
+        """
+        now = time.monotonic()
+        mode = self.get_compare_mode(pane.pane_id)
+        result = classify_content(
+            content, mode, self.prompt_patterns, pane.category,
+            agent_key_from_pane(pane.current_command, pane.pane_pid,
+                                    pane.pane_id))
+        self._next_generation()
+        return self._apply_bookkeeping(pane, content, result, now)
+
+    def _capture_args(
+        self, pane_id: str, capture_lines: int | None = None,
+        session_name: str | None = None,
+    ) -> list[str]:
+        n = (self._cfg(session_name, "capture_lines")
+             if capture_lines is None else capture_lines)
+        return [
+            "capture-pane", "-p", "-e", "-t", pane_id,
+            "-S", f"-{n}",
+        ]
+
+    def capture_pane(
+        self, pane_id: str, capture_lines: int | None = None
+    ) -> PaneSnapshot | None:
+        pane = self._pane_cache.get(pane_id)
+        if pane is None:
+            return None
+        rc, content = self.tmux_run(
+            self._capture_args(pane_id, capture_lines, pane.session_name))
+        if rc != 0:
+            return None
+        return self._finalize_capture(pane, content)
+
+    def get_pane(self, pane_id: str) -> "TmuxPaneInfo | None":
+        """Return the cached pane metadata for ``pane_id`` (no subprocess).
+
+        Lightweight accessor over ``_pane_cache`` (populated by discovery) for
+        callers that need a pane's ``window_name`` / ``session_name`` without a
+        live ``capture-pane`` — e.g. the applink router resolving a pane to its
+        task family for the modal handshakes (t822_11). Returns ``None`` when the
+        pane is unknown (not yet discovered or already gone).
+        """
+        return self._pane_cache.get(pane_id)
+
+    def seed_pane_cache(self, panes) -> None:
+        """Replace the pane cache wholesale with ``panes`` (``pane_id -> TmuxPaneInfo``).
+
+        For ONE caller only: a subscription-backed client (``status_client.
+        MonitorClient``, t2037_2) whose producer runs elsewhere and which uses
+        this instance purely as its action gateway. That instance never
+        discovers, so without a seed every cache-backed action — the window
+        collapse of :meth:`kill_agent_pane_smart`, :meth:`switch_to_pane`,
+        :meth:`get_running_tuis`, the ``capture_pane*`` lookups — would take its
+        cache-miss route and quietly behave differently. Rebinds, never mutates
+        in place, like :meth:`set_parked_agents`.
+
+        Pass agent-facing panes only, never shadows (the cache-boundary
+        invariant), and never mix a seed with this instance's own discovery.
+
+        **The caller owns the release.** :meth:`_clean_stale` does NOT reap a
+        seeded entry: it picks stale ids from ``_last_content``, which a seeded
+        pane never entered. So a caller that stops seeding and lets this instance
+        discover again must first call ``seed_pane_cache({})`` — otherwise a pane
+        that vanished in between stays visible to every cache-backed accessor.
+        In-process monitors never call this; their behaviour is unchanged.
+        """
+        self._pane_cache = dict(panes)
+
+    def get_shadow_snapshot(self, followed_pane_id: str) -> "PaneSnapshot | None":
+        """Latest snapshot of the shadow bound to ``followed_pane_id`` (t1133).
+
+        ``None`` when the agent has no live shadow (or the shadow's capture
+        failed this tick). Populated only by the async live path
+        (:meth:`commit_snapshots`); the sync :meth:`capture_all` clears the map,
+        so a stale value is never returned.
+        """
+        return self._shadow_snapshots.get(followed_pane_id)
+
+    def shadow_snapshots(self) -> dict[str, "PaneSnapshot"]:
+        """Every live shadow snapshot, keyed by the FOLLOWED pane id — a shallow
+        copy, so the caller cannot mutate the producer's map (t2037_1). The
+        status server's frame builder is the consumer."""
+        return dict(self._shadow_snapshots)
+
+    async def refresh_shadow_snapshot(
+        self, followed_pane_id: str
+    ) -> "PaneSnapshot | None":
+        """Re-capture ONE bound shadow and merge it into the shadow map (t1216_1).
+
+        Lets a caller refresh a single agent's shadow far faster than the ~3 s
+        full cycle without paying for (or disturbing) a full refresh. It never
+        touches the agent-facing path: no `_next_generation`, no `_pane_cache`
+        (the pane object is passed explicitly), no agent snapshots.
+
+        ``None`` means **"no update this tick" — never "the shadow is gone"**.
+        There are four such cases and callers must treat them identically,
+        leaving whatever is on screen in place:
+
+        1. the followed pane has no shadow entry (nothing to refresh — this
+           method never *creates* one, so it can never resurrect a shadow the
+           full refresh just removed);
+        2. the entry was rebound to a different shadow pane while this capture
+           was in flight (see below);
+        3. a newer write already landed for this key;
+        4. the capture itself failed.
+
+        Only :meth:`commit_snapshots` may DELETE, because only discovery knows
+        what actually exists. That asymmetry is deliberate: mirroring the full
+        refresh's hide-on-transient-failure at a sub-second cadence would make
+        the shadow glyph flicker on any hiccup, so this path retains instead and
+        the next full refresh (≤ one refresh interval away) hides or replaces it.
+        The staleness that buys is bounded by exactly that interval.
+
+        Two guards make the merge safe against an interleaved full refresh, and
+        both run BEFORE any bookkeeping is applied — see
+        :meth:`_merge_shadow_snapshot`.
+        """
+        prev = self._shadow_snapshots.get(followed_pane_id)
+        if prev is None:
+            return None
+        captured_pane_id = prev.pane.pane_id
+        # Reserved in the statement immediately before the read below, so the
+        # seq orders this write against the full refresh by READ time.
+        seq = self._next_shadow_write_seq()
+        raw = await self.capture_pane_content_async(captured_pane_id, pane=prev.pane)
+        if raw is None:
+            return None
+        pane, content = raw
+        mode = self.get_compare_mode(pane.pane_id)
+        patterns = self.prompt_patterns
+        result = await self._run_offloaded(
+            lambda: _classify_one(
+                content, mode, patterns, pane.category,
+                agent_key_from_pane(pane.current_command, pane.pane_pid,
+                                    pane.pane_id))
+        )
+        return self._merge_shadow_snapshot(
+            followed_pane_id, captured_pane_id, seq, pane, content, result
+        )
+
+    def _merge_shadow_snapshot(
+        self,
+        key: str,
+        captured_pane_id: str,
+        seq: int,
+        pane: TmuxPaneInfo,
+        content: str,
+        result: "ClassifyResult",
+    ) -> "PaneSnapshot | None":
+        """Loop-side guarded merge of one re-captured shadow (t1216_1).
+
+        Runs synchronously after the await, so both guards and the write are
+        atomic with respect to every other coroutine.
+
+        **Identity, not just existence.** A live shadow can die and be replaced
+        by a new one bound to the SAME followed pane while a capture of the old
+        one is in flight. The key is still present in that case, so a
+        presence-only check would let the dead pane's content overwrite its live
+        replacement. Requiring the current entry to still name the pane we
+        actually read closes that, and simultaneously covers the removal case.
+
+        **Bookkeeping strictly after the guards.** :meth:`_apply_bookkeeping` is
+        the only writer of `_last_content` / `_last_change_time`, and its
+        contract puts generation ownership on the caller. Calling it before the
+        checks would let a REJECTED late refresh write stale content and reset
+        the shadow's idle clock — corrupting state the merge itself then
+        declines to publish, and making the next full refresh see a change that
+        never happened.
+        """
+        cur = self._shadow_snapshots.get(key)
+        if cur is None or cur.pane.pane_id != captured_pane_id:
+            return None  # removed by a full refresh, or rebound to a new shadow
+        if seq <= self._shadow_snapshot_seq.get(key, -1):
+            return None  # a newer read already landed for this key
+        snap = self._apply_bookkeeping(pane, content, result, time.monotonic())
+        self._shadow_snapshots[key] = snap
+        self._shadow_snapshot_seq[key] = seq
+        return snap
+
+    def commit_snapshot(
+        self,
+        gen: int,
+        pane: TmuxPaneInfo,
+        content: str,
+        result: ClassifyResult,
+    ) -> PaneSnapshot | None:
+        """Loop-side, generation-guarded single-pane commit (t1111_4).
+
+        Returns ``None`` (writing nothing) when ``gen`` has been superseded by a
+        newer reservation — protecting both the idle bookkeeping and the returned
+        snapshot. Symmetric with :meth:`commit_snapshots`, including both of its
+        state branches in the same order (frozen first, then parked): neither a
+        frozen nor a parked pane produced content, so letting one reach
+        `_apply_bookkeeping` would reset the idle clock it has no verdict for.
+        """
+        if gen != self._capture_generation:
+            return None
+        if result is not None and result.frozen:
+            return _frozen_snapshot(pane, time.monotonic())
+        if result is not None and result.parked:
+            return _parked_snapshot(pane, time.monotonic())
+        return self._apply_bookkeeping(pane, content, result, time.monotonic())
+
+    async def capture_pane_async(
+        self, pane_id: str, capture_lines: int | None = None
+    ) -> PaneSnapshot | None:
+        """Finalizing single-pane async capture.
+
+        Reserves its generation **before** the tmux await (its content is "as of"
+        fetch-start) and commits guarded, so a stale-but-late return can't clobber
+        a newer-reserved refresh (t1111_4). Under no overlap the reserved gen is
+        still current at commit → it writes exactly as before (the applink pusher
+        test relies on this finalize). Kept for that test / future callers; the
+        live refresh paths now use the classified/raw paths instead.
+        """
+        pane = self._pane_cache.get(pane_id)
+        if pane is None:
+            return None
+        gen = self._next_generation()
+        rc, content = await self._tmux_async(
+            self._capture_args(pane_id, capture_lines, pane.session_name))
+        if rc != 0:
+            return None
+        mode = self.get_compare_mode(pane_id)
+        result = classify_content(
+            content, mode, self.prompt_patterns, pane.category,
+            agent_key_from_pane(pane.current_command, pane.pane_pid,
+                                    pane.pane_id))
+        return self.commit_snapshot(gen, pane, content, result)
+
+    async def capture_pane_content_async(
+        self, pane_id: str, capture_lines: int | None = None,
+        pane: "TmuxPaneInfo | None" = None,
+    ) -> tuple["TmuxPaneInfo", str] | None:
+        """Raw one-shot capture for consumers (the applink history RPC) that must
+        NOT perturb idle/awaiting-input state.
+
+        Returns ``(pane, content)`` or ``None``. Unlike :meth:`capture_pane_async`
+        it does **not** call :meth:`_finalize_capture`, so it never touches
+        ``_last_content`` / ``_last_change_time`` — idle and prompt detection stay
+        driven solely by the live ``capture_all_async`` path. A deeper-than-live
+        capture (history pulls ~2000 lines vs the 200-line live capture) would
+        otherwise reset the pane's idle clock on every scrollback request.
+
+        ``pane`` (t1133): when the caller already holds the ``TmuxPaneInfo``
+        (the shadow-status path — shadow panes are deliberately NOT in
+        ``_pane_cache``), pass it to skip the cache lookup. Cache-backed
+        callers keep the id-only form.
+        """
+        if pane is None:
+            pane = self._pane_cache.get(pane_id)
+        if pane is None:
+            return None
+        rc, content = await self._tmux_async(
+            self._capture_args(pane_id, capture_lines, pane.session_name))
+        if rc != 0:
+            return None
+        return pane, content
+
+    async def capture_pane_classified_async(
+        self, pane_id: str, capture_lines: int | None = None
+    ) -> tuple[int, "TmuxPaneInfo | None", "str | None", "ClassifyResult | None"]:
+        """Two-phase single-pane capture for the fast-preview path (t1111_4).
+
+        Reserves the generation **before** the raw tmux await, offloads the pure
+        `classify_content` work, and returns ``(gen, pane, content, result)``
+        WITHOUT committing bookkeeping — the caller checks ``gen`` and calls
+        :meth:`commit_snapshot` on the loop. On a fetch miss returns
+        ``(gen, None, None, None)``. The classify is fail-closed (invariant D).
+
+        **A frozen stand-in is refused before the tmux await** (t1705_7). This is
+        the SECOND capture route — `_fast_preview_refresh` uses it instead of
+        `capture_all_classified_async`, and it then overwrites `_snapshots[id]`
+        with whatever comes back. Without this guard, merely focusing a frozen
+        pane would capture it, run prompt/idle classification over a dead
+        stand-in's replayed output, and replace its `frozen=True` snapshot with
+        an ordinary one — losing the row render, the counter term, the preview
+        placeholder and the action guards on the very pane being looked at. The
+        guard lives HERE, in the monitor, rather than at the app's call site, so
+        every present and future caller of this route inherits it.
+
+        **A parked agent is refused the same way** (t1769), and the loss was the
+        same: focusing a parked card replaced its `parked=True` snapshot, so the
+        parked placeholder, row render and session-bar term vanished on the pane
+        being looked at. Frozen is checked FIRST, exactly as at the bulk
+        partition: a pane can carry the parked mark and be frozen, and a
+        parked-first check would return `parked=True, frozen=False`, a flag no
+        renderer can recover.
+
+        The parked check runs once, before the await, with no commit-time
+        re-check. That is safe for the one case it leaves open — a capture that
+        passed the check and is still in flight when the agent is parked. Such a
+        park reaches the App's snapshot through the full refresh the park
+        schedules (this capture already missed the new set), and that refresh
+        publishes the set and then reserves a NEWER generation. So this capture's
+        commit is either rejected by the generation guard or lands first and is
+        overwritten by the refresh's parked snapshot. (A capture that STARTS
+        after the publish takes the guard above and commits parked directly.)
+        """
+        gen = self._next_generation()
+        pane = self._pane_cache.get(pane_id)
+        if pane is not None and self._is_frozen_pane(pane):
+            return gen, pane, "", ClassifyResult(compare_value="", frozen=True)
+        if pane is not None and self._is_parked_pane(pane):
+            return gen, pane, "", ClassifyResult(compare_value="", parked=True)
+        raw = await self.capture_pane_content_async(pane_id, capture_lines)
+        if raw is None:
+            return gen, None, None, None
+        pane, content = raw
+        mode = self.get_compare_mode(pane_id)
+        patterns = self.prompt_patterns
+        result = await self._run_offloaded(
+            lambda: _classify_one(
+                content, mode, patterns, pane.category,
+                agent_key_from_pane(pane.current_command, pane.pane_pid,
+                                    pane.pane_id))
+        )
+        return gen, pane, content, result
+
+    async def capture_cursor_async(
+        self, pane_id: str
+    ) -> tuple[int, int, bool, int] | None:
+        """Return the pane cursor as ``(row, col, visible, style)`` or ``None``.
+
+        Used by the applink push loop (t822_8) to populate the ``cursor`` field of
+        a ``keyframe`` (``capture-pane`` carries no cursor). ``row``/``col`` are
+        the cursor's 0-based position within the visible pane; ``visible`` from
+        ``cursor_flag``; ``style`` is block (``0``) in Stage 1 (tmux exposes no
+        portable cursor-shape field here).
+        """
+        rc, out = await self._tmux_async([
+            "display-message", "-p", "-t", pane_id,
+            "-F", "#{cursor_y} #{cursor_x} #{cursor_flag}",
+        ])
+        if rc != 0:
+            return None
+        parts = out.strip().split()
+        if len(parts) < 3:
+            return None
+        try:
+            return (int(parts[0]), int(parts[1]), parts[2] == "1", 0)
+        except ValueError:
+            return None
+
+    def _clean_stale(self, current_ids: set[str]) -> None:
+        stale = [pid for pid in self._last_content if pid not in current_ids]
+        for pid in stale:
+            del self._last_content[pid]
+            self._last_change_time.pop(pid, None)
+            self._pane_cache.pop(pid, None)
+        for pid in list(self._compare_mode_overrides):
+            if pid not in current_ids:
+                self._compare_mode_overrides.pop(pid, None)
+        for pid in [p for p in self._pane_sessions if p not in current_ids]:
+            del self._pane_sessions[pid]
+
+    def capture_all(self) -> dict[str, PaneSnapshot]:
+        """Synchronous all-pane capture (debug CLI `tmux_monitor.py` only).
+
+        Agent-facing panes only — shadow-status state (t1133) is produced
+        solely by the async live path (`capture_all_classified_async` →
+        `commit_snapshots`). This path CLEARS `_shadow_snapshots` so a sync
+        cycle can never leave stale shadow state visible behind
+        `get_shadow_snapshot`: the glyph goes absent, never frozen.
+        """
+        panes = self.discover_panes()
+        self._clean_stale({p.pane_id for p in panes})
+        self._clear_shadow_snapshots()
+
+        snapshots: dict[str, PaneSnapshot] = {}
+        for pane in panes:
+            snap = self.capture_pane(pane.pane_id)
+            if snap is not None:
+                snapshots[pane.pane_id] = snap
+        return snapshots
+
+    async def capture_all_classified_async(
+        self,
+    ) -> tuple[int, list[tuple[TmuxPaneInfo, "str | None", "ClassifyResult | None"]]]:
+        """Offloadable produce phase of the live refresh (t1111_4).
+
+        Reserves the generation, discovers panes, does the raw (non-finalizing)
+        captures concurrently, then runs ONE off-loop batch of `classify_content`
+        (the strip/prompt-regex CPU work). Returns ``(gen, classified)`` where each
+        entry is ``(pane, content, result)`` for a successful capture and
+        ``(pane, None, None)`` for a pane whose raw fetch failed — the failed
+        pane's id is still present so the loop-side :meth:`commit_snapshots` can
+        clean stale ids without dropping a pane over a transient capture error.
+        Mutates **no** ``_last_content`` state; that is the commit's job.
+
+        The shadow WRITE seq is reserved further down — **after** discovery and
+        immediately before the raw-capture gather — not here beside ``gen``. See
+        the comment at that site (t1216_1).
+        """
+        gen = self._next_generation()
+        # Caller-owned sink: the enumerated-session set belongs to THIS call, so
+        # an overlapping discovery cannot hand its answer to our generation.
+        enum_sink: list = []
+        panes, shadows = await self.discover_panes_with_shadows_async(
+            enum_sink=enum_sink
+        )
+
+        # Discovery-derived liveness facts, stamped with THIS generation
+        # (t1326). Recorded here — from discovery — and never from the committed
+        # snapshots, because `commit_snapshots` drops any pane whose content
+        # capture failed (`if result is None: continue`). Deriving "which agents
+        # exist" from snapshots would make a transient capture failure look like
+        # a departed agent, and the mark purge would delete a live agent's mark.
+        #
+        # Keyed by `gen` rather than assigned to a bare attribute so an older
+        # overlapping capture can never overwrite a newer one's facts: the
+        # winning commit pops its own key, and losing generations are pruned.
+        self._record_discovery_facts(
+            gen, panes, shadows,
+            enum_sink[0] if enum_sink else None,
+        )
+
+        # Raw captures concurrently (non-finalizing); tolerate per-pane faults.
+        # Shadow panes (t1133) join the SAME gather (invariant E — one cycle,
+        # no separate fan-out); they pass their pane object explicitly because
+        # they are never in `_pane_cache` (cache-boundary invariant).
+        # Parked agents (t1685) are split off HERE — after `_record_discovery_facts`
+        # above, never before it. Parking skips only the CAPTURE; the pane must
+        # stay in discovery, because `sweep_liveness` keys on discovery and a
+        # parked agent that dropped out of it would have its own mark reaped by
+        # the next purge. That ordering is the load-bearing correctness fact of
+        # the whole feature.
+        #
+        # Frozen stand-ins (t1705_7) are split off at the same point and for the
+        # same reason, and the two partitions are MUTUALLY EXCLUSIVE with frozen
+        # taking precedence.
+        #
+        # That precedence is load-bearing, not a tie-break for tidiness. Frozen
+        # deliberately COEXISTS with the parked mark (pinned), so one pane can
+        # satisfy both predicates. If parked were still filtered over all panes,
+        # such a pane would be re-injected as `parked=True, frozen=False` and the
+        # frozen flag would simply never be set — which no renderer can recover,
+        # however early it checks `frozen`. The row would claim "parked", the
+        # session bar would count it in the wrong term, and the R/p/k guards
+        # would refuse on a genuinely frozen agent. The mark still renders: it
+        # comes from the mark store via `_mark_kind`, not from this snapshot.
+        #
+        # Shadow panes are deliberately NOT filtered by either: a shadow is its
+        # own pane, and a minimonitor following a parked or frozen agent keeps
+        # its shadow working.
+        frozen_panes = [p for p in panes if self._is_frozen_pane(p)]
+        frozen_ids = {p.pane_id for p in frozen_panes}
+        parked_panes = [p for p in panes
+                        if p.pane_id not in frozen_ids and self._is_parked_pane(p)]
+        skipped_ids = frozen_ids | {p.pane_id for p in parked_panes}
+        all_panes = [p for p in panes if p.pane_id not in skipped_ids] + shadows
+        # Reserve this batch's shadow WRITE seq HERE — after the discovery await
+        # above, in the last statement before the shadow panes are actually read
+        # (t1216_1). Reserving it beside `gen` would date this batch from before
+        # discovery, so a fast `refresh_shadow_snapshot` that both reserved AND
+        # read entirely inside the discovery window would out-rank a full refresh
+        # that reads the same pane later — and the full refresh's NEWER content
+        # would lose the merge. The `gen ==` guard stops a batch that has already
+        # been superseded from clobbering the live batch's reservation (it cannot
+        # commit anyway — `commit_snapshots` rejects it at the same check).
+        if gen == self._capture_generation:
+            self._full_shadow_seq = (gen, self._next_shadow_write_seq())
+        raw_results = await asyncio.gather(
+            *(self.capture_pane_content_async(p.pane_id, pane=p) for p in all_panes),
+            return_exceptions=True,
+        )
+
+        # Read per-pane mode on the loop (invariant B) and assemble the batch.
+        to_classify: list[tuple[TmuxPaneInfo, str, str]] = []
+        failed: list[TmuxPaneInfo] = []
+        for pane, res in zip(all_panes, raw_results):
+            if isinstance(res, tuple):
+                _, content = res
+                to_classify.append((pane, content, self.get_compare_mode(pane.pane_id)))
+            else:
+                # None (fetch miss) or an Exception (fault): keep prior content.
+                failed.append(pane)
+
+        patterns = self.prompt_patterns  # read on loop, passed by value
+        classified_ok = await self._run_offloaded(
+            lambda: _classify_batch(to_classify, patterns)
+        )
+        classified: list[tuple[TmuxPaneInfo, str | None, ClassifyResult | None]] = list(
+            classified_ok
+        )
+        classified.extend((pane, None, None) for pane in failed)
+        # Parked panes rejoin the batch with an explicit marker rather than the
+        # `(pane, None, None)` shape used for a FAILED capture. The two must not
+        # be conflated in either direction: `commit_snapshots` drops the failed
+        # shape, so routing a parked pane through it would make the row vanish
+        # even when the user has asked to see parked agents.
+        classified.extend(
+            (pane, None, ClassifyResult(compare_value="", parked=True))
+            for pane in parked_panes
+        )
+        # Frozen stand-ins rejoin the same way, and for the same reason.
+        classified.extend(
+            (pane, None, ClassifyResult(compare_value="", frozen=True))
+            for pane in frozen_panes
+        )
+        return gen, classified
+
+    def commit_snapshots(
+        self,
+        gen: int,
+        classified: list[tuple[TmuxPaneInfo, "str | None", "ClassifyResult | None"]],
+    ) -> dict[str, PaneSnapshot] | None:
+        """Loop-side, generation-guarded commit of a produced batch (t1111_4).
+
+        Returns ``None`` (touching nothing — idle clock AND returned set both
+        protected) when ``gen`` has been superseded by a newer reservation.
+        Otherwise cleans stale panes and applies the idle bookkeeping, returning
+        the assembled snapshots. Panes whose raw fetch failed (``result is None``)
+        are kept in the clean-stale set but produce no snapshot this tick, so their
+        prior ``_last_content`` survives — matching the pre-split behaviour.
+
+        Shadow split (t1133): entries whose ``pane.shadow_target`` is non-empty
+        are committed into a **fresh** ``_shadow_snapshots`` map (keyed by the
+        FOLLOWED pane's id) instead of the returned dict, so shadow panes never
+        surface in agent-facing snapshots. Rebuilt-wholesale semantics: a dead
+        shadow disappears next tick, and a shadow whose raw fetch transiently
+        failed produces no entry this tick (glyph hidden for the tick — the
+        same one-tick dropout a failed agent pane's row has; deliberately no
+        stale-state preservation, which would freeze the idle clock on screen).
+        Duplicate shadows targeting one followed pane: the newest (largest
+        ``%N``) wins, mirroring ``match_shadow_pane``.
+
+        Stamped merge (t1216_1): "rebuilt wholesale" now means *rebuilt for every
+        key this batch is the newest reader of*. Each rebuilt entry carries the
+        shadow WRITE seq this batch reserved at its capture site, and a key that
+        an interleaved :meth:`refresh_shadow_snapshot` read **later** keeps the
+        refresh's entry — but only while both are reads of the *same* pane, since
+        discovery, not the seq, decides WHICH pane is a given agent's shadow.
+        Deletion is unchanged and remains exclusive to this method: a key absent
+        from this batch's own discovery is dropped regardless of seq, which is
+        what makes a dead shadow disappear and what the single-shadow merge
+        relies on to never resurrect one.
+        """
+        if gen != self._capture_generation:
+            return None
+        # Past the guard: this generation won, so promote the discovery facts it
+        # recorded (t1326). Doing it here — atomically with the snapshots — is
+        # what guarantees the mark purge can never pair one tick's snapshots
+        # with another tick's view of which sessions and agents exist.
+        self._publish_discovery_facts(gen)
+        self._clean_stale({pane.pane_id for pane, _, _ in classified})
+        # Cache-boundary enforcement (t1133): a shadow pane discovered BEFORE
+        # its `@aitask_shadow_target` option was stamped (the spawner sets it
+        # after the pane exists) may have been cached as a normal agent on that
+        # earlier tick — and `_clean_stale` keeps it because the shadow id is
+        # in the classified keep-set. Evict such entries from every
+        # cache-backed map here (loop-side), so `get_pane`/`capture_pane`/
+        # compare-mode state stay shadow-blind even across that race.
+        # (`_last_content`/`_last_change_time` deliberately keep shadow ids —
+        # that is the shadow's idle bookkeeping.)
+        for pane, _, _ in classified:
+            if pane.shadow_target:
+                self._pane_cache.pop(pane.pane_id, None)
+                self._compare_mode_overrides.pop(pane.pane_id, None)
+        now = time.monotonic()
+        snapshots: dict[str, PaneSnapshot] = {}
+        # Shadow entries are only SELECTED here; their bookkeeping is deferred
+        # until after the per-key merge below has picked a winner. Agent panes
+        # are unaffected and keep their bookkeeping inline.
+        #
+        # Why: `_apply_bookkeeping` is the sole writer of `_last_content` /
+        # `_last_change_time`, and the merge can retain a newer fast-refresh
+        # snapshot for a key. Applying it to a batch shadow that then LOSES the
+        # merge would leave the displayed snapshot new while rewriting the idle
+        # bookkeeping with this batch's older content — so the next full refresh
+        # would see a change that never happened and reset the idle clock. Same
+        # ordering rule `_merge_shadow_snapshot` follows: decide first, write
+        # bookkeeping only for the entry actually published.
+        shadow_candidates: dict[
+            str, tuple[TmuxPaneInfo, str, "ClassifyResult"]
+        ] = {}
+        for pane, content, result in classified:
+            if result is not None and result.frozen:
+                # Frozen is checked FIRST — the capture partition already made
+                # the two mutually exclusive, and checking it first keeps that
+                # precedence visible at the second site too rather than relying
+                # on the first one silently.
+                snapshots[pane.pane_id] = _frozen_snapshot(pane, now)
+                continue
+            if result is not None and result.parked:
+                # Built directly, NOT through `_apply_bookkeeping` (t1685):
+                # that method is the only writer of `_last_content` /
+                # `_last_change_time`, and a parked pane produced no content to
+                # compare, so letting it near the idle clock would reset the
+                # pane's change time to "now" on every tick and make it look
+                # permanently busy the moment it is unparked.
+                snapshots[pane.pane_id] = _parked_snapshot(pane, now)
+                continue
+            if result is None:
+                continue
+            if pane.shadow_target:
+                prev = shadow_candidates.get(pane.shadow_target)
+                if prev is None or (
+                    _pane_id_num(pane.pane_id) > _pane_id_num(prev[0].pane_id)
+                ):
+                    shadow_candidates[pane.shadow_target] = (pane, content, result)
+            else:
+                snapshots[pane.pane_id] = self._apply_bookkeeping(
+                    pane, content, result, now
+                )
+        # Stamp this batch with the seq reserved at its capture site. The
+        # fallback covers a hand-built `commit_snapshots` call with no matching
+        # `capture_all_classified_async` reservation: a fresh (therefore highest)
+        # seq reproduces the pre-t1216_1 wholesale-overwrite semantics exactly.
+        if self._full_shadow_seq is not None and self._full_shadow_seq[0] == gen:
+            batch_seq = self._full_shadow_seq[1]
+        else:
+            batch_seq = self._next_shadow_write_seq()
+        # Discovery is authoritative for EXISTENCE and IDENTITY (which pane is
+        # this agent's shadow); the seq arbitrates only RECENCY, and only between
+        # two reads of the SAME pane. So a key an interleaved single-shadow
+        # refresh read later keeps that refresh's newer entry — unless discovery
+        # has since bound a different pane to the key, in which case the newer
+        # read is of a pane that is no longer the shadow and must not be kept.
+        # (This is the commit-side half of the rebind race that
+        # `_merge_shadow_snapshot` guards from the other direction.)
+        merged: dict[str, PaneSnapshot] = {}
+        merged_seq: dict[str, int] = {}
+        for key, (pane, content, result) in shadow_candidates.items():
+            prior_seq = self._shadow_snapshot_seq.get(key)
+            prior_snap = self._shadow_snapshots.get(key)
+            if (
+                prior_seq is not None
+                and prior_snap is not None
+                and prior_snap.pane.pane_id == pane.pane_id
+                and prior_seq > batch_seq
+            ):
+                # This batch lost: leave both the snapshot AND the idle
+                # bookkeeping exactly as the newer read left them.
+                merged[key] = prior_snap
+                merged_seq[key] = prior_seq
+            else:
+                merged[key] = self._apply_bookkeeping(pane, content, result, now)
+                merged_seq[key] = batch_seq
+        self._shadow_snapshots = merged
+        self._shadow_snapshot_seq = merged_seq
+        return snapshots
+
+    async def capture_all_async(self) -> dict[str, PaneSnapshot] | None:
+        """Live all-pane capture with the classify CPU work off the event loop.
+
+        Returns the snapshot dict, or ``None`` when a newer overlapping
+        `capture_all_async` (or other capture) reserved a later generation before
+        this one committed — the caller MUST skip applying a ``None`` so a stale
+        cycle can neither corrupt ``_last_content`` nor overwrite the caller's
+        visible snapshots (t1111_4). For a serial caller ``gen`` is always current
+        → a dict, behaviourally identical to the pre-split path.
+        """
+        gen, classified = await self.capture_all_classified_async()
+        return self.commit_snapshots(gen, classified)
+
+    def send_enter(self, pane_id: str) -> bool:
+        # `--` ends option parsing so a hostile pane_id/key can't be read as a
+        # tmux flag (defense-in-depth; pane_id is already the -t value).
+        rc, _ = self.tmux_run(["send-keys", "-t", pane_id, "--", "Enter"])
+        return rc == 0
+
+    def send_keys(self, pane_id: str, keys: str, literal: bool = False) -> bool:
+        """Send arbitrary key(s) to a tmux pane.
+
+        If literal=True, uses -l flag to send raw text without interpretation.
+        If literal=False, sends as tmux key name (Enter, Up, C-c, etc.).
+        """
+        cmd = ["send-keys", "-t", pane_id]
+        if literal:
+            cmd.append("-l")
+        # `--` ends option parsing: without it a leading-dash `keys` value (e.g.
+        # "-R", "-N") is consumed by tmux as a flag rather than sent as keys.
+        cmd.append("--")
+        cmd.append(keys)
+        rc, _ = self.tmux_run(cmd)
+        return rc == 0
+
+    def forward_key(
+        self, pane_id: str, key: str, character: str | None = None
+    ) -> bool:
+        """Translate an abstract key name and forward it to a tmux pane.
+
+        Backs both the desktop preview-zone key forwarding and the applink
+        ``forward_key`` verb (t822_7). Returns ``False`` when the key is
+        unmappable (no tmux equivalent).
+        """
+        translated = translate_key(key, character)
+        if translated is None:
+            return False
+        keys, literal = translated
+        return self.send_keys(pane_id, keys, literal=literal)
+
+    def switch_to_pane(self, pane_id: str, prefer_companion: bool = False) -> bool:
+        pane = self._pane_cache.get(pane_id)
+        if pane is None:
+            return False
+        # Cross-session: teleport via the shared primitive. `prefer_companion`
+        # is intentionally ignored — companion lookup is an intra-session UX
+        # affordance (the minimonitor lives in the same window as its agent).
+        # No multi-session gate (t2034_2): a client only offers panes its own
+        # view admits, so a pane from another session reaching here means the
+        # client is showing other sessions.
+        if (
+            pane.session_name
+            and pane.session_name != self.session
+        ):
+            return switch_to_pane_anywhere(pane_id)
+        # Same-session: existing companion-aware path.
+        #
+        # Every window target here is the PANE ID, never the cached
+        # `pane.window_index` (t2227). The cache is a scan old, and
+        # `renumber-windows` shifts indexes whenever an earlier window closes,
+        # so `=session:<cached index>` can name the neighbouring window. tmux
+        # resolves a pane id given as a window target to the window that pane
+        # is in now — the same form `kill_window` has always used.
+        target_session = pane.session_name or self.session
+        self.tmux_run(["select-window", "-t", pane_id])
+        target_pane = pane_id
+        if prefer_companion:
+            companion = self.find_companion_pane_id(
+                pane.window_index, target_session, window_target=pane_id,
+            )
+            if companion:
+                target_pane = companion
+        rc, _ = self.tmux_run(["select-pane", "-t", target_pane])
+        return rc == 0
+
+    def find_companion_pane_id(
+        self, window_index: str, session: str | None = None, *,
+        window_target: str | None = None,
+    ) -> str | None:
+        """Find the minimonitor/companion pane ID in a given window.
+
+        Same two-rung identity as :meth:`_is_companion_pane` (t1686): the pane's
+        own ``@aitask_monitor_kind`` marker first, its ``#{pane_pid}`` cmdline
+        second. Without the marker rung a companion restarted inside an
+        interactive shell was unfindable, so ``prefer_companion`` silently fell
+        back to the agent pane.
+
+        ``window_target``, when given, is used verbatim as the ``-t`` (t2227):
+        pass a pane id to list the window that pane is in *now*. The positional
+        ``(window_index, session)`` form remains for callers holding a fresh
+        index; a cached snapshot's index is not fresh (see ``switch_to_pane``).
+        """
+        if window_target is None:
+            target_session = session if session is not None else self.session
+            window_target = tmux_window_target(target_session, window_index)
+        fmt = f"#{{pane_id}}\t#{{pane_pid}}\t#{{{MONITOR_KIND_OPTION}}}"
+        rc, stdout = self.tmux_run([
+            "list-panes", "-t", window_target, "-F", fmt,
+        ])
+        if rc != 0:
+            return None
+        # NOT `stdout.strip()`: the last field is empty on every unmarked pane,
+        # and a whole-buffer strip eats the FINAL record's trailing tab — the
+        # interior records keep theirs only because a newline follows. The last
+        # pane in the window would then be short a field, be dropped here, and
+        # never reach the cmdline rung below.
+        for line in stdout.splitlines():
+            if not line.strip():
+                continue          # blank lines are not records
+            parts = line.split("\t")
+            if len(parts) != 3:
+                continue
+            pane_id_str, pid_str, monitor_kind = parts
+            # Marker first, and before the pid parse: a malformed `#{pane_pid}`
+            # must not suppress an otherwise valid marker verdict.
+            if is_live_companion_marker(monitor_kind):
+                return pane_id_str
+            try:
+                pid = int(pid_str)
+            except ValueError:
+                continue
+            if _is_companion_process(pid):
+                return pane_id_str
+        return None
+
+    def kill_pane(self, pane_id: str) -> bool:
+        """Kill a tmux pane by its ID."""
+        rc, _ = self.tmux_run(["kill-pane", "-t", pane_id])
+        if rc == 0:
+            self._pane_cache.pop(pane_id, None)
+            self._last_content.pop(pane_id, None)
+            self._last_change_time.pop(pane_id, None)
+            return True
+        return False
+
+    def kill_window(self, pane_id: str) -> bool:
+        """Kill the entire tmux window containing the given pane."""
+        rc, _ = self.tmux_run(["kill-window", "-t", pane_id])
+        if rc == 0:
+            self._pane_cache.pop(pane_id, None)
+            self._last_content.pop(pane_id, None)
+            self._last_change_time.pop(pane_id, None)
+            return True
+        return False
+
+    def kill_agent_pane_smart(
+        self, pane_id: str, *, cache_miss: bool = False,
+    ) -> tuple[bool, bool]:
+        """Kill an agent pane, collapsing the window if it was the last agent.
+
+        Returns (ok, killed_window). If no other agent panes remain in the
+        window after removing this one, the whole window is killed — which
+        also cleans up any companion minimonitor pane. Otherwise only the
+        requested pane is killed, preserving the minimonitor for surviving
+        siblings.
+
+        After ANY successful kill, the agent's bound helpers (shadow,
+        scratchpad) are killed too (t2088). `kill-pane` / `kill-window` fire no
+        `pane-died`, so `aitask_companion_cleanup.sh` job 1 never runs here: on
+        the pane branch every helper would survive, and on the window branch
+        one placed in another window would.
+
+        ``cache_miss=True`` takes the cache-miss route even when the pane IS in
+        the discovery cache: a plain pane kill, never the window collapse — but
+        the helper sweep still runs. It is for a client that must not see the
+        pane in the cache (applink's own pane, which the producer excluded until
+        t2034_2), so that client keeps exactly the behaviour it had.
+        """
+        if cache_miss:
+            ok, killed_window = self.kill_pane(pane_id), False
+        else:
+            ok, killed_window = self._kill_agent_pane(pane_id)
+        if ok:
+            self._kill_bound_helpers(pane_id)
+        return ok, killed_window
+
+    def _kill_bound_helpers(self, pane_id: str) -> list[str]:
+        """The shared guarded sweep (`helper_panes.kill_bound_helpers`)."""
+        killed = kill_bound_helpers(self.tmux_run, pane_id,
+                                    frozen_option=FROZEN_OPTION)
+        for helper in killed:
+            self._pane_cache.pop(helper, None)
+            self._last_content.pop(helper, None)
+            self._last_change_time.pop(helper, None)
+        return killed
+
+    def _collapse_window_for(self, pane_id: str) -> "bool | None":
+        """Whether killing ``pane_id`` should take its whole window with it.
+
+        True when no other real agent shares the window (the window then holds
+        only this agent and its helpers / companion), False when one does, and
+        ``None`` when it cannot be decided — a pane missing from the discovery
+        cache or a failed listing — where the caller falls back to a plain
+        pane kill. `kill_agent_pane_smart`'s decision only: the guarded run
+        kill (:meth:`kill_agent_run_guarded`) never kills a window.
+        """
+        if self._pane_cache.get(pane_id) is None:
+            return None
+        # List the window the pane is in NOW: the pane id as the window target
+        # (t2227), never `=session:<cached window_index>`. The cache is a scan
+        # old and `renumber-windows` shifts indexes when an earlier window
+        # closes, so the cached index could list the NEIGHBOURING window — and
+        # a neighbour holding no other agent reads as "collapse", turning `k`
+        # into `kill-window` on a window that still has a live agent in it. The
+        # pane id also carries the session, so cross-session kills stay exact.
+        rc, stdout = self.tmux_run([
+            "list-panes", "-t", pane_id, "-F", FROZEN_AWARE_PANE_FORMAT,
+        ])
+        if rc != 0:
+            return None
+        panes = classify_window_panes(stdout)
+        if not any(wp.pane_id == pane_id for wp in panes):
+            # A listing that does not contain the pane it was asked about is not
+            # a description of that pane's window: undecidable, plain pane kill.
+            return None
+        others = count_other_real_agents(
+            [(wp.pane_id, wp.is_helper) for wp in panes], pane_id,
+        )
+        return others == 0
+
+    def kill_agent_run_guarded(
+        self, identity: "RunIdentity",
+    ) -> tuple[str, bool]:
+        """Kill ONE agent run, never whatever now occupies its pane (t2175_5).
+
+        ``identity`` was read when the run was harvested. The kill is ONE
+        ``if-shell -F`` whose condition the server evaluates at dispatch time:
+        still unfrozen, still running ``identity.pane_pid``, same server
+        generation. A freeze or restore that respawned another process into the
+        pane id fails it. Then a read-back decides, because ``if-shell``
+        answers 0 whether or not its branch ran.
+
+        **Pane only — never the window.** A window kill would also kill the
+        window's other occupants, and their identity cannot be proved at
+        dispatch: the condition is evaluated in the TARGET pane's context only,
+        so a single ``swap-pane`` (or a pane moved in) between any listing and
+        the dispatch would hand ``kill-window`` an unrelated, unharvested agent
+        under an unchanged window id and pane count. The killed agent's bound
+        helpers are retired by the guarded sweep, and a companion minimonitor
+        closes itself once it verifiably sits alone in its window
+        (`MiniMonitorApp._check_auto_close`) — the "kill the companion only,
+        never the window" rule.
+
+        Returns ``(status, False)``: ``killed`` (gone on the same server; the
+        helpers are swept), ``changed`` (the pane is still there — another
+        process, or frozen), ``unknown`` (the read-back failed, or names another
+        server: never read as gone), or ``failed`` (the identity is malformed;
+        nothing dispatched). The second element is always False — no window is
+        ever killed here.
+        """
+        pane_id = identity.pane_id
+        if not re.fullmatch(r"%[0-9]+", pane_id or ""):
+            return "failed", False
+        try:
+            cond = run_identity_condition(
+                identity.pane_pid, identity.server_pid, FROZEN_OPTION)
+        except ValueError:
+            return "failed", False
+        self.tmux_run(["if-shell", "-F", "-t", pane_id, cond,
+                       f"kill-pane -t {pane_id}"])
+        rc, out = self.tmux_run(
+            ["display-message", "-p", "-t", pane_id, READBACK_FORMAT])
+        state = readback_state(rc, out, pane_id, identity.server_pid)
+        if state == "present":
+            return "changed", False
+        if state != "gone":
+            return "unknown", False
+        self._pane_cache.pop(pane_id, None)
+        self._last_content.pop(pane_id, None)
+        self._last_change_time.pop(pane_id, None)
+        self._kill_bound_helpers(pane_id)
+        return "killed", False
+
+    def dispatch_text_guarded(
+        self, identity: "RunIdentity", text: str, nonce: str,
+    ) -> tuple[str, str]:
+        """Paste ``text`` into ONE agent run, never whatever now occupies its
+        pane (t2211_4) — :func:`guarded_paste_text` over this monitor."""
+        return guarded_paste_text(self, identity, text, nonce)
+
+    def dispatch_key_guarded(
+        self, identity: "RunIdentity", key: str, nonce: str,
+    ) -> tuple[str, str]:
+        """Send ``key`` to ONE agent run outside any tmux mode (t2211_4) —
+        :func:`guarded_send_key` over this monitor."""
+        return guarded_send_key(self, identity, key, nonce)
+
+    def _kill_agent_pane(self, pane_id: str) -> tuple[bool, bool]:
+        """`kill_agent_pane_smart` minus the helper sweep: one exit per route."""
+        collapse = self._collapse_window_for(pane_id)
+        if collapse is None:
+            # Not in the cache, or the window listing failed: a plain pane kill
+            # and no record retirement, exactly as before the extraction.
+            return self.kill_pane(pane_id), False
+        others = 0 if collapse else 1
+
+        # KILL FIRST, then retire the record (t1705_6, reversing t1705_4).
+        #
+        # `drop` deletes the record AND its capture files -- the only copy of
+        # that agent's output. The two orderings fail very differently:
+        #
+        #   drop -> kill : a failed kill leaves a LIVE pane still stamped
+        #                  `@aitask_frozen=<id>` whose record and capture are
+        #                  gone. `reconcile` iterates RECORDS, so it cannot see
+        #                  that pane at all -- nothing repairs it.
+        #   kill -> drop : a failed drop leaves a `frozen` record whose pane is
+        #                  gone, which is exactly reconcile's benign
+        #                  `frozen | pane gone | keep (restorable into a new
+        #                  window)` row, and a later drop converges.
+        #
+        # Pane options are pane-scoped and die with the pane, so killing first
+        # also retires the three stamps with no separate unstamp step. This
+        # matches `aitask_frozen.sh drop`'s protocol; the two must not disagree
+        # about which failure mode is acceptable.
+        target = self._pane_cache.get(pane_id)
+        record_id = target.frozen_record if target is not None else ""
+
+        if others == 0:
+            ok, killed_window = self.kill_window(pane_id), True
+        else:
+            ok, killed_window = self.kill_pane(pane_id), False
+
+        if record_id and ok:
+            self._drop_session_record(record_id)
+        return ok, killed_window
+
+    def _drop_session_record(self, record_id: str) -> bool:
+        """Best-effort ``aitask_agent_sessions.sh drop <id>`` (t1705_4).
+
+        Routed through the shell wrapper because it is the store's SOLE writer
+        (it holds the mutex); importing `agent_sessions`' mutators here would
+        write unlocked. Best-effort by design: a store that is locked or
+        unreadable must not stop the user killing a pane — reconcile's
+        ``capture_missing`` / ``dead_pane`` rules retire the record later.
+
+        The store refuses (exit 9, ``HARVEST_REQUIRED``) to drop a record whose
+        capture text was never harvested into the sitrep store (t2175_2) — a
+        receipt read, well inside this call's 10 s. The record then stays
+        `frozen` with its pane gone, reconcile's benign KEEP row, and stays
+        droppable through `aitask_frozen.sh drop`, which harvests first.
+        """
+        script = (
+            Path(__file__).resolve().parent.parent / "aitask_agent_sessions.sh"
+        )
+        try:
+            proc = subprocess.run(
+                [str(script), "drop", record_id],
+                capture_output=True, text=True, timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return proc.returncode == 0
+
+    def spawn_tui(self, tui_name: str) -> bool:
+        # SECURITY (t985): tmux `new-window`'s last arg is a shell command, so an
+        # unconstrained tui_name interpolated into f"ait {tui_name}" is arbitrary
+        # command execution. Refuse anything not in the canonical TUI registry
+        # (TUI_NAMES) BEFORE it reaches the shell — closes the sink for every
+        # caller (desktop monitor + applink). Valid spawns derive from the same
+        # registry, so legitimate launches are unaffected.
+        if tui_name not in TUI_NAMES:
+            return False
+        rc, _ = self.tmux_run([
+            "new-window", "-t", tmux_window_target(self.session, ""),
+            "-n", tui_name, f"ait {tui_name}",
+        ])
+        return rc == 0
+
+    def get_running_tuis(self) -> set[str]:
+        return {
+            pane.window_name
+            for pane in self._pane_cache.values()
+            if pane.category == PaneCategory.TUI
+        }
+
+    def get_missing_tuis(self) -> set[str]:
+        return self.tui_names - self.get_running_tuis()
+
+
+def load_monitor_config(project_root: Path) -> dict:
+    """Load monitor config from project_config.yaml tmux.monitor section.
+
+    Returns dict suitable for passing as kwargs to TmuxMonitor (minus session).
+    """
+    defaults = {
+        "capture_lines": 200,
+        "idle_threshold": 5.0,
+        "agent_prefixes": list(DEFAULT_AGENT_PREFIXES),
+        "tui_names": set(DEFAULT_TUI_NAMES),
+        "compare_mode_default": DEFAULT_COMPARE_MODE,
+    }
+    config_path = project_root / "aitasks" / "metadata" / "project_config.yaml"
+    if not config_path.is_file():
+        return defaults
+    try:
+        import yaml
+        with open(config_path) as f:
+            data = yaml.safe_load(f) or {}
+        monitor = data.get("tmux", {}).get("monitor", {})
+        if not isinstance(monitor, dict):
+            return defaults
+        if "capture_lines" in monitor:
+            defaults["capture_lines"] = int(monitor["capture_lines"])
+        if "idle_threshold_seconds" in monitor:
+            defaults["idle_threshold"] = float(monitor["idle_threshold_seconds"])
+        if "agent_window_prefixes" in monitor:
+            defaults["agent_prefixes"] = list(monitor["agent_window_prefixes"])
+        if "tui_window_names" in monitor:
+            # Merge with registry defaults so new framework TUIs are never
+            # masked by a stale override list in project_config.yaml.
+            defaults["tui_names"] = set(TUI_NAMES) | set(monitor["tui_window_names"])
+        if "compare_mode_default" in monitor:
+            val = str(monitor["compare_mode_default"])
+            if val in COMPARE_MODES:
+                defaults["compare_mode_default"] = val
+    except Exception:
+        pass
+    return defaults
+
+
+def load_project_tmux_config(project_root: Path) -> dict:
+    """Load the ``tmux`` section from project_config.yaml.
+
+    Companion to :func:`load_monitor_config` (which returns the nested
+    ``tmux.monitor`` subsection). Shared by both monitor apps so the shadow
+    placement keys (``shadow_same_window``, ``shadow_pane_width``,
+    ``default_split``) are read identically (t1216_4).
+    """
+    try:
+        import yaml
+        pc = project_root / "aitasks" / "metadata" / "project_config.yaml"
+        if pc.is_file():
+            with open(pc) as f:
+                data = yaml.safe_load(f) or {}
+            return data.get("tmux", {})
+    except Exception:
+        pass
+    return {}
+
+
+# -- Launched helper panes (shadow, scratchpad) ---------------------------------
+# Both spawns take the new pane's id from the launch's own `-P` output; these
+# cover the two ways that can still go wrong — no usable id printed, and a stamp
+# that will not write — without ever reading an unproven answer as "gone".
+
+# Bounded recovery when the launch printed no usable pane id: tries x spacing.
+_LAUNCH_RECOVER_TRIES = 3
+_LAUNCH_RECOVER_SPACING = 0.05
+
+
+def _probe_pane(monitor, pane: str) -> str:
+    """``"live"`` / ``"gone"`` / ``"unknown"`` for ``pane``.
+
+    ``display-message -p -t <gone pane>`` exits ZERO with EMPTY output, so the
+    output is the signal — but only when the query itself succeeded: the gateway
+    answers ``(-1, "")`` on a timeout or transport failure, and that empty
+    string proves nothing. Anything not plainly live or gone is unknown.
+    """
+    rc, out = monitor.tmux_run(["display-message", "-p", "-t", pane, "#{pane_id}"])
+    if rc != 0:
+        return "unknown"
+    seen = out.strip()
+    if seen == pane:
+        return "live"
+    if not seen:
+        return "gone"
+    return "unknown"
+
+
+def _recover_launched_pane(monitor, pid: int | None) -> tuple[str, str | None]:
+    """Find the pane of a helper launch that printed no usable pane id.
+
+    ``("found", id)``, ``("exited", None)`` or ``("unknown", None)``. Absence is
+    reported only from a valid pid AND a successful, INTERPRETABLE query:
+    without a pid there is nothing to look for, and a failed query — or one
+    whose listing has any row that is not ``%<n> <positive pid>`` — is missing
+    evidence, not a gone pane, so it is retried and then reported unknown.
+    Bounded — at most :data:`_LAUNCH_RECOVER_TRIES` queries.
+    """
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return "unknown", None
+    for attempt in range(_LAUNCH_RECOVER_TRIES):
+        if attempt:
+            time.sleep(_LAUNCH_RECOVER_SPACING)
+        rc, out = monitor.tmux_run(
+            ["list-panes", "-a", "-F", "#{pane_id} #{pane_pid}"])
+        if rc != 0:
+            continue
+        rows = [_RECOVER_ROW_RE.fullmatch(line.strip())
+                for line in out.splitlines() if line.strip()]
+        if not all(rows) or any(int(r.group(2)) <= 0 for r in rows):
+            continue
+        for row in rows:
+            if int(row.group(2)) == pid:
+                return "found", row.group(1)
+        return "exited", None
+    return "unknown", None
+
+
+_RECOVER_ROW_RE = re.compile(r"(%\d+) (\d+)")
+
+
+def _stamp_or_remove(monitor, pane: str, option: str, value: str) -> str:
+    """Stamp ``option`` on a newly launched helper pane, or take the pane away.
+
+    ``"ok"`` on a write (one retry). Otherwise the pane must not stay behind
+    unclassified — an unstamped helper (shadow or scratchpad) lists as an agent
+    and evades both the duplicate lookup and the cleanup hook — so:
+    ``"exited"`` when a probe proves it is already gone (nothing to kill); else
+    a best-effort ``kill-pane`` —
+    also on an UNKNOWN probe, since we hold the id of a pane we created
+    milliseconds ago — and ``"removed"`` only when a second probe proves it gone,
+    ``"stuck"`` when that cannot be confirmed.
+    """
+    args = ["set-option", "-p", "-t", pane, option, value]
+    rc, _ = monitor.tmux_run(args)
+    if rc != 0:
+        rc, _ = monitor.tmux_run(args)
+    if rc == 0:
+        return "ok"
+    if _probe_pane(monitor, pane) == "gone":
+        return "exited"
+    monitor.tmux_run(["kill-pane", "-t", pane])
+    return "removed" if _probe_pane(monitor, pane) == "gone" else "stuck"
+
+
+_SHADOW_REMOVAL_MESSAGES = {
+    "exited": ("Shadow pane {pane} exited before it could be classified "
+               "— no shadow is running", "warning"),
+    "removed": ("Shadow pane {pane} could not be classified — removed it. "
+                "No shadow is running.", "error"),
+    "stuck": ("Shadow pane {pane} could not be classified, and its removal "
+              "could not be confirmed — close it by hand", "error"),
+}
+
+
+def spawn_shadow(
+    monitor,
+    *,
+    full_cmd: str,
+    followed_pane: str,
+    followed_window: str,
+    session: str,
+    task_id: str | None,
+    target_root: Path,
+    companion_pane: str | None,
+    select_window: bool,
+    notify: Callable[..., None],
+    schedule_refresh: Callable[[], None],
+    phase_signal=None,
+) -> str | None:
+    """Place, launch, and lifecycle-wire a shadow companion pane.
+
+    Shared body behind both apps' ``e`` / ``E`` shortcuts (t1216_4). Placement is
+    ALWAYS handler-controlled — a same-window split to the RIGHT of the followed
+    AGENT pane sized to ``shadow_pane_width``, or a separate window when
+    ``tmux.shadow_same_window`` is false — never a picker dialog's own placement.
+    Returns the new shadow's pane id, or ``None`` when nothing usable was created.
+
+    ``monitor`` is duck-typed on the **gateway surface only** (``tmux_run`` ->
+    ``(rc, stdout)``), matching the rest of this module's shadow seam; the
+    ``notify`` / ``schedule_refresh`` callables keep it Textual-free.
+
+    **This function never reads ``TMUX_PANE``.** ``companion_pane`` is the pane
+    ``aitask_companion_cleanup.sh`` despawns once the followed agent's window
+    holds no real agent besides the dying one; ``None`` means "bind to the newly
+    created shadow pane", which is always safe. Pass a pane **outside** the
+    followed agent's window only if you want that pane killed on the agent's
+    death — the script's job-2 ``kill-pane`` has no marker check, so passing a
+    monitor's own pane makes the agent's exit close the monitor. Callers state
+    this as per-app policy; there is no default.
+
+    ``schedule_refresh`` is **not** called when the launch itself fails, so a
+    failed spawn does not trigger a redundant refresh.
+
+    The new pane's id comes from the launch's own ``-P`` output on BOTH
+    placement branches (:func:`launch_split_pane` / :func:`launch_window_pane`);
+    when none is printed it is recovered by pid (:func:`_recover_launched_pane`),
+    and a pane that cannot be identified is reported, never claimed gone. If the
+    ``@aitask_shadow_target`` stamp cannot be written the new pane is removed
+    rather than left behind (:func:`_stamp_or_remove`): an unstamped shadow is
+    indistinguishable from a real agent forever (it lists as an agent, is
+    targeted by kill/next-agent actions, counts as a real sibling, evades the
+    duplicate guard, and — because the cleanup script matches on the marker — is
+    never cleaned up).
+    """
+    if monitor is None:
+        return None
+    # Placement: same window (split) by default; separate window if the project
+    # config opts out.
+    tmux_cfg = load_project_tmux_config(target_root)
+    same_window = bool(tmux_cfg.get("shadow_same_window", True))
+    if same_window:
+        try:
+            shadow_width = int(tmux_cfg.get("shadow_pane_width", 60))
+        except (TypeError, ValueError):
+            shadow_width = 60
+        cfg = TmuxLaunchConfig(
+            session=session,
+            window=followed_window,
+            new_session=False,
+            new_window=False,
+            split_direction=str(tmux_cfg.get("default_split", "horizontal")),
+            # Insert the shadow to the RIGHT of the followed AGENT pane, sized to
+            # the configured width (t994). Target the agent pane (not the
+            # window's active pane, which may be a narrow minimonitor) so the
+            # width is sized against the wide agent pane; keep the agent anchored
+            # on the left (no split_before).
+            split_size=shadow_width,
+            split_target_pane=followed_pane,
+            cwd=str(target_root),
+            select_window=select_window,
+        )
+    else:
+        cfg = TmuxLaunchConfig(
+            session=session,
+            window=f"agent-shadow-{task_id or 'x'}",
+            new_session=False,
+            new_window=True,
+            cwd=str(target_root),
+            select_window=select_window,
+        )
+
+    # Last-moment duplicate re-check. The callers' pre-dialog guard cannot cover
+    # the seconds an agent-picker dialog is open, nor two queued dialogs. Refuse
+    # on a found shadow AND on an unverifiable query — spawning a second shadow
+    # breaks the one-shadow-per-agent lifecycle binding.
+    ok, existing = find_shadow_pane_status(monitor, followed_pane)
+    if not ok:
+        notify(
+            "Could not verify whether a shadow is already running — not launching",
+            severity="warning",
+        )
+        return None
+    if existing:
+        notify("A shadow is already running for this agent", severity="warning")
+        return None
+
+    # The new pane's id comes from the launch itself (t2087): a by-pid lookup
+    # afterwards answers None both for "query failed" and for "no such pane",
+    # and acting on that None left a live, UNSTAMPED shadow behind.
+    launch = launch_split_pane if same_window else launch_window_pane
+    shadow_pane, pid, err = launch(full_cmd, cfg)
+    if err:
+        notify(f"Shadow launch failed: {err}", severity="error")
+        return None
+
+    if not shadow_pane:
+        state, shadow_pane = _recover_launched_pane(monitor, pid)
+        if state == "exited":
+            notify("Shadow exited immediately — nothing was launched",
+                   severity="warning")
+            schedule_refresh()
+            return None
+        if state != "found" or not shadow_pane:
+            ident = f" (pid {pid})" if pid else ""
+            notify(f"Shadow launched{ident}, but its pane could not be "
+                   "classified — it may appear in the agent list; close any "
+                   "stray pane by hand", severity="error")
+            schedule_refresh()
+            return None
+
+    # Stamp the authoritative @aitask_shadow_target option. Without it a
+    # same-window shadow (sharing the agent's window name) would be listed as an
+    # agent and never auto-killed.
+    outcome = _stamp_or_remove(monitor, shadow_pane, SHADOW_TARGET_OPTION,
+                               followed_pane)
+    if outcome != "ok":
+        text, severity = _SHADOW_REMOVAL_MESSAGES[outcome]
+        notify(text.format(pane=shadow_pane), severity=severity)
+        schedule_refresh()
+        return None
+
+    # Ensure the followed agent auto-kills its bound shadow on exit.
+    hook_status = attach_companion_cleanup_hook(
+        followed_pane, companion_pane or shadow_pane
+    )
+    if hook_status == "unverified":
+        notify(
+            "Shadow launched; auto-cleanup on agent exit could not be wired "
+            "— close the shadow by hand when the agent exits",
+            severity="warning",
+        )
+    else:
+        notify("Launched shadow agent")
+    # Stamp the advisory phase BEFORE handing control back (t1420). The per-tick
+    # re-stamp is not sufficient on its own: the user can launch a shadow and
+    # have it read `--phase` before the next UI tick, and it would then miss the
+    # very checkpoint they spawned it for and fall back to the ledger. Callers
+    # pass the signal because only they hold the followed pane's live half.
+    # Best-effort by contract — see refresh_shadow_phase_stamp.
+    if phase_signal is not None:
+        refresh_shadow_phase_stamp(monitor, shadow_pane, phase_signal)
+    schedule_refresh()
+    return shadow_pane
+
+
+def refresh_shadow_phase_stamp(monitor, shadow_pane: str, signal) -> bool:
+    """Write the advisory phase onto a shadow pane's ``@aitask_shadow_phase``.
+
+    Shared rather than living in one app: **both** TUIs spawn shadows
+    (``minimonitor_app.action_launch_shadow`` and
+    ``monitor_app.action_launch_shadow``), so a refresh wired into only one would
+    leave the other's shadows frozen at their launch value — exactly the
+    staleness the pane-option channel was chosen over argv to avoid. Callers pass
+    it from whatever per-tick path already resolved a bound shadow pane; the
+    comparison/mutation lives here and the display stays theirs, the same split
+    :func:`compute_shadow_staleness` uses.
+
+    **Best-effort, and deliberately NOT fatal** — the opposite of the
+    ``@aitask_shadow_target`` stamp in :func:`spawn_shadow`, which kills the pane
+    when it fails because an unclassifiable shadow is worse than none. An
+    advisory hint must never be able to destroy or disturb a shadow, so every
+    failure here is swallowed and the previous value simply stands.
+    """
+    if not shadow_pane or signal is None:
+        return False
+    # Built OUTSIDE the guard on purpose. ``format_signal`` is total — it
+    # validates every field against its vocabulary and cannot raise on a
+    # PhaseSignal — so anything that blows up here is a programming error, and a
+    # broad ``except`` around it would turn that into a silent no-op. (It did
+    # exactly that once: a missing SHADOW_PHASE_OPTION became a swallowed
+    # NameError and the stamp never wrote, with every test still green.)
+    line = workflow_phase.format_signal(signal)
+    args = _shadow_phase_stamp_args(shadow_pane, line)
+    try:
+        rc, _ = monitor.tmux_run(args)
+    except Exception:
+        # Only the transport is tolerated: tmux may be gone, the pane may have
+        # died between resolution and write, or a duck-typed monitor may raise.
+        return False
+    return rc == 0
+
+
+def _shadow_phase_stamp_args(shadow_pane: str, line: str) -> list[str]:
+    """The one place the stamp's argv is built, shared by both siblings."""
+    return ["set-option", "-p", "-t", shadow_pane, SHADOW_PHASE_OPTION, line]
+
+
+async def refresh_shadow_phase_stamp_async(monitor, shadow_pane: str, signal) -> bool:
+    """Async sibling of :func:`refresh_shadow_phase_stamp` (t1598).
+
+    Same best-effort, never-fatal contract. minimonitor reaches this from
+    ``_maybe_offer_concerns`` on the refresh path, where the sync ``tmux_run``
+    was a round-trip on the event-loop thread. ``format_signal`` is called
+    OUTSIDE the ``try`` for the same reason as the sync sibling: it is total, and
+    a broad ``except`` around it would turn a real defect into a silent no-op.
+    """
+    if not shadow_pane or signal is None:
+        return False
+    line = workflow_phase.format_signal(signal)
+    args = _shadow_phase_stamp_args(shadow_pane, line)
+    try:
+        rc, _ = await monitor.tmux_run_async(args)
+    except Exception:
+        return False
+    return rc == 0
+
+
+# -- Scratchpad spawn (t2073_4) -------------------------------------------------
+#
+# minimonitor `o` opens `ait scratchpad` in a vertical split of the followed
+# agent's pane. The pad is a bound helper (`lib/helper_panes.py`): once stamped
+# with SCRATCHPAD_TARGET_OPTION, discovery, the occupancy check, the cleanup
+# hook and freeze all treat it as one. This section is only the spawn side.
+
+SCRATCHPAD_POSITIONS = ("top", "bottom")
+SCRATCHPAD_DEFAULT_POSITION = "bottom"
+SCRATCHPAD_DEFAULT_HEIGHT = 12
+# THIS framework's store helper, run with cwd=<project root> — the same shape as
+# minimonitor's `_BOARD_COLUMN_SH`. Its `path` verb creates nothing.
+_SCRATCHPAD_STORE_SH = _SCRIPTS_DIR / "aitask_scratchpad_store.sh"
+_SCRATCHPAD_PATH_TIMEOUT = 5.0
+
+
+def scratchpad_query_args() -> list[str]:
+    """tmux argv listing every pane's id, scratchpad target, store key, frozen mark."""
+    return ["list-panes", "-a", "-F",
+            f"#{{pane_id}}\t#{{{SCRATCHPAD_TARGET_OPTION}}}\t"
+            f"#{{{SCRATCHPAD_STORE_OPTION}}}\t#{{{FROZEN_OPTION}}}"]
+
+
+def match_scratchpad_pane(out: str, followed_pane: str,
+                          store_key: str) -> str | None:
+    """The first pad that blocks opening another, or ``None``. Pure.
+
+    A pad blocks when its store key equals ``store_key`` (task pads — one per
+    project and task, so the key is the canonical store dir, never the bare id)
+    or when it is bound to ``followed_pane`` (one pad per agent, saved or not).
+
+    **Frozen first** (`lib/helper_panes.py`): a pane carrying ``@aitask_frozen``
+    is a stand-in that may retain the options of whatever ran there before the
+    respawn, so its markers are never read as a running pad.
+    """
+    for line in out.splitlines():
+        if not line.strip():
+            continue
+        parts = (line.split("\t") + ["", "", "", ""])[:4]
+        pane_id, target, store, frozen = (p.strip() for p in parts)
+        # The store key is a canonical OS path (policy 5, t2236).
+        store = tmux_os_path(store)
+        if not pane_id or frozen:
+            continue
+        if (store_key and store == store_key) or (
+                followed_pane and target == followed_pane):
+            return pane_id
+    return None
+
+
+def find_scratchpad_pane_status(
+    monitor, followed_pane: str, store_key: str
+) -> tuple[bool, str | None]:
+    """Live duplicate lookup for a spawn: ``(ok, pane)``.
+
+    ``ok`` is False when the query could not be answered — a create decision
+    must refuse then, never read it as "no pad" (the
+    :func:`find_shadow_pane_status` rule). Duck-typed on ``tmux_run`` only.
+    """
+    if monitor is None:
+        return False, None
+    rc, out = monitor.tmux_run(scratchpad_query_args(), timeout=2)
+    if rc != 0:
+        return False, None
+    return True, match_scratchpad_pane(out, followed_pane, store_key)
+
+
+def scratchpad_store_key(target_root: Path, task_id: str) -> str | None:
+    """Canonical absolute store dir of ``task_id`` in ``target_root``, or None.
+
+    Asks the store helper's ``path`` verb, which creates nothing and returns the
+    same key before and after the store exists. ``None`` on any failure (exit
+    status, timeout, unrunnable helper, or output that is not exactly one
+    absolute path) — the caller refuses the spawn rather than guessing a key.
+    """
+    try:
+        proc = subprocess.run(
+            [str(_SCRATCHPAD_STORE_SH), "path", task_id],
+            cwd=str(target_root), capture_output=True, text=True,
+            timeout=_SCRATCHPAD_PATH_TIMEOUT,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    lines = proc.stdout.splitlines()
+    if len(lines) != 1 or not lines[0].startswith("/"):
+        return None
+    return lines[0]
+
+
+def scratchpad_command(task_id: str | None, target_pane: str,
+                       store_root: str | None = None) -> str:
+    """The pad's command line: ``ait scratchpad --task|--unsaved … --target …``.
+
+    A task pad PINS ``AITASK_SCRATCHPAD_DIR`` to ``store_root`` — the canonical
+    root the duplicate lookup resolved. ``split-window`` starts the pad in the
+    tmux server's environment, not the caller's, and ``ait`` runs the project's
+    own copy of the helper from the project root; without the pin a root set
+    (or unset) only in the minimonitor would make the stamped key and the store
+    the editor really opens diverge. ``env`` execs, so the pane's pid is still
+    the launched process (the :func:`launch_in_tmux` contract).
+    """
+    if task_id is None:
+        return f"ait scratchpad --unsaved --target {shlex.quote(target_pane)}"
+    if not store_root or not store_root.startswith("/"):
+        raise ValueError(
+            f"a task scratchpad needs an absolute store root, got {store_root!r}")
+    return (f"env AITASK_SCRATCHPAD_DIR={shlex.quote(store_root)} "
+            f"ait scratchpad --task {shlex.quote(task_id)} "
+            f"--target {shlex.quote(target_pane)}")
+
+
+def scratchpad_placement(tmux_cfg: dict) -> tuple[str, int]:
+    """``(position, height)`` from ``tmux.scratchpad_position`` / ``_height``.
+
+    An invalid value falls back to its default: a position outside
+    :data:`SCRATCHPAD_POSITIONS`, or a height that is not a whole number >= 1.
+    Only an ``int`` or a string of decimal digits is accepted — validated BEFORE
+    any conversion, because ``yaml.safe_load`` also yields floats (``1.5`` would
+    truncate to 1; ``.inf`` would raise ``OverflowError``) and bools
+    (``int(True)`` is 1).
+    """
+    position = str(tmux_cfg.get("scratchpad_position",
+                                SCRATCHPAD_DEFAULT_POSITION)).strip().lower()
+    if position not in SCRATCHPAD_POSITIONS:
+        position = SCRATCHPAD_DEFAULT_POSITION
+    raw = tmux_cfg.get("scratchpad_height", SCRATCHPAD_DEFAULT_HEIGHT)
+    height = SCRATCHPAD_DEFAULT_HEIGHT
+    if isinstance(raw, int) and not isinstance(raw, bool):
+        height = raw
+    elif isinstance(raw, str) and re.fullmatch(r"[0-9]+", raw.strip()):
+        height = int(raw.strip())
+    if height < 1:
+        height = SCRATCHPAD_DEFAULT_HEIGHT
+    return position, height
+
+
+_PAD_REMOVAL_MESSAGES = {
+    "exited": ("Scratchpad pane {pane} exited before it could be classified "
+               "— nothing was opened", "warning"),
+    "removed": ("Scratchpad pane {pane} could not be classified — removed it. "
+                "No scratchpad is open.", "error"),
+    "stuck": ("Scratchpad pane {pane} could not be classified, and its removal "
+              "could not be confirmed — close it by hand", "error"),
+}
+
+
+def spawn_scratchpad(
+    monitor,
+    *,
+    followed_pane: str,
+    followed_window: str,
+    session: str,
+    task_id: str | None,
+    target_root: Path,
+    companion_pane: str | None,
+    select_window: bool,
+    notify: Callable[..., None],
+    schedule_refresh: Callable[[], None],
+) -> str | None:
+    """Place, launch, stamp and lifecycle-wire a scratchpad pane (t2073_4).
+
+    Mirrors :func:`spawn_shadow`. ``task_id`` None opens an UNSAVED pad. The pad
+    goes in a vertical split of the followed AGENT pane, above or below it per
+    ``tmux.scratchpad_position`` / ``tmux.scratchpad_height``. Returns the pad's
+    pane id, or ``None`` when no usable pad was created.
+
+    **This function never reads ``TMUX_PANE``** — ``companion_pane`` follows the
+    :func:`spawn_shadow` contract: the pane the cleanup hook despawns once the
+    agent's window holds no real agent; ``None`` binds to the new pad.
+
+    The live lookup refuses on an unverifiable query and on a pad already open
+    for the same store or the same agent; it skips frozen panes. It is a guard
+    against the obvious duplicate, not the authority: between the launch and the
+    stamp a concurrent press cannot see the new pad, and there the app's
+    ``flock`` on the store keeps a second editor read-only.
+
+    A pad that cannot be stamped is removed (see :func:`_stamp_or_remove`); a
+    pad whose pane cannot be identified at all is reported, never claimed gone.
+    """
+    if monitor is None:
+        return None
+    store_key = ""
+    if task_id:
+        key = scratchpad_store_key(target_root, task_id)
+        if key is None:
+            notify(f"Could not resolve the scratchpad store for t{task_id} "
+                   "— not opening", severity="error")
+            return None
+        store_key = key
+
+    ok, existing = find_scratchpad_pane_status(monitor, followed_pane, store_key)
+    if not ok:
+        notify("Could not verify whether a scratchpad is already open "
+               "— not opening", severity="warning")
+        return None
+    if existing:
+        where = f"t{task_id}" if task_id else "this agent"
+        notify(f"A scratchpad is already open for {where}", severity="warning")
+        return None
+
+    position, height = scratchpad_placement(load_project_tmux_config(target_root))
+    cfg = TmuxLaunchConfig(
+        session=session,
+        window=followed_window,
+        new_session=False,
+        new_window=False,
+        split_direction="vertical",
+        split_before=(position == "top"),
+        split_size=height,
+        split_target_pane=followed_pane,
+        cwd=str(target_root),
+        select_window=select_window,
+    )
+    command = scratchpad_command(task_id, followed_pane,
+                                 os.path.dirname(store_key) or None)
+    pad, pid, err = launch_split_pane(command, cfg)
+    if err:
+        notify(f"Scratchpad launch failed: {err}", severity="error")
+        return None
+
+    if not pad:
+        state, pad = _recover_launched_pane(monitor, pid)
+        if state == "exited":
+            notify("Scratchpad exited immediately — nothing was opened",
+                   severity="warning")
+            schedule_refresh()
+            return None
+        if state != "found" or not pad:
+            ident = f" (pid {pid})" if pid else ""
+            notify(f"Scratchpad launched{ident}, but tmux returned no usable "
+                   "pane id — check the agent's window and close any stray "
+                   "pane by hand", severity="error")
+            schedule_refresh()
+            return None
+
+    stamps = [(SCRATCHPAD_TARGET_OPTION, followed_pane)]
+    if store_key:
+        stamps.append((SCRATCHPAD_STORE_OPTION, store_key))
+    for option, value in stamps:
+        outcome = _stamp_or_remove(monitor, pad, option, value)
+        if outcome != "ok":
+            text, severity = _PAD_REMOVAL_MESSAGES[outcome]
+            notify(text.format(pane=pad), severity=severity)
+            schedule_refresh()
+            return None
+
+    hook_status = attach_companion_cleanup_hook(
+        followed_pane, companion_pane or pad
+    )
+    if hook_status == "unverified":
+        notify("Scratchpad opened; auto-cleanup on agent exit could not be "
+               "wired — close the scratchpad by hand when the agent exits",
+               severity="warning")
+    elif task_id:
+        notify(f"Opened scratchpad for t{task_id}")
+    else:
+        notify("Opened scratchpad (not saved)")
+    schedule_refresh()
+    return pad
+
+
+# -- Sitrep window (t2175_4, two roles since t2211_2) -------------------------
+#
+# One sitrep agent AND one sitrep TUI per repository, in their OWN window
+# (`agent-sitrep`) with a full-height minimonitor companion — not a split beside
+# another agent like the shadow. The agent pane carries `@aitask_sitrep_root`,
+# the TUI pane `@aitask_sitrep_tui_root`, both = the canonical project root;
+# those stamps are the authoritative identities. The lookup that guards against
+# a second spawn follows the shadow/scratchpad rules (aidocs/framework/sitrep.md):
+# refuse on an unverifiable query, skip frozen and dead panes, skip helper panes
+# by the shared `pane_is_helper` rule, never take the TUI for the agent, and
+# match the stamp before the name+cwd fallback (a restore into a new window
+# recreates the pane without the stamp).
+
+#: :data:`FROZEN_AWARE_PANE_FORMAT`'s fields (the TUI stamp among them), then the
+#: agent stamp, the window name and the pane's cwd. The cwd is LAST: the matcher
+#: splits off a fixed number of fields and keeps the remainder whole, so a tab in
+#: a path is data.
+SITREP_PANE_FORMAT = "\t".join([
+    FROZEN_AWARE_PANE_FORMAT, f"#{{{SITREP_ROOT_OPTION}}}", "#{window_name}",
+    "#{pane_current_path}",
+])
+_SITREP_SPLIT = _FROZEN_AWARE_ARITY + 2          # fields before the cwd
+_SITREP_PANE_ID_RE = re.compile(r"%[0-9]+")
+_SITREP_LOCK_SUFFIX = ".aitask-sitrep-spawn.lock"
+#: How long a spawn waits for another spawn on the same tmux server.
+SITREP_LOCK_TIMEOUT = 5.0
+#: The TUI's share of the agent column, and the agent's when it is respawned
+#: above a surviving TUI (measured: both orders give the same rows, t2211_2).
+SITREP_TUI_SIZE = "40%"
+SITREP_AGENT_SIZE = "60%"
+#: One `display-message` read of where a pane lives.
+_SITREP_PLACE_FORMAT = "#{session_name}\t#{window_id}\t#{window_index}\t#{window_name}"
+
+
+class SitrepSpawn(NamedTuple):
+    """The outcome of :func:`spawn_sitrep`."""
+
+    #: ``spawned`` (a new window) | ``added_tui`` (the agent was live, its TUI
+    #: was added) | ``respawned_agent`` (the TUI was live, the agent was
+    #: respawned above it) | ``focused`` | ``focus_failed`` (both exist, but
+    #: switching failed) | ``refused``.
+    status: str
+    #: The sitrep AGENT's pane id, on every status (``None`` when refused).
+    pane: str | None
+    #: The window the agent lives in, ``<session>:<window>``, when the spawn
+    #: changed it.
+    window: str
+    #: Refusal reason (``lookup_failed``, ``lock_busy``, ``root:<why>`` …) or,
+    #: otherwise, a comma-joined warning list (``companion_not_spawned``,
+    #: ``tui_not_spawned:<why>``, ``tui_moved``, ``tui_not_moved``,
+    #: ``focus_failed``, ``focus_not_restored``) — empty when clean.
+    detail: str
+    #: The sitrep TUI's pane id, when one is known to exist.
+    tui: str | None = None
+
+
+class _SitrepRow(NamedTuple):
+    pane_id: str
+    pid: int
+    shadow: str
+    monitor_kind: str
+    frozen: str
+    dead: str
+    scratch: str
+    tui_root: str
+    stamp: str
+    window: str
+    cwd: str
+
+
+class _SitrepPlace(NamedTuple):
+    session: str
+    window_id: str
+    window_index: str
+    window_name: str
+
+
+def sitrep_query_args() -> list[str]:
+    """tmux argv listing every pane's :data:`SITREP_PANE_FORMAT` row."""
+    return ["list-panes", "-a", "-F", SITREP_PANE_FORMAT]
+
+
+def sitrep_tui_command(root: str) -> str:
+    """The sitrep TUI pane's command (patchable, like `resolve_dry_run_command`)."""
+    return f"ait sitrep tui --root {shlex.quote(root)}"
+
+
+def _sitrep_canon(path: str) -> str | None:
+    """The canonical project root of ``path``, or ``None`` when it has none."""
+    from sitrep_harvest import HarvestFailure, canonical_root
+    try:
+        return canonical_root(path)[0]
+    except HarvestFailure:
+        return None
+
+
+def _sitrep_rows(out: str):
+    """The well-formed rows of a ``sitrep_query_args`` listing."""
+    for line in out.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("\t", _SITREP_SPLIT)
+        if len(parts) != _SITREP_SPLIT + 1:
+            continue
+        (pane_id, pid_str, shadow, monitor_kind, frozen, dead, scratch, tui_root,
+         stamp, window, cwd) = parts
+        pane_id = pane_id.strip()
+        if not _SITREP_PANE_ID_RE.fullmatch(pane_id):
+            continue
+        try:
+            pid = int(pid_str)
+        except ValueError:
+            continue
+        # The two root stamps and the cwd are PATHS compared against a
+        # canonical OS root: read them into Python's OS representation
+        # (identity on a UTF-8 host; policy 5, t2236).
+        yield _SitrepRow(pane_id, pid, shadow, monitor_kind, frozen, dead,
+                         scratch, tmux_os_path(tui_root), tmux_os_path(stamp),
+                         window, tmux_os_path(cwd))
+
+
+def match_sitrep_pane(out: str, root: str,
+                      canon: Callable[[str], str | None],
+                      is_helper: Callable[..., bool] | None = None) -> str | None:
+    """The sitrep agent pane serving ``root`` in a ``sitrep_query_args`` listing.
+
+    Pure: ``canon`` (path -> canonical root) and ``is_helper`` are injected.
+    Rows that are frozen, dead, helpers or the sitrep TUI never match — the
+    sitrep window holds its own minimonitor companion and its TUI (same window,
+    same cwd, no agent stamp), neither of which may pass for the agent, also
+    when the agent beside them is frozen or gone. Then two passes, so row order
+    never decides: a pane stamped for ``root`` wins over any name+cwd fallback
+    candidate (an unstamped pane in a sitrep-named window whose cwd maps to
+    ``root``).
+    """
+    from sitrep_harvest import is_sitrep_window
+    helper = is_helper or pane_is_helper
+    fallback: str | None = None
+    for row in _sitrep_rows(out):
+        if row.frozen.strip() or row.dead.strip() == "1":
+            continue
+        if is_sitrep_tui_pane(row.frozen, row.tui_root):
+            continue
+        if helper(row.frozen, row.shadow, row.monitor_kind, row.scratch, row.pid):
+            continue
+        stamp = row.stamp.strip()
+        if stamp:
+            if stamp == root:
+                return row.pane_id
+            continue
+        if fallback is None and is_sitrep_window(row.window.strip()) and row.cwd \
+                and canon(row.cwd) == root:
+            fallback = row.pane_id
+    return fallback
+
+
+def match_sitrep_tui_pane(out: str, root: str) -> str | None:
+    """The live sitrep TUI pane serving ``root`` — by its stamp only, any window.
+
+    Pure. Frozen and dead panes never match. No name or cwd fallback: an
+    unstamped TUI is not one this repository can prove it owns.
+    """
+    for row in _sitrep_rows(out):
+        if row.frozen.strip() or row.dead.strip() == "1":
+            continue
+        if row.tui_root.strip() == root:
+            return row.pane_id
+    return None
+
+
+def find_sitrep_roles(monitor, root: str, canon=None
+                      ) -> tuple[bool, str | None, str | None]:
+    """Live role lookup for a sitrep spawn: ``(ok, agent_pane, tui_pane)``.
+
+    ONE ``list-panes -a`` read. ``ok`` is False when the query could not be
+    answered — a create decision must refuse then, never read it as "no
+    sitrep" (the :func:`find_shadow_pane_status` rule). Duck-typed on
+    ``tmux_run`` only.
+    """
+    if monitor is None:
+        return False, None, None
+    rc, out = monitor.tmux_run(sitrep_query_args(), timeout=2)
+    if rc != 0:
+        return False, None, None
+    return (True, match_sitrep_pane(out, root, canon or _sitrep_canon),
+            match_sitrep_tui_pane(out, root))
+
+
+def find_sitrep_pane_status(monitor, root: str, canon=None
+                            ) -> tuple[bool, str | None]:
+    """The agent half of :func:`find_sitrep_roles`: ``(ok, agent_pane)``."""
+    ok, agent, _tui = find_sitrep_roles(monitor, root, canon)
+    return ok, agent
+
+
+@contextlib.contextmanager
+def _sitrep_spawn_lock(monitor, session: str, timeout: float):
+    """Serialize sitrep lookup -> launch -> stamp on one tmux server.
+
+    Yields held: bool. Inside it, a second spawn re-reads AFTER the first one
+    stamped its panes, so concurrent `ait sitrep` calls leave one agent and one
+    TUI per root. One lock file per server beside its socket, the
+    `_companion_spawn_lock` shape (never deleted; a dead holder's flock is
+    dropped by the kernel). FAILS CLOSED: no socket path, an unopenable file or
+    the deadline -> False.
+    """
+    rc, out = monitor.tmux_run(
+        ["display-message", "-p", "-t", tmux_session_scope_target(session),
+         "#{socket_path}"])
+    socket_path = out.strip() if rc == 0 else ""
+    if not socket_path or "\n" in socket_path or not os.path.isabs(socket_path):
+        yield False
+        return
+    try:
+        fd = os.open(socket_path + _SITREP_LOCK_SUFFIX,
+                     os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0), 0o600)
+    except OSError:
+        yield False
+        return
+    try:
+        held = _flock_until(fd, timeout)
+        try:
+            yield held
+        finally:
+            if held:
+                import fcntl
+                fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def _sitrep_place(monitor, pane: str) -> "_SitrepPlace | None":
+    """Where ``pane`` lives now, or None when that cannot be read in full."""
+    rc, out = monitor.tmux_run(
+        ["display-message", "-p", "-t", pane, _SITREP_PLACE_FORMAT])
+    if rc != 0:
+        return None
+    parts = [f.strip() for f in (out.splitlines() or [""])[0].split("\t")]
+    if len(parts) != 4 or not all(parts):
+        return None
+    return _SitrepPlace(*parts)
+
+
+def _sitrep_active_pane(monitor, window_id: str) -> str | None:
+    """The active pane of window ``window_id``, or None when unreadable."""
+    if not window_id:
+        return None
+    rc, out = monitor.tmux_run(
+        ["display-message", "-p", "-t", window_id, "#{pane_id}"])
+    pane = out.strip() if rc == 0 else ""
+    return pane if _SITREP_PANE_ID_RE.fullmatch(pane) else None
+
+
+def _sitrep_pane_window(monitor, pane: str) -> str | None:
+    """The id of the window ``pane`` is in NOW, or None when unreadable/gone."""
+    rc, out = monitor.tmux_run(
+        ["display-message", "-p", "-t", pane, "#{pane_id}\t#{window_id}"])
+    if rc != 0:
+        return None
+    found, _, window_id = (out.splitlines() or [""])[0].partition("\t")
+    window_id = window_id.strip()
+    return window_id if found.strip() == pane and window_id.startswith("@") else None
+
+
+def _sitrep_split_role(monitor, command: str, anchor: str, place: _SitrepPlace,
+                       *, before: bool, size: str, root: str, option: str
+                       ) -> tuple[str | None, str]:
+    """Split one sitrep role beside ``anchor`` and stamp it: ``(pane, why)``.
+
+    Vertical, DETACHED (tmux ``-d``: the new pane never becomes the window's
+    active pane), cwd = root. A pane that cannot be stamped is removed
+    (:func:`_stamp_or_remove`) — an unstamped role would evade the lookup.
+    ``why`` is empty on success, else ``launch:<err>`` / ``launch:exited`` /
+    ``launch:unclassified`` / ``stamp:<outcome>``.
+    """
+    cfg = TmuxLaunchConfig(
+        session=place.session, window=place.window_name, new_session=False,
+        new_window=False, split_direction="vertical", split_before=before,
+        split_size=size, split_target_pane=anchor, cwd=root,
+        select_window=False, split_detached=True)
+    pane, pid, err = launch_split_pane(command, cfg)
+    if err:
+        return None, f"launch:{err}"
+    if not pane:
+        state, pane = _recover_launched_pane(monitor, pid)
+        if state == "exited":
+            return None, "launch:exited"
+        if state != "found" or not pane:
+            return None, "launch:unclassified"
+    outcome = _stamp_or_remove(monitor, pane, option, root)
+    if outcome != "ok":
+        return None, f"stamp:{outcome}"
+    return pane, ""
+
+
+def _sitrep_agent_slot_occupied(monitor, tui: str) -> bool | None:
+    """Does the TUI's window hold anything but the TUI and helpers?
+
+    An occupant — a FROZEN sitrep agent (frozen first: never a helper), a dead
+    pane, a user's shell — means a respawn must not be split over it. None when
+    the window cannot be listed, or the listing does not contain the TUI.
+    """
+    rc, out = monitor.tmux_run(
+        ["list-panes", "-t", tui, "-F", FROZEN_AWARE_PANE_FORMAT])
+    if rc != 0:
+        return None
+    panes = classify_window_panes(out)
+    if not any(p.pane_id == tui for p in panes):
+        return None
+    return any(p.pane_id != tui and not p.is_helper and not p.is_sitrep_tui
+               for p in panes)
+
+
+def _sitrep_launch_agent_window(monitor, root: str, session: str,
+                                select_window: bool, agent_string: str | None
+                                ) -> tuple[str | None, str, str]:
+    """The agent in a new `agent-sitrep[-n]` window: ``(pane, window, why)``."""
+    full_cmd = resolve_dry_run_command(Path(root), "sitrep",
+                                       agent_string=agent_string)
+    if not full_cmd:
+        return None, "", "no_command"
+    rc, out = monitor.tmux_run(
+        ["list-windows", "-t", tmux_session_scope_target(session),
+         "-F", "#{window_name}"])
+    if rc != 0:
+        return None, "", "window_list_failed"
+    from sitrep_harvest import SITREP_WINDOW_BASE
+    names = {line.strip() for line in out.splitlines() if line.strip()}
+    window = unique_window_name(names, SITREP_WINDOW_BASE)
+    cfg = TmuxLaunchConfig(session=session, window=window,
+                           new_session=False, new_window=True,
+                           cwd=root, select_window=select_window)
+    pane, pid, err = launch_window_pane(full_cmd, cfg)
+    if err:
+        return None, "", f"launch:{err}"
+    if not pane:
+        state, pane = _recover_launched_pane(monitor, pid)
+        if state == "exited":
+            return None, "", "launch:exited"
+        if state != "found" or not pane:
+            return None, "", "launch:unclassified"
+    outcome = _stamp_or_remove(monitor, pane, SITREP_ROOT_OPTION, root)
+    if outcome != "ok":
+        return None, "", f"stamp:{outcome}"
+    return pane, window, ""
+
+
+def spawn_sitrep(monitor, *, target_root, session: str, select_window: bool,
+                 agent_string: str | None = None,
+                 lock_timeout: float | None = None) -> SitrepSpawn:
+    """Focus the repository's sitrep window, or create / repair it.
+
+    ``target_root`` may be any path in the repository: it is mapped to the main
+    worktree (`sitrep_harvest.canonical_root`), the one store's root. Under the
+    per-server lock, the live role lookup (refuse when it cannot be answered),
+    then one of (aidocs/framework/sitrep.md "The sitrep window"):
+
+    * agent and TUI live -> focus the agent;
+    * neither -> a new `agent-sitrep[-n]` window, cwd = root: the agent, then
+      the TUI split under it (a TUI that fails is a warning, the agent stands);
+    * agent only -> the TUI split under it (``added_tui``);
+    * TUI only, its window otherwise empty -> the agent split above it
+      (``respawned_agent``);
+    * TUI only, its window holding an occupant (a frozen agent, a dead pane, a
+      shell) -> a new window with the agent, and the TUI MOVED under it
+      (``join-pane -d``) — never a split over the frozen session, never a
+      second TUI.
+
+    Every new pane is stamped; one that cannot be is removed. Outside the lock,
+    the minimonitor companion — ``explicit``, ``force_companion`` and
+    ``full_height``: the sitrep window always gets one, as a full-height right
+    column, whatever the auto-spawn setting or the configured companion window
+    prefixes. Repairs keep the user's focus: role splits are detached, and
+    without ``select_window`` the window's active pane is restored if the
+    companion spawn moved it.
+
+    **Never reads ``TMUX_PANE``** — the caller names the session. Duck-typed on
+    ``monitor.tmux_run``.
+    """
+    from sitrep_harvest import HarvestFailure, canonical_root, spawn_test_pause
+    try:
+        root, _ = canonical_root(str(target_root))
+    except HarvestFailure as e:
+        return SitrepSpawn("refused", None, "", f"root:{e}")
+    wait = SITREP_LOCK_TIMEOUT if lock_timeout is None else lock_timeout
+    warns: list[str] = []
+    place: _SitrepPlace | None = None
+    original_active: str | None = None
+    with _sitrep_spawn_lock(monitor, session, wait) as held:
+        if not held:
+            return SitrepSpawn("refused", None, "", "lock_busy")
+        ok, agent, tui = find_sitrep_roles(monitor, root)
+        if not ok:
+            return SitrepSpawn("refused", None, "", "lookup_failed")
+        if agent and tui:
+            # A pane can vanish between the lookup and the switch, and the
+            # selection itself can fail: report it rather than claim the focus.
+            # --no-select (select_window False) reuses the pane without moving.
+            if select_window and not switch_to_pane_anywhere(agent):
+                return SitrepSpawn("focus_failed", agent, "", "focus_failed", tui)
+            return SitrepSpawn("focused", agent, "", "", tui)
+        occupied = False
+        if tui and not agent:
+            occupied = _sitrep_agent_slot_occupied(monitor, tui)
+            if occupied is None:
+                return SitrepSpawn("refused", None, "", "lookup_failed")
+        # Test seam (inert unless AITASK_SITREP_SPAWN_PAUSE_FIFO is set).
+        spawn_test_pause("spawn:after_lookup")
+        if agent or (tui and not occupied):
+            # A repair in place: read where, and the window's focus, first.
+            place = _sitrep_place(monitor, agent or tui)
+            if place is None:
+                return SitrepSpawn("refused", None, "", "place_unreadable")
+            if not select_window:
+                original_active = _sitrep_active_pane(monitor, place.window_id)
+        if agent:
+            tui, why = _sitrep_split_role(
+                monitor, sitrep_tui_command(root), agent, place, before=False,
+                size=SITREP_TUI_SIZE, root=root, option=SITREP_TUI_ROOT_OPTION)
+            if not tui:
+                return SitrepSpawn("refused", None, "", f"tui:{why}")
+            status = "added_tui"
+        elif tui and not occupied:
+            full_cmd = resolve_dry_run_command(Path(root), "sitrep",
+                                               agent_string=agent_string)
+            if not full_cmd:
+                return SitrepSpawn("refused", None, "", "no_command")
+            agent, why = _sitrep_split_role(
+                monitor, full_cmd, tui, place, before=True,
+                size=SITREP_AGENT_SIZE, root=root, option=SITREP_ROOT_OPTION)
+            if not agent:
+                return SitrepSpawn("refused", None, "", why)
+            status = "respawned_agent"
+        else:
+            agent, window, why = _sitrep_launch_agent_window(
+                monitor, root, session, select_window, agent_string)
+            if not agent:
+                return SitrepSpawn("refused", None, "", why)
+            status = "spawned"
+            if tui:
+                # The TUI's window holds the frozen session (or another
+                # occupant): move the one TUI here instead of a second one.
+                rc, _ = monitor.tmux_run(
+                    ["join-pane", "-d", "-v", "-l", SITREP_TUI_SIZE,
+                     "-s", tui, "-t", agent])
+                warns.append("tui_moved" if rc == 0 else "tui_not_moved")
+            else:
+                tui, why = _sitrep_split_role(
+                    monitor, sitrep_tui_command(root), agent,
+                    _SitrepPlace(session, "", "", window), before=False,
+                    size=SITREP_TUI_SIZE, root=root,
+                    option=SITREP_TUI_ROOT_OPTION)
+                if not tui:
+                    warns.append(f"tui_not_spawned:{why}")
+    if status == "spawned":
+        # Forced AND explicit: the sitrep window always gets its companion,
+        # whatever `tmux.minimonitor.auto_spawn` or `companion_window_prefixes`
+        # say. The occupancy, pane-count and lock gates still apply.
+        companion = maybe_spawn_minimonitor(
+            session, window, agent_pane=agent, project_root=Path(root),
+            explicit=True, force_companion=True, full_height=True)
+        if not companion:
+            warns.append("companion_not_spawned")
+        return SitrepSpawn("spawned", agent, f"{session}:{window}",
+                           ",".join(warns), tui)
+    # A repair: the companion restores the full-height column if it is gone,
+    # and is a no-op (its "present" gate) when it survived.
+    companion = maybe_spawn_minimonitor(
+        place.session, place.window_name, window_index=place.window_index,
+        agent_pane=agent, project_root=Path(root), explicit=True,
+        force_companion=True, full_height=True)
+    if not companion:
+        # None is either "already present" (the common repair) or "required
+        # but not spawned" (a failed split, a refusing gate): ask the window.
+        existing = window_companion_pane(agent)
+        if not existing:
+            warns.append("companion_not_spawned")
+        elif status == "respawned_agent":
+            # The surviving companion armed its hook on the OLD agent: arm one
+            # on the new agent too, so its exit is cleaned up the same way.
+            attach_companion_cleanup_hook(agent, existing)
+    if select_window:
+        if not switch_to_pane_anywhere(agent):
+            warns.append("focus_failed")
+    elif original_active is None:
+        if companion:
+            warns.append("focus_not_restored")   # the one mover; no original
+    elif _sitrep_active_pane(monitor, place.window_id) != original_active:
+        # Restore only into the repaired window: the original pane may have
+        # been moved meanwhile, and selecting it would then change the focus
+        # of ANOTHER window while leaving this one unrestored.
+        if _sitrep_pane_window(monitor, original_active) != place.window_id:
+            warns.append("focus_not_restored")
+        else:
+            rc, _ = monitor.tmux_run(["select-pane", "-t", original_active])
+            if rc != 0:
+                warns.append("focus_not_restored")
+    return SitrepSpawn(status, agent, f"{place.session}:{place.window_name}",
+                       ",".join(warns), tui)
+
+
+# -- Task context --------------------------------------------------------------
+
+_TASK_ID_RE = re.compile(
+    r'^agent-(?P<operation>pick|qa|resume)-(?P<task_id>\d+(?:_\d+)?)$')
+
+
+def is_task_completed(info) -> bool:
+    """True when a pane's resolved task is finished (t1322).
+
+    Accepts a ``TaskInfo`` or ``None``. Both signals are checked because
+    ``aitask_archive.sh`` sets ``status: Done`` *before* it moves the file into
+    ``aitasks/archived/``, so a monitor tick can land between the two and see
+    either one alone.
+
+    Lives here, beside ``TaskInfoCache``, so the headless status server
+    (t2037_1) can apply the same rule without importing Textual;
+    ``monitor_shared`` re-exports it for the TUIs.
+    """
+    if info is None:
+        return False
+    if str(getattr(info, "status", "")).strip() == "Done":
+        return True
+    abs_path = str(getattr(info, "task_file_abs", "") or "")
+    return "/archived/" in abs_path.replace(os.sep, "/")
+
+
+def task_id_from_window_name(window_name: str) -> str | None:
+    """Pure pane→task mapping: extract the task id from an agent window name.
+
+    Returns the captured id (e.g. ``"100"`` or ``"100_1"``) or ``None`` when the
+    window name is not an ``agent-(pick|qa|resume)-<id>`` window. Kept
+    import-free and side-effect-free so it can be unit-tested directly.
+
+    ``resume`` was added in t1322: the board launches resumed agents into
+    ``agent-resume-<id>`` windows, which previously matched nothing — so a
+    resumed agent showed no task title, no gate summary, and could never reach
+    the COMPLETED status. Prefixes that carry no task id (``agent-explore-``,
+    ``agent-raw-``) must keep resolving to ``None``.
+    """
+
+    m = _TASK_ID_RE.match(window_name)
+    return m.group("task_id") if m else None
+
+
+@dataclass(frozen=True)
+class RunIdentity:
+    """One agent RUN, as opposed to the pane that hosts it (t2175_5).
+
+    A pane id is a container: a freeze respawns a stand-in viewer into it and a
+    restore respawns the agent again, so "pane %5" names different processes
+    over time. Harvest-and-close binds the run it harvested — the process
+    (``pane_pid``) on its server generation (``server_pid``, tmux ``#{pid}``),
+    plus the frozen record the pane carried (empty for a live agent) — and
+    closes only that run (:meth:`TmuxMonitor.kill_agent_run_guarded`).
+    """
+
+    pane_id: str
+    pane_pid: str
+    server_pid: str
+    frozen_record: str
+    #: The pane's `@aitask_sitrep_tui_root` (t2211_2): non-empty on an unfrozen
+    #: pane means the sitrep TUI, which `h` must refuse — at the identity read,
+    #: so a snapshot that still lists the TUI (a status server older than the
+    #: discovery rule) cannot get it harvested-and-closed.
+    sitrep_tui_root: str = ""
+
+
+#: One `display-message -p -t <pane>` read of a :class:`RunIdentity`.
+RUN_IDENTITY_FORMAT = (f"#{{pane_id}}\t#{{pane_pid}}\t#{{pid}}\t#{{{FROZEN_OPTION}}}"
+                       f"\t#{{{SITREP_TUI_ROOT_OPTION}}}")
+
+
+def parse_run_identity(rc: int, out: str, pane_id: str) -> "RunIdentity | None":
+    """Parse a :data:`RUN_IDENTITY_FORMAT` read of ``pane_id``, or ``None``.
+
+    ``None`` for anything that does not prove the identity: a failed read, a
+    short read, a pane that no longer exists (tmux answers an empty
+    ``#{pane_id}``), an answer naming another pane, or pids that are not bare
+    digits (they are later spliced into a guard condition).
+    """
+    if rc != 0:
+        return None
+    fields = (out.splitlines() or [""])[0].split("\t")
+    if len(fields) != 5:
+        return None
+    pid_ok = re.compile(r"[0-9]+").fullmatch
+    found, pane_pid, server_pid, frozen, tui_root = (f.strip() for f in fields)
+    if found != pane_id or not (pid_ok(pane_pid) and pid_ok(server_pid)):
+        return None
+    return RunIdentity(pane_id, pane_pid, server_pid, frozen, tui_root)
+
+
+# --- Guarded dispatch into an agent pane (t2211_4) ---------------------------
+#
+# The sitrep TUI types requests into the sitrep agent. The run kill above set
+# the pattern: ONE `if-shell -F` whose condition the server evaluates at
+# dispatch time, then a read-back, because `if-shell` answers 0 whether or not
+# a branch ran. A kill can be read back by the pane's absence; a send cannot
+# (`readback_state` sees the pane present either way), so each branch stamps a
+# per-dispatch NONCE into a pane option and the read-back classifies that.
+#
+# The payload never meets a tmux parser: it is loaded into a uniquely named
+# buffer through stdin (`load-buffer -b <name> -`), and the guarded branches
+# carry only controlled tokens -- a validated `%N` pane id, a hex nonce, a fixed
+# buffer prefix, a fixed option name, the fixed key `Enter`.
+
+#: Acked by the guarded branches: ``<nonce>:sent`` / ``<nonce>:skipped``.
+#: Unset right after the read-back; dies with the pane.
+DISPATCH_ACK_OPTION = "@aitask_dispatch_ack"
+#: One `display-message -p -t <pane>` read-back of a guarded dispatch.
+DISPATCH_ACK_FORMAT = f"#{{pane_id}}\t#{{pid}}\t#{{{DISPATCH_ACK_OPTION}}}"
+#: Paste buffers are ``aitask-sitrep-<nonce>``: unique per dispatch, deleted
+#: by the paste (``-d``), by the else branch, or by the caller on any doubt.
+DISPATCH_BUFFER_PREFIX = "aitask-sitrep-"
+#: The only keys a guarded key dispatch sends.
+DISPATCH_KEYS = frozenset({"Enter"})
+#: The conjunct that keeps a keystroke out of a tmux mode's key table (t2001):
+#: in copy-mode, Enter is copy-pipe-and-cancel, never the agent's Enter.
+PANE_NOT_IN_MODE = "#{==:#{pane_in_mode},0}"
+
+DISPATCH_SENT = "sent"
+DISPATCH_SKIPPED = "skipped"
+DISPATCH_UNKNOWN = "unknown"
+#: Nothing was dispatched (a malformed identity / nonce / key, or the buffer
+#: could not be loaded): the pane received nothing.
+DISPATCH_FAILED = "failed"
+SKIP_IN_MODE = "in_mode"
+SKIP_IDENTITY_CHANGED = "identity_changed"
+
+_DISPATCH_PANE_RE = re.compile(r"%[0-9]+")
+_DISPATCH_NONCE_RE = re.compile(r"[0-9a-f]{8,64}")
+_DISPATCH_REASON_FORMAT = (f"#{{pane_id}}\t#{{pane_pid}}\t#{{pid}}\t#{{{FROZEN_OPTION}}}"
+                           "\t#{pane_in_mode}")
+
+
+def new_dispatch_nonce() -> str:
+    """A fresh hex nonce for one guarded dispatch."""
+    return secrets.token_hex(8)
+
+
+def dispatch_condition(identity: "RunIdentity") -> str:
+    """The `if-shell -F` condition of a guarded dispatch into ``identity``.
+
+    The run identity (unfrozen, same ``pane_pid``, same server generation —
+    :func:`run_identity_condition`) AND the pane not in a tmux mode. Raises
+    ``ValueError`` for pids that are not bare digits (they are spliced in).
+    """
+    return all_of([
+        run_identity_condition(identity.pane_pid, identity.server_pid, FROZEN_OPTION),
+        PANE_NOT_IN_MODE,
+    ])
+
+
+def dispatch_ack_state(rc: int, out: str, pane_id: str, server_pid: str,
+                       nonce: str) -> str:
+    """Classify a :data:`DISPATCH_ACK_FORMAT` read-back of a guarded dispatch.
+
+    ``sent`` only from a successful read of the SAME pane on the SAME server
+    generation whose ack is exactly ``<nonce>:sent``; ``skipped`` for
+    ``<nonce>:skipped``. Anything else — a failed or short read, another pane
+    or server, a missing, stale or foreign ack — is ``unknown``, never ``sent``.
+    """
+    if rc != 0 or not _DISPATCH_NONCE_RE.fullmatch(nonce or ""):
+        return DISPATCH_UNKNOWN
+    fields = (out.splitlines() or [""])[0].split("\t")
+    if len(fields) != 3:
+        return DISPATCH_UNKNOWN
+    found, server, ack = (f.strip() for f in fields)
+    if found != pane_id or server != server_pid:
+        return DISPATCH_UNKNOWN
+    if ack == f"{nonce}:{DISPATCH_SENT}":
+        return DISPATCH_SENT
+    if ack == f"{nonce}:{DISPATCH_SKIPPED}":
+        return DISPATCH_SKIPPED
+    return DISPATCH_UNKNOWN
+
+
+def _dispatch_well_formed(identity: "RunIdentity", nonce: str) -> bool:
+    if not (_DISPATCH_PANE_RE.fullmatch(identity.pane_id or "")
+            and _DISPATCH_NONCE_RE.fullmatch(nonce or "")):
+        return False
+    try:
+        dispatch_condition(identity)
+    except ValueError:
+        return False
+    return True
+
+
+def _skip_reason(monitor, identity: "RunIdentity") -> str:
+    """Why a guarded dispatch skipped: ``in_mode`` when the identity terms
+    still hold now (so the mode conjunct is what failed), else
+    ``identity_changed`` (another process, frozen, another server, or gone)."""
+    pane = identity.pane_id
+    rc, out = monitor.tmux_run(["display-message", "-p", "-t", pane,
+                                _DISPATCH_REASON_FORMAT])
+    fields = [f.strip() for f in (out.splitlines() or [""])[0].split("\t")] \
+        if rc == 0 else []
+    if (len(fields) == 5 and fields[0] == pane and fields[1] == identity.pane_pid
+            and fields[2] == identity.server_pid and not fields[3]):
+        return SKIP_IN_MODE
+    return SKIP_IDENTITY_CHANGED
+
+
+def _guarded_dispatch(monitor, identity: "RunIdentity", nonce: str,
+                      true_cmd: str, else_cmd: str) -> tuple[str, str]:
+    pane = identity.pane_id
+    ack = f"set-option -p -t {pane} {DISPATCH_ACK_OPTION} {nonce}:"
+    on_true = f"{true_cmd} ; {ack}{DISPATCH_SENT}"
+    on_else = (f"{else_cmd} ; " if else_cmd else "") + f"{ack}{DISPATCH_SKIPPED}"
+    monitor.tmux_run(["if-shell", "-F", "-t", pane, dispatch_condition(identity),
+                      on_true, on_else])
+    rc, out = monitor.tmux_run(["display-message", "-p", "-t", pane,
+                                DISPATCH_ACK_FORMAT])
+    state = dispatch_ack_state(rc, out, pane, identity.server_pid, nonce)
+    monitor.tmux_run(["set-option", "-pu", "-t", pane, DISPATCH_ACK_OPTION])
+    reason = _skip_reason(monitor, identity) if state == DISPATCH_SKIPPED else ""
+    return state, reason
+
+
+def guarded_paste_text(monitor, identity: "RunIdentity", text: str,
+                       nonce: str) -> tuple[str, str]:
+    """Paste ``text`` into ``identity``'s pane only if the run is still there.
+
+    ``(state, reason)``: ``sent`` / ``skipped`` (reason ``in_mode`` |
+    ``identity_changed``) / ``unknown`` / ``failed`` (nothing dispatched:
+    reason ``malformed`` | ``buffer_failed``). The buffer is loaded through
+    stdin and deleted on every path but a confirmed paste (which deletes it
+    itself). Duck-typed on ``monitor.tmux_run`` / ``monitor.tmux_run_input``.
+    Paste only — submitting is a separate :func:`guarded_send_key`.
+    """
+    if not _dispatch_well_formed(identity, nonce) or not text:
+        return DISPATCH_FAILED, "malformed"
+    pane = identity.pane_id
+    buf = f"{DISPATCH_BUFFER_PREFIX}{nonce}"
+    rc, _ = monitor.tmux_run_input(["load-buffer", "-b", buf, "-"], text)
+    if rc != 0:
+        monitor.tmux_run(["delete-buffer", "-b", buf])
+        return DISPATCH_FAILED, "buffer_failed"
+    state, reason = _guarded_dispatch(
+        monitor, identity, nonce, f"paste-buffer -d -b {buf} -t {pane}",
+        f"delete-buffer -b {buf}")
+    if state != DISPATCH_SENT:
+        monitor.tmux_run(["delete-buffer", "-b", buf])
+    return state, reason
+
+
+def guarded_send_key(monitor, identity: "RunIdentity", key: str,
+                     nonce: str) -> tuple[str, str]:
+    """Send ``key`` (one of :data:`DISPATCH_KEYS`) to ``identity``'s pane only
+    if the run is still there and the pane is not in a mode. Same result
+    shape as :func:`guarded_paste_text`."""
+    if key not in DISPATCH_KEYS or not _dispatch_well_formed(identity, nonce):
+        return DISPATCH_FAILED, "malformed"
+    return _guarded_dispatch(monitor, identity, nonce,
+                             f"send-keys -t {identity.pane_id} {key}", "")
+
+
+def task_ref_from_window_name(window_name: str) -> tuple[str, str] | None:
+    """``(operation, task_id)`` from an agent window name, or ``None``.
+
+    The Python twin of `aitask_session_hook.sh` step 6, which records the same
+    pair at launch. The freeze engine uses it when that hook never ran, so a
+    record it creates stays re-pickable (t1848). Same pattern as
+    :func:`task_id_from_window_name` — one definition, never a copy.
+    """
+
+    m = _TASK_ID_RE.match(window_name)
+    return (m.group("operation"), m.group("task_id")) if m else None
+
+
+@dataclass
+class TaskInfo:
+    """Resolved task metadata and content for display in the monitor."""
+    task_id: str
+    task_file: str
+    title: str
+    priority: str
+    effort: str
+    issue_type: str
+    status: str
+    body: str
+    plan_content: str | None
+    # Absolute path to the task file. ``task_file`` stays relative to the owning
+    # project root (display value, asserted by tests); ``task_file_abs`` is what
+    # gate-ledger parsing must use, since a relative path is cwd-dependent and
+    # wrong under cross-session / multi-project monitoring. Defaulted so the one
+    # keyword-arg test stub keeps constructing TaskInfo unchanged.
+    task_file_abs: str = ""
+    # Normalized ``depends`` ids (bare, a leading ``t`` stripped) — the same
+    # normalization ``find_ready_siblings`` applies. Feeds
+    # :meth:`TaskInfoCache.blocking_dependencies`, which the minimonitor's
+    # pick-by-number dialog uses to warn about an unpickable target (t1310).
+    # Defaulted for the same reason as ``task_file_abs``.
+    #
+    # **Read through ``dep_resolution.read_depends``, never by iterating the raw
+    # field** (t1527). A hand-edited `depends: 999` is an int, and iterating it
+    # raised ``TypeError`` inside ``_resolve`` — killing the lookup entirely;
+    # `depends: "999"` is a string, and iterating it yielded ``['9','9','9']``,
+    # three dependencies nobody wrote. Both now leave this list EMPTY and set
+    # the companion flag below, which is what makes the field fail closed
+    # instead of reading as "no dependencies".
+    depends: list[str] = field(default_factory=list)
+    # ``True`` when `depends:` was present but not a list. Always carried
+    # alongside ``depends`` — a caller that reads one without the other turns an
+    # unreadable field back into "no dependencies".
+    depends_malformed: bool = False
+    # File identity ``(st_mtime_ns, st_size)`` of ``task_file_abs``, sampled
+    # BEFORE the content read in ``_resolve`` — never after (t1322). The archive
+    # script's rewrites are rename-based (``sed -i``, ``awk > tmp && mv`` in
+    # aitask_archive.sh), so a read that races a rewrite returns the OLD inode's
+    # bytes while a post-read stat samples the NEW one — which would pin stale
+    # content under a fresh key, permanently. ``None`` (unstat-able, or a
+    # hand-built test stub) means "never serve this from cache".
+    file_identity: tuple[int, int] | None = None
+
+
+def _file_identity(path: str) -> tuple[int, int] | None:
+    """``(st_mtime_ns, st_size)`` for ``path``, or ``None`` if it cannot be stat'ed.
+
+    ns mtime (not float ``st_mtime``) catches two edits inside one wall-clock
+    second; ``st_size`` closes the same-mtime-different-length case. Deliberately
+    the same key :class:`GateSummaryCache` uses, so two caches over the same file
+    can never disagree about whether it changed.
+    """
+    if not path:
+        return None
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_mtime_ns, st.st_size)
+
+
+class GateSummaryCache:
+    """Compact gate-summary cache for the monitor TUIs.
+
+    Invalidated by file identity (``(st_mtime_ns, st_size)`` of the task file)
+    rather than a per-tick ``clear()``: a live-growing ledger re-derives only on
+    the tick its file actually changes, so an unchanged ledger is never re-read
+    from disk. (The board's ``aitask_board.TaskManager.gate_state_for`` clears
+    each cycle; keying on mtime here removes that per-tick disk I/O.) Fails
+    closed to ``""`` (no column) on any parse/IO error — a malformed or missing
+    ledger must never break the monitor. Keyed by the resolved **absolute**
+    task-file path (``TaskInfo.task_file_abs``), so it is correct under
+    cross-session / multi-project monitoring regardless of the process's working
+    directory.
+
+    ``clear()`` is retained for minimonitor, which still clears each refresh.
+
+    **Also carries the ledger half of the workflow-phase signal (t1420).** The
+    full ``TaskGateState`` was already being derived here and thrown away; the
+    phase seam extends this cache's stored value rather than adding a second
+    parse of the same file (the t1323 seam). Only the FILE-derived half is
+    cached — its key is file identity, whereas the live half changes every tick,
+    so :meth:`phase_for` composes that at call time.
+    """
+
+    def __init__(self) -> None:
+        # abs task-file path -> ((st_mtime_ns, st_size), summary,
+        #                        (phase, detail), (recording, detail)).
+        self._cache: dict[
+            str, tuple[tuple[int, int], str, tuple[str, str], tuple[str, str]]
+        ] = {}
+
+    def clear(self) -> None:
+        self._cache.clear()
+
+    def summary_for(self, info: "TaskInfo | None") -> str:
+        return self._entry_for(info)[0]
+
+    def ledger_phase_for(self, info: "TaskInfo | None") -> tuple[str, str]:
+        """``(phase, detail)`` — the file-derived half of the phase signal."""
+        entry = self._entry_for(info)
+        return entry[1]
+
+    def phase_for(self, info: "TaskInfo | None", *,
+                  screen_text: str | None = None,
+                  awaiting_input: bool | None = None,
+                  awaiting_input_kind: str = "",
+                  agent: str = "",
+                  current_command: str | None = None
+                  ) -> "workflow_phase.PhaseSignal":
+        """Compose the cached ledger half with this tick's live observation.
+
+        Advisory only: the returned phase may never gate what a caller does.
+
+        ``agent`` should be the key that actually scoped the pane's prompt
+        matching (``PaneSnapshot.agent_key``); pass ``current_command`` alongside
+        it so an unresolvable pane is reported as such rather than as a caller
+        that supplied nothing (t1467).
+        """
+        entry = self._entry_for(info)
+        return workflow_phase.compose(
+            entry[1], screen_text=screen_text, awaiting_input=awaiting_input,
+            awaiting_input_kind=awaiting_input_kind, agent=agent,
+            recording=entry[2], current_command=current_command)
+
+    def _entry_for(
+        self, info: "TaskInfo | None"
+    ) -> tuple[str, tuple[str, str], tuple[str, str]]:
+        # Key + parse off the ABSOLUTE path, never the relative ``task_file`` —
+        # the relative form is cwd-dependent and resolves wrong in cross-session
+        # monitor mode.
+        _EMPTY = ("", (workflow_phase.UNKNOWN_PHASE, "no task file"),
+                  ("unknown", ""))
+        if info is None or not info.task_file_abs:
+            return _EMPTY
+        key = info.task_file_abs
+        # File-identity key: ns mtime + size. ns granularity (not float
+        # ``st_mtime``) catches two ledger edits within the same wall-clock
+        # second; size closes the same-mtime-different-length case cheaply.
+        # A missing/unreadable file is a miss that fails closed to ``""``.
+        try:
+            st = os.stat(key)
+        except OSError:
+            self._cache.pop(key, None)
+            return _EMPTY
+        identity = (st.st_mtime_ns, st.st_size)
+        cached = self._cache.get(key)
+        if cached is not None and cached[0] == identity:
+            return cached[1], cached[2], cached[3]
+        summary = ""
+        # Derived from the already-loaded body, so an unreadable path still
+        # yields an honest UNKNOWN rather than a fabricated PLAN (t1420).
+        phase = workflow_phase.phase_from_ledger_text(info.body or "")
+        recording = ("unknown", "")
+        try:
+            # Cheap prefilter on the already-loaded body before the full parse;
+            # the full state re-reads the file (matches the board: has_ledger
+            # from content, state from filepath).
+            if gate_ledger.has_gate_markers(info.body or ""):
+                state = gate_ledger.read_task_gate_state(info.task_file_abs)
+                summary = gate_ledger.compact_gate_summary(state)
+        except Exception:
+            summary = ""
+        try:
+            recording = workflow_phase.recording_from_text(
+                info.body or "",
+                workflow_phase.default_profiles_dir(info.task_file_abs))
+        except Exception:
+            recording = ("unknown", "")
+        self._cache[key] = (identity, summary, phase, recording)
+        return summary, phase, recording
+
+
+@dataclass
+class _TaskEntry:
+    """One :class:`TaskInfoCache` slot.
+
+    A positive entry carries its own freshness key on ``info.file_identity``; a
+    negative one has no path to stat, so it carries a retry budget instead.
+    """
+    info: TaskInfo | None
+    miss_at: float = 0.0     # monotonic time of the last failed _resolve
+    miss_count: int = 0      # consecutive failed _resolves
+
+
+class TaskInfoCache:
+    """Cache for resolved task info — avoids file I/O on every refresh.
+
+    Cross-project aware: when callers provide a tmux ``session_name`` the cache
+    resolves the task file from the project root that owns that session (via
+    ``session_to_project``). An empty/unknown ``session_name`` falls back to
+    the local ``project_root`` — preserving single-session behaviour.
+
+    **Freshness (t1322).** Entries are invalidated by file identity
+    (``(st_mtime_ns, st_size)``), the same key :class:`GateSummaryCache` uses.
+    Before t1322 a resolved entry was immortal: a task archived while the TUI was
+    open served its pre-archival ``TaskInfo`` forever, which made a COMPLETED
+    status impossible to detect. Three things now reject a cached answer:
+
+    * the identity changed — an in-place edit (``status: Ready`` → ``Done``);
+    * the stat raised — the file **moved** (``aitasks/`` → ``aitasks/archived/``);
+    * the entry is negative and its retry is due (see ``_MISS_RETRY_SCHEDULE``).
+
+    Unlike :class:`GateSummaryCache`, an ``OSError`` here must **re-resolve, not
+    fail closed**: failing closed would blank the pane's task title on exactly
+    the tick its task completes.
+    """
+
+    # Backoff steps for a negative (unresolvable) entry, then a sparse terminal
+    # interval repeated FOREVER. The terminal step is load-bearing: a budget
+    # that stops permanently poisons a pane whose miss outlived it — an
+    # interrupted archive, or a long `.aitask-data` reconciliation holding
+    # `aitasks/` unresolvable for minutes — and nothing else guarantees
+    # recovery. Steady-state cost is one _resolve per 5 min per missing task.
+    _MISS_RETRY_SCHEDULE: tuple[float, ...] = (5.0, 15.0, 60.0)
+    _MISS_RETRY_TERMINAL: float = 300.0
+
+    # Injectable clock so tests drive the retry schedule deterministically
+    # instead of monkeypatching time.monotonic globally (no sleeps — see
+    # aidocs/framework/testing_conventions.md).
+    _now = staticmethod(time.monotonic)
+
+    def __init__(
+        self,
+        project_root: Path,
+        session_to_project: dict[str, Path] | None = None,
+    ):
+        self._project_root = project_root
+        self._session_to_project: dict[str, Path] = dict(session_to_project or {})
+        # Keyed by (session_name, task_id) so two projects can both have t100
+        # without clobbering each other.
+        self._cache: dict[tuple[str, str], _TaskEntry] = {}
+        self._window_to_task_id: dict[str, str | None] = {}
+        # Pane-keyed task-id cache (t986). Keyed by pane_id so panes sharing a
+        # window are never conflated; see get_task_id_for_pane.
+        self._pane_to_task_id: dict[str, str | None] = {}
+        # Local-dependency resolvers, one per project root (t1527). The verdict
+        # is decided by lib/dep_resolution.py — the SAME core `ait ls` and the
+        # board consume — so the three surfaces cannot disagree about whether a
+        # dep is satisfied, blocking, or unresolvable.
+        self._dep_resolvers: dict[Path, "dep_resolution.LocalDepResolver"] = {}
+
+    def update_session_mapping(self, mapping: dict[str, Path]) -> None:
+        """Replace the session→project_root mapping (idempotent).
+
+        Clears the resolved-task cache when the mapping changes, since entries
+        for a session may have been resolved against a stale (or absent)
+        mapping and now point at the wrong project's task data.
+
+        **Do not delete this as redundant now that entries are identity-keyed
+        (t1322).** It is the one staleness class the identity key structurally
+        cannot catch: when a session's project root changes, the OLD root's
+        absolute path may still stat perfectly fine (a real ``t100`` in the
+        fallback project), so the identity gate would keep serving the wrong
+        project's task indefinitely, with no signal. Clearing also resets the
+        negative-retry budgets — correct, since a mapping change is exactly the
+        event that can turn a permanent miss into a hit.
+        """
+        if mapping != self._session_to_project:
+            self._session_to_project = dict(mapping)
+            self._cache.clear()
+
+    def _root_for_session(self, session_name: str) -> Path:
+        """Resolve the project root for a tmux session, falling back to local."""
+        if session_name and session_name in self._session_to_project:
+            return self._session_to_project[session_name]
+        return self._project_root
+
+    def get_task_id(self, window_name: str) -> str | None:
+        """Extract task ID from agent window name. Cached.
+
+        Window-keyed; retained for callers that only have a window name. Pane
+        display sites should prefer :meth:`get_task_id_for_pane`.
+        """
+        if window_name not in self._window_to_task_id:
+            self._window_to_task_id[window_name] = task_id_from_window_name(window_name)
+        return self._window_to_task_id[window_name]
+
+    def get_task_id_for_pane(self, pane: TmuxPaneInfo) -> str | None:
+        """Resolve the task id for a specific pane, cached by ``pane_id``.
+
+        Pane-keyed rather than window-keyed (t986): a tmux window may hold more
+        than one pane (an agent plus a shadow/minimonitor helper, or — in
+        future — more than one agent), so conflating panes by their shared
+        window name is unsafe. The task id is still *derived* from the agent
+        window name today; keying the cache on ``pane_id`` is the seam a future
+        per-pane task source can slot into without touching call sites. Helper
+        panes do not reach this method (discovery already drops shadow/companion
+        panes), and a stray helper window name resolves to ``None`` anyway.
+        """
+        pane_id = pane.pane_id
+        if pane_id not in self._pane_to_task_id:
+            self._pane_to_task_id[pane_id] = task_id_from_window_name(pane.window_name)
+        return self._pane_to_task_id[pane_id]
+
+    def get_task_info(
+        self, task_id: str, session_name: str = ""
+    ) -> TaskInfo | None:
+        """Resolve task info from task ID, re-reading when the file changed.
+
+        Hot path is exactly one ``os.stat`` on the cached ``task_file_abs``
+        (~0.65 µs warm, vs ~125 µs for a full re-resolve), so an unchanged task
+        is never re-read from disk. See the class docstring for the three ways a
+        cached answer is rejected.
+        """
+        key = (session_name, task_id)
+        entry = self._cache.get(key)
+        if entry is not None:
+            info = entry.info
+            if info is not None:
+                # The `is not None` guard is load-bearing: _file_identity
+                # returns None on OSError, and a bare `==` would make
+                # None == None true — serving a stale entry for a file we can
+                # no longer stat, which is precisely the archived-move case.
+                if (
+                    info.file_identity is not None
+                    and _file_identity(info.task_file_abs) == info.file_identity
+                ):
+                    return info
+            elif not self._miss_retry_due(entry):
+                return None
+        return self._store(key, self._resolve(task_id, session_name), entry)
+
+    def _miss_retry_due(self, entry: _TaskEntry) -> bool:
+        """Whether a negative entry is due for another ``_resolve`` attempt.
+
+        Backs off through ``_MISS_RETRY_SCHEDULE`` and then repeats
+        ``_MISS_RETRY_TERMINAL`` forever — it never stops retrying.
+        """
+        idx = entry.miss_count - 1
+        if idx < len(self._MISS_RETRY_SCHEDULE):
+            step = self._MISS_RETRY_SCHEDULE[idx]
+        else:
+            step = self._MISS_RETRY_TERMINAL
+        return (self._now() - entry.miss_at) >= step
+
+    def _store(
+        self,
+        key: tuple[str, str],
+        info: TaskInfo | None,
+        prev: _TaskEntry | None,
+    ) -> TaskInfo | None:
+        """Commit a ``_resolve`` result, carrying the miss budget forward."""
+        if info is None:
+            self._cache[key] = _TaskEntry(
+                info=None,
+                miss_at=self._now(),
+                miss_count=(prev.miss_count + 1) if prev is not None else 1,
+            )
+            return None
+        self._cache[key] = _TaskEntry(info=info)
+        return info
+
+    def invalidate(self, task_id: str, session_name: str = "") -> None:
+        """Drop a cached entry so the next lookup re-resolves.
+
+        Still needed after t1322's identity keying: it is the only *immediate*
+        retry for a cached negative (a backoff that is not yet due would
+        otherwise return ``None`` again to a user's explicit gesture), and the
+        only thing that re-decides ``_resolve``'s active-beats-archived
+        precedence when both copies of a task exist.
+        """
+        self._cache.pop((session_name, task_id), None)
+
+
+    def get_parent_id(self, task_id: str) -> str | None:
+        """Extract parent task number from a child task ID."""
+        if "_" not in task_id:
+            return None
+        return task_id.split("_", 1)[0]
+
+    def dep_resolver(self, session_name: str = "") -> "dep_resolution.LocalDepResolver":
+        """The local-dependency resolver for this session's project root.
+
+        One per root, kept across calls so its two file-identity caches survive;
+        each :meth:`blocking_dependencies` call with ``refresh=True`` starts a
+        new *cycle* on it (see that method).
+        """
+        root = self._root_for_session(session_name)
+        resolver = self._dep_resolvers.get(root)
+        if resolver is None:
+            tasks_dir = root / "aitasks"
+            registry = tasks_dir / "metadata" / "gates.yaml"
+            resolver = dep_resolution.LocalDepResolver(
+                str(tasks_dir), str(registry) if registry.exists() else None)
+            self._dep_resolvers[root] = resolver
+        return resolver
+
+    def blocking_dependencies(
+        self,
+        info: "TaskInfo",
+        session_name: str = "",
+        *,
+        refresh: bool = True,
+    ) -> list["dep_resolution.DepVerdict"]:
+        """Non-satisfied ``depends`` entries of an already-resolved task (t1310).
+
+        Takes the resolved :class:`TaskInfo` rather than an id so the caller —
+        which has just invalidated and re-read the target for display — reads
+        each task file exactly once.
+
+        **The verdict is not decided here.** Since t1527 it comes from
+        ``lib/dep_resolution``, the one decision core ``ait ls`` and the board
+        also consume, so the three surfaces cannot disagree. Two consequences
+        for this method specifically:
+
+        * a dependency that is *active* but whose required gates all pass is now
+          **satisfied** — the t635_3 gate-release rule, which this surface alone
+          used to ignore, so it reported a blocker the other two did not;
+        * the return is a list of :class:`~dep_resolution.DepVerdict`, not of
+          ids, because an id that resolves to no task file is a third outcome
+          (``UNRESOLVABLE``) the caller must render differently — collapsing it
+          into "blocking" would hide a data error as ordinary upstream work.
+
+        Fail-closed is unchanged and now shared: an entry that does not resolve
+        still blocks. Archived dependencies still resolve (the core searches
+        ``aitasks/archived/``) and carry ``status: Done``, so completed work is
+        not a blocker.
+
+        **Freshness.** ``refresh=True`` starts a new resolver cycle: it drops
+        every cached answer and installs a fresh gate evaluator. That is the same
+        role the old per-dep ``invalidate`` loop played — a forced immediate
+        retry of a negative, and a re-decision of active-beats-archived
+        precedence — plus the one the old loop could not play: the registry and
+        code-digest memos behind the gate-release rule are re-validation inputs,
+        and a cycle that outlived a refresh would freeze them (the t1416 hazard;
+        see ``dep_resolution.LocalDepResolver`` and
+        ``gate_ledger.DependentsEvaluator``).
+
+        ``refresh=False`` reuses the current cycle — it only skips the forced
+        invalidation, exactly as before.
+        """
+        resolver = self.dep_resolver(session_name)
+        if refresh:
+            resolver.invalidate_all()
+        # Both halves of the read, always together: dropping ``depends_malformed``
+        # would silently turn an unreadable field back into "no dependencies".
+        return [v for v in resolver.classify_tokens(
+            info.depends, malformed=info.depends_malformed) if v.blocking]
+
+    def find_next_sibling(
+        self, task_id: str, session_name: str = ""
+    ) -> tuple[str, str, str] | None:
+        """Find the next Ready sibling/child task.
+
+        If task_id is a child (e.g. "123_4"), returns the next Ready sibling
+        under the same parent, excluding the current task. If task_id is a
+        parent (e.g. "123"), returns the first Ready child of that parent.
+
+        Returns ``(task_id, title, followup_kind)`` or None. ``followup_kind``
+        is type-coerced to a string (``""`` when absent, or when frontmatter
+        held a list / int / bool) but **not** validated against the vocabulary:
+        an unrecognised value rides through verbatim so the render boundary
+        (``followup_kinds.marker_for``) can show it as unrecognised rather than
+        as "not a follow-up" (t1468_5).
+        """
+        if "_" in task_id:
+            parent, _child = task_id.split("_", 1)
+            exclude_id: str | None = task_id
+        else:
+            parent = task_id
+            exclude_id = None
+
+        root = self._root_for_session(session_name)
+        search_dir = root / "aitasks" / f"t{parent}"
+        if not search_dir.is_dir():
+            return None
+
+        candidates = []
+        child_re = re.compile(rf'^t{re.escape(parent)}_(\d+)_')
+        for path in sorted(search_dir.glob(f"t{parent}_*_*.md")):
+            m = child_re.match(path.stem)
+            if not m:
+                continue
+            sib_child = m.group(1)
+            sib_id = f"{parent}_{sib_child}"
+            if exclude_id is not None and sib_id == exclude_id:
+                continue
+            try:
+                raw = path.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            parsed = parse_frontmatter(raw)
+            if parsed is None:
+                continue
+            metadata, body, _ = parsed
+            if str(metadata.get("status", "")).strip() != "Ready":
+                continue
+            title = None
+            for line in body.splitlines():
+                ls = line.strip()
+                if ls.startswith("# "):
+                    title = ls[2:].strip()
+                    break
+            if not title:
+                parts = path.stem.split("_", 2)
+                title = parts[2].replace("_", " ") if len(parts) > 2 else path.stem
+            candidates.append((int(sib_child), sib_id, title,
+                               normalize_followup_kind(
+                                   metadata.get("followup_kind"))))
+
+        if not candidates:
+            return None
+        candidates.sort(key=lambda x: x[0])
+        _, sib_id, title, followup_kind = candidates[0]
+        return (sib_id, title, followup_kind)
+
+    def find_ready_siblings(
+        self, task_id: str, session_name: str = ""
+    ) -> list[tuple[str, str, list[str], str]]:
+        """List pending Ready siblings of ``task_id``.
+
+        Returns rows of ``(sib_id, title, blocking_sibling_ids, followup_kind)``
+        sorted by child number ascending. ``blocking_sibling_ids`` lists sibling
+        ids under the same parent that appear in this sibling's ``depends``
+        field and are not yet ``Done`` — so callers can show a
+        "blocked by tX" hint while still allowing the row to be picked.
+        ``followup_kind`` carries auto-spawned-follow-up provenance under the
+        same coercion rule as ``find_next_sibling`` (t1468_5).
+
+        Same parent/exclude rules as ``find_next_sibling``: when ``task_id``
+        is a child, the current sibling is excluded; when ``task_id`` is a
+        parent, all Ready children are returned.
+        """
+        if "_" in task_id:
+            parent, _child = task_id.split("_", 1)
+            exclude_id: str | None = task_id
+        else:
+            parent = task_id
+            exclude_id = None
+
+        root = self._root_for_session(session_name)
+        search_dir = root / "aitasks" / f"t{parent}"
+        if not search_dir.is_dir():
+            return []
+
+        # First pass: collect the Ready siblings' rows. The per-sibling STATUS
+        # map this used to build alongside them is gone (t1527) — the second pass
+        # asks the shared decision core instead, which knows about gate release
+        # and about archived siblings, neither of which a status map built from
+        # the active child dir can answer.
+        parsed_rows: list[tuple[int, str, str, list[str], str]] = []
+        child_re = re.compile(rf'^t{re.escape(parent)}_(\d+)_')
+        for path in sorted(search_dir.glob(f"t{parent}_*_*.md")):
+            m = child_re.match(path.stem)
+            if not m:
+                continue
+            sib_child = m.group(1)
+            sib_id = f"{parent}_{sib_child}"
+            try:
+                raw = path.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            parsed = parse_frontmatter(raw)
+            if parsed is None:
+                continue
+            metadata, body, _ = parsed
+            status = str(metadata.get("status", "")).strip()
+            if status != "Ready":
+                continue
+            if exclude_id is not None and sib_id == exclude_id:
+                continue
+            title = None
+            for line in body.splitlines():
+                ls = line.strip()
+                if ls.startswith("# "):
+                    title = ls[2:].strip()
+                    break
+            if not title:
+                parts = path.stem.split("_", 2)
+                title = parts[2].replace("_", " ") if len(parts) > 2 else path.stem
+            # Shared reader (t1527): a non-list field yields no tokens rather
+            # than a TypeError or a per-character explosion. A malformed field
+            # names no SIBLING, so it contributes nothing to this hint — which
+            # is the sibling-only scope, not a fail-open: `blocking_dependencies`
+            # is the surface that reports it, on the same task.
+            _tokens, _ = dep_resolution.read_depends(metadata.get("depends"))
+            # Normalize "t42" / "42" / 42 to bare numeric strings.
+            depends_norm = [str(d).lstrip("t") for d in _tokens]
+            parsed_rows.append((
+                int(sib_child), sib_id, title, depends_norm,
+                normalize_followup_kind(metadata.get("followup_kind")),
+            ))
+
+        if not parsed_rows:
+            return []
+
+        # Second pass: a blocker is a sibling dep the shared decision core does
+        # not call satisfied.
+        #
+        # The core (t1527) replaced a local `sib_status.get(dep) != "Done"` test,
+        # which ignored the t635_3 gate-release rule and so claimed a sibling at
+        # `Implementing` with every required gate passing was still holding the
+        # next task — the same defect `blocking_dependencies` carried. It also
+        # only ever saw the ACTIVE child dir, so an archived (Done) sibling read
+        # as a blocker; the core searches `aitasks/archived/` too.
+        #
+        # The sibling SCOPING is deliberately unchanged: a cross-parent dep is
+        # still not surfaced here. This is a "blocked by sibling" hint next to a
+        # pickable row, not a gate — widening it is not a fix.
+        resolver = self.dep_resolver(session_name)
+        resolver.invalidate_all()   # one cycle per call; see blocking_dependencies
+        rows: list[tuple[str, str, list[str], str]] = []
+        for (_child_num, sib_id, title, depends_norm,
+                followup_kind) in sorted(parsed_rows, key=lambda r: r[0]):
+            sibling_deps = [d for d in depends_norm if d.startswith(f"{parent}_")]
+            blocking = [v.raw for v in resolver.classify(sibling_deps) if v.blocking]
+            rows.append((sib_id, title, blocking, followup_kind))
+        return rows
+
+    def _resolve(self, task_id: str, session_name: str = "") -> TaskInfo | None:
+        """Look up task file and parse its content. Pure Python, no subprocess.
+
+        Searches both the active location (``aitasks/``) and the archived
+        location (``aitasks/archived/``) so that monitor TUIs can keep
+        showing task info for an agent pane whose task has already been
+        archived. Active dirs win when the same id is present in both.
+        Tasks bundled into ``aitasks/archived/_b0/old<N>.tar.zst`` are not
+        extracted — those agents are old enough that lookup misses are
+        acceptable.
+        """
+        root = self._root_for_session(session_name)
+        tasks_dir = root / "aitasks"
+        plans_dir = root / "aiplans"
+        archived_tasks_dir = tasks_dir / "archived"
+        archived_plans_dir = plans_dir / "archived"
+
+        if "_" in task_id:
+            parent, child = task_id.split("_", 1)
+            pattern = f"t{parent}_{child}_*.md"
+            search_dirs = (
+                tasks_dir / f"t{parent}",
+                archived_tasks_dir / f"t{parent}",
+            )
+        else:
+            pattern = f"t{task_id}_*.md"
+            search_dirs = (tasks_dir, archived_tasks_dir)
+
+        task_path = None
+        for d in search_dirs:
+            if not d.is_dir():
+                continue
+            matches = list(d.glob(pattern))
+            if matches:
+                task_path = matches[0]
+                break
+        if task_path is None:
+            return None
+
+        # Sample the file identity BEFORE the read, never after (t1322).
+        # aitask_archive.sh rewrites the task file by rename (`sed -i`,
+        # `awk > tmp && mv`), so a read that races a rewrite returns the OLD
+        # inode's bytes; an identity sampled afterwards would belong to the NEW
+        # file and would pin that stale content in the cache permanently.
+        identity = _file_identity(str(task_path))
+
+        try:
+            raw = task_path.read_text(encoding="utf-8")
+        except OSError:
+            return None
+
+        parsed = parse_frontmatter(raw)
+        if parsed is None:
+            return None
+        metadata, body, _ = parsed
+
+        # Extract title: first markdown heading or derive from filename
+        title = None
+        for line in body.splitlines():
+            line_s = line.strip()
+            if line_s.startswith("# "):
+                title = line_s[2:].strip()
+                break
+        if not title:
+            stem = task_path.stem
+            parts = stem.split("_", 1)
+            title = parts[1].replace("_", " ") if len(parts) > 1 else stem
+
+        # Find plan file (active dir first, archived as fallback).
+        plan_content = None
+        if "_" in task_id:
+            parent, child = task_id.split("_", 1)
+            plan_pattern = f"p{parent}_{child}_*.md"
+            plan_dirs = (
+                plans_dir / f"p{parent}",
+                archived_plans_dir / f"p{parent}",
+            )
+        else:
+            plan_pattern = f"p{task_id}_*.md"
+            plan_dirs = (plans_dir, archived_plans_dir)
+
+        for pd in plan_dirs:
+            if not pd.is_dir():
+                continue
+            plan_matches = list(pd.glob(plan_pattern))
+            if not plan_matches:
+                continue
+            try:
+                plan_raw = plan_matches[0].read_text(encoding="utf-8")
+                if plan_raw.startswith("---"):
+                    fm_parts = plan_raw.split("---", 2)
+                    if len(fm_parts) >= 3:
+                        plan_content = fm_parts[2].strip()
+                    else:
+                        plan_content = plan_raw
+                else:
+                    plan_content = plan_raw
+            except OSError:
+                pass
+            break
+
+        _depends_tokens, _depends_malformed = dep_resolution.read_depends(
+            metadata.get("depends"))
+
+        return TaskInfo(
+            task_id=task_id,
+            task_file=str(task_path.relative_to(root)),
+            title=title,
+            priority=str(metadata.get("priority", "")),
+            effort=str(metadata.get("effort", "")),
+            issue_type=str(metadata.get("issue_type", "")),
+            status=str(metadata.get("status", "")),
+            body=body,
+            plan_content=plan_content,
+            task_file_abs=str(task_path),
+            # Same normalization as find_ready_siblings: "t42" / "42" / 42 all
+            # become the bare "42". The shared reader also classifies a non-list
+            # field as malformed rather than iterating it — see the field docs.
+            depends=[str(d).lstrip("t") for d in _depends_tokens],
+            depends_malformed=_depends_malformed,
+            file_identity=identity,
+        )

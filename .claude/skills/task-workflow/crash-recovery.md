@@ -1,0 +1,149 @@
+# Crash Recovery Procedure
+
+Called from task-workflow Step 4 (and the Step 7 ownership guard) when one
+or more reclaim signals are emitted by `aitask_pick_own.sh`. Surveys
+in-progress work, displays a case-appropriate prompt, and returns the
+user's decision (`reclaim` | `decline`).
+
+## Inputs (from caller context)
+
+- `task_id`, `task_name`, `task_file`, `EMAIL`
+- `resume_point` — the ledger-derived re-entry stage
+  (`PLAN` | `IMPLEMENT` | `POSTIMPL`), if Step 3 Check 5 already computed it.
+  If unset (e.g. when called from the Step 7 ownership guard), compute it here:
+  `./.aitask-scripts/aitask_gate.sh resume-point <task_id>`.
+- Parsed signal fields. When multiple signals are emitted, prefer in this
+  order: `LOCK_RECLAIM` > `RECLAIM_CRASH` > `RECLAIM_STATUS`.
+  - `LOCK_RECLAIM:<prev_hostname>|<prev_locked_at>|<current_hostname>`
+  - `RECLAIM_CRASH:<prev_locked_at>|<prev_hostname>|<prev_pid>`
+  - `RECLAIM_STATUS:<prev_status>|<prev_assigned_to>`
+
+**This procedure is never the right answer for a live or unverified holder.**
+`LOCK_LIVE_HOLDER:` / `LOCK_UNVERIFIABLE_HOLDER:` are refusals, not reclaim
+signals: nothing was claimed, and the whole point of them is that the session
+in question may still be working. They are handled at their own prompt in
+`SKILL.md` Step 4 — do not route them here, and do not reuse the "appears to
+have crashed" wording for them.
+
+Set `signal_type` to one of `LOCK_RECLAIM` / `RECLAIM_CRASH` /
+`RECLAIM_STATUS` based on the prefer-order above.
+
+## Step 1 — Survey in-progress work
+
+The previous agent may have left uncommitted changes the user should know
+about before deciding. Run these read-only checks:
+
+1. Worktree check:
+   ```bash
+   git worktree list --porcelain
+   ```
+   If a `branch refs/heads/aitask/<task_name>` line is present, capture
+   the `worktree <path>` two lines above as `survey_dir`. Otherwise set
+   `survey_dir` to the current directory (`.`).
+
+   Finding no worktree does **not** imply the task was picked in
+   current-branch mode. The fork happens at the top of `SKILL.md` Step 7, so
+   a task interrupted anywhere between plan approval and that point
+   legitimately has none even under a `create_worktree: true` profile — its
+   work, if any, is on the current branch. Report the absence; do not
+   infer the profile from it.
+
+2. Status + diff (run from `survey_dir`):
+   ```bash
+   git -C "<survey_dir>" status --porcelain | head -20
+   git -C "<survey_dir>" diff --stat HEAD | tail -10
+   ```
+   Count modified files (M+A+D), staged files (entries starting with
+   non-space in column 1), and untracked (`??`).
+
+3. Recorded checkpoints (the **primary** progress signal — the gate ledger is
+   the source of truth for *where* work stopped):
+   ```bash
+   ./.aitask-scripts/aitask_gate.sh status <task_id>
+   ```
+   Summarize the derived per-gate state as a single line. Resolve the resume
+   target from `resume_point` (`IMPLEMENT` → "implementation, Step 7";
+   `POSTIMPL` → "post-implementation, Step 9"; `PLAN` → "planning, from
+   scratch").
+
+4. Plan progress (fallback detail, used mainly when the ledger is empty):
+   ```bash
+   ./.aitask-scripts/aitask_query_files.sh plan-file <task_id>
+   ```
+   If `PLAN_FILE:<path>` is returned, read the file and look for the
+   most-recent marker — "Final Implementation Notes", checked-step
+   markers (`- [x]`), or a "Post-Review Changes" section. Summarize as a
+   single line.
+
+Build a short summary block (3-7 lines):
+
+```
+Prior in-progress work:
+- Worktree: <path, or "(none — current branch, or fork not reached)">
+- N modified, M staged, K untracked
+- Recorded checkpoints: <derived gate state, or "none recorded">
+- Resume target: <implementation (Step 7) | post-implementation (Step 9) | planning>
+- Plan: <progress hint or "no plan file">
+```
+
+If there are no uncommitted changes, no recorded checkpoints, and no plan
+progress, the summary is "Prior in-progress work: none detected".
+
+## Step 2 — Case-specific prompt
+
+Use `AskUserQuestion`. Pick the question text by `signal_type`:
+
+- `LOCK_RECLAIM` (multi-PC):
+  > "Task t\<N\> is already in `Implementing`, claimed by you on
+  > `<prev_hostname>` since `<prev_locked_at>` (current host:
+  > `<current_hostname>`).
+  >
+  > \<survey\>
+  >
+  > Reclaim and continue here?"
+
+- `RECLAIM_CRASH` (same-host crash):
+  > "Previous agent on this machine appears to have crashed (PID
+  > `<prev_pid>` no longer running since `<prev_locked_at>`).
+  >
+  > \<survey\>
+  >
+  > Resume with prior work intact?"
+
+- `RECLAIM_STATUS` (anomaly — the lock is missing, predates the PID anchor,
+  recorded no session process, or is this session's own):
+  > "Task t\<N\> shows status `Implementing` already assigned to you,
+  > but no PID anchor matches your environment.
+  >
+  > \<survey\>
+  >
+  > Reclaim and continue here?"
+
+Header: "Reclaim"
+
+Options:
+- "Reclaim and continue" (description: "Resume work — the lock is held here, prior in-progress changes remain intact")
+- "Pick a different task" (description: "Release the lock, revert to Ready, choose another task")
+
+## Step 3 — Handle decision
+
+If "Reclaim and continue": return `reclaim` to the caller. The caller's
+**Re-entry Routing** gate (task-workflow Step 4) reads the `resume_point`
+context variable to decide where to resume — this procedure only *surveys and
+displays* the resume target (Step 1); it does not itself route or need to return
+`resume_point`.
+
+If "Pick a different task": run lock release, revert status, commit, push,
+then return `decline`:
+
+```bash
+./.aitask-scripts/aitask_lock.sh --unlock <task_id> 2>/dev/null || true
+./.aitask-scripts/aitask_update.sh --batch <task_id> --status Ready --assigned-to ""
+./.aitask-scripts/aitask_task_commit.sh -m "ait: Revert t<task_id> to Ready (reclaim declined)" <task_file>
+./ait git push
+```
+
+`<task_file>` is **required**; parse the output per the **outcome contract** in
+`.claude/skills/ait-git/SKILL.md`. Name the task's own file rather than the
+`aitasks/` directory, or the revert commit also carries whatever a concurrent
+session was mid-editing.

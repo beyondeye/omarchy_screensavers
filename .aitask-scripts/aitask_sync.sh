@@ -1,0 +1,2646 @@
+#!/usr/bin/env bash
+# aitask_sync.sh - Bidirectional sync of task data with remote
+#
+# Supports both data-branch mode (.aitask-data worktree) and legacy mode
+# (tasks on main branch). Auto-commits uncommitted task changes, fetches,
+# rebases, and pushes.
+#
+# Usage:
+#   ./.aitask-scripts/aitask_sync.sh            # Interactive mode (colored output)
+#   ./.aitask-scripts/aitask_sync.sh --batch    # Structured output for scripting
+#   AIT_SYNC_ALLOW_PROMPT=1 ...                 # allow graphical auth prompts
+#
+# Batch output protocol (single line on stdout):
+#   SYNCED                     Both push and pull completed
+#   PUSHED                     Local changes pushed, nothing to pull
+#   PULLED                     Remote changes pulled, nothing to push
+#   NOTHING                    Already up-to-date
+#   CONFLICT:<file1>,<file2>   Merge conflicts detected (rebase aborted)
+#   AUTOMERGED                 Conflicts detected but all auto-resolved
+#   MERGED                     Diverged branch converged by a guarded merge
+#                              commit and pushed: protected files blocked the
+#                              rebase and are left uncommitted (t1731)
+#   NO_NETWORK                 Fetch/push timed out or failed
+#   NO_REMOTE                  No remote configured
+#   DEFERRED:<reason>[:<detail>]  Sync deliberately did less than a full cycle
+#                              and this is NOT an error. Closed reason set:
+#                              publication_blocked, protected_dirty,
+#                              worktree_wedged. Split on the FIRST colon only;
+#                              <detail> is free text and may contain colons.
+#   ERROR:<message>            Unexpected error
+#
+# CONTINUATION LINES. A `DEFERRED:protected_dirty` status is followed by one
+# line per protected file — the whole snapshot, so a consumer never has to
+# re-derive locks or the dirty set for itself:
+#
+#   DEFERRED_FILE:<sub_reason>|<task>|<path>|<tree_state>|<holder>|<email>|
+#                 <host>|<pid>|<pane>|<pane_state>|<action>
+#
+# path/action/email/host/pane are percent-encoded (%25 %7C %0A %0D); the rest
+# are closed vocabularies validated by the parser. The status is still the FIRST
+# line and only the first, so a consumer reading one line is unaffected.
+# <pane> is the holder's gateway pane as <session>:<window_id>.<pane_id> and
+# <pane_state> is waiting_<kind> | active. Both are filled only for a live or
+# unverifiable lock taken on this host whose pid a gateway pane owns, and are ""
+# otherwise (lib/tmux_exec.sh::ait_tmux_pane_for_pid, lib/pane_state_probe.py).
+# See lib/sync_action_runner.py (DeferredFile) for the authoritative field list;
+# `show_help` carries the user-facing summary of the same thing.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/aitask_path.sh
+source "$SCRIPT_DIR/lib/aitask_path.sh"
+# shellcheck source=lib/python_resolve.sh
+source "$SCRIPT_DIR/lib/python_resolve.sh"
+# shellcheck source=lib/terminal_compat.sh
+source "$SCRIPT_DIR/lib/terminal_compat.sh"
+# shellcheck source=lib/task_utils.sh
+source "$SCRIPT_DIR/lib/task_utils.sh"
+# shellcheck source=lib/pid_anchor.sh
+source "$SCRIPT_DIR/lib/pid_anchor.sh"        # lock_holder_liveness (the t1466 seam)
+# shellcheck source=lib/stale_lock.sh
+source "$SCRIPT_DIR/lib/stale_lock.sh"        # ait_lock_dir
+# shellcheck source=lib/registry_lock.sh
+source "$SCRIPT_DIR/lib/registry_lock.sh"     # registry_lock_acquire/release
+# shellcheck source=lib/tmux_exec.sh
+source "$SCRIPT_DIR/lib/tmux_exec.sh"         # ait_tmux_pane_for_pid (holder's pane)
+# task_automerge.sh is THE conflict-resolution engine, shared with
+# lib/task_utils.sh::_task_pull_rebase since t1727. It depends on _ait_data_git
+# and _ait_detect_data_worktree from task_utils.sh (sourced above) and on
+# resolve_python; both are already loaded by the time we get here.
+# shellcheck source=lib/task_automerge.sh
+source "$SCRIPT_DIR/lib/task_automerge.sh"
+# shellcheck source=lib/artifact_fetch_exclusion.sh
+source "$SCRIPT_DIR/lib/artifact_fetch_exclusion.sh"   # afx_fingerprint (t2099 guard)
+
+# --- Configuration ---
+BATCH_MODE=false
+NETWORK_TIMEOUT=10
+# Opt-ins for the auto-commit sweep (t1599_3). All three default OFF: each one
+# trades safety for availability, and that call is the operator's to make
+# explicitly, never a silent consequence of an outage or a timer.
+COMMIT_UNOWNED=false
+ASSUME_UNLOCKED=false
+RELEASE_QUARANTINE=false
+# Commit-on-behalf (t1725_3). All three default OFF and are only ever set by an
+# explicit operator action or by the syncer's per-file confirmation.
+#   COMMIT_FOR_TASKS  ids whose OWN live session's edits may be committed
+#   EXPECT_PATHS      the exact dirty set the caller showed the user
+#   REQUIRE_WAITING   refuse unless the holder's pane is parked on a prompt
+COMMIT_FOR_TASKS=()
+EXPECT_PATHS=()
+EXPECT_PATHS_SET=false
+REQUIRE_WAITING=false
+
+# --- Auto-merge support (best-effort) ---
+# The engine lives in lib/task_automerge.sh and resolves its own python + driver
+# lazily. Point its progress channel at iinfo_err so interactive `ait sync`
+# keeps its per-file "Auto-merged: <f>" lines and `--batch` stays silent —
+# unchanged from when those lines were emitted inline. Failures never come
+# through here; they go to warn() and are never suppressed.
+# shellcheck disable=SC2034  # consumed by lib/task_automerge.sh via indirect call
+AIT_AUTOMERGE_PROGRESS_FN=iinfo_err
+
+# --- Help ---
+show_help() {
+    cat <<'EOF'
+Usage: aitask_sync.sh [options]
+
+Sync task data with remote: auto-commit local changes, fetch, rebase,
+and push. Works in both data-branch mode (.aitask-data worktree) and
+legacy mode (tasks on main branch).
+
+Options:
+  --batch               Structured output for scripting (no colors, no prompts)
+  --commit-unowned      Auto-commit files with no derivable task owner
+  --assume-unlocked     Sweep even when the lock branch cannot be read
+  --release-quarantine  Publish withheld commits (see below)
+  --commit-for-task <id>[,<id>...]
+                        Commit the dirty files of a task whose OWN live session
+                        holds it. Only ever your own verified session (same host
+                        AND same userconfig email as the lock); any other holder,
+                        including one whose identity cannot be verified, is
+                        refused. See "Committing on a live session's behalf".
+  --expect-path <path>  Repeatable. The exact dirty paths you were shown; if the
+                        group differs at commit time the group is skipped. Give
+                        one --expect-path per file, percent-encoded -- NOT a
+                        comma-separated list, since a comma is a legal character
+                        in a path. States ONE task's set, so it cannot be
+                        combined with several --commit-for-task ids; run one
+                        task per invocation.
+  --require-waiting     With --commit-for-task, refuse unless the holding
+                        session is parked on a prompt. Fails CLOSED: if the pane
+                        cannot be probed the group is skipped.
+  --help, -h            Show this help
+
+Environment:
+  AIT_SYNC_ALLOW_PROMPT=1  Let fetch/push show a GRAPHICAL authentication
+                        prompt (SSH_ASKPASS on a display, a GIT_ASKPASS /
+                        core.askPass helper, Git Credential Manager's UI).
+                        Prompts are off by default. Fetch and push stay bounded
+                        to 10 seconds with their whole process tree killed on
+                        expiry, and a terminal prompt is never possible.
+
+Interactive mode:
+  Shows colored progress messages. On merge conflicts, opens $EDITOR
+  (default: nano) for each conflicted file, then continues the rebase.
+
+Batch output protocol (single line on stdout):
+  SYNCED                     Both push and pull completed
+  PUSHED                     Local changes pushed, nothing to pull
+  PULLED                     Remote changes pulled, nothing to push
+  NOTHING                    Already up-to-date
+  CONFLICT:<file1>,<file2>   Merge conflicts (rebase aborted in batch)
+  AUTOMERGED                 Conflicts detected but all auto-resolved
+  MERGED                     Local and remote both moved on while protected
+                             files blocked the rebase: joined by a merge commit
+                             and pushed; those files are left uncommitted
+  NO_NETWORK                 Fetch/push timed out or failed
+  NO_REMOTE                  No remote configured
+  DEFERRED:<reason>[:<detail>]  Deliberately did less than a full cycle; not an
+                             error. Reasons: publication_blocked,
+                             protected_dirty, worktree_wedged.
+  ERROR:<message>            Unexpected error
+
+  A protected_dirty deferral is followed by one continuation line per file:
+
+  DEFERRED_FILE:<sub_reason>|<task>|<path>|<tree_state>|<holder>|<email>|<host>|
+                <pid>|<pane>|<pane_state>|<action>
+
+  <holder> is self|other|remote|unverified|none and <tree_state> is
+  tracked|untracked|unknown. <pane> is the holding session's tmux pane and
+  <pane_state> is waiting_<kind>|active, when this host could read them; both
+  are empty otherwise. Textual fields are percent-encoded (%25 %7C %0A
+  %0D). The status line is still the first line, so a reader that takes only
+  that one is unaffected. The same detail is also printed on stderr in prose.
+
+Committing on a live session'"'"'s behalf:
+  The sweep never commits a file whose task is held by another live session --
+  that is the correct outcome, and it stays. But when the holder is YOUR OWN
+  session, parked on a question you have walked away from, the deferral names it
+  and offers the way out:
+
+      ./ait sync --commit-for-task <id>
+
+  This commits that task'"'"'s dirty files exactly as they stand right now. The
+  sweep cannot tell a session that is waiting from one that is mid-edit and
+  momentarily quiet, so the flag is deliberately never automatic and prints a
+  warning when it fires. It bypasses no other guard: the state re-check and the
+  publication quarantine both still apply.
+
+Auto-commit policy:
+  The pre-sync sweep groups dirty task/plan files by their OWNING task and
+  commits each group path-scoped, so a commit never carries another task's
+  file. It skips (and reports on stderr) anything it cannot vouch for: a file
+  whose task is locked by a live -- or unverifiable -- session, a file with no
+  derivable owner, an ambiguous cross-task rename, and everything at all when
+  the lock branch is unreadable. Skipped files stay dirty, which is safe.
+
+  --commit-unowned      Also commit files with no derivable task id (e.g.
+                        aitasks/metadata/*), under a message that names no task.
+  --assume-unlocked     Treat an UNREADABLE lock branch as "nothing is locked".
+                        Availability over safety -- an outage can coincide with
+                        a live editor, so this is deliberately never automatic.
+  --release-quarantine  Publish commits withheld because a file was rewritten
+                        while they were being made. Nothing else releases them:
+                        age never does, because an expiry would publish exactly
+                        the raced content the hold exists to withhold.
+EOF
+}
+
+# --- Argument parsing ---
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --batch)  BATCH_MODE=true; shift ;;
+        --commit-unowned)     COMMIT_UNOWNED=true; shift ;;
+        --assume-unlocked)    ASSUME_UNLOCKED=true; shift ;;
+        --release-quarantine) RELEASE_QUARANTINE=true; shift ;;
+        --commit-for-task)
+            [[ $# -ge 2 ]] || die "--commit-for-task needs an id (or comma-separated ids)"
+            IFS=',' read -r -a _cft <<< "$2"
+            COMMIT_FOR_TASKS+=("${_cft[@]}")
+            shift 2 ;;
+        # REPEATABLE, one path per argument — never a CSV. A comma is a legal
+        # character in a git path and _pct_encode deliberately leaves it alone,
+        # so joining a list on commas would split a legal path and fail every
+        # scope check that follows.
+        --expect-path)
+            [[ $# -ge 2 ]] || die "--expect-path needs a percent-encoded path"
+            # Stored ENCODED and decoded at use time: this loop runs before the
+            # function definitions below, so _pct_decode does not exist yet.
+            EXPECT_PATHS+=("$2")
+            EXPECT_PATHS_SET=true
+            shift 2 ;;
+        --require-waiting) REQUIRE_WAITING=true; shift ;;
+        --help|-h) show_help; exit 0 ;;
+        *) die "Unknown option: $1. Use --help for usage." ;;
+    esac
+done
+
+# --expect-path states ONE task's dirty set, and _commit_group compares it to
+# each group in turn. With two ids in --commit-for-task, task 10 sees task 20's
+# declared paths as missing from its own group and vice versa, so BOTH are
+# refused as commit_scope_changed and the combined form silently commits
+# nothing. Rather than grow a per-id expectation syntax for a case the caller
+# can express as two runs, refuse the ambiguous combination outright.
+if [[ "$EXPECT_PATHS_SET" == true ]]; then
+    if (( ${#COMMIT_FOR_TASKS[@]} == 0 )); then
+        die "--expect-path is only meaningful with --commit-for-task."
+    fi
+    if (( ${#COMMIT_FOR_TASKS[@]} > 1 )); then
+        die "--expect-path states a single task's dirty set, so it cannot be combined with more than one --commit-for-task id (got: ${COMMIT_FOR_TASKS[*]}). Run one task per invocation."
+    fi
+fi
+if [[ "$REQUIRE_WAITING" == true ]] && (( ${#COMMIT_FOR_TASKS[@]} == 0 )); then
+    die "--require-waiting is only meaningful with --commit-for-task."
+fi
+
+# --- Bounded network wrapper ---
+# Runs one fetch/push through lib/bounded_run.py: git runs with no controlling
+# terminal and stdin /dev/null, as the leader of its own process group (in a new
+# session only when this sync has a terminal to drop), and on expiry its whole process
+# group is killed -- SIGTERM, then SIGKILL after the grace -- so a transport
+# that ignores SIGTERM (an ssh, a configured core.sshCommand) cannot outlive
+# the sync. Returns git's status, or 124 when NETWORK_TIMEOUT expired.
+#
+# Prompts are off by default (--noninteractive: no askpass, no display, no GCM
+# UI). AIT_SYNC_ALLOW_PROMPT=1 -- exactly "1" -- keeps the caller's askpass /
+# display environment so a GRAPHICAL prompt can authenticate; the bound, the
+# missing terminal and the group kill are unchanged, so a terminal prompt is never
+# possible and a graphical one must finish inside NETWORK_TIMEOUT.
+#
+# lib/sync_action_runner.py runs this script in a terminal-less session, so git
+# stays a member of that session and its session-scoped stop reaches every
+# transport; it also exports AIT_BOUNDED_RUN_GRACE short enough for this
+# runner's own, orderly cleanup to finish inside its TERM window.
+#
+# Not `bounded_run.py -- task_git`: task_git is a shell function, so the raw git
+# args are built here, respecting the data worktree.
+_git_with_timeout() {
+    _ait_detect_data_worktree
+    local git_args=() runner_args=(--timeout "$NETWORK_TIMEOUT") py
+    if [[ "$_AIT_DATA_WORKTREE" != "." ]]; then
+        git_args=(-C "$_AIT_DATA_WORKTREE")
+    fi
+    git_args+=("$@")
+    if [[ "${AIT_SYNC_ALLOW_PROMPT:-}" != 1 ]]; then
+        runner_args+=(--noninteractive)
+    fi
+
+    py="$(resolve_python)"
+    "${py:-python3}" "$SCRIPT_DIR/lib/bounded_run.py" \
+        "${runner_args[@]}" -- git "${git_args[@]}"
+}
+
+# --- Output helpers ---
+batch_out() {
+    if [[ "$BATCH_MODE" == true ]]; then
+        echo "$1"
+    fi
+}
+
+# A CONTINUATION line: extra structured detail written AFTER a status line that
+# batch_out already emitted. Deliberately NOT batch_out, for two reasons:
+#
+#   1. tests/test_sync_action_runner.py's _emitted_tokens scan reads every
+#      `batch_out "<literal>"` in this file as a declared STATUS token. A detail
+#      line routed through batch_out would be scanned as one and fail the
+#      closed-vocabulary contract.
+#   2. parse_sync_output takes the status from the FIRST non-empty line only, so
+#      a detail line must never be able to occupy that position.
+#
+# Emitted only from _emit_protected_deferral, never merely because records
+# exist — several existing tests assert `not_contains "DEFERRED"` over the whole
+# stdout of runs that HAVE protected records and correctly do not defer.
+batch_detail() {
+    if [[ "$BATCH_MODE" == true ]]; then
+        echo "$1"
+    fi
+}
+
+# Only show interactive messages in non-batch mode
+iinfo() {
+    if [[ "$BATCH_MODE" == false ]]; then
+        info "$1"
+    fi
+}
+
+# Interactive info routed to STDERR. For use inside functions whose STDOUT is a
+# data channel — a progress line written there is parsed by the caller as a
+# conflicted filename and the interactive loop then opens $EDITOR on it. This is
+# what AIT_AUTOMERGE_PROGRESS_FN points at, so lib/task_automerge.sh's per-file
+# notices keep landing on stderr and stay silent in --batch.
+iinfo_err() {
+    if [[ "$BATCH_MODE" == false ]]; then
+        info "$1" >&2
+    fi
+}
+
+iwarn() {
+    if [[ "$BATCH_MODE" == false ]]; then
+        warn "$1"
+    fi
+}
+
+isuccess() {
+    if [[ "$BATCH_MODE" == false ]]; then
+        success "$1"
+    fi
+}
+
+# --- Check for remote ---
+check_remote() {
+    if ! task_git remote get-url origin &>/dev/null; then
+        # A failed lookup means "no origin" only when git could read its
+        # configuration (t2070): an unreadable config fails every command, and
+        # reading that as NO_REMOTE skipped the sync in silence. Only this
+        # failure path asks again, with the plain remote list, whose exit
+        # status separates the two.
+        local err="" rc=0
+        err="$(task_git remote 2>&1 >/dev/null)" || rc=$?
+        if [[ $rc -ne 0 ]]; then
+            batch_out "ERROR:remote_probe_failed"
+            warn "Could not read the git configuration; nothing was synced (git: ${err%%$'\n'*})"
+            exit 1
+        fi
+        batch_out "NO_REMOTE"
+        if [[ "$BATCH_MODE" == false ]]; then
+            warn "No remote configured"
+        fi
+        exit 0
+    fi
+}
+
+# --- Auto-commit uncommitted task/plan changes (t1599_3) ---
+#
+# This sweep is INTENTIONAL — its job is to leave the worktree clean so the later
+# `pull --rebase` can run — so path-scoping alone is not the fix. It used to
+# `add aitasks/ aiplans/` and then commit the WHOLE index, so any file another
+# session was mid-edit on was swept into a commit whose message named a
+# different task (18 of 66 sync auto-commits on the live data branch carried
+# more than two task/plan files).
+#
+# It now groups the dirty set by OWNING task, commits each group path-scoped
+# under a message naming its real task, and refuses to commit anything it cannot
+# vouch for. Everything below is arranged so this function NEVER aborts and
+# always returns 0: under `set -euo pipefail` a stray non-zero would exit the
+# script with no stdout, and every consumer reads empty stdout as
+# `ERROR: empty output from sync script` (the syncer escalates that into an
+# offer to spawn a code agent).
+
+# Outcome sets. These are two ORTHOGONAL non-success outcomes and must not share
+# a flag — see the guards in main():
+#   PROT_*               files we could not commit are still dirty. Blocks the
+#                        REBASE — see _rebase_blocked for exactly when.
+#   PUBLICATION_BLOCKED  we made a commit whose content we cannot vouch for.
+#                        Blocks the PUSH, regardless of remote_ahead — the race
+#                        advances refs/heads/aitask-locks, never aitask-data, so
+#                        remote_ahead == 0 is its NORMAL shape and a
+#                        rebase-gated guard would detect it and push anyway.
+#
+# The protection record is PER FILE, not per skip event (t1725_3). It used to be
+# a flat list of reason strings, which is why the deferral could only ever say
+# "N file(s) held by other sessions": the path, the owner, the holder and the
+# remedy were all computed and then thrown away at the wire. Every consumer
+# (syncer, board) now gets the whole snapshot — see _emit_protected_deferral.
+#
+# ELEVEN PARALLEL ARRAYS, APPENDED IN LOCKSTEP. Only _protect() may append, and
+# it appends to all of them in one place; a per-call-site append would let them
+# drift in length, and a short read under `set -u` aborts the script with empty
+# stdout — the exact failure tests/test_sync_protect_paths.sh characterizes.
+PROT_REASON=()      # closed set: the _protect "<reason>" literals
+PROT_TASK=()        # owning task id, or "" for a path-less protection
+PROT_PATH=()        # repo-relative path, or "" for a path-less protection
+PROT_STATE=()       # tracked | untracked | unknown
+PROT_HOLDER=()      # self | other | remote | unverified | none
+PROT_EMAIL=()       # lock's locked_by, when known
+PROT_HOST=()        # lock's hostname, when known
+PROT_PID=()         # lock's pid, when known
+PROT_PANE=()        # holder's gateway pane target, when resolved (else "")
+PROT_PANE_STATE=()  # waiting_<kind> | active, when probed (else "")
+PROT_ACTION=()      # the prescriptive line: what would clear this file
+PUBLICATION_BLOCKED=()
+declare -A PATH_STATE=()
+SKIP_REPORT=()
+QUARANTINE_HELD=()
+
+_note_skip() { SKIP_REPORT+=("$1"); }
+
+# --- test-only seams -------------------------------------------------------
+#
+# Two boundaries in this file are only reachable by winning a race against
+# another process, so they cannot be driven by an ordinary fixture. A git
+# `pre-commit` hook is NOT usable for the second one: under `commit --only` git
+# runs prepare_index() and writes the tree BEFORE prepare_to_commit() invokes
+# the hook, so a hook that rewrites the file cannot change the committed bytes —
+# the recorded hash would still match and the publication guard would never
+# fire, giving a test that passes while proving nothing.
+#
+# The seams are inert in production by construction: an env var alone can never
+# enable them, only an env var TOGETHER with a marker file in the lock base.
+# NEVER create that file in a real lock base. Same gate shape as
+# aitask_merge_task.sh:40-45.
+#
+#   pre_commit_phase   after the dirty scan + first lock enumeration, BEFORE the
+#                      5a.2 CAS re-enumeration      (proves the CAS fires)
+#   pre_group_commit   after the 5a.3 state re-check, IMMEDIATELY before the
+#                      commit                       (proves the publication guard)
+#   pre_push           immediately before the FIRST push, so a hook can advance
+#                      the remote in the window between main's rebase gate and
+#                      the push       (proves do_push re-gates on fresh inputs)
+#   pre_guarded_ff     after the guarded merge's checks and commit-tree, BEFORE
+#                      its fast-forward (t1731)   (proves the fast-forward itself
+#                      refuses what changed after the checks: a moved HEAD, or
+#                      an ignored file that appeared after the scan)
+#   pre_pull           at the top of do_pull_rebase, BEFORE the pin (t1792): a
+#                      commit landing here turns a behind-only branch into a
+#                      diverged one   (proves the pull never autostashes)
+#   pre_pull_apply     after the behind-only ignored-file check, BEFORE the
+#                      fast-forward (t1792)   (proves the fast-forward refuses an
+#                      ignored file created after the check and a moved HEAD,
+#                      with no rebase fallback, and applies only the pinned
+#                      commit, never one fetched later)
+_sync_test_seams_enabled() {
+    local base
+    base="$(dirname "$(ait_lock_dir data_index)")" || return 1
+    [[ -f "$base/.ait_sync_test_seams" ]]
+}
+_sync_test_seam() {
+    local point="$1" var="AIT_SYNC_SEAM_${1}"
+    [[ -n "${!var:-}" ]] || return 0
+    _sync_test_seams_enabled || return 0
+    warn "aitask_sync: TEST SEAM ACTIVE - running ${point} hook"
+    eval "${!var}" || true
+    return 0
+}
+
+# --- the holder's pane ----------------------------------------------------
+#
+# A deferral names the pane a live holder runs in and whether it is parked on a
+# prompt, so the user reads "answer the question in pane X" rather than a pid.
+# Resolved ONCE per task and memoized: _protect runs once per path, and a task
+# with many dirty files must not cost one tmux walk and one Python start each.
+#
+# The memo is written ONLY in the sweep's own frame: _protect_task_paths calls
+# _resolve_holder_pane directly, and _commit_group's re-probe overwrites it.
+# _holder_action runs inside $( ), so it may read these maps but anything it
+# wrote would die with the subshell.
+#
+# Best-effort by construction: every lookup is absorbed, and an unestablished
+# answer is "", never a guess and never an abort. A state holds only what the
+# wire grammar admits (lib/sync_action_runner.py rejects the WHOLE record
+# otherwise); the word `unresolvable` belongs to the --require-waiting message,
+# never to a record.
+declare -A HOLDER_PANE=() HOLDER_PANE_STATE=() HOLDER_PANE_DONE=()
+_HOLDER_PANE_STATE_RE='^(waiting_[a-z0-9_]+|active)$'
+
+# _probe_pane_state <pane_id> — lib/pane_state_probe.py's one line, validated
+# against the record grammar; "" when the probe is missing, cannot run, or
+# establishes nothing.
+_probe_pane_state() {
+    local pane_id="$1" py="" st=""
+    if [[ -n "$pane_id" && -f "$SCRIPT_DIR/lib/pane_state_probe.py" ]]; then
+        py="$(resolve_python 2>/dev/null)" || py=""
+        if [[ -n "$py" ]]; then
+            st="$("$py" "$SCRIPT_DIR/lib/pane_state_probe.py" "$pane_id" 2>/dev/null)" || st=""
+        fi
+    fi
+    [[ "$st" =~ $_HOLDER_PANE_STATE_RE ]] || st=""
+    printf '%s' "$st"
+}
+
+# _resolve_holder_pane <tid> — fill the memo for <tid>, once. Only a lock taken
+# on THIS host with a numeric pid can name a pane here: anything else leaves the
+# memo empty and the record's two pane columns "".
+_resolve_holder_pane() {
+    local tid="$1" pid host cur line pane_id
+    [[ -n "${HOLDER_PANE_DONE[$tid]:-}" ]] && return 0
+    HOLDER_PANE_DONE["$tid"]=1
+    HOLDER_PANE["$tid"]=""
+    HOLDER_PANE_STATE["$tid"]=""
+    pid="${LOCK_PID[$tid]:-}"
+    host="${LOCK_HOST[$tid]:-}"
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 0
+    cur="$(hostname 2>/dev/null)" || cur=""
+    [[ -n "$host" && -n "$cur" && "$host" != "unknown" && "$host" == "$cur" ]] || return 0
+    line="$(ait_tmux_pane_for_pid "$pid" 2>/dev/null)" || line=""
+    [[ "$line" == *$'\t'* ]] || return 0
+    pane_id="${line%%$'\t'*}"
+    HOLDER_PANE["$tid"]="${line#*$'\t'}"
+    HOLDER_PANE_STATE["$tid"]="$(_probe_pane_state "$pane_id")"
+    return 0
+}
+
+# _protect <reason> <task> <path> <tree_state> <human line>
+#
+# <task> and <path> are "" for a path-less protection (scan_failed,
+# lock_contended), whose <tree_state> is `unknown`. Per-task protections call
+# this ONCE PER PATH of that task, so the record set is per file.
+#
+# The holder columns are resolved here rather than by the caller: every caller
+# that knows a task id also wants the same classification, and duplicating it
+# per call site is how the "held by other sessions" text got out of step with
+# what the lock actually said.
+_protect() {
+    local reason="$1" task="$2" path="$3" state="$4" line="$5"
+    local holder="none" email="" host="" pid="" pane="" pane_state=""
+    if [[ -n "$task" && "$task" != "__unowned__" ]]; then
+        holder="$(_holder_class "$task")"
+        email="${LOCK_EMAIL[$task]:-}"
+        host="${LOCK_HOST[$task]:-}"
+        pid="${LOCK_PID[$task]:-}"
+        pane="${HOLDER_PANE[$task]:-}"
+        pane_state="${HOLDER_PANE_STATE[$task]:-}"
+    fi
+    PROT_REASON+=("$reason")
+    PROT_TASK+=("$task")
+    PROT_PATH+=("$path")
+    PROT_STATE+=("$state")
+    PROT_HOLDER+=("$holder")
+    PROT_EMAIL+=("$email")
+    PROT_HOST+=("$host")
+    PROT_PID+=("$pid")
+    PROT_PANE+=("$pane")
+    PROT_PANE_STATE+=("$pane_state")
+    PROT_ACTION+=("$line")
+    _note_skip "$line"
+}
+
+# Resolve the git-dir that owns the data worktree, falling back to this repo's
+# in legacy mode. Used for state that must NOT live under aitasks/ — putting it
+# there would make it the very ownerless-dirty-file problem this sweep skips.
+#
+# Resolved by MODE, never by emptiness, through lib/task_utils.sh::
+# _data_wedge_gitdir. 0 + the path on stdout; 2 = it could not be resolved, and
+# nothing is printed. Never a default: a fabricated git-dir composes into the
+# wedge check (every sentinel test misses) and into the quarantine ledger (a
+# fresh, empty one — every held entry lost). aidocs/framework/failopen_git_probes.md
+# row A10.
+_sync_gitdir() {
+    local gd
+    # unverified: an empty answer from either mode means "could not resolve" ⇒ 2
+    gd="$(_data_wedge_gitdir)"
+    [[ -n "$gd" ]] || return 2
+    printf '%s' "$gd"
+}
+
+# 0 + the ledger path; 2 when the git-dir that holds it cannot be resolved.
+_quarantine_path() {
+    local gd
+    # unverified: propagate 2 — never start a fresh, empty ledger somewhere else
+    gd="$(_sync_gitdir)" || return 2
+    printf '%s/ait-sync-quarantine' "$gd"
+}
+
+# A git path may contain ANY byte except NUL — including `|` and a newline, both
+# of which are legal and both of which would corrupt the `|`-delimited,
+# line-based quarantine record below (a mangled path is then checked against the
+# wrong file, which can release a hold that should stand). Percent-encode the
+# three characters that carry meaning in that record; everything else is passed
+# through, so the common case stays readable in the file.
+#
+# CR is encoded for the SAME reason as LF, not as an afterthought: the
+# DEFERRED_FILE: records these fields travel in are consumed by Python, and a
+# raw CR would be read as a line boundary there (and would make the stderr
+# report and this persisted record unreadable besides). The parser splits on LF
+# alone precisely so this codec does not have to chase every character
+# `str.splitlines()` recognises — see lib/sync_action_runner.py.
+#
+# Decode order matters: `%25` LAST, so a path that literally contained "%7C"
+# (encoded "%257C") does not decode twice.
+_pct_encode() {
+    local sVar="$1" out="" c i
+    for ((i = 0; i < ${#sVar}; i++)); do
+        c="${sVar:i:1}"
+        case "$c" in
+            '%')   out+='%25' ;;
+            '|')   out+='%7C' ;;
+            $'\n') out+='%0A' ;;
+            $'\r') out+='%0D' ;;
+            *)     out+="$c" ;;
+        esac
+    done
+    printf '%s' "$out"
+}
+_pct_decode() {
+    local sVar="$1"
+    sVar="${sVar//%0A/$'\n'}"
+    sVar="${sVar//%0D/$'\r'}"
+    sVar="${sVar//%7C/|}"
+    sVar="${sVar//%25/%}"
+    printf '%s' "$sVar"
+}
+
+# 0 + the git-dir sentinel when the data worktree is wedged; 1 when it is not;
+# 2 when the git-dir cannot be resolved. A consumer must tell 1 from 2 — a bare
+# `if` reads "cannot look" as "not wedged".
+# task_git add/reset/commit are on neither allowlist, so assert_data_worktree_clean
+# would die() — exit 1 with no batch_out — in the middle of this function.
+_worktree_wedged() {
+    local gd st
+    # unverified: propagate 2 — "cannot look" is never "not wedged"
+    gd="$(_sync_gitdir)" || return 2
+    for st in rebase-merge rebase-apply MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD BISECT_LOG; do
+        if [[ -e "$gd/$st" ]]; then printf '%s' "$st"; return 0; fi
+    done
+    return 1
+}
+
+# Refuse the whole run: the data worktree's git-dir cannot be resolved, so neither
+# the wedge check nor the quarantine ledger can be trusted, and proceeding would
+# publish whatever the ledger withholds. Called before anything is swept or
+# published (main's Step 1b, and auto_commit before its lock). Exits.
+_refuse_unresolved_gitdir() {
+    _note_skip "could not resolve the data worktree's git-dir — nothing swept, nothing published. See why with: git -C .aitask-data rev-parse --absolute-git-dir; 'ait setup' repairs the data worktree layout, 'git worktree repair' re-links a moved worktree. Then re-run sync."
+    report_skipped
+    batch_out "ERROR:data_gitdir_unresolved"
+    iwarn "Could not resolve the data worktree's git-dir; nothing was synced."
+    exit 1
+}
+
+# Path -> owning task id, or exit 1 when the path has no derivable owner.
+# This is the INVERSE of resolve_task_file()/resolve_plan_file() in task_utils.sh
+# (id -> path); no shared helper exists for this direction and no sibling needs
+# one, so it lives here.
+_owner_of_path() {
+    local p="$1" d
+    case "$p" in
+        aitasks/*) d="${p#aitasks/}" ;;
+        aiplans/*) d="${p#aiplans/}" ;;
+        *) return 1 ;;
+    esac
+    d="${d#archived/}"
+    # Child: t<P>/t<P>_<C>_*.md — the two parent numbers must agree, otherwise
+    # the path is malformed and guessing an owner for it is exactly the
+    # mis-attribution this task exists to stop.
+    if [[ "$d" =~ ^[tp]([0-9]+)/[tp]([0-9]+)_([0-9]+)_[^/]*\.md$ ]]; then
+        [[ "${BASH_REMATCH[1]}" == "${BASH_REMATCH[2]}" ]] || return 1
+        printf '%s_%s' "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}"
+        return 0
+    fi
+    if [[ "$d" =~ ^[tp]([0-9]+)_[^/]*\.md$ ]]; then
+        printf '%s' "${BASH_REMATCH[1]}"
+        return 0
+    fi
+    return 1
+}
+
+# Two-valued path state: `present:<blob>` or `absent`. Returns 1 when the path
+# exists but cannot be hashed — that is an ERROR, never evidence of absence.
+#
+# EXISTENCE decides the state. `git hash-object` on a missing path exits 128
+# with empty stdout, so keying the state on its failure would collapse "deleted"
+# and "unreadable" into one value. The eligible set deliberately contains absent
+# paths: a deletion, and the source half of an archive move.
+_path_state() {
+    local p="$1" full="$1" h
+    [[ "$_AIT_DATA_WORKTREE" != "." ]] && full="$_AIT_DATA_WORKTREE/$p"
+    if [[ ! -e "$full" ]]; then
+        printf 'absent'
+        return 0
+    fi
+    # _ait_data_git, not task_git: hash-object is on neither the read-only nor
+    # the recovery allowlist, so task_git would die() on a wedged worktree.
+    h="$(_ait_data_git hash-object -- "$p" 2>/dev/null)" || return 1
+    [[ -n "$h" ]] || return 1
+    printf 'present:%s' "$h"
+}
+
+# --- Lock snapshot ---------------------------------------------------------
+declare -A LOCK_HOST=() LOCK_PID=() LOCK_START=() LOCK_KIND=() LOCK_EMAIL=()
+LOCKS_STATUS=""
+
+# Populate the snapshot from ONE `aitask_lock.sh --list --batch` call (one
+# ls-remote + one fetch, regardless of how many locks exist).
+_lock_snapshot() {
+    LOCK_HOST=(); LOCK_PID=(); LOCK_START=(); LOCK_KIND=(); LOCK_EMAIL=()
+    LOCKS_STATUS=""
+    local out rc=0 line rest lid lemail lhost lpid lstart lkind
+    out="$("$SCRIPT_DIR/aitask_lock.sh" --list --batch 2>/dev/null)" || rc=$?
+    if [[ $rc -ne 0 ]]; then
+        LOCKS_STATUS="LOCKS_UNAVAILABLE"
+        return 0
+    fi
+    while IFS= read -r line; do
+        case "$line" in
+            LOCKS_OK|LOCKS_UNINITIALIZED|LOCKS_UNAVAILABLE) LOCKS_STATUS="$line" ;;
+            LOCK:*)
+                rest="${line#LOCK:}"
+                IFS='|' read -r lid lemail lhost lpid lstart lkind <<< "$rest"
+                [[ -n "$lid" ]] || continue
+                LOCK_HOST["$lid"]="$lhost"
+                LOCK_PID["$lid"]="$lpid"
+                LOCK_START["$lid"]="$lstart"
+                LOCK_KIND["$lid"]="$lkind"
+                # Kept, not discarded: _holder_class compares it against
+                # get_user_email to decide `self` vs `other` (t1725_3).
+                LOCK_EMAIL["$lid"]="$lemail"
+                ;;
+        esac
+    done <<< "$out"
+    # A snapshot with no verdict line is not a snapshot. Fail safe.
+    [[ -n "$LOCKS_STATUS" ]] || LOCKS_STATUS="LOCKS_UNAVAILABLE"
+}
+
+# free | alive | dead | unknown — the routing verdict for ONE task.
+# `dead` is the only verdict that permits committing another session's file.
+# True when <tid> was named by --commit-for-task.
+_commit_for_task_listed() {
+    local tid="$1" c
+    for c in ${COMMIT_FOR_TASKS+"${COMMIT_FOR_TASKS[@]}"}; do
+        [[ "$c" == "$tid" ]] && return 0
+    done
+    return 1
+}
+
+_holder_verdict() {
+    local tid="$1" h cur
+    [[ "$ASSUME_UNLOCKED" == true ]] && { printf 'free'; return 0; }
+
+    # --commit-for-task: commit a task's dirty files even though its own session
+    # is live. Evaluated HERE rather than at the call sites so it applies at
+    # BOTH lock snapshots — the pre-scan one and the 5a.2 CAS re-enumeration.
+    # That is what makes a lock changing hands mid-run fall out for free: the
+    # two verdicts then disagree and the existing CAS drops the group as
+    # lock_acquired_during_scan.
+    #
+    # `self` ONLY. Every other class is refused, `unverified` included: an
+    # unverifiable identity is not this user's, and treating it as one would
+    # commit a stranger's uncommitted work. The override bypasses neither the
+    # 5a.3 state re-check nor the 5a.4 publication guard.
+    if _commit_for_task_listed "$tid"; then
+        local cls
+        cls="$(_holder_class "$tid")"
+        if [[ "$cls" == "self" ]]; then
+            printf 'free'
+            return 0
+        fi
+        warn "--commit-for-task t${tid} refused: the lock is ${cls} (${LOCK_EMAIL[$tid]:-no email} on ${LOCK_HOST[$tid]:-unknown host}), not your own verified session"
+    fi
+
+    h="${LOCK_HOST[$tid]:-}"
+    [[ -z "$h" ]] && { printf 'free'; return 0; }
+
+    cur="$(hostname 2>/dev/null || echo unknown)"
+    # Cross-host guard, replicating aitask_lock.sh's: lock_holder_liveness takes
+    # only (pid, starttime, kind) and has NO host awareness, so handed a foreign
+    # machine's PID it probes the LOCAL process table and fabricates a verdict.
+    # A coincidentally-absent local PID would read `dead` and we would commit a
+    # file another machine's live session owns. "unknown" is not comparable
+    # either — two machines both reporting it would compare equal.
+    if [[ "$h" == "unknown" || "$h" != "$cur" ]]; then
+        printf 'unknown'
+        return 0
+    fi
+    # Prints alive|dead|unknown on STDOUT and always exits 0. is_lock_holder_alive
+    # collapses dead and unknown into one false, so it is unusable here.
+    lock_holder_liveness "${LOCK_PID[$tid]:--}" "${LOCK_START[$tid]:--}" "${LOCK_KIND[$tid]:-proc}"
+}
+
+# self | other | remote | unverified | none — WHO holds this task's lock,
+# relative to the person running this sync (t1725_3).
+#
+# This exists because "held by other sessions" was wrong in the case that
+# actually happens: on 2026-09-07 all 13 locks on the branch belonged to the
+# same user, 12 of them on this host, and the blocking one was that user's own
+# pane parked on a prompt. Telling them a stranger held it sent them looking in
+# the wrong place for a whole session.
+#
+# `self` is deliberately the HARDEST verdict to reach: every identity must be
+# present AND verified. An absent local email must never compare equal to an
+# absent lock email — that would classify every anonymous lock as the user's own
+# and make it eligible for --commit-for-task, which commits another session's
+# uncommitted work. Anything missing or malformed is `unverified`, never `self`.
+_AIT_SELF_EMAIL_CACHED=""
+_AIT_SELF_EMAIL_DONE=false
+_self_email() {
+    if [[ "$_AIT_SELF_EMAIL_DONE" != true ]]; then
+        _AIT_SELF_EMAIL_CACHED="$(get_user_email 2>/dev/null || true)"
+        _AIT_SELF_EMAIL_DONE=true
+    fi
+    printf '%s' "$_AIT_SELF_EMAIL_CACHED"
+}
+
+_holder_class() {
+    local tid="$1" lhost lemail me cur
+
+    # An UNREADABLE snapshot is not evidence of anything, least of all that the
+    # task is unlocked. With LOCKS_UNAVAILABLE every LOCK_* entry is empty, so
+    # the `none` shortcut below would fire and put a false fact on a wire record
+    # that advertises itself as the COMPLETE snapshot -- a consumer reading
+    # holder=none could reasonably offer "nobody holds this, commit it", which
+    # is exactly what the locks_unavailable branch exists to prevent.
+    #
+    # LOCKS_UNINITIALIZED is different and stays readable: there is no lock
+    # branch, so nothing IS locked and `none` is true. An empty LOCKS_STATUS
+    # (no snapshot taken yet) is unreadable too, which is the fail-safe answer.
+    #
+    # Deliberately NOT conditioned on --assume-unlocked. That flag is an
+    # availability-over-safety call about whether to COMMIT; it does not make
+    # the unread lock branch readable, and this field states what is known.
+    _locks_readable || { printf 'unverified'; return 0; }
+
+    lhost="${LOCK_HOST[$tid]:-}"
+    [[ -z "$lhost" ]] && { printf 'none'; return 0; }
+
+    lemail="${LOCK_EMAIL[$tid]:-}"
+    cur="$(hostname 2>/dev/null || true)"
+
+    # A host we cannot name, on either side, is not a host we can compare.
+    if [[ "$lhost" == "unknown" || -z "$cur" || "$cur" == "unknown" ]]; then
+        printf 'unverified'
+        return 0
+    fi
+    # A different machine: liveness is not decidable from here at all.
+    if [[ "$lhost" != "$cur" ]]; then
+        printf 'remote'
+        return 0
+    fi
+    # Same verified host. Now the identity has to be real on BOTH sides.
+    me="$(_self_email)"
+    if [[ -z "$lemail" || -z "$me" ]]; then
+        printf 'unverified'
+        return 0
+    fi
+    if [[ "$lemail" == "$me" ]]; then
+        printf 'self'
+    else
+        printf 'other'
+    fi
+}
+
+# The prescriptive line for a lock-held file, per holder class. This is the text
+# that reaches the user, so it names the concrete next action rather than the
+# internal reason. "held by other sessions" appears nowhere.
+_holder_action() {
+    local tid="$1" path="$2" class="$3"
+    local host="${LOCK_HOST[$tid]:-?}" pid="${LOCK_PID[$tid]:-?}" email="${LOCK_EMAIL[$tid]:-}"
+    # "pid N" plus, when the sweep resolved it, where that session is and what it
+    # is doing. Read from the memo only: this runs in $( ).
+    local where="pid $pid" pane="${HOLDER_PANE[$tid]:-}" pstate="${HOLDER_PANE_STATE[$tid]:-}"
+    if [[ -n "$pane" ]]; then
+        where+=", pane $pane"
+        case "$pstate" in
+            waiting_*) where+=", waiting on a prompt: ${pstate#waiting_}" ;;
+            active)    where+=", running — not at a prompt" ;;
+        esac
+    fi
+    case "$class" in
+        self)
+            printf 't%s: %s — held by YOUR OWN live session on this host (%s) — finish or answer that session; or commit on its behalf: ./ait sync --commit-for-task %s' \
+                "$tid" "$path" "$where" "$tid" ;;
+        other)
+            printf 't%s: %s — held by %s'"'"'s live session on %s (%s) — left for that session' \
+                "$tid" "$path" "$email" "$host" "$where" ;;
+        remote)
+            printf 't%s: %s — held on %s (liveness cannot be verified from here) — left for that host' \
+                "$tid" "$path" "$host" ;;
+        *)
+            printf 't%s: %s — held by a session whose identity could not be verified (lock email / local userconfig email missing) — left as is' \
+                "$tid" "$path" ;;
+    esac
+}
+
+# True when the snapshot is trustworthy enough to conclude anything about a task.
+# This answers ONE question and says nothing about any particular task; whether a
+# given task is held is answered by LOCK_HOST. There is deliberately no global
+# "nothing is locked" test — using one as a per-task precondition would let an
+# unrelated live lock on tY gate a decision about tX.
+_locks_readable() {
+    [[ "$LOCKS_STATUS" == "LOCKS_OK" || "$LOCKS_STATUS" == "LOCKS_UNINITIALIZED" ]]
+}
+
+# --- Quarantine (durable, cross-invocation) --------------------------------
+#
+# PUBLICATION_BLOCKED is script-scope state; the raced commit is not. Without
+# persistence the hold would last exactly one run: the next sync finds the path
+# still dirty and still locked, calls it protected_dirty, sees remote_ahead == 0
+# and pushes the commit this run withheld.
+#
+# Keyed by (path, blob), never by commit SHA: a later `pull --rebase` rewrites
+# the SHA and would silently invalidate a SHA-keyed entry.
+# Line format: <path>|<blob>|<task_id>|<first_seen_epoch>
+_quarantine_load_and_prune() {
+    # $1: the ledger path, resolved ONCE by auto_commit. Nothing is resolved here,
+    # so this can never read a relocated (and therefore empty) ledger.
+    local qf="$1" line p p_enc blob tid seen head_blob rc verdict age warn_age
+    local st st_rc unread
+    QUARANTINE_HELD=()
+    [[ -s "$qf" ]] || return 0
+
+    warn_age="${AIT_SYNC_QUARANTINE_WARN_AGE:-86400}"
+
+    while IFS='|' read -r p_enc blob tid seen; do
+        [[ -n "$p_enc" && -n "$blob" ]] || continue
+        p="$(_pct_decode "$p_enc")"
+
+        # Clause 1 — superseded: a later commit landed on top, so publishing now
+        # publishes history rather than a tip. Independent of any lock.
+        rc=0
+        head_blob="$(task_git rev-parse --verify --quiet "HEAD:$p" 2>/dev/null)" || rc=$?
+        if [[ $rc -ne 0 || "$head_blob" != "$blob" ]]; then
+            iinfo_err "quarantine released (superseded): $p"
+            continue
+        fi
+
+        # Clause 2 — ownership released AND state verified. All three, never any.
+        # A CLEAN worktree is NOT settlement on its own: `commit -o` committed
+        # the worktree bytes, so the path is clean BY CONSTRUCTION right after
+        # the race, and a cleanliness-only clause would release immediately.
+        unread=0
+        if _locks_readable; then
+            verdict="$(_holder_verdict "$tid")"
+            if [[ "$verdict" == "free" || "$verdict" == "dead" ]]; then
+                # unverified: an UNREADABLE worktree is not settled ⇒ hold. Hoisted
+                # out of `[[ -z "$(…)" ]]`, where a failed substitution is invisible
+                # and reads as clean. aidocs/framework/failopen_git_probes.md row A4.
+                st_rc=0
+                st="$(task_git status --porcelain -- "$p" 2>/dev/null)" || st_rc=$?
+                if (( st_rc == 0 )) && [[ -z "$st" ]]; then
+                    iinfo_err "quarantine released (owner gone, state settled): $p"
+                    continue
+                fi
+                (( st_rc == 0 )) || unread=1
+            fi
+        fi
+
+        QUARANTINE_HELD+=("${p_enc}|${blob}|${tid}|${seen}")
+        PUBLICATION_BLOCKED+=("$p")
+
+        # Age NEVER releases. An automatic expiry would fire in exactly the
+        # states clause 2 refuses to release on — a live holder, an `unknown`
+        # cross-host holder, an unreadable lock branch — so a session that
+        # legitimately runs longer than the window would have its raced content
+        # published merely because time passed. That is the cross-session
+        # swallow this task exists to prevent, re-entering through the escape
+        # hatch. Past the window the report ESCALATES; only the operator
+        # releases, which makes the safety-vs-availability call explicit.
+        age=$(( $(date +%s) - ${seen:-0} ))
+        if (( unread )); then
+            _note_skip "quarantine held: $p (t${tid}) — its owner is gone, but the path's state could not be read (git status rc=${st_rc}), so it was not released. Re-run sync; if this persists check ./ait git status, or release deliberately with: ./ait sync --release-quarantine"
+        elif (( ${seen:-0} > 0 && age > warn_age )); then
+            _note_skip "QUARANTINE HELD ${age}s (>${warn_age}s): $p (t${tid}, holder: ${LOCK_HOST[$tid]:-none}) — sync is publishing NOTHING until this clears. Release deliberately with: ./ait sync --release-quarantine"
+        else
+            _note_skip "quarantine held: $p (t${tid}) — withheld from the remote until t${tid}'s session commits or ends"
+        fi
+    done < "$qf"
+    return 0
+}
+
+_quarantine_persist() {
+    # $1: the ledger path auto_commit resolved (see _quarantine_load_and_prune).
+    local qf="$1" tmp
+    if (( ${#QUARANTINE_HELD[@]} == 0 )); then
+        rm -f "$qf" 2>/dev/null || true
+        return 0
+    fi
+    tmp="${qf}.tmp.$$"
+    printf '%s\n' "${QUARANTINE_HELD[@]}" > "$tmp" 2>/dev/null || return 0
+    mv -f "$tmp" "$qf" 2>/dev/null || rm -f "$tmp" 2>/dev/null || true
+    return 0
+}
+
+# --- The sweep -------------------------------------------------------------
+auto_commit() {
+    local rc=0 dirtyf
+    dirtyf="$(mktemp)" || { _protect "scan_failed" "" "" "unknown" "could not allocate a scratch file — nothing swept"; return 0; }
+    # -uall is MANDATORY, not cosmetic: git's default collapses an untracked
+    # directory to the directory itself, so a new child task shows as
+    # `?? aitasks/t99/`. That has no derivable owner and would be skipped as
+    # ownerless, silently never committing a new child task.
+    #
+    # To a FILE, not a variable: bash discards NUL bytes in command
+    # substitution, so `$(git status -z)` loses every separator it exists for.
+    #
+    # The dirty scan runs BEFORE the lock enumeration on purpose: a lock
+    # acquired while we were scanning is then visible to us. The reverse order
+    # is silently unsafe.
+    task_git status --porcelain -z -uall -- aitasks/ aiplans/ > "$dirtyf" 2>/dev/null || rc=$?
+    if [[ $rc -ne 0 ]]; then
+        rm -f "$dirtyf"
+        _protect "scan_failed" "" "" "unknown" "could not read the worktree status — nothing swept"
+        return 0
+    fi
+
+    # The ONE place the ledger path is resolved: _quarantine_load_and_prune and
+    # _quarantine_persist take it from here, so no consumer can open a fresh,
+    # empty ledger somewhere else.
+    local qf="" q_rc=0
+    # unverified: the ledger cannot be located ⇒ refuse, before the lock is taken
+    qf="$(_quarantine_path)" || q_rc=$?
+    if (( q_rc != 0 )); then
+        rm -f "$dirtyf"
+        _refuse_unresolved_gitdir
+    fi
+    # Fast path: nothing dirty and nothing quarantined is today's no-op, with no
+    # added network cost on the overwhelmingly common clean sync.
+    if [[ ! -s "$dirtyf" && ! -s "$qf" ]]; then
+        rm -f "$dirtyf"
+        return 0
+    fi
+
+    if [[ "$RELEASE_QUARANTINE" == true ]]; then
+        rm -f "$qf" 2>/dev/null || true
+        iwarn "Quarantine released by operator request (--release-quarantine)."
+    fi
+
+    # Serialize the whole classify -> commit phase. `.aitask-data` is ONE
+    # worktree with ONE index shared by every session on this machine, and
+    # task_git does no locking at all. Fail CLOSED: never sweep unlocked.
+    local lock_dir
+    lock_dir="$(ait_lock_dir data_index)"
+    if ! registry_lock_acquire "$lock_dir" 15 "sync auto-commit"; then
+        _protect "lock_contended" "" "" "unknown" "another sync holds the data-index lock — nothing swept"
+        # No commit was made, so nothing is withheld from the remote; but a
+        # quarantine from an EARLIER run must still hold. Evaluate it read-only.
+        _lock_snapshot
+        _quarantine_load_and_prune "$qf"
+        rm -f "$dirtyf"
+        return 0
+    fi
+
+    _lock_snapshot
+    _quarantine_load_and_prune "$qf"
+
+    if [[ -s "$dirtyf" ]]; then
+        _sweep_dirty "$dirtyf"
+    fi
+
+    _quarantine_persist "$qf"
+    registry_lock_release "$lock_dir"
+    rm -f "$dirtyf"
+    return 0
+}
+
+# Group the dirty set by owning task and commit each group path-scoped.
+# Reads the NUL-delimited porcelain from a FILE: bash discards NUL bytes in
+# command substitution, so `$(git status -z)` silently loses every separator.
+# Porcelain XY -> the tree state the rebase gate reasons about. `??` is the only
+# untracked shape; everything else git reports is a tracked path. The
+# distinction is load-bearing: `git rebase` refuses on unstaged TRACKED changes
+# but ignores an untracked path entirely unless an incoming commit creates it.
+_xy_state() {
+    [[ "${1:-}" == "??" ]] && { printf 'untracked'; return 0; }
+    printf 'tracked'
+}
+
+# _protect_task_paths <reason> <tid> <template>
+#
+# A per-TASK protection expanded into one record PER PATH of that task, so the
+# deferral can name files rather than reporting a count of skip events. Reads
+# _sweep_dirty's ent_* arrays through bash's dynamic scope — it is only ever
+# called from there, and its own frame is what keeps them alive.
+#
+# <template> is either the literal `@holder_action` (build the line with
+# _holder_action, which picks the wording from the holder class) or free text
+# containing %PATH%.
+#
+# A task with no surviving entries still records ONE path-less row: a protection
+# that produced no record at all would be a file the user is never told about.
+_protect_task_paths() {
+    local reason="$1" tid="$2" template="$3"
+    local gi hit=0 line class
+    class="$(_holder_class "$tid")"
+    # Here, before the loop and in this frame: _holder_action below runs in $( )
+    # and only reads the memo, and _protect copies it into each record.
+    case "$reason" in
+        live_lock|unknown_liveness) _resolve_holder_pane "$tid" ;;
+    esac
+    for ((gi = 0; gi < ${#ent_path[@]}; gi++)); do
+        [[ "${ent_owner[$gi]}" == "$tid" ]] || continue
+        hit=1
+        if [[ "$template" == "@holder_action" ]]; then
+            line="$(_holder_action "$tid" "${ent_path[$gi]}" "$class")"
+        else
+            line="${template//%PATH%/${ent_path[$gi]}}"
+        fi
+        _protect "$reason" "$tid" "${ent_path[$gi]}" "${ent_state[$gi]}" "$line"
+    done
+    if (( hit == 0 )); then
+        if [[ "$template" == "@holder_action" ]]; then
+            line="$(_holder_action "$tid" "(no files resolved)" "$class")"
+        else
+            line="${template//%PATH%/(no files resolved)}"
+        fi
+        _protect "$reason" "$tid" "" "unknown" "$line"
+    fi
+}
+
+_sweep_dirty() {
+    local tmpf="$1"
+    local -a fields=()
+    local f
+    while IFS= read -r -d '' f; do fields+=("$f"); done < "$tmpf"
+
+    # Parallel indexed arrays, NOT a delimiter-joined string. A git path may
+    # contain a newline, so joining on one would split a single file into two
+    # bogus paths — which then miss in PATH_STATE and, under `set -u`, abort the
+    # whole script with EMPTY stdout: the exact `ERROR: empty output` failure
+    # this sweep exists to avoid. Bash strings cannot hold NUL, so there is no
+    # safe delimiter; carrying the paths as array elements avoids needing one.
+    local -a ent_path=() ent_owner=() ent_state=()
+    local -A owner_seen=()
+    PATH_STATE=()               # path   -> present:<blob> | absent (script scope:
+                                # _commit_group reads it; no namerefs in this tree)
+    local i=0 n=${#fields[@]}
+
+    while (( i < n )); do
+        local entry="${fields[$i]}" xy path orig="" owner owner2 st
+        i=$((i + 1))
+        [[ -z "$entry" ]] && continue
+        xy="${entry:0:2}"
+        path="${entry:3}"
+        # An `R`/`C` entry names TWO paths: with -z the NEXT field is the
+        # source, i.e. <new> then <orig> — the reverse of the arrow display.
+        # (Verified. Note git only emits R when BOTH halves are staged; an
+        # unstaged worktree move arrives as separate ` D <orig>` + `?? <new>`
+        # entries, which group correctly on their own.)
+        if [[ "$xy" == R* || "$xy" == C* ]]; then
+            orig="${fields[$i]:-}"
+            i=$((i + 1))
+        fi
+        [[ -z "$path" ]] && continue
+
+        if ! owner="$(_owner_of_path "$path")"; then
+            if [[ "$COMMIT_UNOWNED" == true ]]; then
+                owner="__unowned__"
+            else
+                # Never sweep an ownerless path into a residual commit — that is
+                # what left aitasks/metadata/stats_config.json with three of its
+                # four commits attributed to unrelated tasks. The report must be
+                # PRESCRIPTIVE: an ownerless dirty file is a standing state.
+                #
+                # Since t1677 the config-editing surfaces (settings TUI, board
+                # column CRUD, chatlink wizard, `ait setup`) commit their own
+                # writes, so most metadata files DO have an owner now — what
+                # reaches here is a hand edit, a deliberately human-reviewed file
+                # like gates.yaml, or a commit that failed. The remedy names the
+                # same helper those writers use, so the advice and the behaviour
+                # cannot drift.
+                _protect "ownerless" "" "$path" "$(_xy_state "$xy")" "ownerless, NOT auto-committed: $path — no session is going to commit this file for you. Clear it with: ./.aitask-scripts/aitask_metadata_commit.sh '$path'   (or, for a path outside aitasks/metadata/, ./ait git add '$path' && ./ait git commit -m '$(ait_metadata_commit_message "$path")')   (or re-run with --commit-unowned)"
+                continue
+            fi
+        fi
+
+        # An entry that legitimately names two paths gets no guessed owner.
+        if [[ -n "$orig" ]]; then
+            if ! owner2="$(_owner_of_path "$orig")" || [[ "$owner2" != "$owner" ]]; then
+                _protect "ambiguous_rename" "$owner" "$path" "$(_xy_state "$xy")" "ambiguous cross-task rename, skipped: '$path' <- '$orig'"
+                continue
+            fi
+        fi
+
+        # Resolve BOTH halves before adding EITHER: a failure on the source
+        # side must not leave a half-added rename in the group.
+        local st_orig=""
+        if ! st="$(_path_state "$path")"; then
+            _protect "unverifiable" "$owner" "$path" "$(_xy_state "$xy")" "could not hash (skipped): $path"
+            continue
+        fi
+        if [[ -n "$orig" ]] && ! st_orig="$(_path_state "$orig")"; then
+            _protect "unverifiable" "$owner" "$orig" "$(_xy_state "$xy")" "could not hash (skipped): $orig"
+            continue
+        fi
+        PATH_STATE["$path"]="$st"
+        ent_path+=("$path"); ent_owner+=("$owner"); ent_state+=("$(_xy_state "$xy")")
+        owner_seen["$owner"]=1
+        if [[ -n "$orig" ]]; then
+            PATH_STATE["$orig"]="$st_orig"
+            # The source half of a rename is by construction TRACKED: git only
+            # emits R when both halves are staged.
+            ent_path+=("$orig"); ent_owner+=("$owner"); ent_state+=("tracked")
+        fi
+    done
+
+    (( ${#owner_seen[@]} )) || return 0
+
+    # An unreadable lock branch is NOT evidence of no locks; an outage can
+    # easily coincide with a live editor. The operator makes the
+    # availability-over-safety call explicitly, never a network failure.
+    if ! _locks_readable && [[ "$ASSUME_UNLOCKED" != true ]]; then
+        local tid
+        for tid in "${!owner_seen[@]}"; do
+            _protect_task_paths "locks_unavailable" "$tid" "t${tid}: %PATH% — lock branch unreadable, so no holder could be checked; left dirty (re-run with --assume-unlocked to override)"
+        done
+        return 0
+    fi
+
+    # Per-task routing. `dead` is the recovery case and the ONLY verdict that
+    # permits committing; `alive` and `unknown` both skip. Fail safe.
+    local -A eligible=() pre_verdict=()
+    local tid verdict
+    for tid in "${!owner_seen[@]}"; do
+        if [[ "$tid" == "__unowned__" ]]; then
+            eligible["$tid"]=1
+            pre_verdict["$tid"]="free"
+            continue
+        fi
+        verdict="$(_holder_verdict "$tid")"
+        pre_verdict["$tid"]="$verdict"
+        case "$verdict" in
+            free|dead) eligible["$tid"]=1 ;;
+            alive)   _protect_task_paths "live_lock" "$tid" "@holder_action" ;;
+            *)       _protect_task_paths "unknown_liveness" "$tid" "t${tid}: %PATH% — the holder could not be verified as gone (${LOCK_HOST[$tid]:-?}); treated as live and left dirty" ;;
+        esac
+    done
+    (( ${#eligible[@]} )) || return 0
+
+    _sync_test_seam pre_commit_phase
+
+    # Step 5a.2 — compare-and-swap the snapshot immediately before committing.
+    # A session can acquire a lock and start editing AFTER our enumeration and
+    # BEFORE this group's commit; the claim path takes hundreds of milliseconds
+    # between its lock push and its own commit, so the window is real.
+    _lock_snapshot
+    for tid in "${!eligible[@]}"; do
+        [[ "$tid" == "__unowned__" ]] && continue
+        verdict="$(_holder_verdict "$tid")"
+        if [[ "$verdict" != "${pre_verdict[$tid]}" ]]; then
+            _protect_task_paths "lock_acquired_during_scan" "$tid" "t${tid}: %PATH% — was locked while we were scanning, so the group was dropped; re-run once that session settles"
+            unset "eligible[$tid]"
+        fi
+    done
+
+    local msg
+    for tid in "${!eligible[@]}"; do
+        local -a paths=()
+        local gi
+        for ((gi = 0; gi < ${#ent_path[@]}; gi++)); do
+            [[ "${ent_owner[$gi]}" == "$tid" ]] && paths+=("${ent_path[$gi]}")
+        done
+        (( ${#paths[@]} )) || continue
+
+        if [[ "$tid" == "__unowned__" ]]; then
+            # A message that stays true regardless of who appended — the same
+            # rule aitask_pick_own.sh applies to the shared contributor list.
+            msg="ait: Auto-commit unowned task data before sync"
+        else
+            msg="ait: Auto-commit t${tid} task data before sync"
+        fi
+        _commit_group "$tid" "$msg" "${paths[@]}"
+    done
+    return 0
+}
+
+# Commit ONE owner's paths. <state_ref> is the name of the path_state map.
+# The tree state recorded for <path> during the scan. _commit_group runs inside
+# _sweep_dirty's frame, so ent_* are visible here through bash's dynamic scope.
+# `unknown` is the fail-safe answer: a path we cannot classify must block the
+# rebase rather than be assumed harmless.
+_group_state() {
+    local want="$1" gi
+    for ((gi = 0; gi < ${#ent_path[@]}; gi++)); do
+        [[ "${ent_path[$gi]}" == "$want" ]] && { printf '%s' "${ent_state[$gi]}"; return 0; }
+    done
+    printf 'unknown'
+}
+
+# A group-wide protection expanded to one record per path of the group. Same
+# shape as _protect_task_paths, but driven by _commit_group's own `paths` array
+# (the group is already resolved by the time it runs).
+_protect_group_paths() {
+    local reason="$1" tid="$2" template="$3" gp
+    for gp in "${paths[@]}"; do
+        _protect "$reason" "$tid" "$gp" "$(_group_state "$gp")" "${template//%PATH%/$gp}"
+    done
+}
+
+_commit_group() {
+    local tid="$1" msg="$2"; shift 2
+    local -a paths=("$@")
+    local p now cur rc
+
+    # Hazard B — never touch an index entry another session staged. `add` would
+    # replace it and `reset` would remove it, destroying in-flight work while
+    # trying not to swallow it. Defer the whole group instead.
+    local staged="" s_rc=0
+    # unverified: the shared index cannot be read, so whether another session
+    # staged these paths is unknown ⇒ defer the group, the same outcome as a
+    # detection. aidocs/framework/failopen_git_probes.md row A3.
+    staged="$(task_git diff --cached --name-only -- "${paths[@]}" 2>/dev/null)" || s_rc=$?
+    if (( s_rc != 0 )); then
+        _protect_group_paths "unverifiable" "$tid" \
+            "t${tid}: %PATH% — could not read the shared index (git diff --cached rc=${s_rc}), so whether another session staged these paths is unknown; the group was deferred. Re-run sync once the index is readable."
+        return 0
+    fi
+    if [[ -n "$staged" ]]; then
+        local sp
+        for sp in "${paths[@]}"; do
+            _protect "staged_elsewhere" "$tid" "$sp" "$(_group_state "$sp")" \
+                "t${tid}: $sp — another session has staged $(echo "$staged" | tr '\n' ' ')so the whole group was deferred; let that session finish"
+        done
+        return 0
+    fi
+
+    # Step 5a.3 — re-derive the STATE (not just a hash) immediately before the
+    # commit and require it to be unchanged. Both transition directions matter:
+    # absent->present is a deleted file another session recreated, which a
+    # hash-only check cannot see at all.
+    for p in "${paths[@]}"; do
+        if ! now="$(_path_state "$p")"; then
+            _protect_group_paths "unverifiable" "$tid" "t${tid}: %PATH% — could not re-hash '$p' just before the commit, so the group was skipped"
+            return 0
+        fi
+        # `:-` guard: a miss must degrade to "skip this group", never abort the
+        # script under `set -u` with no stdout.
+        if [[ "$now" != "${PATH_STATE[$p]:-}" ]]; then
+            _protect_group_paths "content_changed" "$tid" "t${tid}: %PATH% — '$p' changed after classification, so the group was skipped; re-run once that session settles"
+            return 0
+        fi
+    done
+
+    # --- commit-on-behalf guards ------------------------------------------
+    #
+    # These apply only to a group that reached here through --commit-for-task,
+    # i.e. one whose owning session is LIVE. Everything a UI showed the user is
+    # a snapshot; these re-validate it at the moment of effect.
+    #
+    # PLACEMENT IS LOAD-BEARING: after the 5a.3 re-check (so they judge settled
+    # state) but BEFORE the staging loop below. Both of them abandon the group
+    # with `return 0`, and a path this run had already staged would stay in the
+    # shared index -- where it blocks the rebase exactly like an unstaged one,
+    # which is why the commit-failed path further down has to unstage. Running
+    # before anything is staged means there is nothing to unwind.
+    if _commit_for_task_listed "$tid"; then
+        # --expect-path: the caller states the exact dirty set it showed. If the
+        # group has grown or shrunk since, the confirmation the user gave was
+        # for a different set of files, so it does not carry.
+        if [[ "$EXPECT_PATHS_SET" == true ]]; then
+            local -A want=() have=()
+            local w pw delta=""
+            for w in ${EXPECT_PATHS+"${EXPECT_PATHS[@]}"}; do
+                pw="$(_pct_decode "$w")"; want["$pw"]=1
+            done
+            for p in "${paths[@]}"; do have["$p"]=1; done
+            for p in "${paths[@]}"; do
+                [[ -n "${want[$p]:-}" ]] || delta+=" +$p"
+            done
+            for w in "${!want[@]}"; do
+                [[ -n "${have[$w]:-}" ]] || delta+=" -$w"
+            done
+            if [[ -n "$delta" ]]; then
+                _protect_group_paths "commit_scope_changed" "$tid" \
+                    "t${tid}: %PATH% — the dirty set changed after it was confirmed (${delta# }); nothing was committed. Re-check and confirm again."
+                return 0
+            fi
+        fi
+
+        # --require-waiting: only commit on behalf of a session that is parked
+        # on a prompt, re-probed HERE rather than trusted from the snapshot the
+        # UI rendered, or from this run's memo. FAILS CLOSED: a pane that cannot
+        # be resolved, a probe that cannot run and a probe that establishes
+        # nothing all read as not waiting. Never commit another session's work on
+        # the strength of a check that did not run.
+        if [[ "$REQUIRE_WAITING" == true ]]; then
+            local pane_state="unresolvable" hline="" hpane_id="" htarget="" hstate=""
+            if declare -F ait_tmux_pane_for_pid >/dev/null; then
+                hline="$(ait_tmux_pane_for_pid "${LOCK_PID[$tid]:-}" 2>/dev/null)" || hline=""
+            fi
+            # The helper answers "<pane_id>\t<target>"; the probe takes the id.
+            if [[ "$hline" == *$'\t'* ]]; then
+                hpane_id="${hline%%$'\t'*}"
+                htarget="${hline#*$'\t'}"
+                hstate="$(_probe_pane_state "$hpane_id")"
+                [[ -n "$hstate" ]] && pane_state="$hstate"
+            fi
+            # The fresh observation replaces the memo, so a holder_not_waiting
+            # record carries the pane and state this decision was made on.
+            HOLDER_PANE_DONE["$tid"]=1
+            HOLDER_PANE["$tid"]="$htarget"
+            HOLDER_PANE_STATE["$tid"]="$hstate"
+            if [[ "$pane_state" != waiting_* ]]; then
+                _protect_group_paths "holder_not_waiting" "$tid" \
+                    "t${tid}: %PATH% — t${tid}'s session is not parked on a prompt (observed: ${pane_state}), so its files were left alone. Answer that session, or re-run without --require-waiting to override deliberately."
+                return 0
+            fi
+        fi
+    fi
+
+    # Stage ONLY untracked paths, and remember exactly which — a pathspec cannot
+    # name a file git does not know about, but a tracked path needs no staging
+    # because `commit -o` takes worktree content. Recording what we staged is
+    # what lets the failure path unstage our entries and nobody else's.
+    local -a staged_by_us=()
+    for p in "${paths[@]}"; do
+        if ! task_git ls-files --error-unmatch -- "$p" >/dev/null 2>&1; then
+            [[ "${PATH_STATE[$p]:-}" == absent ]] && continue
+            if task_git add -- "$p" >/dev/null 2>&1; then
+                staged_by_us+=("$p")
+            fi
+        fi
+    done
+
+    _sync_test_seam pre_group_commit
+
+    rc=0
+    task_git_commit_scoped --no-stage "$msg" "${paths[@]}" || rc=$?
+    if [[ $rc -eq 1 ]]; then
+        # A path left staged blocks the rebase exactly like an unstaged one, so
+        # the cleanup is required — but it is scoped to entries THIS run created,
+        # which is what keeps it from unstaging another session's work.
+        if (( ${#staged_by_us[@]} )); then
+            task_git reset -q -- "${staged_by_us[@]}" >/dev/null 2>&1 || true
+        fi
+        _protect_group_paths "commit_failed" "$tid" "t${tid}: %PATH% — the commit failed, so the file was left dirty"
+        return 0
+    fi
+    [[ $rc -eq 2 ]] && return 0   # verified nothing to commit
+
+    # Progress parity with the pre-t1599_3 "Auto-committing N files..." line,
+    # now per group so the user can see WHICH task each commit belongs to.
+    # iinfo is a no-op in batch mode, where stdout is the data channel.
+    if [[ "$tid" == "__unowned__" ]]; then
+        iinfo "Auto-committed ${#paths[@]} unowned task/plan file(s)"
+    else
+        iinfo "Auto-committed ${#paths[@]} file(s) for t${tid}"
+    fi
+
+    # Say plainly what was just done on someone's behalf. The sweep cannot see
+    # whether that session was mid-edit but momentarily quiet, so the content is
+    # whatever it happened to be at this instant — and the person who asked for
+    # it is the only one who can judge that. warn() so it survives --batch,
+    # where stdout is the data channel.
+    if _commit_for_task_listed "$tid"; then
+        warn "t${tid}'s session is live — its uncommitted edits were committed as they stand now (${#paths[@]} file(s))"
+    fi
+
+    # Step 5a.4 — guard publication, PER STATE. A `present` path must resolve in
+    # HEAD to the blob we classified; an `absent` one must NOT resolve at all
+    # (that absence is what records a deletion or a rename's source side).
+    for p in "${paths[@]}"; do
+        rc=0
+        cur="$(task_git rev-parse --verify --quiet "HEAD:$p" 2>/dev/null)" || rc=$?
+        if [[ "${PATH_STATE[$p]:-}" == absent ]]; then
+            (( rc != 0 )) && continue
+            _quarantine_add "$p" "$cur" "$tid"
+        else
+            local want="${PATH_STATE[$p]:-}"; want="${want#present:}"
+            [[ $rc -eq 0 && "$cur" == "$want" ]] && continue
+            _quarantine_add "$p" "${cur:-$want}" "$tid"
+        fi
+    done
+    return 0
+}
+
+# Record a commit whose content we cannot vouch for. It is NOT un-made:
+# reversing it would mean `reset --soft/--mixed HEAD^`, which moves HEAD and
+# leaves the content in the SHARED index — Hazard B, against a path another
+# session is actively writing.
+_quarantine_add() {
+    local p="$1" blob="$2" tid="$3"
+    QUARANTINE_HELD+=("$(_pct_encode "$p")|${blob}|${tid}|$(date +%s)")
+    PUBLICATION_BLOCKED+=("$p")
+    _note_skip "PUBLICATION WITHHELD: $p was rewritten while t${tid}'s commit was being made. The commit is local-only and will NOT be pushed until t${tid}'s session commits its own version or ends."
+}
+
+# Everything skipped, with its reason. STDERR in BOTH modes: in batch mode
+# stdout is the data channel and parse_sync_output() reads the FIRST non-empty
+# line, so a report line there would be consumed as the status.
+# --- The rebase gate ------------------------------------------------------
+#
+# Which incoming paths a pull would check out. Populated once per fetch.
+declare -A INCOMING=()
+
+# 0 = INCOMING is authoritative; 1 = unknown (caller must fail closed).
+#
+# NUL-DELIMITED, VIA A FILE. `$(task_git diff --name-only …)` is wrong twice
+# over, and both ways fail OPEN — the membership test misses and the gate lets a
+# rebase overwrite the very file it is protecting:
+#
+#   * a path containing a newline is split into two names that match nothing;
+#   * git C-QUOTES paths with unusual bytes by default, so `"a\nb.md"` never
+#     compares equal to the raw porcelain path the sweep recorded;
+#   * and `$( )` discards NUL outright, which is why the dirty scan in
+#     auto_commit already writes to a file for exactly this reason.
+#
+# NO TRAP IS NEEDED, AND THAT IS A PROPERTY TO PRESERVE. Between mktemp and
+# `rm -f` there is no exit point: `diff` is on the read-only allowlist so
+# task_git cannot die() here, `|| rc=$?` absorbs the status under `set -e`, and
+# the read loop cannot exit. This script has no trap at all and its deferral,
+# conflict and network paths all exit from nested functions, so a temp file
+# allocated at call-site scope would leak on every one of them. Anything added
+# inside this window must keep it exit-free.
+_load_incoming() {
+    INCOMING=()
+    local incf p rc=0
+    incf="$(mktemp)" || return 1
+    # --no-renames: with rename detection an incoming rename X->Y lists only Y,
+    # so a protected X the checkout is about to delete would never be seen and
+    # the run would fail with ERROR:pull_rebase_failed instead of deferring.
+    task_git diff --name-only -z --no-renames "HEAD..@{u}" > "$incf" 2>/dev/null || rc=$?
+    if [[ $rc -eq 0 ]]; then
+        while IFS= read -r -d '' p; do INCOMING["$p"]=1; done < "$incf"
+    fi
+    rm -f "$incf"
+    return $rc
+}
+
+# _rebase_blocked <local_ahead> <remote_ahead> — 0 = blocked, 1 = not blocked.
+#
+# The old rule was "any protected file AND remote_ahead > 0". That deferred two
+# cases that nothing actually blocks, which is what made a parked pane able to
+# stall a whole branch (t1725, finding 4). The rule is now five-way:
+#
+#   1. remote_ahead == 0  -> NOT blocked, unconditionally. There is no rebase to
+#      block; do_push needs no clean tree, so eligible commits still publish.
+#      This clause is what keeps the deliberate asymmetry (t1599_3) intact.
+#   2. tree_state=unknown -> blocked. We could not classify the file, and an
+#      unclassified file is not an absent one.
+#   3. tracked AND local_ahead > 0 -> blocked. Replaying local commits needs a
+#      clean tree; `git pull --rebase` refuses with unstaged tracked changes.
+#      Blocked is not yet deferred: on a DIVERGED branch main and do_push's
+#      retry then try the guarded merge (t1731, _converge_by_guarded_merge),
+#      which needs no clean tree and declines unless it is provably safe.
+#   4. path is INCOMING -> blocked, tracked or untracked alike. The checkout
+#      would overwrite the file we are protecting.
+#   5. otherwise -> NOT blocked. With local_ahead == 0 do_pull_rebase
+#      fast-forwards (a fast-forward never conflicts); with local_ahead > 0 only untracked,
+#      non-incoming files remain, which a rebase ignores.
+_rebase_blocked() {
+    local local_ahead="$1" remote_ahead="$2" i
+
+    [[ "$remote_ahead" -gt 0 ]] || return 1
+
+    for ((i = 0; i < ${#PROT_REASON[@]}; i++)); do
+        [[ "${PROT_STATE[$i]}" == "unknown" ]] && return 0
+        if [[ "${PROT_STATE[$i]}" == "tracked" && "$local_ahead" -gt 0 ]]; then
+            return 0
+        fi
+        local pth="${PROT_PATH[$i]}"
+        if [[ -n "$pth" && -n "${INCOMING[$pth]:-}" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# --- guarded merge (t1731) ---------------------------------------------------
+#
+# A DIVERGED branch (local_ahead > 0 AND remote_ahead > 0) whose rebase is
+# blocked used to defer forever: `git pull --rebase` refuses on ANY unstaged
+# tracked change, and with commits on both sides no fast-forward exists. With
+# several agents sharing one checkout that is the steady state, not an incident.
+# A merge refuses only when it would OVERWRITE a dirty file, so when the checks
+# below prove the merge cannot touch a protected path, sync converges by merge
+# commit instead. Merge commits on aitask-data are an accepted, routine outcome
+# of this path; the rebase stays the preferred route whenever _rebase_blocked
+# lets it run, and this path is tried only when it does not.
+#
+# Built so that nothing is written before everything is known:
+#   1. pin HEAD and @{u} to SHAs once — a concurrent fetch or a holder's commit
+#      can move either ref mid-run, and every later step must see one world;
+#   2. decide (_guarded_merge_prepare), writing nothing but loose objects;
+#   3. build the commit from merge-tree's tree with commit-tree, so its tree is
+#      exactly that tree and no worktree or index byte can enter it;
+#   4. advance with `merge --ff-only --no-autostash --no-overwrite-ignore`, the
+#      ONE command here that writes the worktree. It checks before writing,
+#      refuses to overwrite a dirty, untracked or IGNORED file (git's default
+#      overwrites ignored files silently, and a file created after step 2's scan
+#      is stopped only here), leaves unrelated staged entries alone, refuses if
+#      HEAD moved off the pinned SHA, and never leaves a MERGE_HEAD — so there is
+#      never an --abort, and a refusal is a deferral, not an error.
+#
+# Every refusal names one slug from a closed set, on stderr only (the wire keeps
+# DEFERRED:protected_dirty as its one status):
+#   not_diverged  unknown_state  rev_unresolved  multiple_merge_bases
+#   sides_overlap  merge_conflict  protected_written  ignored_written  ff_refused
+# One slug per guard is what lets tests/test_sync_guarded_merge.sh tell which
+# guard refused apart from git's own backstops; its completeness scan reads the
+# `_gm_refuse <slug>` call sites below.
+#
+# Every git read goes through _ait_data_git, not task_git: task_git's wedge
+# assertion die()s, and a die() here would exit with empty stdout. Only the
+# fast-forward goes through task_git — inside $( ), where a die() is confined to
+# a non-zero status and read as a refusal.
+GM_SLUG=""
+GM_REFUSAL=""
+GM_H=""
+GM_U=""
+GM_TREE=""
+GM_MERGED=""        # the merge commit this run advanced to ("" = none)
+declare -A GM_LOCAL_SIDE=() GM_REMOTE_SIDE=()
+GM_WRITTEN=()
+GM_IGNORED=()
+GM_HIT_W=""         # _gm_ignored_hit: the written path ...
+GM_HIT_P=""         # ... and the ignored file it touches
+
+# _gm_refuse <slug> <detail> — record why the guarded merge declined. Returns 0;
+# the caller returns 1, so recording a refusal can never trip `set -e` itself.
+_gm_refuse() {
+    GM_SLUG="$1"
+    GM_REFUSAL="$2"
+}
+
+_gm_report_refusal() {
+    echo "sync: Guarded merge not possible (${GM_SLUG:-unknown}): ${GM_REFUSAL}" >&2
+}
+
+# A path for a human line on stderr, shell-quoted so a newline in it cannot forge
+# a second line.
+_gm_show() { printf '%q' "$1"; }
+
+# _gm_names_into <local|remote|written|ignored> <git args...> — run a NUL-emitting
+# git listing and load it into the named set. Non-zero when git failed: an
+# unknown set is not an empty one, and every caller refuses on it.
+#
+# The same exit-free mktemp -> read -> rm window as _load_incoming: nothing
+# between mktemp and rm can exit (_ait_data_git never die()s, `|| rc=$?` absorbs
+# the status, the read loop cannot fail), so no trap is needed.
+_gm_names_into() {
+    local set="$1" f p rc=0
+    shift
+    f="$(mktemp)" || return 1
+    _ait_data_git "$@" > "$f" 2>/dev/null || rc=$?
+    if [[ $rc -eq 0 ]]; then
+        while IFS= read -r -d '' p; do
+            case "$set" in
+                local)   GM_LOCAL_SIDE["$p"]=1 ;;
+                remote)  GM_REMOTE_SIDE["$p"]=1 ;;
+                written) GM_WRITTEN+=("$p") ;;
+                ignored) GM_IGNORED+=("$p") ;;
+            esac
+        done < "$f"
+    fi
+    rm -f "$f"
+    return $rc
+}
+
+# _gm_collides <p> <w> — 0 when writing <w> would touch <p>: the same path, one
+# under the other (a directory/file clash, either direction), or either of those
+# after case-folding, because a case-insensitive filesystem (macOS) maps both
+# names onto one file. The path is quoted inside each pattern so glob characters
+# in it match literally.
+_gm_collides() {
+    local p="$1" w="$2" lp lw
+    [[ "$p" == "$w" || "$w" == "$p/"* || "$p" == "$w/"* ]] && return 0
+    lp="${p,,}"
+    lw="${w,,}"
+    [[ "$lp" == "$lw" || "$lw" == "$lp/"* || "$lp" == "$lw/"* ]] && return 0
+    return 1
+}
+
+# _gm_ignored_hit — does writing any path in GM_WRITTEN touch an ignored file
+# that exists now? 0 = yes (GM_HIT_W / GM_HIT_P name one pair), 1 = no, 2 = the
+# ignored files could not be listed (an unknown set is not an empty one: every
+# caller refuses on it). Shared by the guarded merge and do_pull_rebase (t1792).
+#
+# The relation is exactly _gm_collides's — the same path, one under the other,
+# either of those after case-folding — but INDEXED rather than pairwise: in
+# legacy mode the ignored set is the whole project's (12k+ entries measured on
+# this repository), and an ignored x written loop on every pull would cost
+# seconds. Written paths and every ancestor of each are keyed case-folded; each
+# ignored file is then a lookup plus a walk up its own ancestors.
+_gm_ignored_hit() {
+    GM_IGNORED=(); GM_HIT_W=""; GM_HIT_P=""
+    (( ${#GM_WRITTEN[@]} )) || return 1
+    _gm_names_into ignored ls-files -z -o -i --exclude-standard || return 2
+    (( ${#GM_IGNORED[@]} )) || return 1
+    local -A wpath=() wunder=()
+    local w p k a
+    for w in "${GM_WRITTEN[@]}"; do
+        k="${w,,}"; wpath["$k"]="$w"; a="$k"
+        while [[ "$a" == */* ]]; do
+            a="${a%/*}"
+            [[ -n "${wunder[$a]:-}" ]] && break   # this ancestor and all above it are in
+            wunder["$a"]="$w"
+        done
+    done
+    for p in "${GM_IGNORED[@]}"; do
+        k="${p,,}"
+        # p is written itself, or a written path lies under p ...
+        w="${wpath[$k]:-${wunder[$k]:-}}"
+        # ... or p lies under a written path.
+        a="$k"
+        while [[ -z "$w" && "$a" == */* ]]; do
+            a="${a%/*}"
+            w="${wpath[$a]:-}"
+        done
+        if [[ -n "$w" ]]; then
+            GM_HIT_W="$w"; GM_HIT_P="$p"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# _guarded_merge_prepare <local_ahead> <remote_ahead> — 0 = provably safe (sets
+# GM_H GM_U GM_TREE), 1 = not (sets GM_SLUG / GM_REFUSAL). Writes nothing but
+# merge-tree's loose objects.
+_guarded_merge_prepare() {
+    local local_ahead="$1" remote_ahead="$2" i p w base bases mt n
+    GM_SLUG=""; GM_REFUSAL=""; GM_H=""; GM_U=""; GM_TREE=""
+    GM_LOCAL_SIDE=(); GM_REMOTE_SIDE=(); GM_WRITTEN=(); GM_IGNORED=()
+
+    # Diverged only. Behind-only belongs to do_pull_rebase's fast-forward: with nothing of
+    # our own to merge, a merge commit would add nothing but a second parent.
+    if [[ "$local_ahead" -le 0 || "$remote_ahead" -le 0 ]]; then
+        _gm_refuse not_diverged "local_ahead=$local_ahead remote_ahead=$remote_ahead"
+        return 1
+    fi
+    for ((i = 0; i < ${#PROT_STATE[@]}; i++)); do
+        if [[ "${PROT_STATE[$i]}" == "unknown" ]]; then
+            _gm_refuse unknown_state "a protected entry could not be classified"
+            return 1
+        fi
+    done
+
+    # Pin once. Every step below takes these SHAs, never HEAD or @{u}.
+    GM_H="$(_ait_data_git rev-parse --verify --quiet 'HEAD^{commit}' 2>/dev/null)" || GM_H=""
+    GM_U="$(_ait_data_git rev-parse --verify --quiet '@{u}^{commit}' 2>/dev/null)" || GM_U=""
+    if [[ ! "$GM_H" =~ ^[0-9a-f]{40,64}$ || ! "$GM_U" =~ ^[0-9a-f]{40,64}$ ]]; then
+        _gm_refuse rev_unresolved "HEAD or @{u} did not resolve to a commit"
+        return 1
+    fi
+
+    # Exactly one merge base. With criss-cross history ort merges against a
+    # virtual base, and a side diff from any one real base is not what it does.
+    bases="$(_ait_data_git merge-base --all "$GM_H" "$GM_U" 2>/dev/null)" || bases=""
+    n=0
+    [[ -n "$bases" ]] && n="$(printf '%s\n' "$bases" | wc -l | tr -d ' ')"
+    if [[ "$n" != "1" ]]; then
+        _gm_refuse multiple_merge_bases "expected exactly one merge base, found $n"
+        return 1
+    fi
+    base="$bases"
+
+    # POLICY: the two sides changed disjoint path sets, so no path is a conflict
+    # candidate and no merge driver is ever consulted. --no-renames, because
+    # rename detection lists only a rename's destination, and "local renamed
+    # A->B, remote modified A" would then look disjoint.
+    if ! _gm_names_into local diff --name-only -z --no-renames "$base" "$GM_H" \
+       || ! _gm_names_into remote diff --name-only -z --no-renames "$base" "$GM_U"; then
+        _gm_refuse unknown_state "could not list the paths each side changed"
+        return 1
+    fi
+    if (( ${#GM_LOCAL_SIDE[@]} )); then
+        for p in "${!GM_LOCAL_SIDE[@]}"; do
+            if [[ -n "${GM_REMOTE_SIDE[$p]:-}" ]]; then
+                _gm_refuse sides_overlap "local and remote both changed $(_gm_show "$p")"
+                return 1
+            fi
+        done
+    fi
+
+    # PROOF: git's own merge of the pinned commits is clean. This catches what
+    # path-disjointness cannot see, e.g. a file on one side where the other adds
+    # a directory. The first line of the output is the merged tree.
+    mt="$(_ait_data_git merge-tree --write-tree --no-messages "$GM_H" "$GM_U" 2>/dev/null)" || {
+        _gm_refuse merge_conflict "git merge-tree did not produce a clean merge"
+        return 1
+    }
+    GM_TREE="${mt%%$'\n'*}"
+    if [[ ! "$GM_TREE" =~ ^[0-9a-f]{40,64}$ ]]; then
+        _gm_refuse merge_conflict "git merge-tree produced no tree id"
+        return 1
+    fi
+
+    # Protection is checked against exactly the paths the fast-forward writes.
+    if ! _gm_names_into written diff --name-only -z --no-renames "$GM_H" "$GM_TREE"; then
+        _gm_refuse unknown_state "could not list the paths the merge writes"
+        return 1
+    fi
+    (( ${#GM_WRITTEN[@]} )) || return 0
+    for ((i = 0; i < ${#PROT_PATH[@]}; i++)); do
+        p="${PROT_PATH[$i]}"
+        [[ -n "$p" ]] || continue
+        for w in "${GM_WRITTEN[@]}"; do
+            if _gm_collides "$p" "$w"; then
+                _gm_refuse protected_written \
+                    "the merge writes $(_gm_show "$w"), which touches protected $(_gm_show "$p")"
+                return 1
+            fi
+        done
+    done
+
+    # Ignored files present NOW. The sweep never protects them, and git's default
+    # overwrites them silently. This is the early, specific refusal; a file that
+    # appears after this scan is stopped by --no-overwrite-ignore instead.
+    local ig_rc=0
+    _gm_ignored_hit || ig_rc=$?
+    case $ig_rc in
+        0)  _gm_refuse ignored_written \
+                "the merge writes $(_gm_show "$GM_HIT_W"), over ignored $(_gm_show "$GM_HIT_P")"
+            return 1 ;;
+        2)  _gm_refuse unknown_state "could not list ignored files"
+            return 1 ;;
+    esac
+    return 0
+}
+
+# _converge_by_guarded_merge <local_ahead> <remote_ahead>
+#   0 = HEAD advanced to a verified merge commit (GM_MERGED); the caller pushes.
+#   1 = declined and nothing changed (GM_SLUG / GM_REFUSAL); the caller defers.
+#   2 = an unexpected failure, already reported as ERROR:<...>; never push.
+_converge_by_guarded_merge() {
+    _guarded_merge_prepare "$1" "$2" || return 1
+
+    local c now p ff_rc=0 ff_err=""
+    local n=${#PROT_REASON[@]}
+    local -a prot_paths=()
+
+    c="$(_ait_data_git commit-tree "$GM_TREE" -p "$GM_H" -p "$GM_U" \
+        -m "ait: Merge ${GM_U:0:12} into aitask-data — rebase blocked by ${n} protected file(s)" \
+        2>/dev/null)" || c=""
+    if [[ ! "$c" =~ ^[0-9a-f]{40,64}$ ]]; then
+        batch_out "ERROR:guarded_merge_failed"
+        warn "Guarded merge: could not create the merge commit; nothing was changed."
+        return 2
+    fi
+
+    _sync_test_seam pre_guarded_ff
+
+    ff_err="$(task_git merge --ff-only --no-autostash --no-overwrite-ignore --quiet "$c" 2>&1)" || ff_rc=$?
+    if [[ $ff_rc -ne 0 ]]; then
+        _gm_refuse ff_refused "the fast-forward to the merge was refused: ${ff_err//$'\n'/ }"
+        return 1
+    fi
+
+    # Deterministic checks only. A byte-hash of the protected files would be
+    # racy — their holder is live and may write them at any moment — and would
+    # prove nothing about the merge. What the merge guarantees is that its tree
+    # leaves every protected path exactly as HEAD had it.
+    now="$(_ait_data_git rev-parse --verify --quiet HEAD 2>/dev/null)" || now=""
+    for p in "${PROT_PATH[@]}"; do
+        if [[ -n "$p" ]]; then prot_paths+=("$p"); fi
+    done
+    if [[ "$now" != "$c" ]] || { (( ${#prot_paths[@]} )) \
+        && ! GIT_LITERAL_PATHSPECS=1 _ait_data_git diff --quiet "$GM_H" "$c" -- "${prot_paths[@]}" 2>/dev/null; }; then
+        batch_out "ERROR:guarded_merge_unverified"
+        warn "Guarded merge: HEAD is ${now:-unresolvable}, expected $c with every protected path unchanged; nothing will be pushed."
+        return 2
+    fi
+
+    GM_MERGED="$c"
+    echo "sync: guarded merge ${c:0:12} (${GM_U:0:12} into ${GM_H:0:12}); ${n} protected file(s) left uncommitted" >&2
+    return 0
+}
+
+# A merge landed but its push did not (it deferred, or the network failed): say
+# so on stderr, so a deferral or NO_NETWORK token is not mistaken for "nothing
+# happened". The next run publishes it, or a plain rebase linearizes it.
+_gm_note_unpublished() {
+    [[ -n "$GM_MERGED" ]] || return 0
+    echo "sync: merge ${GM_MERGED:0:12} was made locally and is not yet published" >&2
+}
+
+# The ONE emitter for a protected_dirty deferral: the status line plus one
+# DEFERRED_FILE: continuation per record. Both call sites (main and do_push) go
+# through here so the two can never drift, and so records are emitted only
+# alongside a status line that declares them.
+#
+# The first line keeps its `DEFERRED:protected_dirty:` prefix and the closed
+# three-reason set, so parse_sync_output and the token-contract scan are
+# unaffected. Its detail text now carries per-sub-reason counts instead of the
+# wrong "held by other sessions" (all 13 locks in the incident that motivated
+# this belonged to the user running the sync).
+_emit_protected_deferral() {
+    local n=${#PROT_REASON[@]} i counts="" r
+    local -A tally=()
+    for ((i = 0; i < n; i++)); do
+        tally["${PROT_REASON[$i]}"]=$(( ${tally["${PROT_REASON[$i]}"]:-0} + 1 ))
+    done
+    for r in $(printf '%s\n' "${!tally[@]}" | sort); do
+        counts+=" ${r}=${tally[$r]}"
+    done
+    batch_out "DEFERRED:protected_dirty:${n} file(s) block the rebase:${counts}"
+
+    for ((i = 0; i < n; i++)); do
+        # Every textual field is percent-encoded: a git path may contain `|` and
+        # a newline, `hostname` and `locked_by` are user-controlled, and a tmux
+        # session name (t1725_4's pane target) may contain both. The closed and
+        # numeric fields travel bare and are validated by the parser.
+        batch_detail "DEFERRED_FILE:${PROT_REASON[$i]}|${PROT_TASK[$i]}|$(_pct_encode "${PROT_PATH[$i]}")|${PROT_STATE[$i]}|${PROT_HOLDER[$i]}|$(_pct_encode "${PROT_EMAIL[$i]}")|$(_pct_encode "${PROT_HOST[$i]}")|${PROT_PID[$i]}|$(_pct_encode "${PROT_PANE[$i]}")|${PROT_PANE_STATE[$i]}|$(_pct_encode "${PROT_ACTION[$i]}")"
+    done
+    # Neutral wording: this emitter serves both main() and do_push()'"'"'s retry, and
+    # each adds its own context line after it.
+    iwarn "Sync deferred: ${n} protected file(s) block the rebase."
+}
+
+report_skipped() {
+    (( ${#SKIP_REPORT[@]} )) || return 0
+    local l
+    {
+        echo "sync: not everything was auto-committed —"
+        for l in "${SKIP_REPORT[@]}"; do echo "  - $l"; done
+    } >&2
+    return 0
+}
+
+# --- Fetch with timeout ---
+# --- Routine-fetch exclusion guard (t2099) ---------------------------------
+#
+# The broad `fetch origin` below follows every positive mapping, so a gitbranch
+# artifact store on origin is excluded only by the ^refs/heads/<store> entries
+# `ait artifact fetch-exclusion apply` maintains. A clone learns a NEW store
+# branch (a migration target) only from the data branch, so before each broad
+# fetch the guard fetches the data branch ALONE, applies the exclusion from the
+# union of the local and fetched config + store record, and only then lets the
+# broad fetch run. It FAILS CLOSED: when protection cannot be established, the
+# broad fetch does not run and the sync defers (retried by the next sync).
+#
+# Remaining window (not closable here): a migration pushes the new store branch
+# before the record naming it reaches the remote, so until the migrating clone
+# syncs, other clones' broad fetches can download the new branch once.
+#
+# Every apply is keyed by a fingerprint of its inputs (lib/artifact_fetch_
+# exclusion.sh): an unchanged fingerprint skips the CLI entirely; a failed apply
+# stores none, so the next sync retries.
+_SYNC_AFX_REASON=""
+
+# _sync_afx_data_ref -- print the remote-tracking ref of the data branch.
+_sync_afx_data_ref() {
+    local db
+    # Full ref, never --short: beside a same-named tag --short answers
+    # "heads/<b>", and the guard would then fetch a branch that does not exist,
+    # read the miss as "no remote data branch" and let the broad fetch run (t2132).
+    db="$(git -C "$_AIT_DATA_WORKTREE" symbolic-ref -q HEAD)" || return 1
+    case "$db" in
+        refs/heads/?*) db="${db#refs/heads/}" ;;
+        *)             return 1 ;;
+    esac
+    printf 'refs/remotes/origin/%s' "$db"
+}
+
+# _sync_afx_reconcile [<ref>] -- fingerprint fast path, else the locked apply.
+# 0 = protection established (applied, unchanged, not configured, or an old git
+# that can never be protected); 1 = unknown (_SYNC_AFX_REASON says why).
+_sync_afx_reconcile() {
+    local ref="${1:-}" fp stored rc=0
+    local -a ref_arg=()
+    [[ -n "$ref" ]] && ref_arg=( --also-ref "$ref" )
+    fp="$(afx_fingerprint "$_AIT_DATA_WORKTREE" "$ref")" \
+        || { _SYNC_AFX_REASON="fingerprint_failed"; return 1; }
+    stored="$(git config --get "$AFX_FINGERPRINT_KEY" 2>/dev/null)" || stored=""
+    [[ "$fp" == "$stored" ]] && return 0
+    "$SCRIPT_DIR/aitask_artifact.sh" fetch-exclusion apply --if-changed "${ref_arg[@]}" >/dev/null || rc=$?
+    if (( rc != 0 )); then
+        _SYNC_AFX_REASON="apply_failed"
+        return 1
+    fi
+    return 0
+}
+
+# _sync_fetch_exclusion_guard -- run immediately before EVERY broad fetch.
+# 0 = proceed; 124 = timed out, 3 = remote unreachable (the caller reports
+# NO_NETWORK); 1 = protection unknown (the caller defers). In every non-zero case
+# the caller does NOT run its broad fetch.
+_sync_fetch_exclusion_guard() {
+    local ref db rc=0 lrc=0
+    _SYNC_AFX_REASON=""
+    _ait_detect_data_worktree
+    ref="$(_sync_afx_data_ref)" || { _SYNC_AFX_REASON="no_data_branch"; return 1; }
+    db="${ref#refs/remotes/origin/}"
+    _sync_test_seam pre_exclusion_fetch
+    _git_with_timeout "${AIT_RECONCILE_GIT_OPTS[@]}" fetch origin "+refs/heads/$db:$ref" 2>/dev/null || rc=$?
+    if (( rc == 124 )); then
+        return 124
+    elif (( rc != 0 )); then
+        # Only a DEFINITIVE absence (ls-remote exit 2) is a no-op: no remote
+        # data branch means no remote record. An unreachable remote is the
+        # network (the broad fetch would fail the same way); a reachable remote
+        # whose data branch still would not fetch leaves protection unknown.
+        _git_with_timeout ls-remote --exit-code origin "refs/heads/$db" >/dev/null 2>&1 || lrc=$?
+        case "$lrc" in
+            2)   ref="" ;;
+            124) return 124 ;;
+            0)   _SYNC_AFX_REASON="data_branch_fetch_failed"; return 1 ;;
+            *)   return 3 ;;
+        esac
+    fi
+    _sync_afx_reconcile "$ref" || return 1
+    _sync_test_seam post_exclusion_guard
+    return 0
+}
+
+# _sync_fetch_exclusion_defer_msg [initial] -- the user-facing half of a guard
+# deferral. From do_fetch ("initial") the sweep's skip report is emitted first:
+# that deferral exits before main's own report_skipped call, and what the sweep
+# left uncommitted must not vanish. The retry path runs after it, so it skips it.
+_sync_fetch_exclusion_defer_msg() {
+    [[ "${1:-}" == initial ]] && report_skipped
+    iwarn "Sync deferred: the routine-fetch exclusion for the gitbranch artifact store could not be confirmed (${_SYNC_AFX_REASON}); fetching now could download the store. Fix the cause (see above), or run 'ait artifact fetch-exclusion apply', then sync again."
+}
+
+# _sync_reconcile_after_converge -- after every successful convergence (no
+# network): settles what the fetch-time union kept on the safe side — a retired
+# branch the incoming record dropped, a dedicated declaration the incoming
+# config turned off — within the same sync. Failure only warns: the fetch
+# already happened, and no fingerprint is stored, so the next guard retries.
+_sync_reconcile_after_converge() {
+    local ref=""
+    _ait_detect_data_worktree
+    ref="$(_sync_afx_data_ref)" || ref=""
+    if [[ -n "$ref" ]] && ! git rev-parse -q --verify "$ref^{commit}" >/dev/null 2>&1; then
+        ref=""
+    fi
+    _sync_afx_reconcile "$ref" \
+        || iwarn "Could not update the routine-fetch exclusion after pulling (${_SYNC_AFX_REASON}); the next sync retries."
+    return 0
+}
+
+do_fetch() {
+    iinfo "Fetching from remote..."
+    local fetch_exit=0
+    # Every fetch/push runs under lib/bounded_run.py. With no usable Python it
+    # cannot start, and the failure must not pass as NO_NETWORK -- that is the
+    # "offline, try later" outcome, and a broken install never heals by waiting.
+    local py
+    py="$(resolve_python)"
+    if [[ -z "$py" ]] \
+        || ! "$py" -c 'import sys; sys.exit(sys.version_info < (3, 8))' >/dev/null 2>&1; then
+        batch_out "ERROR:no_python"
+        iwarn "No usable Python (>= 3.8) to run the bounded fetch/push; 'ait setup' repairs the framework venv."
+        exit 1
+    fi
+    # t2099: the store exclusion must be in place BEFORE the broad fetch, or the
+    # broad fetch must not run at all.
+    local guard_rc=0
+    _sync_fetch_exclusion_guard || guard_rc=$?
+    if (( guard_rc == 124 || guard_rc == 3 )); then
+        fetch_exit=$guard_rc
+    elif (( guard_rc != 0 )); then
+        batch_out "DEFERRED:fetch_exclusion:${_SYNC_AFX_REASON}"
+        _sync_fetch_exclusion_defer_msg initial
+        exit 0
+    else
+        # Pinned (AIT_RECONCILE_GIT_OPTS, lib/task_utils.sh — t1789): this fetch
+        # feeds the rebase, so it must not leave a detached maintenance run behind.
+        _git_with_timeout "${AIT_RECONCILE_GIT_OPTS[@]}" fetch origin 2>/dev/null || fetch_exit=$?
+    fi
+
+    if [[ $fetch_exit -eq 124 ]]; then
+        batch_out "NO_NETWORK"
+        if [[ "$BATCH_MODE" == false ]]; then
+            warn "Network timeout during fetch"
+        fi
+        exit 0
+    elif [[ $fetch_exit -ne 0 ]]; then
+        batch_out "NO_NETWORK"
+        if [[ "$BATCH_MODE" == false ]]; then
+            warn "Fetch failed (no network?)"
+        fi
+        exit 0
+    fi
+}
+
+# --- Count commits ahead/behind ---
+count_local_ahead() {
+    task_git rev-list --count "@{u}..HEAD" 2>/dev/null || echo "0"
+}
+
+count_remote_ahead() {
+    task_git rev-list --count "HEAD..@{u}" 2>/dev/null || echo "0"
+}
+
+# --- Converge with the remote: pinned fast-forward, or pull with rebase ---
+#
+# Every route that brings remote commits in comes through here: main's Step 7
+# and do_push's retry. Two routes, chosen from a PINNED view of the branch:
+#
+#   behind-only (no local commits) -> a FAST-FORWARD to the pinned upstream SHA.
+#     It never conflicts, and it is the only convergence available while
+#     protected files are dirty: git refuses it outright if it would overwrite a
+#     dirty file, which _rebase_blocked already excluded (t1658_1's ff-only rule,
+#     t1696). It is also the one route git can make fully protective (t1792):
+#       --no-autostash         a user's merge.autoStash would stash and re-apply
+#                              the files the sweep left protected — the stashing
+#                              t1599_3 and t1658_1 rejected;
+#       --no-overwrite-ignore  git's default silently overwrites an ignored file
+#                              (userconfig.yaml, *.local.json) that an incoming
+#                              commit writes; with it, git refuses AT WRITE TIME,
+#                              including a file created after our own check;
+#       "$PULL_U", not @{u}    a commit fetched after the check is not applied.
+#     `merge --ff-only` holds index.lock for its whole checkout and moves HEAD
+#     only from the HEAD it read, so a framework writer cannot interleave with
+#     it. A refusal is REPORTED and never retried as a rebase: that fallback was
+#     the unprotected path (a behind-only `pull --rebase` fast-forwards with the
+#     default overwrite-ignore). A racing local commit just makes the next sync
+#     take the diverged route.
+#
+#   diverged -> `pull --rebase --no-autostash`. KNOWN EXPOSURE: a rebase has no
+#     --no-overwrite-ignore, so it can overwrite an ignored file that an incoming
+#     commit writes. A preflight check here would not be a guarantee — a rebase
+#     writes the worktree in several steps, and framework writers are only
+#     preflight-checked (assert_data_worktree_clean), never excluded; in legacy
+#     mode not even that. Closing it needs t1678's writer lock: t1984.
+#
+# Returns: 0 = converged (_PULL_AUTOMERGED=true when conflicts were auto-merged),
+# 1 = failure, its ERROR:/CONFLICT: token already emitted.
+_PULL_AUTOMERGED=false
+PULL_H=""           # HEAD, pinned by _pull_pin
+PULL_U=""           # @{u}, pinned by _pull_pin
+PULL_BEHIND=false   # PULL_H is an ancestor of PULL_U
+
+_pull_refuse_unverified() {
+    batch_out "ERROR:pull_preflight_unverified"
+    warn "Pull refused: $1. Nothing was changed. Re-run sync."
+}
+
+# warn() prints through `echo -e`, which DECODES backslash escapes: a
+# _gm_show-quoted path ($'a\nb') would come out as two physical lines, and an
+# escaped control character as a raw one. Text carrying a path or git's own
+# message goes through here instead — the colour codes are decoded (%b), the
+# message is printed verbatim (%s).
+_warn_verbatim() { printf '%b%s%b\n' "${YELLOW}Warning: " "$1" "$NC" >&2; }
+
+# Git's own message on one line: newlines become spaces and any other control
+# character a '?', since a path inside the message may hold either.
+_one_line() {
+    local s="${1//$'\n'/ }"
+    printf '%s' "${s//[[:cntrl:]]/?}"
+}
+
+# _pull_pin — pin HEAD and @{u} to SHAs ONCE, and classify the route from them.
+# 0 = pinned; 1 = refused (token emitted). Reads through _ait_data_git, which
+# never die()s.
+_pull_pin() {
+    local rc=0
+    PULL_H="$(_ait_data_git rev-parse --verify --quiet 'HEAD^{commit}' 2>/dev/null)" || PULL_H=""
+    PULL_U="$(_ait_data_git rev-parse --verify --quiet '@{u}^{commit}' 2>/dev/null)" || PULL_U=""
+    if [[ ! "$PULL_H" =~ ^[0-9a-f]{40,64}$ || ! "$PULL_U" =~ ^[0-9a-f]{40,64}$ ]]; then
+        _pull_refuse_unverified "HEAD or @{u} did not resolve to a commit"
+        return 1
+    fi
+    _ait_data_git merge-base --is-ancestor "$PULL_H" "$PULL_U" 2>/dev/null || rc=$?
+    case $rc in
+        0) PULL_BEHIND=true ;;
+        1) PULL_BEHIND=false ;;
+        *) _pull_refuse_unverified "could not tell whether the branch is behind or diverged (merge-base rc=$rc)"
+           return 1 ;;
+    esac
+    return 0
+}
+
+# _pull_ff_ignored_check — refuse the fast-forward, by name, when a path it
+# writes touches an ignored file that exists now. 0 = clear; 1 = refused (token
+# emitted). This only NAMES the file early; --no-overwrite-ignore is the
+# write-time guard. Deletions are excluded: removing a tracked path never
+# touches an untracked file.
+_pull_ff_ignored_check() {
+    local rc=0
+    GM_WRITTEN=()
+    if ! _gm_names_into written diff --name-only -z --no-renames --diff-filter=d "$PULL_H" "$PULL_U"; then
+        _pull_refuse_unverified "could not list the paths the fast-forward writes"
+        return 1
+    fi
+    _gm_ignored_hit || rc=$?
+    case $rc in
+        1)  return 0 ;;
+        0)  batch_out "ERROR:pull_overwrites_ignored"
+            _warn_verbatim "Pull refused: it would write $(_gm_show "$GM_HIT_W") over the ignored local file $(_gm_show "$GM_HIT_P"). Nothing was changed. Move the local file aside, run sync again, then keep the version you want." ;;
+        *)  _pull_refuse_unverified "could not list the ignored files in the data worktree" ;;
+    esac
+    return 1
+}
+
+do_pull_rebase() {
+    local remote_count="$1"
+
+    _sync_test_seam pre_pull
+    _pull_pin || return 1
+
+    if [[ "$PULL_BEHIND" == true ]]; then
+        _pull_ff_ignored_check || return 1
+        _sync_test_seam pre_pull_apply
+        iinfo "Fast-forwarding $remote_count new commits..."
+        local ff_err="" ff_rc=0
+        # Inside $( ): a die() from task_git's wedge assertion stays confined to a
+        # non-zero status and is reported as a refusal.
+        ff_err="$(task_git "${AIT_RECONCILE_GIT_OPTS[@]}" merge --ff-only --no-autostash \
+            --no-overwrite-ignore --quiet "$PULL_U" 2>&1)" || ff_rc=$?
+        if [[ $ff_rc -ne 0 ]]; then
+            batch_out "ERROR:pull_ff_refused"
+            _warn_verbatim "Fast-forward to ${PULL_U:0:12} refused; nothing was changed: $(_one_line "$ff_err")"
+            return 1
+        fi
+        return 0
+    fi
+
+    iinfo "Pulling $remote_count new commits (rebase)..."
+
+    local pull_exit=0
+    # Pinned against rerere and auto-maintenance (AIT_RECONCILE_GIT_OPTS,
+    # lib/task_utils.sh — t1789). Every abort below carries it too, through
+    # _ait_data_git: task_git's guard reads $1 and would refuse a leading -c.
+    # --no-autostash (t1792): a user's rebase.autoStash would stash and re-apply
+    # the files the sweep left protected. Without it the pull refuses on a dirty
+    # tracked file, which is the outcome the sweep's protection relies on.
+    task_git "${AIT_RECONCILE_GIT_OPTS[@]}" pull --rebase --no-autostash --quiet &>/dev/null || pull_exit=$?
+
+    if [[ $pull_exit -ne 0 ]]; then
+        # Check if it's a conflict. A probe that cannot be read is neither answer:
+        # aidocs/framework/failopen_git_probes.md row A5.
+        local conflicted="" c_rc=0
+        conflicted="$(task_git diff --name-only --diff-filter=U 2>/dev/null)" || c_rc=$?
+        if (( c_rc != 0 )); then
+            # Abort — nothing has been resolved yet, so a successful abort loses
+            # nothing — then VERIFY: whatever failed the probe can fail the abort
+            # too, so the report comes from the worktree's state, never from the
+            # abort's rc (the two disagree in both directions).
+            local a_rc=0 w_rc=0 wstate=""
+            _ait_data_git "${AIT_RECONCILE_GIT_OPTS[@]}" rebase --abort >/dev/null 2>&1 || a_rc=$?
+            # unverified: "cannot inspect" is not "recovered" — rc 2 gets its own token
+            wstate="$(_worktree_wedged)" || w_rc=$?
+            case $w_rc in
+                1)  batch_out "ERROR:pull_conflict_unverified"
+                    warn "Pull --rebase stopped, but whether it stopped on a conflict could not be read (git diff rc=${c_rc}). The data worktree was verified clean afterwards (rebase --abort rc=${a_rc}) — your local commits are intact. Re-run sync." ;;
+                0)  batch_out "ERROR:rebase_abort_failed"
+                    warn "Pull --rebase stopped, and whether it stopped on a conflict could not be read (git diff rc=${c_rc}). The recovery FAILED: rebase --abort rc=${a_rc}, and the data worktree is still mid-${wstate}. Every task write is blocked until it is resolved: ./ait git rebase --abort (or resolve it, then ./ait git rebase --continue); ./ait git status shows where it stopped." ;;
+                *)  batch_out "ERROR:rebase_abort_unverified"
+                    warn "Pull --rebase stopped, and whether it stopped on a conflict could not be read (git diff rc=${c_rc}). rebase --abort rc=${a_rc}, and the data worktree's state could not be inspected, so the recovery is UNVERIFIED — your local commits may still be mid-rebase. Check ./ait git status; if it is mid-rebase: ./ait git rebase --abort." ;;
+            esac
+            return 1
+        fi
+
+        if [[ -n "$conflicted" ]]; then
+            # The whole resolve-and-advance cycle — including the multi-commit
+            # replay — lives in lib/task_automerge.sh, shared with
+            # task_utils.sh::_task_pull_rebase (t1727).
+            #
+            # ABSORBING CAPTURE, never a bare call: this script runs
+            # `set -euo pipefail`, so `ait_automerge_rebase_loop; rc=$?` would
+            # exit the shell on the loop's own documented rc 1 (unresolved) and
+            # rc 2 (advance failed) — bypassing the CONFLICT: token and the
+            # interactive fallback exactly when they are needed. `local` on its
+            # own line so the declaration's status never masks the call's.
+            local remaining=""
+            local loop_rc=0
+            ait_automerge_rebase_loop || loop_rc=$?
+
+            case $loop_rc in
+                0)
+                    _PULL_AUTOMERGED=true
+                    isuccess "All conflicts auto-merged successfully"
+                    return 0 ;;
+                2)
+                    # Advance failed for a non-conflict reason.
+                    _ait_data_git "${AIT_RECONCILE_GIT_OPTS[@]}" rebase --abort 2>/dev/null || true
+                    batch_out "ERROR:rebase_continue_failed"
+                    return 1 ;;
+            esac
+            remaining="$AIT_AUTOMERGE_REMAINING"
+
+            # Some files unresolved (or auto-merge unavailable)
+            if [[ "$BATCH_MODE" == true ]]; then
+                _ait_data_git "${AIT_RECONCILE_GIT_OPTS[@]}" rebase --abort 2>/dev/null || true
+                local conflict_list
+                conflict_list=$(echo "$remaining" | tr '\n' ',' | sed 's/,$//')
+                batch_out "CONFLICT:${conflict_list}"
+                exit 0
+            else
+                # Interactive conflict resolution with remaining files only
+                warn "Remaining conflicts in:"
+                echo "$remaining" | while IFS= read -r f; do echo "  - $f"; done
+
+                local editor="${EDITOR:-nano}"
+                echo ""
+                info "Opening each conflicted file in $editor for resolution..."
+
+                # `<<<`, NOT `echo | while`: a pipeline runs the loop in a
+                # SUBSHELL, so `all_resolved=false` never reached the check
+                # below, and a die() in the body killed only the subshell —
+                # silently ending the loop after the FIRST file.
+                local all_resolved=true
+                while IFS= read -r f; do
+                    [[ -z "$f" ]] && continue
+                    echo ""
+                    info "Editing: $f"
+                    if $editor "$(ait_automerge_conflict_path "$f")"; then
+                        # Staging a resolved conflict is exactly what this loop
+                        # exists to do, and it owns the rebase it is resolving —
+                        # so scope the documented bypass to this one call, as
+                        # the auto-merge site above does. Without it
+                        # assert_data_worktree_clean die()s mid-loop.
+                        #
+                        # Keep the call inside `$( )`: the loop now runs in the
+                        # CURRENT shell under `set -euo pipefail`, so a die()
+                        # reached through task_git must stay confined to the
+                        # substitution and surface as a non-zero rc.
+                        local add_err add_rc=0
+                        add_err="$(AIT_GIT_SKIP_STATE_CHECK=1 task_git add "$f" 2>&1)" || add_rc=$?
+                        if [[ $add_rc -ne 0 ]]; then
+                            # A file we could not stage is NOT resolved:
+                            # `rebase --continue` would fail later with the
+                            # diagnostic already thrown away by `2>/dev/null`.
+                            # warn() -> stderr, never info()/iinfo().
+                            warn "could not stage $f (git add rc=$add_rc): ${add_err:-<no output>}"
+                            all_resolved=false
+                        fi
+                    else
+                        warn "Editor exited with error for $f"
+                        all_resolved=false
+                    fi
+                done <<< "$remaining"
+
+                if [[ "$all_resolved" == true ]]; then
+                    if ! ait_automerge_advance; then
+                        warn "Rebase continue failed. Aborting rebase."
+                        _ait_data_git "${AIT_RECONCILE_GIT_OPTS[@]}" rebase --abort 2>/dev/null || true
+                        return 1
+                    fi
+                else
+                    warn "Not all conflicts resolved. Aborting rebase."
+                    _ait_data_git "${AIT_RECONCILE_GIT_OPTS[@]}" rebase --abort 2>/dev/null || true
+                    return 1
+                fi
+            fi
+        else
+            # Not a conflict — some other pull/rebase error
+            _ait_data_git "${AIT_RECONCILE_GIT_OPTS[@]}" rebase --abort 2>/dev/null || true
+            batch_out "ERROR:pull_rebase_failed"
+            if [[ "$BATCH_MODE" == false ]]; then
+                warn "Pull --rebase failed (non-conflict error)"
+            fi
+            return 1
+        fi
+    fi
+    return 0
+}
+
+# --- Push with retry ---
+do_push() {
+    local local_count="$1"
+    iinfo "Pushing $local_count commits to remote..."
+
+    _sync_test_seam pre_push
+
+    local push_exit=0
+    _git_with_timeout push origin 2>/dev/null || push_exit=$?
+
+    if [[ $push_exit -eq 124 ]]; then
+        batch_out "NO_NETWORK"
+        if [[ "$BATCH_MODE" == false ]]; then
+            warn "Network timeout during push"
+        fi
+        _gm_note_unpublished
+        exit 0
+    elif [[ $push_exit -ne 0 ]]; then
+        # `remote_ahead` was sampled ONCE, from the step-5 fetch, so on a branch
+        # several sessions push to in parallel the remote can advance afterwards
+        # and a run that correctly saw remote_ahead == 0 still lands here.
+        #
+        # Defensive: main() exits before do_push when a publication quarantine
+        # is held, but the guard's correctness must not depend on one call
+        # site's ordering — a future reorder must not be able to publish a
+        # commit we deliberately withheld.
+        if (( ${#PUBLICATION_BLOCKED[@]} )); then
+            batch_out "DEFERRED:publication_blocked:${#PUBLICATION_BLOCKED[@]} path(s) withheld"
+            iwarn "Push withheld: ${#PUBLICATION_BLOCKED[@]} path(s) under publication quarantine."
+            return 2
+        fi
+
+        # Retry once (remote may have advanced during our rebase).
+        #
+        # The gate is re-evaluated HERE, on inputs sampled AFTER this fetch, not
+        # before it. main's gate ran against the step-5 fetch; the rejection
+        # proves the remote moved since, and a commit that arrived in between can
+        # create exactly the protected untracked path main's gate waved through.
+        iinfo "Push rejected, retrying after fetch+rebase..."
+
+        # A FAILED retry fetch must not be swallowed. `|| true` left @{u} stale,
+        # after which the recomputation below can read remote_ahead == 0, decide
+        # "not blocked", and act on a world it never saw — surfacing later as a
+        # generic push/rebase error instead of the true outcome. Same contract as
+        # do_fetch: report the network, stop the run.
+        local refetch_exit=0 guard_rc=0
+        # t2099: guard this broad fetch too — the rejection proves the remote
+        # moved, and what moved may be a migration record naming a new store.
+        _sync_fetch_exclusion_guard || guard_rc=$?
+        if (( guard_rc == 124 || guard_rc == 3 )); then
+            refetch_exit=$guard_rc
+        elif (( guard_rc != 0 )); then
+            batch_out "DEFERRED:fetch_exclusion:${_SYNC_AFX_REASON}"
+            _sync_fetch_exclusion_defer_msg
+            return 2
+        else
+            # Pinned for the same reason as do_fetch's: it feeds the retry rebase.
+            _git_with_timeout "${AIT_RECONCILE_GIT_OPTS[@]}" fetch origin 2>/dev/null || refetch_exit=$?
+        fi
+        if [[ $refetch_exit -ne 0 ]]; then
+            batch_out "NO_NETWORK"
+            if [[ "$BATCH_MODE" == false ]]; then
+                warn "Push rejected and the follow-up fetch failed (rc=$refetch_exit)"
+            fi
+            _gm_note_unpublished
+            exit 0
+        fi
+
+        local retry_local retry_remote retry_merged=false
+        retry_local=$(count_local_ahead)
+        retry_remote=$(count_remote_ahead)
+        if ! _load_incoming; then
+            local _ri
+            for ((_ri = 0; _ri < ${#PROT_STATE[@]}; _ri++)); do PROT_STATE[_ri]="unknown"; done
+        fi
+
+        # With protected files that genuinely block, the rebase below is actively
+        # wrong: `pull --rebase` refuses (rc 128), the old `|| true` SWALLOWED
+        # that, the still-un-rebased push was rejected again, and the run reported
+        # ERROR:push_failed — blaming the push for a failure the protected files
+        # caused, and bypassing the protection entirely.
+        #
+        # A blocked rebase here is the same diverged shape main can meet — often
+        # created by the very race that rejected the push — so the guarded merge
+        # (t1731) gets the same chance to converge it, instead of re-creating the
+        # deadlock one push later.
+        if (( ${#PROT_REASON[@]} )) && _rebase_blocked "$retry_local" "$retry_remote"; then
+            local gm_rc=0
+            _converge_by_guarded_merge "$retry_local" "$retry_remote" || gm_rc=$?
+            case $gm_rc in
+                0) retry_merged=true ;;
+                1)
+                    _gm_report_refusal
+                    _emit_protected_deferral
+                    iwarn "Push deferred: protected files block the rebase this push needs."
+                    return 2 ;;
+                *) return 1 ;;   # ERROR:<...> already emitted
+            esac
+        fi
+
+        # Through do_pull_rebase, never a bare `pull --rebase`: on conflict that
+        # one left `rebase-merge` behind for the next ./ait git write to trip
+        # over (t1725_1). do_pull_rebase aborts, and reports CONFLICT: / ERROR:
+        # itself. Skipped when the guarded merge above already converged.
+        if [[ "$retry_merged" == false ]] && ! do_pull_rebase "$retry_remote"; then
+            batch_out "ERROR:push_rebase_failed"
+            if [[ "$BATCH_MODE" == false ]]; then
+                warn "Push rejected and the follow-up rebase failed"
+            fi
+            return 1
+        fi
+        # Converged (guarded merge or rebase): settle the exclusion before the
+        # retry push, so it happens whatever that push's outcome (t2099).
+        _sync_reconcile_after_converge
+        local retry_exit=0
+        _git_with_timeout push origin 2>/dev/null || retry_exit=$?
+
+        if [[ $retry_exit -ne 0 ]]; then
+            batch_out "ERROR:push_failed"
+            if [[ "$BATCH_MODE" == false ]]; then
+                warn "Push failed after retry"
+            fi
+            return 1
+        fi
+    fi
+    return 0
+}
+
+# --- Main ---
+main() {
+    # Step 1: Detect mode
+    _ait_detect_data_worktree
+
+    # Step 1b: Refuse early on a wedged data worktree.
+    #
+    # This MUST come before check_remote: that helper runs
+    # `task_git remote get-url origin &>/dev/null`, and `remote` is on neither
+    # the read-only nor the recovery allowlist, so assert_data_worktree_clean
+    # die()s — with the message swallowed by `&>/dev/null`. The script would
+    # exit 1 with empty stdout and empty stderr, which every consumer classifies
+    # as `ERROR: empty output from sync script`.
+    local wedged="" w_rc=0
+    # unverified: 2 = the git-dir cannot be resolved ⇒ refuse; never "not wedged"
+    wedged="$(_worktree_wedged)" || w_rc=$?
+    if (( w_rc == 2 )); then
+        _refuse_unresolved_gitdir
+    fi
+    if (( w_rc == 0 )); then
+        _note_skip "data worktree is stuck mid-${wedged} — nothing swept; resolve the rebase/merge first"
+        report_skipped
+        batch_out "DEFERRED:worktree_wedged:${wedged}"
+        iwarn "Data worktree is stuck mid-${wedged}. Resolve it, then re-run sync."
+        exit 0
+    fi
+
+    # Step 2: Check for remote
+    check_remote
+
+    # Step 3: Auto-commit uncommitted changes (per owning task; see auto_commit)
+    auto_commit
+
+    # Step 4: Count local-ahead commits
+    local local_ahead
+    local_ahead=$(count_local_ahead)
+
+    # Step 5: Fetch with timeout
+    do_fetch
+
+    # Step 6: Count remote-ahead commits
+    local remote_ahead
+    remote_ahead=$(count_remote_ahead)
+
+    report_skipped
+
+    # Which incoming paths a pull would check out. Computed once, after the
+    # fetch, and consumed by _rebase_blocked. An UNKNOWN incoming set is not an
+    # empty one: fail closed by marking every record unclassifiable, so the gate
+    # blocks rather than waving a possible overwrite through.
+    if ! _load_incoming; then
+        local _pi
+        for ((_pi = 0; _pi < ${#PROT_STATE[@]}; _pi++)); do PROT_STATE[_pi]="unknown"; done
+    fi
+
+    # Two early exits, in this order. They are ORTHOGONAL outcomes:
+    #
+    #   1. publication_blocked — we hold a commit whose content we cannot vouch
+    #      for. Blocks the PUSH, and must NOT be gated on remote_ahead: the race
+    #      advances refs/heads/aitask-locks, never aitask-data, so
+    #      remote_ahead == 0 is its normal shape and a rebase-gated guard would
+    #      detect the mismatch and then push it anyway.
+    #   2. protected_dirty — files we could not commit are still dirty. Whether
+    #      that blocks the REBASE is decided by _rebase_blocked's five-way rule
+    #      (tree state x local_ahead x remote_ahead x incoming), NOT by the mere
+    #      existence of a protected file. The old "any protected file and the
+    #      remote is ahead" test deferred two cases nothing actually blocks: an
+    #      untracked file no incoming commit touches, and a behind-only branch
+    #      that can simply fast-forward.
+    if (( ${#PUBLICATION_BLOCKED[@]} )); then
+        batch_out "DEFERRED:publication_blocked:${#PUBLICATION_BLOCKED[@]} path(s) withheld"
+        iwarn "Sync deferred: ${#PUBLICATION_BLOCKED[@]} path(s) under publication quarantine — nothing pushed."
+        exit 0
+    fi
+    #
+    # A blocked rebase is not yet a deferral. On a DIVERGED branch the guarded
+    # merge (t1731) may still converge it without touching a protected file; it
+    # declines — and the run then defers exactly as before — unless every check
+    # in _guarded_merge_prepare passes.
+    if (( ${#PROT_REASON[@]} )) && _rebase_blocked "$local_ahead" "$remote_ahead"; then
+        local gm_rc=0
+        _converge_by_guarded_merge "$local_ahead" "$remote_ahead" || gm_rc=$?
+        case $gm_rc in
+            0) ;;   # converged: HEAD now contains @{u}, so Step 7 has nothing to pull
+            1)
+                _gm_report_refusal
+                _emit_protected_deferral
+                iwarn "The fetch still ran, so the branch is up to date on disk."
+                exit 0 ;;
+            *) exit 1 ;;   # ERROR:<...> already emitted; nothing is pushed
+        esac
+    fi
+
+    # Step 7: Converge with the remote when it has commits.
+    #
+    # do_pull_rebase picks the route: a pinned, protected FAST-FORWARD when there
+    # are no local commits (the only convergence available while protected files
+    # are dirty — t1658_1, t1696), otherwise `pull --rebase`. See its header for
+    # why a refused fast-forward is never retried as a rebase (t1792).
+    #
+    # A guarded merge above has already converged the branch (GM_MERGED): there
+    # is nothing left to pull.
+    local did_pull=false
+    if [[ -z "$GM_MERGED" && "$remote_ahead" -gt 0 ]]; then
+        if do_pull_rebase "$remote_ahead"; then
+            did_pull=true
+        else
+            # Pull failed (non-batch conflict resolution or error)
+            exit 1
+        fi
+    fi
+
+    # Step 7b (t2099): after the early guarded merge and Step 7's pull, settle the
+    # routine-fetch exclusion from the converged inputs — no network. A no-op
+    # (fingerprint fast path) when nothing relevant changed.
+    _sync_reconcile_after_converge
+
+    # Step 8: Push if local has commits (recount after possible rebase)
+    local did_push=false
+    local_ahead=$(count_local_ahead)
+    if [[ "$local_ahead" -gt 0 ]]; then
+        local push_rc=0
+        do_push "$local_ahead" || push_rc=$?
+        case $push_rc in
+            0) did_push=true ;;
+            2) _gm_note_unpublished; exit 0 ;;   # deferred, not failed — do_push already emitted its token
+            *) _gm_note_unpublished; exit 1 ;;
+        esac
+    fi
+
+    # Step 9: Output result
+    #
+    # MERGED first: a guarded merge that was pushed is its own outcome, and the
+    # only one that says the protected files were left behind uncommitted. It is
+    # exclusive with AUTOMERGED in practice — do_pull_rebase never runs on the
+    # blocked path the merge replaces.
+    if [[ -n "$GM_MERGED" && "$did_push" == true ]]; then
+        batch_out "MERGED"
+        isuccess "Sync complete: diverged branch merged and pushed; protected files left uncommitted"
+    elif [[ "$_PULL_AUTOMERGED" == true ]]; then
+        batch_out "AUTOMERGED"
+        isuccess "Sync complete: conflicts auto-merged"
+    elif [[ "$did_push" == true && "$did_pull" == true ]]; then
+        batch_out "SYNCED"
+        isuccess "Sync complete: pushed and pulled changes"
+    elif [[ "$did_push" == true ]]; then
+        batch_out "PUSHED"
+        isuccess "Sync complete: pushed $local_ahead commits"
+    elif [[ "$did_pull" == true ]]; then
+        batch_out "PULLED"
+        isuccess "Sync complete: pulled $remote_ahead commits"
+    else
+        batch_out "NOTHING"
+        isuccess "Already up to date"
+    fi
+}
+
+main

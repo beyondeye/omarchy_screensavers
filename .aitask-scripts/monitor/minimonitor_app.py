@@ -1,0 +1,6749 @@
+"""minimonitor_app - Compact TUI for monitoring tmux agent panes.
+
+Designed to run as a narrow side-column (~40 columns) alongside code agent
+windows in tmux. Shows all code agents with idle status. Unlike the full
+monitor, it has no preview zone — just a compact agent list with status.
+
+Usage:
+    python minimonitor_app.py [--session NAME] [--interval SECS]
+"""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import contextlib
+import os
+import re
+import subprocess
+import sys
+import textwrap
+import time
+from typing import NamedTuple
+from pathlib import Path
+
+# Set up import paths before any local imports
+_SCRIPT_DIR = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_SCRIPT_DIR))
+sys.path.insert(0, str(_SCRIPT_DIR / "lib"))
+
+from monitor.tmux_monitor import (  # noqa: E402
+    PaneCategory,
+    PaneSnapshot,
+    TmuxMonitor,
+    # The ONE pane-ordering authority (t1659), shared with the full monitor —
+    # the two agent lists must not be able to drift apart.
+    pane_sort_key,
+    tmux_index_key,
+    load_monitor_config,
+    load_project_tmux_config,
+    # Shared shadow seam (t1216_1) — one implementation, shared with the full
+    # monitor, which imports it the same way (`monitor_app.py`).
+    find_shadow_pane,
+    find_shadow_pane_async,
+    find_shadow_pane_info_async,
+    capture_shadow_text,
+    capture_raw_tail,
+    query_pane_mode,
+    compute_shadow_staleness,
+    compute_block_age_staleness,
+    combine_staleness,
+    refresh_shadow_phase_stamp_async,
+    spawn_shadow,
+    _SHADOW_DEEP_RETRY_LINES,
+    _SHADOW_TRUNCATED_MSG,
+)
+# Shares `classify_pane`'s prefix matcher (t1351), so a row is never stripped by
+# a rule the classifier did not use.
+from monitor.monitor_core import agent_display_name  # noqa: E402
+from monitor.monitor_core import spawn_scratchpad  # noqa: E402  (t2073_4)
+# The one "does this pane keep the window alive?" classifier (bound helpers,
+# companions, frozen-first) — rung 2 of `_find_sibling_pane_id` is a call site
+# of it rather than a local copy of the rule (t1388, t2073_3).
+from monitor.monitor_core import (  # noqa: E402
+    CAPTURE_PIN_ALL,
+    FROZEN_AWARE_PANE_FORMAT,
+    classify_window_panes,
+)
+from monitor import review_loop  # noqa: E402  (auto-recheck decision core, t1159_2)
+from monitor import review_loop_log  # noqa: E402  (durable disarm/hold record, t1606)
+from monitor.tmux_control import TmuxControlState  # noqa: E402
+import agent_marks  # noqa: E402
+from monitor.sitrep_close import SitrepCloseMixin  # noqa: E402
+from monitor.monitor_shared import (  # noqa: E402
+    _TASK_ID_RE, GateSummaryCache, TaskInfoCache, TaskDetailDialog,
+    workflow_phase,
+    KillConfirmDialog, FreezeConfirmDialog, NextSiblingDialog, ChooseSiblingModal,
+    AgentMarksMixin, ColumnPickerModal, NewColumnTitleModal,
+    ConcernBlockInspectModal, ConcernPickerModal, TaskNumberInputModal,
+    TaskPickConfirmDialog, ShadowRejectionsMixin, STATE_STYLE_DONE,
+    FROZEN_GLYPH,
+    format_compare_mode_glyph, format_mark_glyph, format_frozen_prefix,
+    format_pane_status, PANE_STATUS_MAX_CELLS,
+    format_section_header, format_session_divider, format_shadow_glyph,
+    format_state_dot, is_task_completed,
+    format_shadow_stale_banner, format_staleness_detail, markup_literal,
+    phase_mark,
+    uncertified_round_block_msg, unparsed_concerns_msg,
+    MonitorClient, build_monitor_client,
+)
+from monitor.concern_parser import (  # noqa: E402
+    block_head_truncated, block_region, build_clipboard_payload,
+    contains_block_evidence,
+    has_concern_block, has_invalid_round_header, is_metadata_only_block,
+    needs_addressing,
+    parse_block_meta, parse_concerns, unrecovered_markers,
+)
+from monitor.desync_summary import (  # noqa: E402
+    # The blocking `get_desync_summary` is deliberately NOT imported here
+    # (t1622): every call site in this module is on a Textual path.
+    get_desync_summary_async as _get_desync_summary_async,
+    get_desync_summary_cached as _get_desync_summary_cached,
+)
+from tui_switcher import TuiSwitcherMixin  # noqa: E402
+from tmux_exec import TMUX_CLIENT_FLAGS, TmuxClient, tmux_text_kwargs  # noqa: E402
+from shortcuts_mixin import ShortcutsMixin  # noqa: E402
+from tui_clipboard import copy_to_system_clipboard  # noqa: E402
+import userconfig_persist  # noqa: E402  (collapsed key-hint mode, t2212)
+from monitor.minimonitor_keys import (  # noqa: E402  (key surface, t2212)
+    COLLAPSED_HINT_LINE,
+    FULL_HINT_LINES,
+    KeyHelpModal,
+    binding_keymap,
+    join_keys,
+    key_display,
+    render_collapsed,
+    render_hints,
+)
+from agent_launch_utils import (  # noqa: E402
+    DEFAULT_TMUX_SESSION,
+    load_tmux_defaults,
+    resolve_dry_run_command,
+    resolve_agent_string,
+    TmuxLaunchConfig,
+    launch_in_tmux,
+    maybe_spawn_minimonitor,
+    mark_monitor_pane,
+    tmux_session_target,
+    tmux_window_target,
+    unmark_monitor_pane,
+)
+from agent_command_screen import AgentCommandScreen, build_pick_screen  # noqa: E402
+import gate_ledger  # noqa: E402  (narrow gate-summary shed; same import path as monitor_core)
+
+from rich.cells import cell_len, set_cell_size  # noqa: E402
+import agent_sessions  # noqa: E402
+from rich.text import Text  # noqa: E402
+from textual.app import App, ComposeResult  # noqa: E402
+from textual.content import Content  # noqa: E402
+from textual.binding import Binding  # noqa: E402
+from textual.containers import VerticalScroll  # noqa: E402
+from textual.css.query import NoMatches  # noqa: E402
+from textual.geometry import Offset  # noqa: E402
+from textual.screen import ModalScreen  # noqa: E402
+from textual.scrollbar import ScrollBar, ScrollTo  # noqa: E402
+from textual.timer import Timer  # noqa: E402
+from textual.widget import Widget  # noqa: E402
+from textual.widgets import Static  # noqa: E402
+
+
+class ReadRecency(NamedTuple):
+    """Read-recency verdict paired with the stamp that produced it (t1493).
+
+    ``_update_shadow_freshness`` used to render the banner itself and kept
+    ``analyzed_at`` local. The banner now lives in a separate every-tick step,
+    which cannot say "analyzed Ns ago" — nor tell which signal drove a stale
+    verdict — from the boolean alone. Binding the two into one value makes them
+    unable to desync, which two loose attributes could not guarantee.
+    """
+
+    stale: bool | None
+    analyzed_at: float | None
+
+
+#: Read recency before anything has been resolved. Module-level so the property
+#: default and the no-shadow reset are literally the same value.
+_UNKNOWN_RECENCY = ReadRecency(None, None)
+
+
+# Consecutive *verified* empty-window observations required before the companion
+# closes itself (t1446). Any observation that is not a verified self-sighting —
+# a tmux failure, an incompletely parsed listing, or a window that still holds
+# another pane — resets the streak to 0, so the count only ever measures
+# back-to-back positive evidence. At the default 3 s refresh this costs ~3 s of
+# extra pane lifetime and buys immunity to a single-tick glitch. There is
+# deliberately NO opposite budget: repeated failures never close the pane.
+AUTO_CLOSE_CONFIRMATIONS = 2
+
+
+#: The per-tick own-window query (t2227), issued as ``list-panes -t $TMUX_PANE``.
+#: ``window_name`` is LAST so a tab inside a name stays inside the name
+#: (:func:`parse_own_window_listing` splits each record at most three times).
+OWN_WINDOW_LISTING_FORMAT = (
+    "#{pane_id}\t#{window_id}\t#{window_index}\t#{window_name}"
+)
+
+
+def parse_own_window_listing(
+    stdout: str, own_pane: str,
+) -> tuple[str, str, str, frozenset[str]] | None:
+    """Validate an :data:`OWN_WINDOW_LISTING_FORMAT` listing as a whole.
+
+    Returns ``(window_id, window_index, window_name, pane_ids)`` — the window
+    fields read from **this pane's own record** — or ``None`` when the listing
+    does not prove what it claims. Validation is all-or-nothing, because the
+    membership set it yields decides which pane the minimonitor's actions
+    target: a listing that is empty, has a short or malformed record, spans two
+    windows, or does not contain ``own_pane`` at all is not evidence of the
+    window this pane is in, so none of it is used.
+
+    Records are split on newlines with no whole-buffer strip, so a name ending
+    in whitespace survives. Blank lines are not records.
+    """
+    if not own_pane:
+        return None
+    pane_ids: set[str] = set()
+    window_ids: set[str] = set()
+    own_fields: tuple[str, str, str] | None = None
+    for line in stdout.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("\t", 3)
+        if len(parts) != 4:
+            return None
+        pane_id, window_id, window_index, window_name = parts
+        if not pane_id.startswith("%") or not window_id.startswith("@"):
+            return None
+        pane_ids.add(pane_id)
+        window_ids.add(window_id)
+        if pane_id == own_pane:
+            own_fields = (window_id, window_index, window_name)
+    if own_fields is None or len(window_ids) != 1:
+        return None
+    return own_fields[0], own_fields[1], own_fields[2], frozenset(pane_ids)
+
+
+# -- Row width budget ---------------------------------------------------------
+#
+# The one place this pane's column arithmetic lives (t1479, t1351). Every value
+# is in terminal **cells**, not code points — `cell_len`, never `len` — because
+# a double-width character costs two columns. Anything that can exceed its
+# budget is cut by `_clip`: `Static` wraps rather than clips, so an overflowing
+# row silently costs a whole extra screen row.
+#
+#     target_width (default 40, `mm_cfg["width"]`)
+#       − 2   MiniPaneCard `padding: 0 1`
+#       − 2   #mini-pane-list's vertical scrollbar, reserved ALWAYS: it appears
+#             only once the list overflows, and a row sized for the scrollbar-
+#             less width wraps the moment it does
+#       = 36  at the default width     ⇒ row 1          = _row_budget()
+#       − 2   the "  " indent every detail row under the name line carries
+#       = 34  at the default width     ⇒ detail content = _detail_budget()
+#
+# Row 1 at the default width, per shape (`␠` = one space):
+#
+#     live    <mark>␠<dot>[␠<shadow>]␠<glyph>␠<name>␠␠<status>
+#             prefix 6 | 8 with ◆ | 9 with ◆! (◆! is `ait monitor`'s; this pane
+#             never asks for it, but would pay for it automatically)
+#             status reserved at PANE_STATUS_MAX_CELLS = 11 (`PROMPT 999s`)
+#             name = 36 − prefix − 2 − 11 = 17 | 15 | 14
+#     parked  P␠<name>␠␠parked          name = 36 − 2 − 8      = 26
+#     frozen  <mark>F␠<name>␠␠frozen    name = 36 − 3 − 8      = 25
+#     other   ␠␠○␠<name>␠␠<cmd ≤ 10>    name = 36 − 4 − 2 − 10 = 20
+#     title   ␠␠<title>                 ≤ min(30, detail)      = 30
+#             (under live AND frozen rows — not capture-derived, t2042)
+#     gates   ␠␠<glyph>␠<phase>␠·␠<gates>  ≤ detail          = 34
+#             (live rows only — the phase reads the capture; the phase glyph's
+#             2 cells are counted BEFORE the shed ladder decides what fits)
+#
+# The docked own-agent card is outside the list, so it has no scrollbar: its
+# phase row (`_own_phase_budget`) is target_width − 2 (`.mini-own-card`
+# `padding: 0 1`) − 2 (indent) = 36 at the default width. It is budgeted for the
+# same reason as the list rows — `_OWN_PANEL_MAX_ROWS` reserves exactly ONE phase
+# row, so a wrapped continuation would be hidden by the panel cap.
+#
+# What gives way, in order (t1351 — decided, not reflexive):
+#
+#   1. Agent rows never show the agent prefix (`agent-pick-1351_12` renders as
+#      `pick-1351_12`): every row in that section carries it, so it is the one
+#      part of the name that says nothing — and the tail it would push out is
+#      where the task id lives. The `other` section and the docked panel keep
+#      full names.
+#   2. A glyph added to row 1 is paid for by the NAME'S TAIL — automatically,
+#      because `_name_room` measures the row's own rendered prefix; nothing here
+#      restates it as a constant. The status is reserved at its bound, not its
+#      current width, so a name does not re-truncate as the counter grows or as
+#      the agent flips between Active and IDLE.
+#   3. Floor: at the default width the widest live prefix must still leave
+#      `_MIN_NAME_CELLS`, pinned by tests/test_minimonitor_row_budget.py. A glyph
+#      that breaks it sheds STATUS VERBOSITY (the elapsed counter) next — never a
+#      second line, which would cost a whole row per agent in a pane whose
+#      scarce resource is rows (why t1479 merged the gate and phase rows).
+#   4. No floor below that: at a configured width too narrow for the fixed
+#      parts the name renders empty and the row may wrap. Rejecting an absurd
+#      width belongs at the config seam (see `_detail_budget`).
+#
+# Assumptions, stated so they can be revisited: ★ ☆ ● ◆ ≈ … ○ are East Asian
+# Ambiguous and are counted as ONE cell each (what `cell_len` and a non-CJK
+# terminal both do). The width is the CONFIGURED `target_width`;
+# `_maybe_pin_width` only shrinks a pane that is wider than it, so a window too
+# narrow for the target leaves the real pane narrower and these budgets
+# overshoot it — owned by a follow-up (t1351's `budget_actual_pane_width`).
+_ROW_PADDING = 2       # MiniPaneCard `padding: 0 1`
+_LIST_SCROLLBAR = 2    # #mini-pane-list `scrollbar-size-vertical` (CSS below)
+_DETAIL_INDENT = 2     # the "  " prefix on the title / gate-phase rows
+_MIN_PHASE_CELLS = 4   # below this a clipped phase carries no information
+_NAME_GAP = 2          # "  " between the name and whatever follows it on row 1
+_OTHER_CMD_CELLS = 10  # an OTHER row's command: enough for `claude`, `nvim`, `python3`
+_TITLE_MAX_CELLS = 30  # task title row; a wide pane does not need a longer title
+_MIN_NAME_CELLS = 12   # `pick-NNNN_NN`: the commonest launch name, 4-digit id + child
+
+
+def _row_budget(target_width: int) -> int:
+    """Cells available to a card's first (name/status) row — see the budget
+    block above. Clamped only at zero, for the reason ``_detail_budget`` gives.
+    """
+    return max(0, target_width - _ROW_PADDING - _LIST_SCROLLBAR)
+
+
+def _name_room(prefix_markup: str, reserve: int, target_width: int) -> int:
+    """Cells left for the name on row 1, given everything before it (as markup)
+    and the cells reserved for what follows the ``_NAME_GAP``.
+
+    May be zero or negative at an absurd width; ``_clip`` answers both.
+    """
+    prefix = cell_len(Text.from_markup(prefix_markup).plain)
+    return _row_budget(target_width) - prefix - _NAME_GAP - reserve
+
+
+def _detail_budget(target_width: int) -> int:
+    """Cells available to a card's indented detail row (title, gate+phase).
+
+    **Real geometry, clamped only at zero.** ``tmux.minimonitor.width`` is
+    user-configurable and nothing validates a minimum, so a floor here (an
+    earlier draft clamped to 8) would hand callers more cells than the pane
+    has and the row would wrap — the one outcome this budget exists to
+    prevent. Consumers are built for a tight budget: ``_clip`` answers 0 and 1
+    without overshooting, and ``format_gate_phase_row`` sheds down to the bare
+    ``<n>/<total>`` ratio. A pane too narrow to say anything renders nothing,
+    which is honest; rejecting an absurd configured width belongs at the config
+    seam, not here.
+    """
+    return max(0, _row_budget(target_width) - _DETAIL_INDENT)
+
+
+def _own_phase_budget(target_width: int) -> int:
+    """Cells available to the docked own-agent card's phase row (t2128).
+
+    No scrollbar term — the panel is ``overflow-y: hidden`` (see its stylesheet
+    comment) — but otherwise the same arithmetic and the same zero-only clamp as
+    :func:`_detail_budget`, for the same reason.
+    """
+    return max(0, target_width - _ROW_PADDING - _DETAIL_INDENT)
+
+
+def _clip(text: str, budget: int) -> str:
+    """Cell-aware terminator. ``Static`` *wraps* rather than clips, so anything
+    that could exceed its budget must be cut here or it silently costs a whole
+    extra row — the exact cost this card is trying to save.
+
+    The return is ALWAYS ≤ ``budget`` cells, degenerate budgets included: the
+    ellipsis itself costs a cell, so budgets 0 and 1 are answered before it is
+    appended rather than overshooting by one.
+    """
+    if budget <= 0:
+        return ""
+    if cell_len(text) <= budget:
+        return text
+    if budget == 1:
+        return "…"
+    return set_cell_size(text, budget - 1).rstrip() + "…"
+
+
+# -- Own-panel header budget --------------------------------------------------
+#
+# `.mini-own-header` is `padding: 0 1` inside a panel with `padding: 0`, so the
+# rule gets `target_width - 2` cells — and it is `height: 1`, which CLIPS rather
+# than wraps. An over-long header therefore loses its trailing `──` and reads as
+# broken, which is why this is a budget and not a format string (t1580).
+_OWN_HEADER_PADDING = 2       # `.mini-own-header` padding: 0 1
+_OWN_HEADER_SEP = " · "
+_MIN_SESSION_CELLS = 4        # below this a clipped session name says nothing
+
+
+def _own_header_text(label: str, session: str, target_width: int) -> str:
+    """``── this agent · <session> ──``, sized to ONE row at ``target_width``.
+
+    Returns Textual markup carrying a single ``[dim]`` span over the whole rule
+    — deliberately NOT ``format_session_divider``'s cyan, which stays reserved
+    for the pane list's repo boundaries. ``test_own_panel_header_stays_dim`` in
+    ``tests/test_monitor_session_divider.py`` is the negative control that says
+    so.
+
+    Budgeted in **cells** off ``target_width``, never off the literal 40:
+    ``tmux.minimonitor.width`` reaches it as a bare ``int(mm_cfg["width"])``
+    with no clamp (see ``main``), so this must hold at ANY width, not merely at
+    plausible ones.
+
+    A three-rung shedding ladder, decoration first — the same shape
+    ``format_gate_phase_row`` uses when its row will not fit:
+
+        1. ``── <label> · <session> ──``  full form
+        2. ``── <label> ──``              session segment dropped whole
+        3. ``<label>``                    rule glyphs dropped, label clipped
+
+    Rung 2 alone is not enough: ``── this window ──`` is 17 cells, so any width
+    below 19 would still overflow, and the trailing ``──`` would vanish — the
+    exact failure this function exists to prevent. **Post-condition, on every
+    rung:** the rendered plain text is ``<= max(0, target_width - 2)`` cells.
+
+    The session name is tmux-side user input, so it is made literal with
+    ``markup_literal`` (not ``escape``, which is wrong under Textual's parser —
+    t2017): unescaped, ``[/]`` would close the ``[dim]`` span early and
+    ``[dim]`` would be eaten outright. It is followed by `` ──``, never directly
+    by a tag. Escaped AFTER truncation, so the backslashes never count against
+    the budget (they vanish again in the rendered plain text).
+    ``label`` is framework-controlled and deliberately NOT escaped — the same
+    rule ``format_section_header`` records for its own caller-built label.
+    """
+    usable = max(0, target_width - _OWN_HEADER_PADDING)
+    bare = f"── {label} ──"
+    room = usable - cell_len(bare) - cell_len(_OWN_HEADER_SEP)
+    if session and room >= _MIN_SESSION_CELLS:
+        body = (f"── {label}{_OWN_HEADER_SEP}"
+                f"{markup_literal(_clip(session, room))} ──")
+    elif cell_len(bare) <= usable:
+        body = bare
+    else:
+        body = _clip(label, usable)
+    return f"[dim]{body}[/]"
+
+
+def _session_is_ambiguous(session: str) -> bool:
+    """True when a tmux session name cannot identify a repo (t1580).
+
+    ``DEFAULT_TMUX_SESSION`` is what every unconfigured repo reports **and** a
+    name a repo may configure deliberately (``seed/project_config.yaml``
+    documents it as its example). Runtime carries no provenance to tell those
+    apart — and does not need to: the name collides across repos either way, so
+    it is never a repo signal.
+
+    Named for what it tests rather than written as a bare
+    ``== DEFAULT_TMUX_SESSION`` at the call site, because the inline form reads
+    as an *unconfigured-repo* check — a claim this cannot make and does not
+    need to.
+    """
+    return session == DEFAULT_TMUX_SESSION
+
+
+async def _composer_drain(seconds: float) -> None:
+    """Yield the event loop between two delivery keystrokes (t1525).
+
+    Module level so tests can rebind it (the `capture_shadow_text` seam pattern)
+    rather than paying real wall clock in the unit suite. `asyncio.sleep` keeps
+    the Textual event loop responsive while the shadow's TUI drains the pty
+    write and repaints.
+    """
+    await asyncio.sleep(seconds)
+
+
+def _pane_mode_detail(in_mode: bool | None, mode_name: str) -> dict:
+    """Durable-record fields for one `query_pane_mode` reading (t2001).
+
+    Carried into the hold/disarm event of the delivery that took the reading,
+    so the log alone says whether a pane was in a mode when an outcome was
+    decided — the question the original `text_not_in_composer` reports could
+    not answer.
+    """
+    return {
+        "pane_in_mode": ("unreadable" if in_mode is None
+                         else "1" if in_mode else "0"),
+        "pane_mode": mode_name or None,
+    }
+
+
+def _phase_head(phase: str, budget: int, glyph: str = "") -> str:
+    """The phase segment — ``<glyph> <phase>`` — sized to ``budget`` cells.
+
+    Shared by the list rows' shed ladder (rung 2) and the docked card, so the
+    two surfaces clip a phase identically (t2128). The glyph is the one part
+    worth keeping longest: it carries the phase's shape and colour in one cell.
+    So the phase TEXT is clipped first, and only while that still leaves
+    :data:`_MIN_PHASE_CELLS`; below that the glyph renders alone, and below one
+    cell nothing does. Without a glyph this is plain :func:`_clip`.
+    """
+    if not phase:
+        return ""
+    lead = f"{glyph} " if glyph else ""
+    if cell_len(lead + phase) <= budget:
+        return lead + phase
+    if not glyph:
+        return _clip(phase, budget)
+    room = budget - cell_len(lead)
+    if room >= _MIN_PHASE_CELLS:
+        return lead + _clip(phase, room)
+    return glyph if cell_len(glyph) <= budget else ""
+
+
+def _gate_phase_parts(phase: str, gates: str, budget: int,
+                      glyph: str = "") -> tuple[str, str]:
+    """:func:`format_gate_phase_row`'s ladder, returning the two segments.
+
+    ``(head, tail)``: the budgeted phase segment (glyph included) and the
+    budgeted gate segment, either possibly ``""``. Kept apart so the caller can
+    style them differently AFTER every width decision was made on plain text —
+    the joined row is ``head · tail`` when both are present.
+    """
+    if not phase and not gates:
+        return "", ""
+    if not gates:
+        return _phase_head(phase, budget, glyph), ""
+    short = gate_ledger.abbreviate_gate_summary(gates)
+    if not phase:
+        for candidate in (gates, short):
+            if cell_len(candidate) <= budget:
+                return "", candidate
+        return "", _clip(short, budget)
+    head = f"{glyph} {phase}" if glyph else phase
+    for candidate in (gates, short):                    # 1. abbreviate the tail
+        if cell_len(f"{head} · {candidate}") <= budget:
+            return head, candidate
+    room = budget - cell_len(f" · {short}")             # 2. the phase gives way
+    lead = cell_len(f"{glyph} ") if glyph else 0
+    if room - lead >= _MIN_PHASE_CELLS:
+        return _phase_head(phase, room, glyph), short
+    if cell_len(short) <= budget:                       # 3. drop the phase
+        return "", short
+    return "", _clip(short, budget)                     # 4. terminal backstop
+
+
+def format_gate_phase_row(phase: str, gates: str, budget: int,
+                          glyph: str = "") -> str:
+    """The gate summary and the advisory workflow phase on ONE line (t1479).
+
+    ``<PHASE><⏸> · <gate summary>`` — phase first (the coarser signal), counts
+    second, and **no ``phase:`` / ``gates:`` labels**: they cost ~13 cells and
+    say nothing that ``IMPLEMENT`` and ``3/4 pass`` do not already say in
+    context. The full monitor merges the same two signals onto its status row;
+    this is the narrow-column equivalent, and it is what turns a gated task's
+    card from four rows into three.
+
+    Either half may be empty (an ungated task has no summary, an unresolvable
+    phase renders as ``""``) — then the other is rendered alone, and ``""``
+    when both are.
+
+    **Shed order when the join exceeds ``budget``** — the gate counts are the
+    last thing to give way, because a failed or stale gate is precisely what
+    must stay visible:
+
+    1. abbreviate the gate tail (``1/4 pass, 1 pending, 1 failed`` →
+       ``1/4 1p 1f``, :func:`gate_ledger.abbreviate_gate_summary`);
+    2. clip the **phase** — it is coarse and re-derivable, the counts are not;
+    3. drop the phase entirely once it would clip below
+       :data:`_MIN_PHASE_CELLS`, where it carries no information anyway;
+    4. terminal backstop — clip the abbreviated summary, reachable only if it
+       alone exceeds the budget.
+
+    ``glyph`` (t2128) is the phase's leading mark, rendered as
+    ``<glyph> <phase>``. Its cells are counted on every rung — the row is
+    measured as it will be drawn, so the ladder never under-counts it into a
+    wrap. A clipped phase (rung 2) keeps its glyph; a dropped phase (rung 3)
+    drops the glyph with it.
+
+    At the default 40-column pane (34-cell detail budget) the worst realistic
+    case, ``◌ unknown (rec off) · 0/4 1p 1f 1s``, is exactly 34 cells: rungs 2-4
+    exist so the failure mode is stated rather than emergent.
+    """
+    return " · ".join(
+        part for part in _gate_phase_parts(phase, gates, budget, glyph) if part)
+
+
+def format_gate_phase_markup(sig, gates: str, budget: int) -> str:
+    """:func:`format_gate_phase_row` for ``sig``, as styled markup (t2128).
+
+    Every width decision is made on the plain text first — glyph included —
+    and only then is the phase segment wrapped in its own style
+    (:func:`monitor_shared.phase_mark`) while the gate counts stay dim, so
+    styling can never change what fits. Both segments are made literal: the
+    text is framework-built today, but this row ends in a closing tag, and
+    ``markup_literal`` costs nothing (t2017).
+    """
+    glyph, style = phase_mark(sig)
+    head, tail = _gate_phase_parts(
+        workflow_phase.render_phase_narrow(sig), gates, budget, glyph)
+    out = f"[{style}]{markup_literal(head)}[/]" if head else ""
+    if tail:
+        sep = " · " if head else ""
+        out += f"[dim]{sep}{markup_literal(tail)}[/]"
+    return out
+
+
+def format_phase_markup(sig, budget: int) -> str:
+    """The docked card's phase row for ``sig``: glyph + phase in its own style,
+    sized to ``budget`` cells by :func:`_phase_head` — ``""`` when there is
+    nothing honest to say or no room to say it (t2128)."""
+    glyph, style = phase_mark(sig)
+    head = _phase_head(workflow_phase.render_phase_narrow(sig), budget, glyph)
+    return f"[{style}]{markup_literal(head)}[/]" if head else ""
+
+
+# -- Widgets ------------------------------------------------------------------
+
+def pick_scroll_anchor(
+    card_offsets: list[tuple[str, int]], scroll_y: float
+) -> tuple[str, float] | None:
+    """``(pane_id, delta)`` for the topmost visible card, or ``None`` (t1539).
+
+    ``card_offsets`` is the pre-rebuild ``[(pane_id, virtual_region.y), ...]`` in
+    DOM order. Picks the last card starting at or above ``scroll_y``, falling
+    back to the first card when the view sits above all of them. ``delta`` is the
+    remainder — the distance from that card's top to the actual scroll offset —
+    so a position part-way through a tall card, or above the first card when a
+    section divider precedes it, survives the round trip. It is deliberately
+    allowed to be negative for exactly that divider case.
+
+    Pure so it can be tested without booting a Textual app; the caller owns
+    every DOM read.
+    """
+    if not card_offsets:
+        return None
+    anchor_id, anchor_top = card_offsets[0]
+    for pane_id, top in card_offsets:
+        if top > scroll_y:
+            break
+        anchor_id, anchor_top = pane_id, top
+    return anchor_id, scroll_y - anchor_top
+
+
+def resolve_anchor_target(
+    order: list[str], anchor_id: str, live_offsets: dict[str, int]
+) -> int | None:
+    """Content ``y`` for ``anchor_id`` after the rebuild, or ``None`` (t1539).
+
+    ``order`` is the pre-rebuild pane_id sequence and ``live_offsets`` maps the
+    pane_ids that survived to their new ``virtual_region.y``. A code-agent can be
+    killed between two refreshes, so the anchor is not guaranteed to exist: walk
+    ``order`` outward from its old index — nearer-above first, because settling
+    just above where the dead agent was reads as "the list closed up" rather than
+    "the list jumped" — and return the first survivor's offset.
+
+    ``None`` means nothing from the old list survived at all, which the caller
+    turns into a clamp rather than a guess.
+    """
+    if anchor_id in live_offsets:
+        return live_offsets[anchor_id]
+    try:
+        idx = order.index(anchor_id)
+    except ValueError:
+        return None
+    for distance in range(1, len(order) + 1):
+        for candidate in (idx - distance, idx + distance):
+            if 0 <= candidate < len(order):
+                pane_id = order[candidate]
+                if pane_id in live_offsets:
+                    return live_offsets[pane_id]
+    return None
+
+
+def list_layout_pending(card_tops: list[int]) -> bool:
+    """True while freshly mounted cards still have no geometry (t1539).
+
+    Textual lays children out asynchronously, so a restore posted with
+    ``call_after_refresh`` can run before the rebuilt list has a scroll range.
+    In that window every card reports ``virtual_region.y == 0`` and
+    ``max_scroll_y`` is 0 — measured live, 320 of 488 sampled ticks. Both
+    numbers a restore would use are therefore lies: ``validate_scroll_y`` clamps
+    the write to 0, which is the bug being fixed.
+
+    Detecting the state from the *card offsets* rather than from ``max_scroll_y``
+    is what makes this usable at all: for an anchored list the anchor's own
+    offset reads 0 in this window, so a ``target > max_scroll_y`` comparison
+    collapses to ~0 and reads false, and the restore commits a bogus offset.
+
+    Only the MID-LIST restore reaches this predicate now (t1653). A
+    bottom-pinned list returns from ``_restore_list_scroll`` before the gate,
+    because Textual's anchor has the compositor recompute the offset inside the
+    arrange pass — there is no non-final ``max_scroll_y`` left to wait for. The
+    caveat this docstring used to carry, that ``target > max_scroll_y`` is
+    "vacuously false" when the target IS ``max_scroll_y``, described that
+    now-unreachable path.
+
+    ``card_tops`` samples ``MiniPaneCard``s only, while the container also mounts
+    session dividers and the ``other (N)`` header. That subset is sound rather
+    than merely convenient: a divider is a fixed-height ``Static`` mounted BEFORE
+    its group's first card, so it cannot make "every card reports 0" false while
+    the layout has in fact landed.
+
+    ``len > 1`` because a single card legitimately sits at 0 and a one-card list
+    has nothing to scroll anyway.
+    """
+    return len(card_tops) > 1 and not any(card_tops)
+
+
+class MiniPaneCard(Static, can_focus=True):
+    """Compact status entry for an agent pane."""
+
+    def __init__(self, pane_id: str, text: str, **kwargs) -> None:
+        super().__init__(text, **kwargs)
+        self.pane_id = pane_id
+
+
+class _ListEntry(NamedTuple):
+    """One widget of the general list, before it is mounted (t2183).
+
+    ``key`` identifies the widget across ticks: the pane id for a ``card``, the
+    rendered text for a ``divider`` or the ``header``. A changed divider or
+    ``other (N)`` text is therefore a changed list SHAPE, which rebuilds.
+    """
+
+    kind: str          # "card" | "divider" | "header"
+    key: str
+    text: str
+    classes: str = ""
+
+
+class _ListRecord(NamedTuple):
+    """What the last full rebuild mounted: the ``(kind, key)`` shape and the
+    widgets, in mount order (t2183). Card TEXT is deliberately not recorded —
+    ``Static.content`` is the truth of what each card shows, including an
+    update that did not come from the tick."""
+
+    keys: tuple
+    widgets: tuple
+
+
+def _fits_width(text: str, width: int) -> bool:
+    """Every line of ``text`` fits ``width`` cells, so ``Static`` will not wrap it.
+
+    Parsed with ``Content.from_markup`` — what ``Static`` itself does with a
+    ``str`` (``textual.visual.visualize``) — so the cell count is the rendered
+    one, not the markup's.
+    """
+    return all(line.cell_length <= width
+               for line in Content.from_markup(text).split("\n"))
+
+
+def card_height_stable(old, new: str, width: int) -> bool:
+    """True only when replacing ``old`` with ``new`` provably keeps a card's
+    height, i.e. ``update(layout=False)`` is safe (t2183).
+
+    ``MiniPaneCard`` is ``height: auto`` and ``Static`` WRAPS, so an equal
+    newline count is not the proof: the row budgets clip to the CONFIGURED
+    ``_target_width``, and the real pane can be narrower (see the budget block
+    at the top of this module). So both texts must also fit the card's ACTUAL
+    content ``width``. Anything unprovable — an unlaid-out card, non-string
+    content, unparseable markup — answers False, which costs one layout pass
+    and never a stale height.
+    """
+    if width <= 0 or not isinstance(old, str):
+        return False
+    if old.count("\n") != new.count("\n"):
+        return False
+    try:
+        return _fits_width(old, width) and _fits_width(new, width)
+    except Exception:
+        return False
+
+
+class MiniPaneScrollBar(ScrollBar):
+    """The list's own vertical scrollbar, so "a thumb drag just ended" is a state
+    this app OWNS rather than one it has to infer (t1653).
+
+    ``Widget._check_anchor()`` takes **no arguments** and is called from two
+    places that need opposite treatment:
+
+    * ``Widget.watch_scroll_y`` — after EVERY scroll change. Mid-rebuild the
+      container is childless, so ``max_scroll_y`` is 0 and the clamp has already
+      put ``scroll_y`` at 0; Textual's ``scroll_y >= max_scroll_y`` is then
+      trivially true and would re-pin a mid-list reader on every tick.
+    * ``ScrollBar._on_mouse_release`` — once, at the end of a thumb drag. This
+      one IS a deliberate "take me to the bottom" gesture, and it must arm the
+      pin even when the position it produced is nowhere near ``max_scroll_y``.
+
+    That last case is not hypothetical. Measured on the live fixture, with card
+    heights changing out of band with the refresh tick: a drag past the trough
+    end settled at ``scroll_y = 43.745`` against a ``max_scroll_y`` that had
+    since grown to 50, and the list then drifted for every one of the following
+    18 ticks. Textual's own re-arm sometimes fires mid-drag and sometimes does
+    not, purely on timing — which is why the arming cannot be left to a position
+    comparison.
+
+    And the obvious ambient discriminator does not work: ``_on_mouse_release``
+    executes ``self.grabbed = None`` on the line BEFORE calling
+    ``self.parent._check_anchor()``, so ``Widget.is_vertical_scrollbar_grabbed``
+    already reads False by the time the check runs. Owning the scrollbar is what
+    makes the release site explicit instead of guessed.
+    """
+
+    def _pane_list(self) -> "MiniPaneList | None":
+        parent = self.parent
+        return parent if isinstance(parent, MiniPaneList) else None
+
+    def _on_mouse_capture(self, event) -> None:
+        # A new drag starts with no claim about where it will end.
+        owner = self._pane_list()
+        if owner is not None and self.vertical:
+            owner._thumb_drag_reached_end = False
+        super()._on_mouse_capture(event)
+
+    def _on_mouse_release(self, event) -> None:
+        owner = self._pane_list()
+        if owner is not None and self.vertical:
+            owner._thumb_release_pending = True
+        try:
+            super()._on_mouse_release(event)    # calls parent._check_anchor()
+        finally:
+            if owner is not None and self.vertical:
+                owner._thumb_release_pending = False
+
+
+class MiniPaneList(VerticalScroll):
+    """The agent list's scroller, with the two seams the restore needs (t1539).
+
+    ``_rebuild_pane_list`` tears every card down and remounts it whenever the card
+    set changes (an unchanged set is updated in place, t2183). While
+    the container is childless its ``max_scroll_y`` is 0, so ``validate_scroll_y``
+    clamps ``scroll_y`` to 0 — measured live: ``scroll_y`` goes ``8.0 -> 0``
+    between the ``remove_children()`` and the end of ``mount_all()``. Restoring
+    the offset afterwards therefore has to fight two things: Textual's own
+    uninvited scrolls (the focus restore and friends), and its own timing.
+
+    The two overrides below discriminate *uninvited* from *user-driven* scrolls
+    by call path, which is exhaustive because the two paths are disjoint:
+
+    * every uninvited scroll arrives via ``Screen.scroll_to_widget``, which walks
+      the ancestor chain calling ``scroll_to_region`` on each — that covers
+      ``focus()``'s ``scroll_visible``, its deferred re-post for an unlaid-out
+      widget, ``Screen.set_focus``'s ``scroll_to_center``, the focus Textual
+      re-homes when the focused card is torn down, and ``ScrollToRegion``;
+    * every user gesture lands in ``_scroll_to`` without ever touching
+      ``scroll_to_region`` — wheel via ``_scroll_*_for_pointer``, scrollbar thumb
+      drag via ``_on_scroll_to``, trough/arrow click via ``scroll_page_*``, and
+      the scroll key bindings.
+
+    Overriding ``allow_vertical_scroll`` instead — the seam the board's design
+    reached for — would be too blunt here: it refuses *both* classes, so a
+    gesture landing inside the rebuild window would be dropped **and** would not
+    retire the pending restore, letting the stale anchor overwrite what the user
+    just did. The scrollbar thumb drag is the sharpest case, because
+    ``_on_scroll_to`` gates on ``_allow_scroll``, which a vertical-only scroller
+    makes false the moment ``allow_vertical_scroll`` is.
+
+    **A THIRD class of write exists, and it is deliberately let through (t1653).**
+    When the bottom pin is armed, Textual's compositor recomputes the offset from
+    ``total_region.bottom`` inside the arrange pass and writes it with
+    ``set_reactive`` (``_compositor.py:609``), which bypasses both overrides
+    above, ``validate_scroll_y``, and ``_list_scroll_lock``. That is wanted, not
+    an oversight: under the anchor, the compositor's write IS the restore, and it
+    happens at the one moment the new geometry is final. The lock exists to
+    refuse scrolls that would fight a pending restore — never the restore itself.
+
+    One consequence has to be handled by the app rather than by Textual: the
+    container branch of that write is unclamped (the non-container branch at
+    ``:693`` uses the reactive setter and does clamp), so a pinned list that
+    stops overflowing holds a NEGATIVE ``scroll_y``. Measured: ``scroll_y = -8``
+    at ``max_scroll_y = 0``. ``_reconcile_anchor`` suspends the anchor for the
+    duration rather than fighting it, keeping the user's request so the list
+    re-pins by itself when content regrows.
+    """
+
+    # Bottom-pin state (t1653). A CLASS attribute for the same reason as the
+    # app's scroll state below: test modules build widgets and hand-set only what
+    # the case touches.
+    #
+    # `_pin_suspended` records that `_reconcile_anchor` turned Textual's anchor
+    # OFF for a degenerate range — the list is shorter than its viewport — while
+    # the user's request to be at the bottom still stands. It is the one state
+    # where "pinned" and Textual's `_anchor_released` legitimately disagree.
+    _pin_suspended = False
+    # `_thumb_release_pending` is true only for the duration of ONE
+    # `ScrollBar._on_mouse_release` call. `_thumb_drag_reached_end` records, at
+    # REQUEST time, whether the drag asked to go at or past the end — see
+    # `_on_scroll_to`.
+    _thumb_release_pending = False
+    _thumb_drag_reached_end = False
+
+    @property
+    def vertical_scrollbar(self) -> ScrollBar:
+        """`Widget.vertical_scrollbar`, but building our own subclass (t1653).
+
+        Mirrors the base property exactly — including the lazy cache and the
+        `_start_widget` registration — so only the class differs. This is the
+        seam that lets the app own the drag-release site; see
+        `MiniPaneScrollBar`.
+        """
+        if self._vertical_scrollbar is not None:
+            return self._vertical_scrollbar
+        self._vertical_scrollbar = scroll_bar = MiniPaneScrollBar(
+            vertical=True, name="vertical", thickness=self.scrollbar_size_vertical
+        )
+        scroll_bar.display = False
+        self.app._start_widget(self, scroll_bar)
+        return scroll_bar
+
+    def on_mount(self) -> None:
+        """Arm Textual's bottom anchor ONCE, then release it (t1653).
+
+        `anchor()` is what makes `_anchored` true, and `_anchored` is the switch
+        `watch_scroll_y` tests before it will even call `_check_anchor`. Without
+        this the list could never re-arm from any gesture. `release_anchor()`
+        immediately after is what makes the list OPEN AT THE TOP rather than
+        tailing like a log; from here on the pin is armed only by a real user
+        gesture. The container is still empty at this point, so the `scroll_end`
+        inside `anchor()` is a no-op.
+        """
+        self.anchor()
+        self.release_anchor()
+
+    @property
+    def is_bottom_pinned(self) -> bool:
+        """True while the user has asked to be held at the bottom.
+
+        `is_anchored` is public; the released flag is not, so the private read is
+        encapsulated HERE and nowhere else (`aitask_setup.sh` pins
+        `textual>=8.2.7,<9`, which floats within major 8).
+
+        A suspended pin still counts: `_reconcile_anchor` turns the anchor off
+        while the list is shorter than its viewport, and the user's request has
+        to outlive that.
+        """
+        return self.is_anchored and (
+            not self._anchor_released or self._pin_suspended)
+
+    def release_anchor(self) -> None:
+        """Textual's release, plus forgetting any suspension (t1653).
+
+        This is the ONE seam every "the user scrolled away" path already funnels
+        through — `_scroll_to(release_anchor=True)` for wheel and key gestures,
+        `scroll_to()` for programmatic scrolls, and
+        `ScrollBar._on_mouse_capture` when a thumb drag begins. Clearing the
+        suspension here keeps the two in lockstep without enumerating those
+        paths, which is the mistake the class docstring above warns about.
+
+        `_reconcile_anchor` deliberately calls `super().release_anchor()`
+        instead: suspending the anchor for a degenerate range is the app pausing
+        the mechanism, not the user changing their mind.
+        """
+        self._pin_suspended = False
+        super().release_anchor()
+
+    def _reconcile_anchor(self) -> None:
+        """Hold Textual's anchor engaged exactly while it is safe to (t1653).
+
+        The compositor's *container* branch writes
+        `total_region.bottom - container_height` through `set_reactive`
+        (`_compositor.py:609`), bypassing `validate_scroll_y` — unlike the
+        non-container branch at `:693`, which uses the reactive setter and does
+        clamp. A pinned list whose content has shrunk below its viewport
+        therefore holds a NEGATIVE offset. Measured on a bare `VerticalScroll`:
+        `scroll_y = -8` at `max_scroll_y = 0`.
+
+        A one-shot correction cannot win that fight — measured: assigning 0 from
+        a post-refresh callback was observed being rewritten to -2 by the next
+        arrange, because the compositor reasserts it on EVERY layout. So the
+        anchor is suspended for the duration instead, and re-engaged when the
+        list overflows again.
+
+        Runs after the layout has settled: from the app's post-rebuild callback,
+        and from `on_resize` for the pane-resize path, which re-arranges with no
+        rebuild at all.
+        """
+        if self.max_scroll_y <= 0:
+            if not self._anchor_released:
+                self._pin_suspended = True
+                # NOT self.release_anchor(): this pauses the mechanism, it does
+                # not revoke the user's request.
+                super().release_anchor()
+            if self._pin_suspended and self.scroll_y != 0:
+                self.scroll_y = 0
+        elif self._pin_suspended:
+            self._pin_suspended = False
+            self.anchor()
+
+    def on_resize(self, event) -> None:
+        # A terminal resize re-arranges without any rebuild, so the app's
+        # per-tick reconcile is not enough on its own: shrinking the pane under
+        # a pinned list reaches the same unclamped write.
+        self.call_after_refresh(self._reconcile_anchor)
+
+    def _on_scroll_to(self, message: ScrollTo) -> None:
+        """Record the drag's INTENT at request time (t1653).
+
+        This is the thumb-drag path and only it — every user gesture reaches
+        `_scroll_to`, but a `ScrollTo` message is posted by
+        `ScrollBar._on_mouse_move` alone.
+
+        "Did this drag ask for the bottom?" has a stable answer only HERE,
+        against the geometry the user was actually looking at. By the time the
+        mouse is released the number the drag was aimed at is gone: measured, a
+        drag past the trough end settled at 43.745 while `max_scroll_y` had grown
+        to 50.
+
+        **The comparison is made in the SCROLLBAR's coordinate space, not the
+        container's**, and that is the whole point rather than a detail.
+        `ScrollBar._on_mouse_move` computes `y` from its own
+        `window_virtual_size / window_size` (`scrollbar.py:384-392`), which are
+        refreshed on layout and are therefore a snapshot of the geometry the
+        thumb was rendered against. Comparing that `y` against the container's
+        `max_scroll_y` mixes two clocks: when content grows between the layout
+        that sized the thumb and this message, a drag that genuinely reached the
+        end of the thumb's travel scores as "did not reach the end", the pin is
+        not armed, and the list drifts for the rest of the session. Measured: a
+        1-in-8 flake in the live fixture with exactly that signature.
+
+        The container's value is the fallback for the case the scrollbar has no
+        usable geometry yet, where it is the only number available.
+        """
+        if message.y is not None:
+            bar = self._vertical_scrollbar
+            if bar is not None and bar.window_size:
+                travel_end = max(0, bar.window_virtual_size - bar.window_size)
+            else:
+                travel_end = self.max_scroll_y
+            self._thumb_drag_reached_end = message.y >= travel_end
+        super()._on_scroll_to(message)
+
+    def _check_anchor(self) -> None:
+        """Arm on gesture INTENT; refuse Textual's degenerate mid-rebuild re-arm.
+
+        Two callers, two treatments — see `MiniPaneScrollBar` for why they cannot
+        be told apart without owning the scrollbar.
+        """
+        if self._thumb_release_pending:
+            # A real end-of-drag gesture. Deliberately NOT subject to the
+            # rebuild-lock refusal below: that guard exists to reject Textual's
+            # own degenerate comparison, not the user's input, and `_scroll_to`
+            # has already retired any pending restore for us.
+            if self._thumb_drag_reached_end:
+                self._thumb_drag_reached_end = False
+                self._pin_suspended = False
+                # anchor() re-arms AND scroll_end()s: `scroll_end` clears
+                # `_anchor_released` itself when the widget is anchored.
+                self.anchor()
+            return
+        if self._locked() or self.max_scroll_y <= 0:
+            # Mid-rebuild the container is childless, so `max_scroll_y` is 0 and
+            # `validate_scroll_y` has already clamped `scroll_y` to 0 — Textual's
+            # `0 >= 0` would silently re-pin a mid-list reader on EVERY tick. A
+            # list with nothing to scroll cannot be a gesture either.
+            return
+        super()._check_anchor()
+
+    def _owner(self):
+        """The owning app, or None. Both overrides run during teardown too, when
+        `self.app` raises NoActiveAppError rather than returning None."""
+        try:
+            return self.app
+        except Exception:
+            return None
+
+    def _locked(self) -> bool:
+        """True while the app is mid-rebuild. False if there is no app yet."""
+        return bool(getattr(self._owner(), "_list_scroll_lock", False))
+
+    def scroll_to_region(self, region, *args, **kwargs):
+        # The single funnel for every UNINVITED scroll; see the class docstring.
+        # `force=True` is the deliberate bypass, and nothing in this app passes
+        # it here — the restore scrolls through `scroll_to`/`scroll_end`.
+        if not kwargs.get("force") and self._locked():
+            return Offset()    # falsy ⇒ "nothing scrolled" for the caller's arithmetic
+        return super().scroll_to_region(region, *args, **kwargs)
+
+    def _scroll_to(self, x=None, y=None, *, force=False, **kwargs):
+        # Anything non-forced reaching here is a real user gesture. The restore
+        # always passes force=True and uninvited scrolls were turned away above,
+        # so this needs no allowlist of Textual's private `_on_*` handler names —
+        # a new one would route through here like the rest.
+        if not force:
+            abandon = getattr(self._owner(), "_abandon_scroll_restore", None)
+            if abandon is not None:
+                abandon()
+        return super()._scroll_to(x, y, force=force, **kwargs)
+
+
+# Accepted shapes for a hand-typed task number (t1310): a parent id, or one
+# child level — the same shape `_TASK_ID_RE` extracts from agent window names.
+# Applied BEFORE any lookup, because the id is interpolated into a glob pattern
+# downstream and passed to the pick command.
+_PICK_TASK_ID_RE = re.compile(r"\d+(?:_\d+)?")
+
+# Headless board-column seam (t1377_1), shelled out to rather than imported: it
+# owns the task-file write, and `monitor/` keeps its no-in-process-mutation
+# stance. Timeout mirrors `_MARKS_CMD_TIMEOUT` — the wrapper takes no lock of its
+# own, so this only has to bound a wedged child.
+_BOARD_COLUMN_SH = _SCRIPT_DIR / "aitask_board_column.sh"
+_BOARD_COLUMN_CMD_TIMEOUT = 20.0
+
+
+# -- Main app -----------------------------------------------------------------
+
+# The complete key surface of the app lives in monitor/minimonitor_keys.py
+# (t2212): FULL_HINT_LINES / COLLAPSED_HINT_LINE name ACTIONS, and the keys
+# come from the App's composed BINDINGS, so the band, the collapsed line and
+# the H help modal all follow a user's rebinds. Minimonitor renders no Footer
+# — its 40-column companion layout surfaces EVERY binding in that band (the
+# tui_conventions.md "surface the hint in the pane's own text" exception); a
+# binding added without a table entry fails the parity audit
+# (tests/test_minimonitor_key_hints_modes.py). KEY_HINTS_TEXT — the default-key
+# rendering every test reads — is derived below the class.
+
+# Top-chrome layout budget (t1499). These five flow above #mini-pane-list in
+# compose order; #mini-key-hints is docked bottom. When the chrome's occupied
+# height leaves the list less than _PANE_LIST_FLOOR_ROWS, the hints compact to
+# _SHORT_HINT_ROWS rather than letting the flow overrun the docked band and
+# paint the agent list off the screen. See _refresh_short_mode.
+#
+# The followed agent leads (t1566): it is this pane's primary identity surface,
+# so the two advisory banners flow BELOW it rather than pushing it down. Keep
+# this tuple in compose() order — _refresh_short_mode only sums the heights, but
+# the stylesheet comment below describes the order and the two must agree.
+_TOP_CHROME = (
+    "#mini-session-bar",
+    "#mini-own-agent",
+    "#mini-shadow-stale",
+    "#mini-loop-status",
+    "#mini-filter-status",
+)
+# Worst-case rendered height of #mini-own-agent, summed row-by-row from what
+# _maybe_build_own_agent_panel actually mounts rather than guessed (t1566). Every
+# term is bounded by CONTENT, not by width: _own_agent_identity_text pre-wraps
+# the window name to at most two lines and the title to at most two, so this
+# holds at 22 columns exactly as it does at 40. A row added to the panel must be
+# added here too.
+_OWN_PANEL_MAX_ROWS = (
+    1      # "── this agent · <session> ──" header — `.mini-own-header` is
+           # `height: 1`, so the session name costs no row; _own_header_text
+           # budgets it to fit at every target_width instead (t1580)
+    + 2    # identity — name wrapped to <=2 lines, mark glyph inline on line 1
+    + 2    # task title — textwrap.wrap(info.title, ...)[:2]
+    + 1    # advisory phase line (_own_phase_text)
+    + 1    # border-bottom: max-height is BORDER-BOX, so the border costs a row
+)
+# Caps of the two advisory banners, as CSS rows. Named here so
+# _MAX_CHROME_ROWS below is a derivation rather than a second set of literals.
+_SHADOW_STALE_ROWS = 1   # one-row contract (t1566) — see SHADOW_STALE_NARROW
+_LOOP_STATUS_ROWS = 2    # longest real literal is 39 cells => 2 rows at 38
+_SESSION_BAR_ROWS = 1    # `height: 1`, and only when the config enables it
+_FILTER_STATUS_ROWS = 1  # `height: 1`, no wrap; only while a filter is active (t2217)
+# Ceiling the pane list is sized against. The floor it buys is stated once, in
+# test_pane_list_keeps_a_row_under_full_live_chrome: at 40 columns this plus the
+# compacted hints leaves the list a row down to pane height 12. A cap raised
+# without raising this fails there instead of silently eating the list.
+_MAX_CHROME_ROWS = (
+    _SESSION_BAR_ROWS + _OWN_PANEL_MAX_ROWS
+    + _SHADOW_STALE_ROWS + _LOOP_STATUS_ROWS + _FILTER_STATUS_ROWS
+)
+
+# The status/phase filter's cycle (t2217), in `shift+right` order; `shift+left`
+# walks it backwards and both wrap. The three phases are `workflow_phase.PHASES`
+# minus UNKNOWN — an agent whose phase does not resolve matches no phase stop.
+# `parked` / `frozen` are marks/states, not phases: those rows are never
+# captured, so they never compute a phase and only these two stops show them.
+_STATUS_FILTERS = ("all", "PLAN", "IMPLEMENT", "POSTIMPL", "parked", "frozen")
+_PHASE_FILTERS = frozenset({"PLAN", "IMPLEMENT", "POSTIMPL"})
+
+# "No precomputed phase" inside `_agent_card_text` (t2217): `None` is a real
+# phase value there (it renders no phase half of the row).
+_PHASE_UNSET = object()
+# The full band's AUTHORED line count — its rendered height at 40 columns, where
+# no default line wraps (pinned by test_minimonitor_top_chrome_render.py). It is
+# NOT what the short-mode predicate reads: below ~24 columns the band word-wraps
+# (22 rows at width 18), so `_refresh_short_mode` measures the band's desired
+# height at the current width instead (`_key_hints_desired_rows`, t1574).
+_KEY_HINTS_ROWS = len(FULL_HINT_LINES)
+_SHORT_HINT_ROWS = 2
+_PANE_LIST_FLOOR_ROWS = 3
+
+
+class MiniMonitorApp(
+    AgentMarksMixin, SitrepCloseMixin, ShadowRejectionsMixin, TuiSwitcherMixin,
+    ShortcutsMixin, App
+):
+    """Compact Textual app for monitoring tmux agent panes."""
+
+    _shortcuts_scope = "minimonitor"
+
+    TITLE = "Mini Monitor"
+
+    # List scroll preservation across the per-tick rebuild (t1539).
+    #
+    # CLASS attributes, not `__init__` assignments, and that is load-bearing:
+    # several test modules build the app with `MiniMonitorApp.__new__(...)` and
+    # hand-set only the attributes the case under test touches, so an
+    # `__init__`-only default would `AttributeError` the moment `_refresh_data`
+    # or `MiniPaneList` read one.
+    _list_scroll_lock = False
+    # (pinned, anchor_id, delta, order) captured before the rebuild, or None.
+    # `pinned` is `MiniPaneList.is_bottom_pinned` — a live mode read, not the
+    # `scroll_y >= max_scroll_y - 1` geometry snapshot it replaced (t1653).
+    _pending_scroll_state: tuple[bool, str, float, list[str]] | None = None
+    _scroll_restore_gen = 0
+    _scroll_lock_timer: Timer | None = None
+    # Frames the restore may wait for `max_scroll_y` to come back. Bounded by
+    # construction; falling through restores what fits.
+    _SCROLL_RESTORE_MAX_ATTEMPTS = 8
+    # Fail-safe release, well inside the default 3 s refresh interval.
+    _SCROLL_LOCK_TIMEOUT = 0.5
+
+    # In-place list updates (t2183): an unchanged card set is diffed against what
+    # each card shows and only changed cards are updated; the full rebuild runs
+    # when the set changes. ``True`` in production. A class attribute so a test
+    # host can pin the full-rebuild path: the t1539/t1653 modules reproduce their
+    # bugs by re-ticking an UNCHANGED set, which this path would otherwise skip
+    # (see ``_ListHost`` in tests/test_minimonitor_scroll_preservation.py).
+    _IN_PLACE_LIST_UPDATES = True
+
+    # Configured width of the companion column, mirrored as a CLASS attribute
+    # for the same reason as the scroll state above (t1566). It used to be read
+    # only inside `_own_agent_identity_text`'s has-a-task branch, so a
+    # `__new__`-built stub with no task never reached it; the identity text is
+    # now wrapped unconditionally, which made every such stub AttributeError.
+    # `__init__` still sets the real value — this is only the floor under it.
+    _target_width = 40
+
+    # Whether the top session bar is shown at all (t1566). Off by default;
+    # `tmux.minimonitor.session_bar: true` turns it on via main(). This gates
+    # only the BAR — the `_multi_session` view is untouched, so agents from other
+    # sessions keep appearing in the pane list and `M` keeps working.
+    #
+    # A CLASS attribute for the same reason as the scroll state above: several
+    # test modules build the app with `MiniMonitorApp.__new__(...)` and hand-set
+    # only what they touch, so an `__init__`-only default would AttributeError
+    # the moment _rebuild_session_bar read it.
+    _session_bar_enabled = False
+
+    # Same `__new__`-built-test rationale: `_parked_agent_pairs` reads these two
+    # and must fail SAFE (publish nothing) rather than AttributeError on an app
+    # that never ran `__init__` (t1685).
+    _own_identity_confirmed: bool = False
+    _own_window_name: str | None = None
+
+    # CLASS attributes for the same reason as `_target_width` above (t1580):
+    # several test modules build the app with `MiniMonitorApp.__new__(...)` and
+    # hand-set only what they touch, so `_own_header_session` reaching
+    # `_root_for_snap` would AttributeError on every such stub. `__init__` still
+    # sets the real values — these are only the floor under them.
+    #
+    # `_root_for_snap`'s `-> Path` annotation is deliberately NOT widened to
+    # `Path | None`: its four production callers all run after `__init__` and
+    # genuinely cannot take a None, so widening it would push a null-check onto
+    # all four to serve a test-construction floor. `_own_header_session` is the
+    # one caller that tolerates the stub's None, and its fail-soft contract
+    # says so explicitly.
+    _monitor: "TmuxMonitor | None" = None
+    _project_root: "Path | None" = None
+
+    # The own panel's cached sessions reader (t1765), built on first use by
+    # `_own_frozen_at`. A CLASS-level None rather than an `__init__` assignment
+    # for the `__new__`-built-test reason above — and here a missing attribute
+    # would not even fail loudly: `_own_frozen_at`'s broad `except` would turn
+    # it into "record unreadable".
+    _own_sessions_view: "agent_sessions.SessionsView | None" = None
+
+    # Status/phase filter (t2217) — `shift+left` / `shift+right` cycle it.
+    # In-memory per instance, like `_hide_inactive`: a forgotten filter must not
+    # hide agents across restarts. CLASS defaults for the `__new__`-built-test
+    # reason above.
+    #
+    # `_entries_filter` is the filter the LAST `_build_list_entries` call built
+    # with, and `_filter_nav_target` the filter a keypress asked to navigate to.
+    # A filter change is consumed as NAVIGATION only by a tick whose entries
+    # were built under that same filter — see `_consume_filter_navigation`.
+    _status_filter: str = "all"
+    _entries_filter: str = "all"
+    _filter_nav_target: str | None = None
+    # The target `_maybe_retick_for_filter` already re-ticked for (one-shot).
+    _filter_retick_for: str | None = None
+    # `{pane_id: (task info, phase)}` for the build in progress only — see
+    # `_agent_card_text`.
+    _build_phases: dict = {}
+
+    CSS = """
+    /* Top chrome. NEVER re-add `dock:` to any of these four (t1499). Textual
+       places same-edge docked siblings at the SAME offset instead of stacking
+       them, so all four landed on y=0 and only #mini-own-agent — last in DOM
+       order — was composited. The other three never rendered in any state,
+       silently: each still reported display=True, visible=True and a
+       "correct" region, which is why the DOM-free banner seams
+       (_shadow_stale_banner_text / _loop_banner_text) and the markup contract
+       test stayed green while the user saw nothing. Same defect and same fix
+       as the board's #filter_area (t1278). Undocked, they flow in compose
+       order and #mini-pane-list (1fr) takes the rest.
+
+       Compose order is #mini-session-bar, #mini-own-agent, #mini-shadow-stale,
+       #mini-loop-status, #mini-filter-status (t1566, t2217): the followed
+       agent is this pane's primary identity surface, so the advisory banners
+       flow BELOW it, and the filter line sits last — directly above the list
+       it describes. _TOP_CHROME carries the same order.
+
+       `display: none` below is LOAD-BEARING, not cosmetic: an empty Static
+       with `height: auto` resolves to ONE row, not zero, so without it the
+       five collapsible widgets would cost 5 permanent rows in a 40-column
+       companion pane. Each write site turns display back on when it has
+       something to show — see _set_shadow_stale_banner, _set_loop_banner,
+       _set_filter_banner, _maybe_build_own_agent_panel and
+       _rebuild_session_bar.
+
+       The `max-height` caps are load-bearing too: undocked chrome GROWS, and
+       unbounded it overruns the bottom-docked #mini-key-hints and paints the
+       agent list off the screen at ~20 rows. Capped, chrome tops out at
+       _MAX_CHROME_ROWS; when even that does not fit, _refresh_short_mode
+       compacts the hints instead — measuring what the chrome actually
+       occupies, never a worst-case budget. The advisory banners are what yield
+       first (t1566): the pane list keeps a row before verbose chrome does. */
+
+    /* Ships HIDDEN (t1566) — the followed agent, not a counter, is what should
+       sit at the top of a 40-column pane. `tmux.minimonitor.session_bar: true`
+       brings it back; _rebuild_session_bar is the one site that reveals it, and
+       on_mount's "Not inside tmux" path reveals it independently because that
+       error has no other surface. */
+    #mini-session-bar {
+        display: none;
+        height: 1;
+        background: $primary;
+        color: $text;
+        padding: 0 1;
+        text-style: bold;
+    }
+
+    /* Hidden until _set_shadow_stale_banner has text. ONE row (t1566): the
+       narrow banner text is sized to fit 38 usable cells, so the cap is a
+       structural guarantee rather than a clip. Advisory chrome yields before
+       the pane list does. Keep in sync with _SHADOW_STALE_ROWS. */
+    #mini-shadow-stale {
+        display: none;
+        height: auto;
+        max-height: 1;
+        background: $error;
+        color: $text;
+        padding: 0 1;
+        text-style: bold;
+    }
+
+    /* Auto-recheck loop status (t1159_2). $warning, deliberately distinct
+       from the $error stale banner above. Hidden on the same rule as that
+       banner. Capped at 2, not 3 (t1566): the longest literal
+       _set_loop_banner is ever called with is 39 cells, which is exactly two
+       rows at 38 usable — the third row was dead budget the pane list wanted.
+       Keep in sync with _LOOP_STATUS_ROWS. */
+    #mini-loop-status {
+        display: none;
+        height: auto;
+        max-height: 2;
+        background: $warning;
+        color: $text;
+        padding: 0 1;
+        text-style: bold;
+    }
+
+    /* Active status/phase filter (t2217). Hidden while the filter is `all`;
+       _set_filter_banner reveals it. Exactly ONE row, structurally: the line
+       carries user-rebindable keys, so its length is not ours to promise —
+       a long rebind loses its tail to the ellipsis instead of costing the
+       list a row. Keep in sync with _FILTER_STATUS_ROWS. */
+    #mini-filter-status {
+        display: none;
+        height: 1;
+        text-wrap: nowrap;
+        text-overflow: ellipsis;
+        background: $panel;
+        color: $text;
+        padding: 0 1;
+        text-style: bold;
+    }
+
+    /* Hidden until _maybe_build_own_agent_panel mounts the panel. NO
+       `max-height:` here on purpose (t1566) — the cap is _OWN_PANEL_MAX_ROWS,
+       applied at that same reveal site so the number sits next to the
+       row-by-row derivation that produces it. A literal here would be a second,
+       silently-drifting copy. */
+    #mini-own-agent {
+        display: none;
+        height: auto;
+        /* No scrollbar, ever (t1566). Two independent reasons, either alone
+           sufficient:
+
+           1. Nothing can scroll it. The panel mounts plain Statics and is
+              excluded from the focus ring (see action_show_own_task_info), so
+              a thumb would advertise rows the user has no way to reach — which
+              IS the defect this task fixes, not a mitigation of it.
+           2. `auto` is unstable at the boundary. A visible scrollbar takes two
+              columns, which re-wraps the name, which makes the panel taller,
+              which keeps the scrollbar: at 22 columns a long name settled into
+              exactly that loop and scrolled a panel whose content otherwise
+              fit. Reserving nothing breaks the cycle, which is what makes
+              _OWN_PANEL_MAX_ROWS hold at every width rather than only at 40. */
+        overflow-y: hidden;
+        background: $boost;
+        border-bottom: solid $primary;
+        padding: 0;
+    }
+
+    .mini-own-header {
+        height: 1;
+        padding: 0 1;
+        color: $text-muted;
+        text-style: bold;
+    }
+
+    .mini-own-card {
+        height: auto;
+        padding: 0 1;
+    }
+
+    /* `scrollbar-size-vertical` is spelled out rather than left to Textual's
+       default: `_LIST_SCROLLBAR` reserves exactly this many cells in every
+       row's budget (t1351), and a test pins the two equal. */
+    #mini-pane-list {
+        height: 1fr;
+        scrollbar-size-vertical: 2;
+    }
+
+    MiniPaneCard {
+        height: auto;
+        padding: 0 1;
+    }
+
+    MiniPaneCard:focus {
+        background: $accent;
+        color: $text;
+    }
+
+    /* No `color:` — the divider's style is single-sourced in
+       monitor_shared.format_session_divider (t1449). */
+    .mini-session-divider {
+        height: 1;
+        padding: 0 1;
+    }
+
+    /* Section header inside the pane list (currently only "other"). No `color:`
+       or `text-style:` — both are single-sourced in
+       monitor_shared.format_section_header (t1449), which is what keeps this
+       rule and the session divider above deliberately different colours. */
+    .mini-section-header {
+        height: 1;
+        padding: 0 1;
+    }
+
+    /* The only `dock:` in this stylesheet, and it must stay the only one on
+       the bottom edge — see the top-of-file comment. */
+    #mini-key-hints {
+        dock: bottom;
+        height: auto;
+        background: $surface;
+        color: $text-muted;
+        padding: 0 1;
+    }
+
+    /* Short-pane mode (t1499): the static hints are the thing that yields
+       when live chrome needs the rows. Toggled by _refresh_short_mode, which
+       measures the chrome's actually-occupied height. */
+    MiniMonitorApp.short #mini-key-hints {
+        max-height: 2;
+    }
+
+    /* Collapsed key hints (t2212): exactly ONE row, structurally. The line
+       holds user-rebindable keys, so its length is not ours to promise —
+       render_collapsed keeps both active keys visible whenever they fit, and
+       this rule keeps the band one row when they do not. */
+    #mini-key-hints.collapsed {
+        height: 1;
+        text-wrap: nowrap;
+        text-overflow: ellipsis;
+    }
+    """
+
+    BINDINGS = [
+        *ShortcutsMixin.SHORTCUTS_MIXIN_BINDINGS,
+        Binding("tab", "focus_sibling_pane", "Focus agent", show=False),
+        Binding("enter", "send_enter_to_sibling", "Send Enter", show=False),
+        Binding("k", "kill_own_agent", "Kill", show=False),
+        Binding("n", "pick_next_for_own", "Next", show=False),
+        Binding("p", "pick_task_by_number", "Pick task", show=False),
+        Binding("e", "launch_shadow", "Shadow", show=False),
+        Binding("E", "launch_shadow_pick", "Shadow (pick agent)", show=False),
+        Binding("o", "open_scratchpad", "Notes", show=False),
+        Binding("c", "pick_concerns", "Concerns", show=False),
+        Binding("j", "tui_switcher", "TUI switcher", show=False),
+        Binding("q", "quit", "Quit", show=False),
+        Binding("s", "switch_to", "Switch", show=False),
+        Binding("i", "show_task_info", "Task Info", show=False),
+        Binding("I", "show_own_task_info", "Task Info (followed)", show=False),
+        Binding("m", "switch_to_monitor", "Full Monitor", show=False),
+        Binding("M", "toggle_multi_session", "Multi", show=False),
+        Binding("d", "cycle_compare_mode", "Detect", show=False),
+        Binding("space", "toggle_mark", "Mark followed agent", show=False),
+        # show=False like every minimonitor binding: this app renders no
+        # Footer — its 40-column companion layout surfaces every binding in
+        # the #mini-key-hints Static instead (the tui_conventions.md
+        # "surface the hint in the pane's own text" exception, justified in
+        # p1159_2; the hints/bindings parity is test-pinned).
+        Binding("L", "toggle_review_loop", "Auto-recheck loop", show=False),
+        # The action id stays `toggle_parked_visibility` even though it now
+        # hides frozen agents too — it is a persisted key-override identifier
+        # (see `action_toggle_parked_visibility`). Only the label widened.
+        Binding("P", "toggle_parked_visibility", "Parked/frozen", show=False),
+        # Frozen agents (t1705_7). `f`/`Z` are free in BOTH apps, so the two
+        # TUIs stay identical; `z` could not be used because the full monitor
+        # binds it to Zoom.
+        Binding("f", "freeze_current", "Freeze followed agent", show=False),
+        Binding("Z", "freeze_all", "Freeze all agents", show=False),
+        # Sitrep (t2175_5): `h` harvests the FOLLOWED agent, shows what was
+        # captured, then offers to close it; `S` opens / switches to the
+        # repository's sitrep window. Same keys as the full monitor.
+        Binding("h", "harvest_close", "Harvest followed agent", show=False),
+        Binding("S", "open_sitrep", "Sitrep window", show=False),
+        # Key-hint modes (t2212): `x` collapses / expands the band, `H` opens
+        # the full key help (`?` stays the shortcut editor). Both are free in
+        # the full monitor too and deliberately left unbound there, so the two
+        # apps never give one key two meanings (test-pinned).
+        Binding("x", "toggle_key_hints", "Collapse key hints", show=False),
+        Binding("H", "show_key_help", "Key help", show=False),
+        # Project jump and status filter (t2217). Plain up/down stay card
+        # navigation (handled in on_key); the shift pairs are App bindings so
+        # they are rebindable like every other key. The action ids are
+        # persisted override keys (tests/test_shortcut_overrides_survive.py) —
+        # never rename them.
+        Binding("shift+up", "jump_project_prev", "Previous project", show=False),
+        Binding("shift+down", "jump_project_next", "Next project", show=False),
+        Binding("shift+left", "filter_prev", "Previous filter", show=False),
+        Binding("shift+right", "filter_next", "Next filter", show=False),
+        # `k` keeps its live-row meaning and branches on the frozen state
+        # INSIDE the action. Restore and re-pick are the frozen-agent viewer's
+        # own `R` / `P`, reached with Tab into the stand-in pane (t2054).
+    ]
+
+    def __init__(
+        self,
+        session: str,
+        project_root: Path,
+        refresh_seconds: int = 3,
+        capture_lines: int = 30,
+        idle_threshold: float = 5.0,
+        agent_prefixes: list[str] | None = None,
+        tui_names: set[str] | None = None,
+        compare_mode_default: str = "stripped",
+        target_width: int = 40,
+        mark_pane: bool = False,
+        session_bar: bool = False,
+        key_hints_collapsed: bool = False,
+        monitor_server: bool | None = None,
+    ) -> None:
+        super().__init__()
+        self.current_tui_name = "minimonitor"
+        # Collapsed key-hint band (t2212). Read from userconfig by main() only,
+        # so an App a test constructs never reads the real userconfig.
+        self._key_hints_collapsed = bool(key_hints_collapsed)
+        # Shadows the class attribute above; see it for why the default lives
+        # there rather than here.
+        self._session_bar_enabled = session_bar
+        # Only the production launcher (main()) passes mark_pane=True. Gating it
+        # keeps a Textual run_test() mount — which inherits the running agent's
+        # $TMUX_PANE — from stamping @aitask_monitor_kind on a live pane, the
+        # same hazard the monitor's rename_window flag exists for (t1240/t1451).
+        self._mark_pane = mark_pane
+        # Whether this instance may subscribe to the shared status server
+        # (t2037_3): None follows AITASKS_MONITOR_SERVER, False keeps it
+        # in-process (main() passes False for an explicit --interval).
+        self._monitor_server = monitor_server
+        self._session = session
+        self._refresh_seconds = refresh_seconds
+        self._capture_lines = capture_lines
+        self._idle_threshold = idle_threshold
+        self._agent_prefixes = agent_prefixes
+        self._tui_names = tui_names
+        self._compare_mode_default = compare_mode_default
+        # Client view state (t2034_2): the `M` toggle and the own-pane drop live
+        # here, not in the producer — see `AgentMarksMixin._project_snapshots`.
+        # Multi-session ON at start, as before (main() never configured it).
+        self._multi_session = True
+        self._own_pane_id = os.environ.get("TMUX_PANE") or None
+        # Configured width of this companion side-column. tmux rescales panes
+        # proportionally on a window resize (incl. detach->reattach), so the
+        # pane spawned at this width drifts wider; on_resize re-pins it.
+        self._target_width = target_width
+        self._snapshots: dict[str, PaneSnapshot] = {}
+        # What the last full rebuild mounted (t2183) and the last session-bar
+        # text rendered. Both are read with `getattr` defaults, because many
+        # tests build this app with `__new__` and never run `__init__`.
+        self._list_record: _ListRecord | None = None
+        self._session_bar_text: str | None = None
+        self._focused_pane_id: str | None = None
+        # A `MonitorClient` wrapping this app's own `TmuxMonitor` (t2037_3);
+        # tests hand-set fakes of either shape.
+        self._monitor: TmuxMonitor | MonitorClient | None = None
+        self._refresh_timer: Timer | None = None
+        self._project_root = project_root
+        self._task_cache = TaskInfoCache(project_root)
+        self._gate_cache = GateSummaryCache()
+        # Pane ids whose task is finished, recomputed once per refresh tick
+        # (t1322) so the card badge and the session bar's `d` counter agree
+        # within a tick. See MonitorApp._compute_completed_panes.
+        self._completed_pane_ids: frozenset[str] = frozenset()
+        self._mount_time: float = 0.0
+        # Back-to-back verified-empty observations (t1446) — see
+        # AUTO_CLOSE_CONFIRMATIONS and _check_auto_close.
+        self._empty_window_streak: int = 0
+        self._own_window_id: str | None = None
+        # Display / diagnostics only (t2227). `renumber-windows` shifts it
+        # whenever an earlier window closes, so NO identity decision may read
+        # it — the followed agent is resolved by pane id, below.
+        self._own_window_index: str | None = None
+        self._own_window_name: str | None = None
+        # The identity source (t2227): pane ids of the window holding
+        # `$TMUX_PANE`, from the last listing `_update_own_window_info`
+        # VALIDATED. Pane ids never change for a pane's lifetime, so matching
+        # snapshots against this set cannot land on a neighbouring window after
+        # a renumber the way the old `window_index` match did. Kept across a
+        # failed query — but a kept set is display-grade only:
+        # `swap-pane` / `join-pane` / `break-pane` move ids between windows, so
+        # actions additionally require `_own_identity_confirmed` (see
+        # `_find_own_agent_snapshot`).
+        self._own_window_pane_ids: frozenset[str] | None = None
+        # Whether THIS tick's `_update_own_window_info` validated the own
+        # window's name AND pane membership (t1685, t2227). Reset at the top of
+        # every `_refresh_data`; gates the parked-capture pin and every action
+        # that resolves the followed agent, both of which fail safe without it.
+        self._own_identity_confirmed: bool = False
+        # The followed-agent docked panel is built once per resolved pane
+        # (static identity, no per-cycle status refresh) — see
+        # _maybe_build_own_agent_panel. `_own_panel_pane_id` is the pane it was
+        # built for; a different resolved pane rebuilds it (t2227).
+        self._own_panel_built: bool = False
+        self._own_panel_pane_id: str | None = None
+        # The docked card widget and the identity string frozen at build time,
+        # so the per-tick repaint (t1383/t1420, _refresh_own_live_state) never needs a
+        # snapshot it may no longer have.
+        self._own_card: Static | None = None
+        self._own_identity_text: Content | str = ""
+        # Tri-state, deliberately: True/False are the two mark glyphs, None means
+        # "nothing markable here" (never an agent, or renamed off the `agent-`
+        # prefix after the panel was built) and renders NO glyph. It is both the
+        # current state and the repaint's change-detector, so the
+        # agent → renamed transition is an ordinary state change rather than a
+        # case the repaint has to special-case.
+        self._own_mark_state: str | None = None
+        # Rendered phase line currently painted on the docked panel (t1420).
+        self._own_phase_state: str = ""
+        # The followed agent's frozen stamp as currently painted (t1705_7).
+        # `None` = not frozen, `""` = frozen with no readable record — the two
+        # render differently, so both are real states here, not "no value".
+        self._own_frozen_state: str | None = None
+        # Auto-offer de-dup (t1037_4): last forwarded concern payload per shadow
+        # pane id, so a re-detected *unchanged* block does not re-fire the hint.
+        self._last_concern_block_payload: dict[str, str] = {}
+        # Shadow panes already warned that their concern block was clipped at the
+        # head by the capture window (t1187). Warn once per episode, not every
+        # tick; cleared for a pane as soon as a complete block is seen on it.
+        self._truncation_warned: set[str] = set()
+        # Shadow panes already warned that their complete concern block parsed to
+        # nothing because every marker was malformed (t1274). Same once-per-
+        # episode policy as `_truncation_warned`, and cleared the same way.
+        self._unparsed_warned: set[str] = set()
+        # Shadow-feedback READ RECENCY (t1104), verdict + the stamp that
+        # produced it, written as one tuple (t1493). Tri-state verdict: None =
+        # unknown (never resolved, or a transient capture/hash failure — do NOT
+        # clear a prior warning on such a failure), False = current, True =
+        # stale. The timestamp is carried because the banner reports "analyzed
+        # Ns ago" from a step that no longer computes the verdict itself; a
+        # loose second attribute could desync from it.
+        self._shadow_read_recency: ReadRecency = ReadRecency(None, None)
+        # COMBINED verdict (read recency joined with block age) — what every
+        # user-facing surface reads. Kept separate from the read-recency
+        # verdict above so each keeps one meaning and one provenance.
+        self._shadow_stale_combined: bool | None = None
+        # Phase binding behind the banner's retirement rule (t1573):
+        # (shadow_pane_id, block_key, origin_phase) for the feedback currently
+        # on the shadow pane — the phase the followed agent was in when THIS
+        # block was first observed. Derived state, deliberately NOT a
+        # "transition happened" latch: a latch has no way back, because
+        # PLAN->IMPLEMENT->PLAN is two known->known transitions and the second
+        # would re-retire the same unchanged block forever, hiding a warning a
+        # misclassified phase never justified. This rebinds on a new block or a
+        # new pane and stops suppressing the moment the agent is observed back
+        # in the origin phase. See _feedback_phase_retired.
+        self._shadow_feedback_phase: tuple[str, int, str] | None = None
+        # Throttle the staleness compare to every OTHER refresh tick (~6s at the
+        # 3s default) to halve the extra pane reads; the concern auto-offer still
+        # runs every tick. Odd counter ⇒ checks on the first tick a shadow is
+        # present (responsive) then every second one.
+        self._shadow_freshness_tick: int = 0
+        # Auto-recheck loop (t1159_2): pure decision core + its display/input
+        # state. The banner text seam mirrors _shadow_stale_banner_text.
+        self._review_loop = review_loop.ReviewLoopController()
+        self._loop_banner_text: str = ""
+        # Work-classifier baseline: (content, awaiting_input_kind, pane_id,
+        # history_size) of the last successful followed snapshot. PRESERVED
+        # across indeterminate ticks (capture failed, agent still discovered)
+        # so a response produced during the gap still classifies as work;
+        # reset only on verified departure, pane replacement, or re-arm.
+        self._loop_baseline: (
+            tuple[str, str, str, int | None, tuple[int, int]] | None) = None
+        # Raw shadow-tail hash ring for the readiness stability conjunct.
+        self._loop_shadow_hash: int | None = None
+        self._loop_shadow_hash_streak: int = 0
+        # Post-interaction settle latch (t1509): a monotonic DEADLINE, not a
+        # tick count — the evidence cadence is user-configurable. None = clear.
+        self._loop_shadow_settle_until: float | None = None
+        # Injectable so the latch tests drive the deadline deterministically
+        # instead of sleeping.
+        self._loop_now = time.monotonic
+        # Monotonic stamp of the last serviced evidence tick. Overlapping
+        # refreshes (t1111_4) invoke the service concurrently; without this
+        # guard each invocation would advance the debounce streak and the
+        # hash-stability ring, collapsing the "N consecutive refreshes"
+        # guarantees into wall-clock-free counters (review round 2).
+        self._loop_last_service_at: float | None = None
+        # Sticky "a False verdict was recorded since the last committed
+        # service tick" (review round 4). The recency cache updates on its
+        # own cadence (throttle + overlapping refreshes), so the ONLY False
+        # between two committed ticks can be observed by a throttled service
+        # and then overwritten by True before the next committed one — a
+        # FIRED controller would never see its re-arm edge. The writer sets
+        # this; the next committed tick delivers False once and clears it.
+        self._loop_stale_false_pending: bool = False
+        # The hold reason currently displayed, or None (t1606). Edge-trigger
+        # state for `_loop_hold`: a hold spans many ticks, so this is what
+        # stops one vetoed delivery from toasting and recording on every one
+        # of them. Cleared on recovery, on any disarm, and at arm.
+        self._loop_hold_reason: str | None = None
+        # Last-observed followed/shadow identities, attached to every durable
+        # loop event (t1606). See `_note_loop_identity`.
+        self._loop_identity: dict[str, str] = {}
+        # Diagnostic fields of the CURRENT delivery attempt (t2001): its latest
+        # pane-mode reading and pre-Enter verdict. Reset at the top of every
+        # `_fire_shadow_recheck` and handed to the hold/disarm that delivery
+        # ends in — never to an absence teardown, which it does not describe.
+        self._loop_delivery_detail: dict[str, object] = {}
+        # Prioritized-agent marks (t1326): cached reader + purge scheduling.
+        self._init_agent_marks()
+
+    def compose(self) -> ComposeResult:
+        # Order matters and is mirrored in _TOP_CHROME + the stylesheet comment:
+        # the followed agent leads, the advisory banners flow below it (t1566).
+        # Hidden by default; `tmux.minimonitor.session_bar: true` reveals it.
+        yield Static(id="mini-session-bar")
+        yield VerticalScroll(id="mini-own-agent")
+        # Live staleness warning for shadow feedback (t1104); empty ⇒ 0 rows.
+        yield Static("", id="mini-shadow-stale")
+        # Auto-recheck loop status (t1159_2); empty ⇒ 0 rows.
+        yield Static("", id="mini-loop-status")
+        # Active status/phase filter (t2217); `all` ⇒ 0 rows.
+        yield Static("", id="mini-filter-status")
+        # MiniPaneList, not a bare VerticalScroll: it carries the scroll seams
+        # the per-tick restore needs (t1539). `query_one(..., VerticalScroll)`
+        # still resolves it, so no lookup site had to change.
+        yield MiniPaneList(id="mini-pane-list")
+        # No width yet, so the collapsed line takes its labelled rung here;
+        # _sync_key_hints_text re-picks it for the measured width after layout.
+        yield Static(
+            self._key_hints_text(),
+            id="mini-key-hints",
+            classes="collapsed" if self._hints_collapsed() else "",
+        )
+
+    def on_mount(self) -> None:
+        self._mount_time = time.monotonic()
+        # Fit the key-hint band to the measured width once layout exists —
+        # compose had no width, so a collapsed line took its labelled rung
+        # there (t2212). Before the TMUX check: the not-inside-tmux path below
+        # returns early and must still show a fitted band.
+        self._schedule_short_mode_refresh()
+
+        if not os.environ.get("TMUX"):
+            bar = self.query_one("#mini-session-bar", Static)
+            bar.update("[bold red]Not inside tmux[/]")
+            # Reveal unconditionally, ignoring _session_bar_enabled (t1566).
+            # The bar ships `display: none` and this path returns before
+            # _start_monitoring(), so _rebuild_session_bar never runs — without
+            # this line a user who launched outside tmux gets a blank pane and
+            # no explanation. Guarded by test_not_inside_tmux_error_is_visible.
+            bar.display = True
+            return
+
+        # Stamp our own pane so the single-instance guards can see us (t1451).
+        # The spawner never does this — see mark_monitor_pane's docstring.
+        if self._mark_pane:
+            with contextlib.suppress(Exception):
+                mark_monitor_pane("minimonitor")
+
+        # Review-loop event retention (t1606). At STARTUP only, and only over
+        # files no live process owns — which is what makes it structurally
+        # incapable of interleaving with another session's append. Suppressed
+        # rather than reported: a housekeeping failure must not delay a boot.
+        with contextlib.suppress(Exception):
+            # reserve=1 holds a slot for THIS session's file, which does not
+            # exist yet — without it the store settles at MAX_SESSION_FILES+1.
+            review_loop_log.prune(reserve=1)
+
+        # Detect own window ID, index, and name for auto-close, auto-selection,
+        # and the "switch to full monitor" handoff. DISPATCHED, not awaited
+        # (t1622): this was a synchronous `subprocess.run(..., timeout=5)`, so a
+        # wedged tmux server held the whole mount — the first paint and the
+        # first input dispatch with it. `run_worker` is `asyncio.create_task`,
+        # the only dispatch that genuinely escapes the App message pump (see
+        # `_start_monitoring` below for why the alternatives do not). Dispatched
+        # BEFORE `_start_monitoring()` so the fields land as early as tmux can
+        # answer, rather than at the end of the first refresh.
+        self.run_worker(
+            self._seed_own_window_info(),
+            name="own_window_seed",
+            group="own-window-seed",
+            exclusive=False,
+            exit_on_error=False,
+        )
+
+        # CRITICAL: Do NOT rename the tmux window — minimonitor runs inside
+        # an agent's window, renaming would break agent classification.
+
+        self._start_monitoring()
+
+    def on_resize(self, event) -> None:
+        """Re-pin the companion pane to its configured width on any resize."""
+        # `event.size`, never `self.size` (t2050). Textual 8.2.7 dispatches this
+        # subclass handler BEFORE `App._on_resize` stores the new size, so
+        # `self.size` here is still the PREVIOUS one — a 40 -> 135 growth read
+        # as 40 and the pin never fired.
+        self._maybe_pin_width(event.size.width)
+        self._schedule_short_mode_refresh()
+
+    def _schedule_short_mode_refresh(self) -> None:
+        """Queue a post-layout ``_refresh_short_mode``; no-op if unmounted.
+
+        Always ``call_after_refresh``, never a direct call: the predicate reads
+        widget regions, and before layout every one of them is 0.
+
+        Suppressed for the same reason as the banner setters' own
+        ``contextlib.suppress`` — several unit tests drive those write sites
+        against an app built with ``__new__`` and a stubbed ``query_one``,
+        where there is no message pump to schedule on.
+        """
+        with contextlib.suppress(Exception):
+            self.call_after_refresh(self._refresh_short_mode)
+
+    def _refresh_short_mode(self) -> None:
+        """Let the static key hints yield when live chrome needs the rows.
+
+        Undocking the top chrome (t1499) let it GROW for the first time, and
+        unbounded growth overruns the bottom-docked ``#mini-key-hints``: the
+        flow children are laid out inside ``height - hints``, so once the
+        chrome exceeds that the pane list is pushed into the docked band and
+        painted over — invisible, with a perfectly plausible region.
+
+        Measures the chrome's **actually occupied** height rather than a
+        worst-case budget. A budget-based predicate is wrong in the common
+        case: ``_maybe_build_own_agent_panel`` builds the followed-agent panel
+        once early in a normal session and leaves it displayed forever, so
+        "is any collapsible widget shown?" is true almost always, and a 22-row
+        pane with no banners would needlessly lose eight hint lines.
+
+        The hints' height it compares against is their *desired* height at the
+        CURRENT width (``_key_hints_desired_rows``, t1574) — the content height
+        of the current mode's text, not a newline count: below ~24 columns the
+        full band word-wraps to twice its authored lines, and a count let the
+        docked band overrun the list there while the predicate saw room.
+
+        Converges in one pass and cannot oscillate: chrome heights depend on
+        width and content only, never on the hints' height; and the desired
+        height is the text's content height at the current width, which
+        ``.short`` cannot change — the class only sets ``max-height``, which
+        clamps the box, not the content — so the class never feeds back into
+        its own input. Always scheduled via ``call_after_refresh`` so the region
+        reads happen after layout; called before it, every region is 0.
+
+        First re-renders the band for the current width
+        (``_sync_key_hints_text``), so after a resize the collapsed line has
+        re-picked its rung before anything is measured.
+        """
+        with contextlib.suppress(Exception):
+            self._sync_key_hints_text()
+            chrome = sum(
+                self.query_one(sel).region.height for sel in _TOP_CHROME
+            )
+            self.set_class(
+                chrome + self._key_hints_desired_rows() + _PANE_LIST_FLOOR_ROWS
+                > self.size.height,
+                "short",
+            )
+
+    # -- Key-hint modes (t2212) ------------------------------------------------
+
+    def _hints_collapsed(self) -> bool:
+        # getattr: several tests drive `compose()` on an App built with
+        # `__new__`, which never ran __init__.
+        return bool(getattr(self, "_key_hints_collapsed", False))
+
+    def _active_keymap(self) -> dict[str, str]:
+        """``{action: key}`` from the COMPOSED bindings — overrides included.
+
+        ``self.BINDINGS`` on an instance is the post-override list
+        ``ShortcutsMixin`` built (shared-scope actions such as ``?``, ``j`` and
+        ``q`` included); on an App built with ``__new__`` it is the class's
+        defaults.
+        """
+        return binding_keymap(self.BINDINGS)
+
+    def _key_hints_text(self, content_width: int | None = None) -> str:
+        keymap = self._active_keymap()
+        if self._hints_collapsed():
+            return render_collapsed(keymap, content_width)
+        return render_hints(FULL_HINT_LINES, keymap)
+
+    def _key_hints_content_width(self, hints) -> int:
+        return max(1, self.size.width - hints.styles.gutter.width)
+
+    def _sync_key_hints_text(self) -> None:
+        """Bring the band's text and ``collapsed`` class in line with the mode.
+
+        The collapsed rung depends on the measured width, so this runs before
+        every short-mode decision (after each resize) as well as on a toggle.
+        ``update`` only when the text changed — an unchanged ``update`` still
+        costs a layout pass.
+        """
+        hints = self.query_one("#mini-key-hints", Static)
+        collapsed = self._hints_collapsed()
+        hints.set_class(collapsed, "collapsed")
+        text = self._key_hints_text(self._key_hints_content_width(hints))
+        if str(hints.content) != text:
+            hints.update(text)
+
+    def _key_hints_desired_rows(self) -> int:
+        """The band's desired height at the current width (t1574).
+
+        The content height of the text it currently holds, measured at its
+        content width — independent of the ``.short`` max-height, which clamps
+        the box and not the content. Falls back to the authored line count if
+        Textual cannot measure (it would rather under- than over-compact).
+        """
+        hints = self.query_one("#mini-key-hints", Static)
+        try:
+            return hints.get_content_height(
+                self.size, self.size, self._key_hints_content_width(hints)
+            )
+        except Exception:
+            return str(hints.content).count("\n") + 1
+
+    def action_toggle_key_hints(self) -> None:
+        """``x`` — collapse the band to one line, or expand it again."""
+        self._key_hints_collapsed = not self._hints_collapsed()
+        with contextlib.suppress(NoMatches):
+            self._sync_key_hints_text()
+        self._schedule_short_mode_refresh()
+        try:
+            userconfig_persist.set_minimonitor_key_hints_collapsed(
+                self._key_hints_collapsed
+            )
+        except Exception as exc:  # noqa: BLE001 — fail-soft by design
+            # The toggle stands for this session either way; only the memory
+            # for the next minimonitor is lost. A malformed userconfig raises
+            # here BEFORE anything is written, so it is never overwritten.
+            self.notify(f"Key-hint mode not saved: {exc}", severity="warning")
+
+    def action_show_key_help(self) -> None:
+        """``H`` — every key with a paragraph each, in a scrollable modal."""
+        keymap = self._active_keymap()
+        self.push_screen(
+            KeyHelpModal(keymap, close_keys=(keymap.get("show_key_help", ""),))
+        )
+
+    def _maybe_pin_width(self, width: int) -> None:
+        """Clamp this minimonitor's companion pane back to its target width.
+
+        ``width`` is the pane's NEW width, from the Resize event — see
+        ``on_resize`` for why it cannot be read off ``self.size``.
+
+        tmux stores window layout as proportions, so on a window resize (live,
+        or detach -> resize terminal -> reattach) it rescales every pane to the
+        same fraction of the new width — a pane spawned at ``target_width``
+        columns drifts wider. Re-pin it whenever we exceed the target. A pane
+        NARROWER than the target is left alone.
+
+        Self-terminating: after the resize the pane width equals the target, so
+        the follow-up Resize event returns early. If the window is too narrow
+        for the target, tmux clamps ``-x`` to what fits and the width stays at
+        or below the target, so it does not loop either.
+        """
+        if self._monitor is None:
+            return
+        own_pane = os.environ.get("TMUX_PANE")
+        if not own_pane:
+            return
+        if width <= self._target_width:
+            return
+        self._monitor.resize_pane(own_pane, x=self._target_width)
+
+    def _teardown_prior_monitoring(self) -> None:
+        """Cancel the prior refresh timer and close the prior monitor's
+        control client, if any. Mirrors `MonitorApp._teardown_prior_monitoring`.
+
+        Minimonitor does not currently re-enter `_start_monitoring()` (no
+        session-rename flow), but the helper is cheap and protects against
+        future re-entry paths.
+        """
+        if self._refresh_timer is not None:
+            with contextlib.suppress(Exception):
+                self._refresh_timer.stop()
+            self._refresh_timer = None
+        prev = self._monitor
+        if prev is not None:
+            self._monitor = None
+
+            async def _close_prev() -> None:
+                with contextlib.suppress(Exception):
+                    await prev.close_control_client()
+
+            self.run_worker(
+                _close_prev(),
+                exclusive=False,
+                exit_on_error=False,
+                group="tmux-control-teardown",
+            )
+
+    def _start_monitoring(self) -> None:
+        """Initialize the TmuxMonitor and start refreshing."""
+        self._teardown_prior_monitoring()
+
+        kwargs: dict = {}
+        if self._agent_prefixes is not None:
+            kwargs["agent_prefixes"] = self._agent_prefixes
+        if self._tui_names is not None:
+            kwargs["tui_names"] = self._tui_names
+
+        local = TmuxMonitor(
+            session=self._session,
+            capture_lines=self._capture_lines,
+            idle_threshold=self._idle_threshold,
+            compare_mode_default=self._compare_mode_default,
+            **kwargs,
+        )
+        if self._monitor_server is False:
+            self.log("monitor status server off: explicit --interval; scanning in-process")
+        # Initial pins: `CAPTURE_PIN_ALL` until a tick confirms this pane's
+        # identity — the fail-safe direction (see `_capture_pins`).
+        self._monitor = build_monitor_client(
+            local, kind="minimonitor", own_pane=self._own_pane_id,
+            session=self._session, project_root=self._project_root,
+            pins=self._capture_pins(), enabled=self._monitor_server, log=self.log,
+        )
+        monitor = self._monitor
+
+        async def _connect_control_client() -> None:
+            # The client's start: the shared server, else the in-process
+            # producer with its own control client (the old behaviour).
+            try:
+                ok = await monitor.start_control_client()
+                if not ok:
+                    self.log("tmux control mode unavailable; using subprocess fallback")
+            except Exception as exc:
+                self.log(f"tmux control mode init failed: {exc!r}")
+
+        self.run_worker(
+            _connect_control_client(),
+            exclusive=False,
+            exit_on_error=False,
+            group="tmux-control-init",
+        )
+
+        # NOT call_later / set_timer / call_after_refresh (t1598). In Textual
+        # 8.2.7 `call_later` posts an `events.Callback` to the App's OWN queue
+        # and `MessagePump.on_callback` awaits it INLINE in the App's message
+        # loop — the same serialized queue `App.on_event` dispatches key and
+        # mouse events from, so the whole first refresh ran ahead of every
+        # queued keypress. `set_timer(0, ...)` is worse: it wraps the callback
+        # in `call_next`, which drains from `_next_callbacks` inline and JUMPS
+        # the queue. `call_after_refresh` escapes the App pump only to land on
+        # the Screen pump, where keys bubble. `run_worker` is
+        # `asyncio.create_task` (textual/worker.py) — the only genuine escape.
+        # `set_interval` below is already safe: it passes the callback
+        # unwrapped, so Timer._tick runs it in the timer's own task, which is
+        # exactly why ticks 2+ never stalled input.
+        #
+        # The first refresh and every interval tick only READ (`scan=False`):
+        # under a shared server they read the subscription, so N clients never
+        # cause N scans. User actions get the scan (`_refresh_data`'s default).
+        self.run_worker(
+            self._refresh_data(scan=False),
+            name="first_refresh",
+            group="refresh-init",
+            exclusive=False,
+            exit_on_error=False,
+        )
+        self._refresh_timer = self.set_interval(
+            self._refresh_seconds, self._tick_refresh
+        )
+
+    async def _tick_refresh(self) -> None:
+        """The interval tick: a refresh that reads, never requests a scan."""
+        await self._refresh_data(scan=False)
+
+    async def on_unmount(self) -> None:
+        # Clear our pane marker on the normal-exit path. An abnormal exit is
+        # covered by monitor_marker_state, which classifies a marker whose pid
+        # is gone as stale so the guards ignore and self-heal it (t1451).
+        if getattr(self, "_mark_pane", False):
+            with contextlib.suppress(Exception):
+                unmark_monitor_pane()
+        if getattr(self, "_monitor", None) is not None:
+            try:
+                await self._monitor.close_control_client()
+            except Exception:
+                pass
+
+    # -- Data refresh ----------------------------------------------------------
+
+    async def _refresh_data(self, *, scan: bool = True,
+                            _request_scan: bool = False) -> None:
+        # `scan` (t2037_3): the default is what every user-action
+        # `call_later(self._refresh_data)` site gets — under a shared status
+        # server those refreshes must also ask the server to scan. That wait
+        # never runs here when this is a `call_later` callback (it is awaited
+        # inline on the App message pump): hand it to the scan worker, which
+        # comes back as `_request_scan` — an ordinary guarded round below. The
+        # timer and the first refresh pass `scan=False` and only read.
+        if scan and self._wants_offpump_scan():
+            self._dispatch_scan_refresh()
+            return
+        # Re-entrancy guard (t1598). The first refresh now runs in its own task
+        # rather than on the App pump, so it can overlap the first interval tick
+        # and the keypress-driven `call_later(self._refresh_data)` sites.
+        # `capture_all_async`'s generation guard covers the capture half but not
+        # the DOM rebuild, and two concurrent remove_children/mount_all passes
+        # are worse than a skipped tick (at most one refresh interval late).
+        #
+        # The reset is in a `finally` and that is load-bearing: every await here
+        # can raise, CancelledError propagates on shutdown, and the two early
+        # returns below would strand the flag on the ORDINARY path. A stranded
+        # flag makes the TUI stop refreshing permanently.
+        if self._refresh_inflight:
+            if _request_scan:
+                self._scan_rerun = True   # re-dispatched by that tick's finally
+            return
+        self._refresh_inflight = True
+        # Withdraw the previous tick's identity confirmation NOW — after the
+        # re-entrancy guard admitted this refresh, before its first await
+        # (t2227). The confirmation says "the last own-window listing validated
+        # the membership"; once a new refresh is under way, that listing is
+        # about to be re-checked, and every await before the query below (the
+        # session mapping first) is a window in which `k` / `n` / Enter would
+        # otherwise still act on a membership a `swap-pane` may have changed.
+        # Actions refuse until this tick's query answers — the fail-safe
+        # direction, costing at most one refresh's latency.
+        self._own_identity_confirmed = False
+        try:
+            if self._monitor is None:
+                return
+            monitor = self._monitor
+
+            # No focus snapshot here (t2183): the selection is read when it is
+            # restored, after every await below. A click during the capture
+            # updates `_focused_pane_id` (`on_descendant_focus`), and restoring a
+            # snapshot taken now would revert it (the t2201 symptom).
+
+            # Everything the parked set is derived from resolves BEFORE the
+            # capture (t1685). The set published below decides which agents this
+            # tick skips capturing; publishing it after the capture would leak
+            # one capture-and-classify of every already-parked agent on every
+            # launch, and would subtract the followed agent against a stale name.
+            #
+            # Refresh per-session project-root mapping so cross-session task data
+            # resolves from the right project (free — uses TmuxMonitor's cached
+            # session list).
+            session_roots = await self._monitor.get_session_to_project_mapping_async()
+            self._task_cache.update_session_mapping(session_roots)
+            # Prioritized marks (t1326) reuse this tick's mapping rather than
+            # re-querying per row — see AgentMarksMixin._set_session_root_map.
+            self._set_session_root_map(session_roots)
+            # Drop last cycle's gate summaries so a live-growing ledger re-derives
+            # this refresh (mirrors the board's per-refresh gate cache).
+            self._gate_cache.clear()
+            # Prioritized marks (t1326): mtime-gated, so this is one os.stat when
+            # nothing changed. Must run before the pane list renders, and is what
+            # makes a mark set in another repo appear here within one tick.
+            self._refresh_marks()
+            # Re-read this pane's window — id, index, name and pane membership
+            # (handles renumber-windows, renames and pane moves). Above the
+            # capture (t1685): `_parked_agent_pairs` subtracts the followed
+            # agent by name, and it must be THIS tick's name. The flag was
+            # already withdrawn at the top of this refresh (t2227), so a failed
+            # query can only ever make the publication and every action more
+            # conservative, never leave a previous tick's confirmation standing.
+            self._own_identity_confirmed = await self._update_own_window_info()
+            self._publish_parked_agents()
+            # A user action under a shared server (t2037_3): with THIS tick's
+            # identity confirmed (or not — then the pins are CAPTURE_PIN_ALL)
+            # and the skip set and pins published, flush the pins and THEN
+            # request the scan, so the scan captures the followed agent live
+            # even if it is parked. Off the App pump — only the scan worker
+            # passes `_request_scan`.
+            if _request_scan and not await self._request_server_scan(monitor):
+                return
+
+            # capture_all_async returns None when a newer overlapping refresh
+            # superseded this one (t1111_4). Skip the stale cycle — a newer refresh
+            # owns the rebuild — rather than overwriting visible snapshots with stale
+            # pane content.
+            snaps = await self._monitor.capture_all_async()
+            if snaps is None:
+                return
+            self._snapshots = self._project_snapshots(snaps)
+            # Completed-pane set for THIS tick (t1322) — after the session
+            # mapping refresh (which may clear the task cache), before the bar
+            # and the pane list read it.
+            self._completed_pane_ids = self._compute_completed_panes()
+
+            # Auto-close check (with 5-second grace period after mount)
+            if self._own_window_id and (time.monotonic() - self._mount_time) > 5.0:
+                await self._check_auto_close()
+
+            # Off the render path (t1622), inside the same enablement gate the
+            # bar builder uses — there is still no reason to compute a string
+            # nobody renders. Awaited here rather than in the (synchronous)
+            # builder: `_refresh_data` is already a worker task, so this
+            # suspends the tick, not the App message pump.
+            desync = ""
+            if self._session_bar_enabled:
+                try:
+                    desync = await _get_desync_summary_async(Path.cwd(), compact=True)
+                except Exception:
+                    desync = ""
+            self._rebuild_session_bar(desync=desync)
+            # Build the followed-agent panel once (static identity — it does not
+            # refresh with the general list), then rebuild the list (which excludes
+            # the followed agent). Await both so remove_children/mount_all complete
+            # before focus restoration — Textual's remove/mount/focus are deferred,
+            # so a direct call into _restore_focus would race the DOM updates.
+            await self._maybe_build_own_agent_panel()
+            # The one live element of that otherwise-static panel (t1383). Must run
+            # after `_set_session_root_map` and `_refresh_marks` above, which
+            # `_is_marked` reads, and after the build so there is a card to update.
+            self._refresh_own_live_state()
+
+            # The general list (t2183). Build this tick's entries, then let the
+            # planner choose: nothing / changed cards in place / full rebuild.
+            entries = self._build_list_entries()
+            updates = self._plan_in_place_list_update(entries)
+            if self._consume_filter_navigation():
+                # A filter change (t2217) swaps the result set: navigation,
+                # not a passive refresh — no anchor capture, no restore. See
+                # `_cycle_status_filter`.
+                await self._navigate_list_after_filter(entries)
+            elif updates is not None and not any(lay for _c, _t, lay in updates):
+                # Nothing is torn down and no card can change height, so the
+                # offset cannot move: no scroll capture, lock or restore. Focus
+                # was never lost either, so whatever is focused NOW — including a
+                # card clicked during this tick's awaits — stands. Only a fully
+                # unfocused app (after a blur) gets the restore, from the
+                # selection as it is now.
+                self._apply_list_updates(updates)
+                if self.focused is None:
+                    self._restore_focus(self._focused_pane_id)
+            else:
+                # Scroll preservation (t1539). Capture BEFORE the rebuild — that
+                # is where `validate_scroll_y` clamps the offset to 0 — then hold
+                # the lock across it so Textual's own scrolls (the focus restore
+                # and its deferred variants) cannot land while the anchor restore
+                # is pending. An in-place update that may change a card's height
+                # takes this path too: the anchor has to survive the reflow.
+                self._capture_list_scroll()
+                gen = self._scroll_restore_gen = self._scroll_restore_gen + 1
+                self._list_scroll_lock = True
+                # The fail-safe is armed HERE, on the acquisition line, and not
+                # inside the restore. `Screen._invoke_and_clear_callbacks` has no
+                # per-callback try, so an exception raised by an EARLIER callback
+                # in the same batch drops every remaining one — including the
+                # restore. A release scheduled from within the restore would then
+                # never run and the lock would stick, silently killing
+                # scroll-into-view for the rest of the session.
+                self._stop_scroll_lock_timer()
+                self._scroll_lock_timer = self.set_timer(
+                    self._SCROLL_LOCK_TIMEOUT,
+                    lambda: self._abandon_scroll_restore(gen),
+                )
+
+                if updates is None:
+                    await self._rebuild_pane_list(entries)
+                else:
+                    self._apply_list_updates(updates)
+
+                # The selection as it is NOW, after every await of the tick.
+                self._restore_focus(self._focused_pane_id)
+                self.call_after_refresh(self._restore_list_scroll, gen, 0)
+
+            # Trailing maintenance — the proactive concern auto-offer (t1037_4) and
+            # the mark expiry / liveness sweep (t1326). DISPATCHED, not awaited: the
+            # purge can block for a full 20s wrapper timeout, and awaiting it here
+            # put that on the render path (t1598). See
+            # `AgentMarksMixin._dispatch_refresh_maintenance`.
+            self._dispatch_refresh_maintenance()
+        finally:
+            self._refresh_inflight = False
+            self._maybe_retick_for_filter()
+            self._maybe_rerun_refresh()
+
+    def _maybe_retick_for_filter(self) -> None:
+        """Re-run the refresh once when a filter change missed this tick (t2217).
+
+        A keypress landing while a tick is in flight has its own
+        `call_later(self._refresh_data)` turned away by the re-entrancy guard,
+        and this tick built its entries under the OLD filter — so without this
+        the list would lag a whole refresh interval behind the indicator. One
+        re-tick per target, never more: a tick that returns before building
+        entries cannot spin this into a loop.
+        """
+        target = self._filter_nav_target
+        if (target is None or target == self._entries_filter
+                or target == self._filter_retick_for):
+            return
+        self._filter_retick_for = target
+        with contextlib.suppress(Exception):
+            self.call_later(self._refresh_data)
+
+    async def _check_auto_close(self) -> None:
+        """Exit only on a POSITIVELY OBSERVED empty window (t1446).
+
+        An observation the process could not actually make — a tmux timeout or
+        transport failure, a listing that did not parse completely, a listing
+        that does not even contain our own pane — is not evidence the window is
+        empty. Those paths never exit and reset the confirmation streak, so only
+        back-to-back positive sightings of solitude can close the companion.
+
+        The original code read `discover_window_panes()` returning `[]` as "no
+        other panes remain" and quit. On 2026-08-06 a machine-wide stall pushed
+        the 5 s tmux timeout over the edge in every minimonitor at once and they
+        all quit within the same second, abandoning the agents they were
+        watching.
+        """
+        if self._monitor is None or self._own_window_id is None:
+            return
+        observed, panes = await self._monitor.discover_window_panes_async(
+            self._own_window_id
+        )
+        own_pane = os.environ.get("TMUX_PANE")
+        if not observed or not own_pane:
+            # tmux failed, or the listing dropped a record (a truncated sibling
+            # row looks exactly like solitude), or we cannot identify our own
+            # pane at all — nothing was verified.
+            self._empty_window_streak = 0
+            return
+        pane_ids = {p.pane_id for p in panes}
+        if own_pane not in pane_ids:
+            # A complete listing that does not mention us is not a self-sighting.
+            self._empty_window_streak = 0
+            return
+        if pane_ids - {own_pane}:
+            self._empty_window_streak = 0  # other panes remain
+            return
+        self._empty_window_streak += 1
+        if self._empty_window_streak >= AUTO_CLOSE_CONFIRMATIONS:
+            self.exit()
+
+    async def _seed_own_window_info(self) -> None:
+        """Populate `_own_window_{id,index,name}` off the mount path (t1622).
+
+        The mount-time sibling of `_update_own_window_info`, and deliberately
+        NOT a call into it: that one routes through `self._monitor`, which does
+        not exist yet when this is dispatched, and whose client is pinned to the
+        dedicated `-L ait` socket (t953). These three fields describe THIS pane
+        on the server we are attached to, so the query must follow ambient
+        `$TMUX` resolution — which is exactly what `TmuxClient(socket_args=[])`
+        is: the gateway with no `-L` flag, building the same argv the raw
+        `subprocess.run` this replaced did.
+
+        **`socket_args=[]` is load-bearing, not tidiness.** A bare
+        `TmuxClient()` reads `tmux_socket_args()` and pins the call to `-L ait`;
+        against a pane on any other server that returns rc != 0 and all three
+        fields stay `None` — a silent degradation (refusals from `m` / `k`,
+        auto-close permanently disabled) with no error anywhere. Pinned by
+        `test_the_seed_queries_the_ambient_server_for_its_own_pane`.
+
+        **Seeds, never overwrites.** The refresh tick re-derives all three every
+        interval and this worker can land after it (a slow tmux answer, a
+        `renumber-windows` in between). Writing only a field that is still
+        `None` makes the two writers order-independent: the tick always owns the
+        current value, and this only fills in what has not been answered yet.
+
+        Timeout 2 s, matching `_update_own_window_info`. The old 5 s was the
+        blocking call's own budget; there is no reason for a seed to wait longer
+        than the tick that supersedes it.
+        """
+        own_pane = os.environ.get("TMUX_PANE", "")
+        if not own_pane:
+            return
+        rc, stdout = await TmuxClient(socket_args=[]).run_async(
+            ["display-message", "-p", "-t", own_pane,
+             "#{window_id}\t#{window_index}\t#{window_name}"],
+            timeout=2,
+        )
+        if rc != 0 or not stdout.strip():
+            return
+        parts = stdout.strip().split("\t")
+        if len(parts) >= 1 and self._own_window_id is None:
+            self._own_window_id = parts[0]
+        if len(parts) >= 2 and self._own_window_index is None:
+            self._own_window_index = parts[1]
+        if len(parts) >= 3 and self._own_window_name is None:
+            self._own_window_name = parts[2]
+
+    async def _update_own_window_info(self) -> bool:
+        """Re-read this pane's window: id, index, name AND the pane ids in it.
+        Returns whether THIS call validated all of them.
+
+        One ``list-panes -t $TMUX_PANE`` round trip (t2227) — the same call
+        count as the ``display-message`` it replaced. tmux resolves a pane id
+        given as the window target to the window that pane is in *now*, so the
+        listing describes the current window even across a ``renumber-windows``
+        shift, a ``swap-pane`` or a ``break-pane``. The membership it yields is
+        the identity source: ``_find_own_agent_snapshot`` matches snapshots by
+        pane id against it, never by ``window_index`` (which is what let a
+        minimonitor started as its origin window was killed freeze the origin
+        agent's name in its docked panel).
+
+        The listing is validated whole by :func:`parse_own_window_listing`
+        before any field is touched. Every failure path returns without touching
+        the fields, so the **previous** values survive — which is right for
+        display (a stale name still beats none) and wrong for anything that must
+        not act on a stale identity. Two consumers are exactly that: the
+        parked-capture subtraction (a stale name subtracts the wrong pair,
+        leaving the real followed agent parked and its panel frozen), and every
+        action that resolves the followed agent (a stale membership set can name
+        a pane that has since moved out of this window). Both read the return
+        value through ``_own_identity_confirmed``, never the surviving fields:
+        "absent" is not the only unsafe state, "unconfirmed" is.
+        """
+        own_pane = os.environ.get("TMUX_PANE", "")
+        if not own_pane or self._monitor is None:
+            return False
+        rc, stdout = await self._monitor.tmux_run_async(
+            ["list-panes", "-t", own_pane, "-F", OWN_WINDOW_LISTING_FORMAT],
+            timeout=2,
+        )
+        if rc != 0:
+            return False
+        parsed = parse_own_window_listing(stdout, own_pane)
+        if parsed is None:
+            return False
+        (self._own_window_id, self._own_window_index,
+         self._own_window_name, self._own_window_pane_ids) = parsed
+        return True
+
+    def _capture_pins(self):
+        """Parked agents this minimonitor needs captured live: the one it follows.
+
+        Parking the followed agent is a signal to *other* monitors' lists, not
+        an instruction to this pane to stop working (t1685 §7): its docked panel,
+        the `L` auto-recheck loop, `c` concerns and shadow readiness are all
+        bound to that agent and all need live capture. So its pair is pinned —
+        subtracted from the published skip set (`_parked_agent_pairs`) and kept
+        live in this client's view (`_project_snapshots`). Under a shared
+        producer (t2034_2) this is a per-client pin, not a change to which agents
+        are parked: other clients still show the agent parked.
+
+        **Fail-safe on an unconfirmed identity.** The pin is only valid against a
+        window name confirmed by THIS tick's `_update_own_window_info`; otherwise
+        this returns :data:`CAPTURE_PIN_ALL`, so no parked pair is published at
+        all. Costing one tick of capture for every parked agent in this pane's
+        view is recoverable and invisible except as CPU; pinning a stale
+        post-rename name would leave the followed agent in the parked set and
+        freeze the panel this pane exists to show, with no error anywhere. The
+        mount-time seed deliberately does not set the confirmation flag — it
+        fills only unset fields and can race the first refresh, which is the
+        other half of the same hazard.
+        """
+        if not self._own_identity_confirmed or not self._own_window_name:
+            return CAPTURE_PIN_ALL
+        return frozenset({(self._session, self._own_window_name)})
+
+    def _own_members(self, confirmed_only: bool) -> frozenset[str] | None:
+        """The own window's pane ids, or ``None`` when they may not be used.
+
+        ``confirmed_only`` is the action gate (t2227): it additionally requires
+        that THIS tick's ``_update_own_window_info`` validated the listing, so a
+        set kept across a failed query — which may predate a ``swap-pane`` or
+        ``break-pane`` — can never steer a kill, a keystroke or a launch. Display
+        callers pass ``False`` and accept the last validated set, so one failed
+        tick does not blank the docked panel. ``getattr`` defaults because many
+        tests build the app with ``__new__``.
+        """
+        members = getattr(self, "_own_window_pane_ids", None)
+        if not members:
+            return None
+        if confirmed_only and not getattr(self, "_own_identity_confirmed", False):
+            return None
+        return members
+
+    def _find_own_agent_snapshot(
+        self, *, confirmed_only: bool = True,
+    ) -> PaneSnapshot | None:
+        """Return the snapshot of the AGENT pane sharing this minimonitor's
+        tmux window (the agent it follows), or None if not detected.
+
+        Matches by **pane id** against the own window's membership
+        (``_own_window_pane_ids``), never by ``window_index`` (t2227). The index
+        and the snapshots are read at different moments, and
+        ``renumber-windows`` shifts the index whenever an earlier window closes
+        — so an index match could pair this tick's index with a scan that still
+        had the *neighbouring* window at it (the symptom: starting a pick from a
+        window while killing that window froze the origin agent in the new
+        minimonitor's docked panel). Pane ids never change, and they are
+        server-unique, so the old session scope is subsumed: a pane in another
+        session can never be a member.
+
+        **This is the action seam, so the default is ``confirmed_only=True``:**
+        it refuses (returns ``None``) unless this tick validated the membership.
+        Only the presentation paths opt out (see ``_find_own_window_snapshot``
+        and ``_refresh_own_live_state``). First match in discovery order, which
+        is pane-index order within a window (``pane_sort_key``).
+        """
+        members = self._own_members(confirmed_only)
+        if members is None:
+            return None
+        for snap in self._snapshots.values():
+            if (
+                snap.pane.category == PaneCategory.AGENT
+                and snap.pane.pane_id in members
+            ):
+                return snap
+        return None
+
+    def _find_own_window_snapshot(
+        self, *, confirmed_only: bool = False,
+    ) -> PaneSnapshot | None:
+        """The pane this minimonitor sits beside, agent or not (t1382).
+
+        The **identity / presentation** seam, deliberately NOT the action seam.
+        ``_find_own_agent_snapshot`` stays strictly AGENT-scoped so ``k`` / ``n``
+        / ``e`` / ``E`` / ``I`` keep refusing in a window renamed off the
+        ``agent-`` prefix — that rename is how a user takes a window out of the
+        agent rotation, and honouring it is the point. But the docked panel and
+        the "don't list the followed pane twice" exclusion are about *which pane
+        we are next to*, not about whether it is an agent, so they resolve here.
+
+        Prefers the AGENT match, so a window holding both an agent and a stray
+        shell still resolves to the agent; otherwise falls back to the
+        lowest-``pane_index`` member pane, which is deterministic across ticks.
+        The fallback cannot pick a helper: shadow and companion panes never
+        reach ``_snapshots``, and this minimonitor's own pane is dropped by the
+        client view (``_project_snapshots``). Membership is by pane id, exactly
+        as in ``_find_own_agent_snapshot`` (t2227).
+
+        **Defaults to ``confirmed_only=False``** — presentation may use the last
+        validated membership so a single failed tick does not tear the panel
+        down. A caller that ACTS on the result (``_find_sibling_pane_id``) must
+        pass ``confirmed_only=True``.
+        """
+        agent = self._find_own_agent_snapshot(confirmed_only=confirmed_only)
+        if agent is not None:
+            return agent
+        members = self._own_members(confirmed_only)
+        if members is None:
+            return None
+        candidates = [
+            snap for snap in self._snapshots.values()
+            if snap.pane.pane_id in members
+        ]
+        if not candidates:
+            return None
+        # Numeric where possible: pane_index is a string, so a plain min() would
+        # order "10" before "2". Shares `tmux_index_key` with the pane-list sort
+        # so the idiom — and its non-numeric fallback — exists once (t1659).
+        return min(candidates, key=lambda s: tmux_index_key(s.pane.pane_index))
+
+    def _root_for_snap(self, snap: PaneSnapshot) -> Path:
+        """Project root that owns the given pane's tmux session, falling back to
+        this minimonitor's project root. Mirrors MonitorApp._root_for_snap.
+
+        Reads **this tick's** session→root map rather than re-querying tmux
+        (t1598). Unlike the monitor's copy, this one is reachable from the render
+        path — `_own_header_session` calls it while the own-agent panel is built
+        — so a sync `get_session_to_project_mapping()` here was a tmux round-trip
+        on the event-loop thread that the poison-pill test could not see.
+        `_set_session_root_map` is fed the *async* mapping every tick, and reusing
+        the last tick's map on a keypress is the same contract
+        `_completed_pane_ids` already documents.
+        """
+        sess = snap.pane.session_name
+        if sess:
+            root = self._session_root_map.get(sess)
+            if root is not None:
+                return root
+        return self._project_root
+
+    def _own_header_session(self, snap) -> str:
+        """Repo label for the own-panel header (t1580).
+
+        The tmux **session name** is the primary value, because that is exactly
+        what the pane list's `format_session_divider` rules show — the followed
+        agent should read like a list entry, which is the whole point of naming
+        it here at all.
+
+        When `_session_is_ambiguous`, that name identifies no repo, and
+        `basename(project_root)` is the value that does (see
+        `AitasksSession.key`). **Substituted, not appended:** this row has one
+        line, and `── this agent · aitasks (aitasks_mobile) ──` does not fit a
+        40-column pane.
+
+        Resolved through `_root_for_snap`, not from `self._project_root`
+        directly: in multi-session mode the followed pane may belong to a
+        different project than this minimonitor's own.
+
+        Fails soft, like `_own_phase_text`: any resolution problem yields the
+        session name unchanged rather than a wrong or empty label. That covers
+        the `__new__`-built test stub where `_root_for_snap` answers None.
+        """
+        session = snap.pane.session_name or getattr(self, "_session", "") or ""
+        if not _session_is_ambiguous(session):
+            return session
+        root = self._root_for_snap(snap)
+        return root.name if root is not None and root.name else session
+
+    # -- List scroll preservation (t1539) --------------------------------------
+
+    def _capture_list_scroll(self) -> None:
+        """Snapshot the list's scroll position, keyed on a card identity.
+
+        Runs immediately before `_rebuild_pane_list`, which is where the offset
+        dies: while the container is childless `max_scroll_y` is 0 and
+        `validate_scroll_y` clamps `scroll_y` to 0 (measured live: 8.0 -> 0
+        between `remove_children()` and the end of `mount_all()`).
+
+        A raw `scroll_y` could not be restored faithfully — agents come and go
+        between ticks, so the content height changes and the row that occupied a
+        given offset may no longer exist. The anchor is a `pane_id` plus the
+        remainder within that card, and the pre-rebuild order is carried too so a
+        killed anchor can fall back to its nearest surviving neighbour.
+
+        Deliberately called from `_refresh_data` rather than from inside
+        `_rebuild_pane_list`: every existing test drives that method with a
+        `_FakeContainer` exposing only `remove_children`/`mount_all`, and reading
+        `scroll_y` there would break all of them.
+        """
+        if self._pending_scroll_state is not None:
+            # A tick landing mid-restore reuses the first snapshot. Re-capturing
+            # would record the transient zeros of a half-laid-out rebuild.
+            return
+        try:
+            container = self.query_one("#mini-pane-list", VerticalScroll)
+        except NoMatches:
+            return          # pre-compose tick; nothing to preserve yet
+        cards = [
+            card for card in container.query(MiniPaneCard)
+            if hasattr(card, "pane_id")
+        ]
+        if not cards:
+            return
+        # The bottom pin is read as a LIVE MODE, not measured from geometry
+        # (t1653). The old `at_bottom = max_y <= 0 or scroll_y >= max_y - 1` was a
+        # snapshot of a number that is stale by construction: card heights change
+        # out of band with the tick, so `max_scroll_y` had already moved by the
+        # time the comparison ran. Once the position drifted more than a row the
+        # test read False for ever and the anchor branch faithfully froze the
+        # wrong offset. The mode below is set by the user's own gesture and
+        # cleared by their next scroll, so it cannot go stale.
+        scroll_y = container.scroll_y
+        pinned = container.is_bottom_pinned
+        anchor = pick_scroll_anchor(
+            [(card.pane_id, card.virtual_region.y) for card in cards], scroll_y
+        )
+        if anchor is None:
+            return
+        anchor_id, delta = anchor
+        self._pending_scroll_state = (
+            pinned, anchor_id, delta, [card.pane_id for card in cards]
+        )
+
+    def _restore_list_scroll(self, gen: int, attempt: int = 0) -> None:
+        """Re-apply the captured offset once the container can actually hold it."""
+        if gen != self._scroll_restore_gen:
+            return          # superseded — a newer tick (or the user) owns the state
+        state = self._pending_scroll_state
+        if state is None:
+            return
+        try:
+            container = self.query_one("#mini-pane-list", VerticalScroll)
+        except NoMatches:
+            self._abandon_scroll_restore(gen)
+            return
+        pinned, anchor_id, delta, order = state
+
+        if pinned:
+            # Nothing to restore: the compositor owns the offset while the anchor
+            # is armed, and recomputes it from `total_region.bottom` inside the
+            # arrange pass — the one moment the new geometry is final. That is
+            # why this returns BEFORE the readiness gate below: the retry ladder
+            # exists to wait for a settled `max_scroll_y`, and an anchored list
+            # never needs to.
+            #
+            # The one thing the app still owns is the degenerate range, and it is
+            # DEFERRED rather than done here: the compositor's unclamped write
+            # happens in the arrange pass that follows this callback, so a
+            # correction applied inline is simply overwritten (measured: -2
+            # survived an inline clamp). See `MiniPaneList._reconcile_anchor`.
+            self.call_after_refresh(container._reconcile_anchor)
+            self._pending_scroll_state = None
+            self._stop_scroll_lock_timer()
+            self.call_after_refresh(self._release_list_scroll_lock, gen)
+            return
+
+        live = {
+            card.pane_id: card.virtual_region.y
+            for card in container.query(MiniPaneCard)
+            if hasattr(card, "pane_id")
+        }
+
+        # READINESS GATE, and it must come BEFORE the anchor is resolved.
+        # `force=True` bypasses `allow_vertical_scroll` but NOT
+        # `validate_scroll_y`'s clamp to `max_scroll_y`, so a restore issued
+        # before the rebuilt list has geometry is silently written as 0 — the bug
+        # itself. In that window the anchor's own offset also reads 0, so
+        # resolving first would compute a target of ~0 and then "succeed".
+        if (attempt < self._SCROLL_RESTORE_MAX_ATTEMPTS
+                and list_layout_pending(list(live.values()))):
+            self.call_after_refresh(self._restore_list_scroll, gen, attempt + 1)
+            return
+
+        target: float | None = None
+        anchor_top = resolve_anchor_target(order, anchor_id, live)
+        if anchor_top is not None:
+            target = anchor_top + delta
+
+        # Second gate: the range may be laid out but still short of the target
+        # for a frame. Falling through the budget restores what fits, which is
+        # the right answer when the list genuinely shrank.
+        if (attempt < self._SCROLL_RESTORE_MAX_ATTEMPTS
+                and target is not None and target > container.max_scroll_y):
+            self.call_after_refresh(self._restore_list_scroll, gen, attempt + 1)
+            return
+
+        try:
+            if target is not None:
+                container.scroll_to(
+                    y=target, animate=False, immediate=True, force=True
+                )
+            else:
+                # Nothing from the old list survived: clamp rather than guess.
+                container.scroll_to(
+                    y=container.max_scroll_y, animate=False, immediate=True,
+                    force=True,
+                )
+        finally:
+            self._pending_scroll_state = None
+            self._stop_scroll_lock_timer()
+            # One extra flush before unlocking, so focus scrolls the rebuild
+            # deferred are still refused. The acquisition timer is the backstop.
+            self.call_after_refresh(self._release_list_scroll_lock, gen)
+
+    def _abandon_scroll_restore(self, gen: int | None = None) -> None:
+        """Drop the pending restore and unlock.
+
+        Called by the fail-safe timer with the generation it was armed for, and
+        by `MiniPaneList._scroll_to` with none — meaning "whatever is current" —
+        when the user scrolls for real.
+
+        RETIRING the generation is the load-bearing half. Unlocking alone would
+        leave a late `_restore_list_scroll` passing its own guard and forcing the
+        stale offset over the scroll the user just performed, and would leave the
+        next tick reusing a stale snapshot (the capture skips while one is
+        pending).
+        """
+        if gen is not None and gen != self._scroll_restore_gen:
+            return          # a stale timer from a superseded tick
+        if self._pending_scroll_state is None and not self._list_scroll_lock:
+            return          # nothing in flight — the common case for a user scroll
+        self._scroll_restore_gen += 1
+        self._pending_scroll_state = None
+        self._stop_scroll_lock_timer()
+        self._list_scroll_lock = False
+
+    def _release_list_scroll_lock(self, gen: int) -> None:
+        """Clear the lock if this generation is still the current one."""
+        if gen == self._scroll_restore_gen:
+            self._list_scroll_lock = False
+
+    def _stop_scroll_lock_timer(self) -> None:
+        if self._scroll_lock_timer is not None:
+            self._scroll_lock_timer.stop()
+            self._scroll_lock_timer = None
+
+    def _restore_focus(self, pane_id: str | None) -> None:
+        """Re-focus the previously focused card after a rebuild."""
+        if pane_id is not None:
+            for card in self.query("#mini-pane-list MiniPaneCard"):
+                if hasattr(card, "pane_id") and card.pane_id == pane_id:
+                    # scroll_visible=False: during a passive refresh the captured
+                    # anchor is authoritative, not the focused card's position
+                    # (t1539). The lock refuses this scroll anyway; suppressing it
+                    # here saves a queued no-op and makes the decision legible at
+                    # the call site. The fallback below now says the same thing
+                    # for the same reason, so NEITHER branch of this method
+                    # scrolls (t1683) — a focus-in is not a scroll gesture, and
+                    # classifying it as one is what let it fight a click.
+                    # Keyboard nav is the real active gesture and is unaffected:
+                    # it runs with the lock clear and goes through
+                    # `Widget.focus()` directly, not through here.
+                    card.focus(scroll_visible=False)
+                    # Widget.focus() is deferred, so on_descendant_focus may
+                    # not fire before the next refresh cycle. Set directly to
+                    # avoid the next tick restoring a stale `_focused_pane_id`.
+                    self._focused_pane_id = card.pane_id
+                    return
+        # Fallback: select the first general-list agent (the followed agent
+        # lives in its own static docked panel and is not focusable).
+        if self._first_list_card() is None:
+            # No card to fall back to — reachable once `P` hides every parked
+            # agent and nothing else is listed (t1685). Clear rather than leave
+            # `_focused_pane_id` naming a pane the list no longer renders;
+            # `_auto_select_own_window` is already a no-op here, but the stale id
+            # is not.
+            self._focused_pane_id = None
+            return
+        self._auto_select_own_window()
+
+    def _first_list_card(self) -> MiniPaneCard | None:
+        """The first general-list agent card, or None when the list is empty."""
+        list_cards = list(self.query("#mini-pane-list MiniPaneCard"))
+        return list_cards[0] if list_cards else None
+
+    def _auto_select_own_window(self) -> None:
+        """Focus the first general-list agent card, if any. NEVER scrolls.
+
+        The followed agent is shown in the static, non-focusable docked panel
+        (``#mini-own-agent``), so there is nothing to auto-select there.
+
+        ``scroll_visible=False`` is unconditional rather than a parameter
+        because its only caller — ``_restore_focus``'s fallback — runs inside a
+        passive refresh where the captured anchor is authoritative (t1539), the
+        same reason the sibling branch above it already passes the flag.
+        Deliberately accepted consequence: when the focused agent dies out from
+        under a mid-list reader, focus moves to card 0 without dragging the list
+        back to the top, so card 0 may be off screen until the next arrow key
+        (t1683).
+        """
+        card = self._first_list_card()
+        if card is not None:
+            card.focus(scroll_visible=False)
+
+    def on_app_focus(self) -> None:
+        """Terminal focus-in: select a card only if nothing is focused.
+
+        Schedules only — the decision belongs in the deferred callback below,
+        and it must not be made here. Textual dispatches ``on_app_focus`` per
+        MRO class, subclass first, so this runs BEFORE ``App._on_app_focus``:
+        ``AppBlur`` has already cleared focus and Textual's own restore has not
+        run yet, which makes an inline ``self.focused is None`` check here
+        always pass.
+
+        Nor may this simply re-post the focus. ``Widget.focus()`` defers via
+        ``call_later`` onto the app's own FIFO, while click-focus is
+        synchronous inside ``Screen._forward_event``. A card-0 focus queued
+        from here therefore lands AFTER a click that was already queued behind
+        the focus-in, silently undoing it — the reported symptom (t1683).
+        """
+        self.call_later(self._auto_select_after_focus_in)
+
+    def _auto_select_after_focus_in(self) -> None:
+        """The deferred half of ``on_app_focus`` — the guard belongs HERE.
+
+        By the time this runs, ``App._watch_app_focus`` has restored the
+        pre-blur widget (non-scrolling), and any click delivered with the
+        focus-in has already focused the card under the cursor. Anything
+        focused is therefore more authoritative than "card 0": a card Textual
+        restored, the card the user just clicked, or an open dialog's own
+        control. Only a completely unfocused app gets the fallback.
+
+        ``set_focus``, not ``Widget.focus()``: the latter defers a SECOND time,
+        and that callback would land after a click still queued behind this
+        one — re-creating the very overwrite this guard exists to prevent.
+        """
+        if self.focused is not None:
+            return
+        card = self._first_list_card()
+        if card is not None:
+            self.set_focus(card, scroll_visible=False)
+
+    def _rebuild_session_bar(self, desync: str | None = None) -> None:
+        agents = [
+            s for s in self._snapshots.values()
+            if s.pane.category == PaneCategory.AGENT
+        ]
+        total = len(agents)
+        # Same partition as the full monitor (t1322/t1685): each NON-PARKED
+        # agent lands in at most one live bucket, on the PROMPT > COMPLETED >
+        # IDLE ladder the badges use. Parked agents leave that partition — they
+        # are not captured, so they have no verdict to bucket — and get their own
+        # term, shown whether or not `P` is hiding their rows. The bar is narrow,
+        # so `done` renders as a compact `Nd` and `parked` as `Np`.
+        live = [a for a in agents if not a.parked and not a.frozen]
+        frozen_count = sum(1 for a in agents if a.frozen)
+        parked_count = sum(1 for a in agents if a.parked and not a.frozen)
+        awaiting_count = sum(1 for a in live if getattr(a, "awaiting_input", False))
+        done_count = sum(1 for a in live
+                         if a.pane.pane_id in self._completed_pane_ids
+                         and not getattr(a, "awaiting_input", False))
+        idle_count = sum(1 for a in live
+                         if a.is_idle and not getattr(a, "awaiting_input", False)
+                         and a.pane.pane_id not in self._completed_pane_ids)
+
+        awaiting_str = f" [bold magenta]{awaiting_count} awaiting[/]" if awaiting_count > 0 else ""
+        done_str = f" [{STATE_STYLE_DONE}]{done_count}d[/]" if done_count > 0 else ""
+        idle_str = f" [yellow]{idle_count} idle[/]" if idle_count > 0 else ""
+        parked_str = f" [dim]{parked_count}p[/]" if parked_count > 0 else ""
+        # A SEPARATE term from `Np`, and shown whether or not `P` hides the rows
+        # — the filter is one control over both states, but which state an agent
+        # is in still matters. Counted disjointly: a frozen agent that also
+        # carries the parked mark is reported once, as frozen.
+        frozen_str = f" [dim]{frozen_count}f[/]" if frozen_count > 0 else ""
+        # Pre-fetched by `_refresh_data` (t1622), which awaits the async reader
+        # inside the same `_session_bar_enabled` gate. `None` means this call
+        # brought none — a test or any future synchronous rebuild — so read the
+        # cache rather than spawning.
+        #
+        # The gate itself is still gated on the FLAG, not on `bar.display`,
+        # which is only set further down, after this ran (t1598): the summary
+        # shells out to a fresh Python interpreter with a 30s TTL cache that
+        # always misses on the first tick, and `_session_bar_enabled` defaults
+        # to False, so on a default install every tick paid for a string nobody
+        # rendered. What the gate now saves is that WORK — it is no longer what
+        # keeps the stall off the render path (t1622 moved the fetch off it for
+        # the enabled case too). Gated rather than early-returned: the bar's
+        # text must keep tracking state so a runtime toggle shows current data.
+        if desync is None:
+            desync = ""
+            if self._session_bar_enabled:
+                try:
+                    desync = _get_desync_summary_cached(Path.cwd(), compact=True)
+                except Exception:
+                    desync = ""
+        # Surface the control-channel state only when not steady-state.
+        # Compact form fits the narrow minimonitor bar.
+        state_badge = ""
+        if self._monitor is not None:
+            s = self._monitor.control_state()
+            if s == TmuxControlState.RECONNECTING:
+                state_badge = " [yellow]rc:retry[/]"
+            elif s == TmuxControlState.FALLBACK:
+                state_badge = " [red]rc:fb[/]"
+        bar = self.query_one("#mini-session-bar", Static)
+        # The one site that reveals the bar in normal operation (t1566). The
+        # rule ships `display: none`, so this is what the config key actually
+        # controls; set every tick so a future runtime toggle takes effect
+        # without a special-cased second write site.
+        bar.display = self._session_bar_enabled
+
+        if self._monitor is not None and self._multi_session:
+            # Count unique sessions currently represented in the snapshot so
+            # the bar tracks what's on screen, not the discovery cache.
+            sessions = {
+                s.pane.session_name for s in agents if s.pane.session_name
+            }
+            n = len(sessions) if sessions else 1
+            text = f"multi: {n}s · {total}a{awaiting_str}{done_str}{idle_str}{parked_str}{frozen_str}{desync}{state_badge}"
+        else:
+            # The session name is tmux-side user input, followed by two spaces —
+            # never by a tag — so `markup_literal` is exact (t2017).
+            text = f"{markup_literal(self._session)}  {total} agent{'s' if total != 1 else ''}{awaiting_str}{done_str}{idle_str}{parked_str}{frozen_str}{desync}{state_badge}"
+        # `Static.update` re-parses and re-lays-out the screen even for the same
+        # string, so an unchanged bar is not re-rendered (t2183).
+        if text != getattr(self, "_session_bar_text", None):
+            self._session_bar_text = text
+            bar.update(text)
+
+    def _compute_completed_panes(self) -> frozenset[str]:
+        """Pane ids whose task is finished, for THIS refresh tick (t1322).
+
+        Mirrors :meth:`MonitorApp._compute_completed_panes` — one pass per tick
+        so the card badge and the session-bar counter cannot disagree, and the
+        only site paying the per-pane ``os.stat`` freshness check.
+        """
+        done: set[str] = set()
+        for pane_id, snap in self._snapshots.items():
+            if snap.pane.category != PaneCategory.AGENT:
+                continue
+            if snap.parked or snap.frozen:
+                # Parked and frozen agents leave the state partition entirely
+                # (t1685, t1705_7): neither was captured, so neither has a
+                # verdict to bucket.
+                continue
+            task_id = self._task_cache.get_task_id_for_pane(snap.pane)
+            if not task_id:
+                continue
+            if is_task_completed(
+                self._task_cache.get_task_info(task_id, snap.pane.session_name)
+            ):
+                done.add(pane_id)
+        return frozenset(done)
+
+    def _agent_card_text(self, snap: PaneSnapshot) -> str:
+        """Build the compact card text (status line + optional task title) for
+        a general-list agent row (``_build_list_entries`` is the only caller).
+
+        NOT used by the docked followed-agent panel — that renders via
+        ``_own_agent_identity_text`` and is static by design: no live status
+        dot, no compare-mode glyph, and no shadow-status glyph (t1133).
+
+        The task info and advisory phase are read from ``_build_phases``
+        (t2217) — the values ``_build_list_entries`` already resolved for this
+        build's filter — so a tick resolves each agent's task and phase ONCE.
+        Outside a build (a direct caller) the map is empty and both are
+        resolved here exactly as before. A map
+        rather than a parameter: test hosts override this method with the
+        one-argument signature, and a build must keep driving them.
+        """
+        if snap.frozen:
+            # Checked BEFORE parked: the two can both be true of one pane
+            # (frozen coexists with the parked mark), and frozen is the stronger
+            # statement — there is no agent process at all. The mark glyph still
+            # renders, composed by `format_frozen_prefix`, so `space` keeping its
+            # meaning on this row stays visible.
+            prefix = f"{format_frozen_prefix(self._mark_kind(snap))} "
+            name = self._row_name(snap, prefix, cell_len("frozen"))
+            text = f"{prefix}{name}  [dim]frozen[/]"
+            # The task title IS allowed here (t2042): it is not capture-derived
+            # — the id comes from the window name and the title from the task
+            # file, the same lookup `i` uses. The gate/phase row is not: the
+            # phase reads the capture, and the gate counts alone would cost a
+            # row per agent that is not advancing its task.
+            task_id = self._task_cache.get_task_id_for_pane(snap.pane)
+            if task_id:
+                info = self._task_cache.get_task_info(
+                    task_id, snap.pane.session_name)
+                if info:
+                    text += self._title_row(info)
+            return text
+        if snap.parked:
+            # The whole row, deliberately (t1685) — see
+            # MonitorApp._format_agent_card_text for why nothing capture-derived
+            # may appear on a pane that was not captured.
+            prefix = f"{format_mark_glyph(agent_marks.KIND_PARKED)} "
+            name = self._row_name(snap, prefix, cell_len("parked"))
+            return f"{prefix}{name}  [dim]parked[/]"
+
+        # Per-tick set is the SOLE source of the completed flag (t1322) — the
+        # `info` lookup below supplies the title and gate summary but must never
+        # re-derive completion, or the badge could disagree with the session bar
+        # for a tick. See MonitorApp._format_agent_card_text.
+        completed = snap.pane.pane_id in self._completed_pane_ids
+        dot = format_state_dot(snap, completed)
+        status = format_pane_status(snap, completed)
+
+
+        glyph = "?"
+        shadow = ""
+        if self._monitor is not None:
+            mode = self._monitor.get_compare_mode(snap.pane.pane_id)
+            is_override = self._monitor.is_compare_mode_overridden(snap.pane.pane_id)
+            glyph = format_compare_mode_glyph(mode, is_override)
+            # Shadow-status glyph (t1133): second colored glyph right after
+            # the agent's own dot when a shadow is bound; "" keeps
+            # non-shadowed rows unchanged.
+            shadow = format_shadow_glyph(
+                self._monitor.get_shadow_snapshot(snap.pane.pane_id)
+            )
+
+        # Leftmost: a durable user annotation, deliberately outside the live
+        # state cluster (dot / shadow / compare-mode), and first to survive
+        # truncation.
+        mark = format_mark_glyph(self._mark_kind(snap))
+        shadow_part = f" {shadow}" if shadow else ""
+        prefix = f"{mark} {dot}{shadow_part} {glyph} "
+        # The name gets what the row leaves after the prefix it actually has and
+        # the status at its BOUND — see the budget block at the top of this
+        # module for the arithmetic and for what gives way, in order.
+        name = self._row_name(snap, prefix, PANE_STATUS_MAX_CELLS)
+        line1 = f"{prefix}{name}  {status}"
+
+        # Optional task title line. Inside a build the task info AND phase were
+        # already resolved for the filter (t2217): reuse both, so a displayed
+        # agent costs one task-file stat per tick, not two.
+        resolved = getattr(self, "_build_phases", {}).get(snap.pane.pane_id)
+        if resolved is not None:
+            info, phase = resolved
+        else:
+            info, phase = None, _PHASE_UNSET
+            task_id = self._task_cache.get_task_id_for_pane(snap.pane)
+            if task_id:
+                info = self._task_cache.get_task_info(
+                    task_id, snap.pane.session_name)
+        if info:
+            line1 += self._title_row(info)
+            # Gate summary + advisory phase share ONE row (t1479): they
+            # describe one thing between them, and two rows of a four-row
+            # card is too much of this pane to spend on it. Either half may
+            # be empty (ungated task / unresolvable phase); the row is
+            # omitted only when both are. The phase leads with its own
+            # glyph and colour, the counts stay dim (t2128).
+            if phase is _PHASE_UNSET:
+                phase = self._phase_for_snap(snap, info)
+            merged = format_gate_phase_markup(
+                phase,
+                self._gate_cache.summary_for(info) or "",
+                _detail_budget(self._target_width),
+            )
+            if merged:
+                # `[/dim]` closes the span `_title_row` (always emitted just
+                # above) deliberately leaves open: inside it the phase's
+                # colour would be painted dimmed — the one thing this row's
+                # styling exists to prevent. Safe against a title ending in
+                # a backslash: the newline sits between it and the tag.
+                line1 += f"\n  [/dim]{merged}"
+        return line1
+
+    def _title_row(self, info) -> str:
+        """The indented task-title row under an agent's name row — live and
+        frozen rows alike (t2042)."""
+        title = _clip(info.title, min(
+            _TITLE_MAX_CELLS, _detail_budget(self._target_width)))
+        # No closing tag, deliberately (t2017): a (clipped) title can end in a
+        # backslash, which would turn a `[/]` here into text, and no escaping
+        # can prevent that (see `markup_literal`). The open `[dim]` is
+        # harmless: the only row that can follow is the live gate/phase row,
+        # which starts by closing it (`[/dim]`, t2128 — its phase is coloured,
+        # and would otherwise paint dimmed); Textual closes the span at end of
+        # input when no row follows. A row added after this one must not
+        # assume it starts unstyled.
+        return f"\n  [dim]{markup_literal(title)}"
+
+    def _display_name(self, snap: PaneSnapshot) -> str:
+        """An agent row's name: the window name without the agent prefix that
+        classified it (t1351 — see the budget block for why).
+
+        Reads the prefixes the classifier itself used. With no monitor (a
+        ``__new__``-built stub, or before mount) there is nothing to mirror, so
+        the full window name is shown rather than a guessed strip.
+        """
+        prefixes = getattr(self._monitor, "agent_prefixes", None)
+        if not isinstance(prefixes, (list, tuple)):
+            return snap.pane.window_name
+        return agent_display_name(snap.pane.window_name, prefixes)
+
+    def _row_name(self, snap: PaneSnapshot, prefix: str, reserve: int) -> str:
+        """``_display_name`` clipped to the cells row 1 leaves it, then escaped.
+
+        Clip BEFORE escaping (as ``_own_header_text`` does): the budget is about
+        rendered cells, and a window name is tmux-side user input whose ``[/]``
+        would otherwise close a span early or raise on render. ``markup_literal``
+        (t2017), not ``escape``: every caller follows the name with two spaces,
+        never directly with a tag.
+        """
+        room = _name_room(prefix, reserve, self._target_width)
+        return markup_literal(_clip(self._display_name(snap), room))
+
+    def _live_task_phase(self, snap: PaneSnapshot):
+        """``(task info, advisory phase)`` for a LIVE agent row (t2217).
+
+        The exact lookup ``_agent_card_text`` makes for its title and
+        gate/phase rows — task id from the window name, task info, then
+        ``_phase_for_snap`` — resolved once so the filter and the card read one
+        value and the task file is stat'ed once per tick. ``(None, None)`` when
+        the row has no task (no id, or no readable task file): such a row
+        renders no title or phase and matches no phase filter. Parked and frozen
+        rows never reach here; they are not captured, so nothing
+        capture-derived may be computed for them.
+        """
+        task_id = self._task_cache.get_task_id_for_pane(snap.pane)
+        if not task_id:
+            return None, None
+        info = self._task_cache.get_task_info(task_id, snap.pane.session_name)
+        if not info:
+            return None, None
+        return info, self._phase_for_snap(snap, info)
+
+    def _phase_for_snap(self, snap: PaneSnapshot, info) -> "workflow_phase.PhaseSignal":
+        """Advisory phase for one pane: cached ledger half + this tick's live
+        observation. Never gates anything — see aidocs/framework/shadow_agent.md."""
+        return self._gate_cache.phase_for(
+            info,
+            screen_text=snap.content,
+            awaiting_input=snap.awaiting_input,
+            awaiting_input_kind=snap.awaiting_input_kind,
+            # Consume the key that actually scoped this pane's matching rather
+            # than re-deriving it (t1467): a second derivation could disagree
+            # with the one the kind was produced under.
+            agent=snap.agent_key,
+            current_command=snap.pane.current_command,
+        )
+
+    def _other_card_text(self, snap: PaneSnapshot) -> str:
+        """One-line card for an uncategorized (``PaneCategory.OTHER``) pane.
+
+        The narrow analogue of ``MonitorApp._format_other_card_text``: no mark,
+        state dot, shadow glyph, compare-mode glyph, status, task title or gate
+        line — none of those mean anything for a pane that is not an agent, and
+        the row has no columns to spare for them.
+
+        The two leading blanks align the ``○`` under the agent rows' always-on
+        mark glyph. The command is reserved at ``_OTHER_CMD_CELLS`` and the
+        window name — shown in full, since an OTHER pane has no agent prefix to
+        drop — gets the rest, so it is what gives way first, exactly as on the
+        agent row. Arithmetic: the budget block at the top of this module.
+        """
+        prefix = "  [dim]○[/] "
+        cmd = markup_literal(_clip(snap.pane.current_command, _OTHER_CMD_CELLS))
+        room = _name_room(prefix, _OTHER_CMD_CELLS, self._target_width)
+        name = markup_literal(_clip(snap.pane.window_name, room))
+        # The command ends the row with its `[dim]` left open (t2017), as in
+        # `MonitorApp._format_other_card_text`: a command ending in a backslash
+        # cannot sit before a closing tag.
+        return f"{prefix}{name}  [dim]{cmd}"
+
+    def _own_agent_identity_text(self, snap: PaneSnapshot) -> Content:
+        """Static identity line for the followed agent: window name + optional
+        task title. Deliberately omits live status (idle/prompt/active) and the
+        idle-detection glyph — the docked panel is built once and is not a
+        refreshing status card like the general-list entries.
+
+        **This includes COMPLETED (t1322), by explicit decision.** The followed
+        agent's own task finishing is not surfaced here; the panel stays static.
+        Use `ait monitor`, or the general list, to see a completed badge. Left
+        this way so the omission reads as a choice, not an oversight.
+
+        **Every part is wrapped to a bounded number of rows (t1566).** The name
+        used to be handed to Rich unwrapped, so it folded over as many rows as
+        the width demanded — which is why no fixed `max-height` could hold: the
+        panel's worst case was an artifact of 40 columns and grew as the pane
+        narrowed. Wrapping it here to at most two lines is what makes
+        ``_OWN_PANEL_MAX_ROWS`` true at 22 columns as well as at 40.
+
+        **A ``Content``, not a markup string (t2017).** The window name and the
+        title are user text and every wrapped line of them sits directly before
+        its closing tag, where a trailing backslash would turn the tag into
+        text — a case no escaping can express (see ``markup_literal``). So each
+        line is a ``$variable`` of one template, substituted after tokenizing,
+        and ``_own_card_text`` concatenates the result as ``Content`` — it is
+        never parsed again.
+        """
+        # One budget for both blocks, and NOT a round number: `padding: 0 1`
+        # leaves `target_width - 2` usable and the mark glyph costs 2 more, so
+        # this is exactly the "★ " budget CompositedWidthTests pins (36 at 40
+        # columns). The floor is deliberately small — a floor ABOVE what fits
+        # (the old `max(20, …)`) makes each line wrap again on a narrow pane,
+        # which is precisely how the row budget used to escape.
+        wrap_width = max(8, self._target_width - 4)
+
+        def _fold(text: str) -> list[str]:
+            """`text` over at most two lines, ellipsized when truncated.
+
+            Empty in, empty out — an empty task title must add NO row, which is
+            what the pre-wrap version did by way of `textwrap.wrap("") == []`.
+            """
+            lines = textwrap.wrap(text, wrap_width)[:2]
+            if len(lines) == 2 and len(text) > sum(len(w) for w in lines) + 1:
+                lines[1] = lines[1][: max(1, wrap_width - 1)] + "…"
+            return lines
+
+        # The name line always exists, even for a nameless window — that is the
+        # row the mark glyph is rendered on.
+        name_lines = _fold(snap.pane.window_name) or [""]
+        # The glyph is prefixed to the whole string later by _own_card_text, so
+        # it lands on the first line; the continuation carries no indent, which
+        # is how it read before this wrapping was made explicit.
+        rows = [f"[bold]$n{i}[/]" for i in range(len(name_lines))]
+        variables = {f"n{i}": part for i, part in enumerate(name_lines)}
+        task_id = self._task_cache.get_task_id_for_pane(snap.pane)
+        if task_id:
+            info = self._task_cache.get_task_info(task_id, snap.pane.session_name)
+            if info:
+                # Wrap the task description over up to two lines, sized to the
+                # companion column (minus its padding + the 2-space indent).
+                for i, wline in enumerate(_fold(info.title)):
+                    rows.append(f"  [dim]$t{i}[/]")
+                    variables[f"t{i}"] = wline
+        return Content.from_markup("\n".join(rows), **variables)
+
+    def _own_card_text(self, mark_kind: str | None, phase: str = "",
+                       frozen_at: str | None = None) -> Content:
+        """Docked-panel card text: the frozen identity line, the mark glyph, and
+        the advisory workflow phase.
+
+        The mark and the phase are the ONLY things this panel refreshes (t1383,
+        t1420). That is a **narrowed** static-panel contract (t944 / t1133 /
+        t1322), not an abandoned one: what stays excluded is live *agent status*
+        — the state dot, the compare-mode and shadow glyphs, the COMPLETED
+        badge. A mark is a durable **user annotation**, not status:
+        ``format_mark_glyph``'s docstring already places it outside the
+        live-state cluster, and it can change without the agent changing at all
+        (set from ``ait monitor`` or another repo, or expired by TTL).
+
+        The phase is admitted deliberately (t1420): this panel *is* the followed
+        agent, and the shadow companion spawned from it picks its review mode
+        from the phase — showing it only on the general list rows, which exclude
+        the followed agent by construction, would put it everywhere except the
+        one place it is for. It is advisory: it never gates a key, a spawn, or
+        anything the user can ask the shadow.
+
+        **Phase only — deliberately no gate summary (t1479).** When the list
+        rows merged their gate counts onto the phase line, this panel did NOT
+        follow: a gate summary is a second live signal, and admitting it would
+        widen the narrowed contract above rather than keep it narrow. What it
+        did adopt is the *rendering*: ``render_phase_narrow`` (label-free), so
+        the phase reads the same on both surfaces of this 40-column pane instead
+        of carrying a ``phase: `` label the rows next to it dropped. That
+        includes the phase glyph and colour (t2128), so ``phase`` is the
+        styled markup ``format_phase_markup`` builds, not plain text.
+
+        ``marked is None`` ⇒ there is nothing markable here (the window was
+        never an agent, or was renamed off the ``agent-`` prefix after the panel
+        was built) ⇒ **no glyph**, matching ``_other_card_text``. The glyph is
+        present exactly when ``space`` would act, which is what keeps a
+        read-only ☆ from appearing on a pane whose ``space`` refuses.
+
+        **Width.** The glyph costs 2 columns on the name line, against ~38
+        usable in the default 40-column pane; unlike the list rows, the docked
+        panel does not truncate the name. Measured at 40 columns: names up to
+        36 characters are unaffected, and real agent windows are far shorter
+        (``agent-pick-1383``, ``agent-explore-2`` — 11-17 chars). Above 36 the
+        name folds and the glyph is left on a line of its own. A non-breaking
+        separator does NOT avoid that (Rich splits on ``\\s``, which matches
+        U+00A0), and truncating here would drop the tail of the identity this
+        panel exists to show — so the fold is accepted. The list rows' budget
+        (t1351) deliberately does not reach here: this panel has no scrollbar
+        and keeps the full window name, agent prefix included.
+        """
+        # `None` means NOTHING IS MARKABLE here (a window renamed off the
+        # `agent-` prefix), and renders no glyph at all — distinct from
+        # `KIND_NONE`, which is a markable agent that simply carries no mark and
+        # renders `☆`. Keeping the two apart is what stops a read-only `☆`
+        # appearing on a pane whose `space` refuses (t1383).
+        #
+        # Assembled as `Content` (t2017): the identity is user text already
+        # built as Content (see `_own_agent_identity_text`), so only the
+        # framework parts here are parsed, each on its own — never the whole
+        # card. (`Content + str` would add a str as PLAIN text, which is why
+        # every framework part goes through `Content.from_markup`.)
+        identity = self._own_identity_text
+        if frozen_at is not None:
+            # A frozen followed agent: this window's own pane now holds the
+            # stand-in viewer, so there is no agent process to have a phase.
+            # The glyph composes with the mark exactly as the list rows do, and
+            # the phase line is suppressed rather than left stale — that line is
+            # the one thing here that WAS live, and a frozen agent has no
+            # current answer for it (t1705_7).
+            prefix = (f"[bold cyan]{FROZEN_GLYPH}[/]" if mark_kind is None
+                      else format_frozen_prefix(mark_kind))
+            stamp = f" {frozen_at}" if frozen_at else ""
+            return (Content.from_markup(f"{prefix} ") + identity
+                    + Content.from_markup("\n  [dim]frozen$stamp[/]",
+                                          stamp=stamp))
+        line = (identity if mark_kind is None
+                else Content.from_markup(f"{format_mark_glyph(mark_kind)} ")
+                + identity)
+        if phase:
+            # `phase` is framework-built markup carrying its own glyph and
+            # colour (`format_phase_markup`, t2128), with its text already made
+            # literal — so it is parsed here as-is, never wrapped in `[dim]`.
+            line += Content.from_markup(f"\n  {phase}")
+        return line
+
+    def _refresh_own_live_state(self) -> None:
+        """Repaint the docked panel's mark glyph and advisory phase on change.
+
+        One set lookup per tick when nothing changed, and a single
+        ``Static.update`` when something did. Four sources converge on this one
+        code path: a local ``space``, a mark set from ``ait monitor`` or another
+        repo, TTL expiry, and the followed window being **renamed out of the
+        agent category** — which drops the state to ``None`` and removes the
+        glyph, rather than stranding the last-rendered ★ on a pane that
+        ``space`` now refuses.
+
+        A parked followed agent shows ``P`` here and keeps its live phase line:
+        this pane goes on capturing the agent it follows (t1685 §7), so the
+        phase is current, not frozen. Parking is a signal to other monitors'
+        lists — not to this one.
+
+        Only the glyph tracks reality: the identity text stays frozen through a
+        rename, per ``_maybe_build_own_agent_panel``'s one-shot contract.
+
+        A display path, so it reads the last *validated* membership
+        (``confirmed_only=False``, t2227): one failed tmux query must not blank
+        the glyph and phase for a tick. It never acts on the result.
+        """
+        if self._own_card is None:
+            return
+        snap = self._find_own_agent_snapshot(confirmed_only=False)
+        mark_kind = self._mark_kind(snap) if snap is not None else None
+        frozen_at = self._own_frozen_at(snap)
+        # A frozen agent has no phase: the process is gone, so any value here
+        # would be whatever it was at freeze time, presented as current.
+        phase = "" if frozen_at is not None else self._own_phase_text(snap)
+        # Four-state compare: KIND_NONE (unmarked agent), KIND_PRIORITY,
+        # KIND_PARKED and None (nothing markable) are all distinct, so every
+        # transition between them repaints. The phase is compared as its
+        # RENDERED string, so a provenance change that does not alter what the
+        # user sees costs no repaint.
+        if (mark_kind == self._own_mark_state
+                and phase == self._own_phase_state
+                and frozen_at == self._own_frozen_state):
+            return
+        self._own_mark_state = mark_kind
+        self._own_phase_state = phase
+        self._own_frozen_state = frozen_at
+        self._own_card.update(
+            self._own_card_text(mark_kind, phase, frozen_at))
+
+    def _own_frozen_at(self, snap) -> "str | None":
+        """The followed agent's `frozen_at` stamp, or None when it is not frozen.
+
+        `None` and `""` are DIFFERENT answers and both occur: `None` means "not
+        frozen", `""` means "frozen, but the record could not be read" (it was
+        dropped, or the store is unreadable). The renderer still says `frozen`
+        for the second — the pane option is the authoritative classifier, and a
+        missing record must not silently downgrade the row to a live one.
+        """
+        if snap is None or not self._is_frozen(snap):
+            return None
+        record_id = snap.frozen_record_id
+        if not record_id:
+            return ""
+        # One reader for the app's lifetime, so an unchanged store costs a stat
+        # rather than a re-parse on every tick (t1765). No `invalidate()`: this
+        # app never writes the store (restore/drop run detached), and every
+        # write is an `os.replace`, whose new inode the stamp already catches.
+        try:
+            view = self._own_sessions_view
+            if view is None:
+                view = self._own_sessions_view = agent_sessions.SessionsView()
+            rec = view.by_id(record_id)
+        except Exception:  # noqa: BLE001 - an unreadable store is not fatal here
+            return ""
+        return (rec.frozen_at or "") if rec is not None else ""
+
+    def _own_phase_text(self, snap) -> str:
+        """Rendered advisory phase for the followed agent, or ``""``.
+
+        Narrow (label-free) form, matching the list rows of the same pane — see
+        ``_own_card_text`` for why this panel takes the phase and not the gate
+        summary that now shares that line on the rows.
+
+        Fails soft: any resolution problem yields no phase line rather than a
+        stale or fabricated one, because this panel must never be broken by an
+        advisory signal.
+
+        Returned as styled markup (glyph + colour, t2128) and sized to
+        ``_own_phase_budget``: ``_OWN_PANEL_MAX_ROWS`` reserves one phase row,
+        so a phase that wrapped would lose its tail under the panel cap.
+        """
+        if snap is None:
+            return ""
+        task_id = self._task_cache.get_task_id_for_pane(snap.pane)
+        if not task_id:
+            return ""
+        info = self._task_cache.get_task_info(task_id, snap.pane.session_name)
+        if info is None:
+            return ""
+        return format_phase_markup(self._phase_for_snap(snap, info),
+                                   _own_phase_budget(self._target_width))
+
+    async def _maybe_build_own_agent_panel(self) -> None:
+        """Populate the docked panel for the agent this minimonitor follows —
+        ONCE PER RESOLVED PANE. Its identity panel is static: it is not rebuilt
+        on each refresh cycle and carries no live status badge (per the
+        followed-agent UX).
+
+        Retries each cycle until the own-window snapshot first resolves (the
+        membership listing lands with the first refresh tick, not at mount).
+
+        **Checked every tick against the pane the current lookup resolves to
+        (t2227).** The panel records the pane id it was built for; when the
+        lookup resolves a *different* pane, the panel is rebuilt. Without that,
+        one tick that resolved the wrong pane froze the wrong name for the
+        minimonitor's lifetime — while the phase line, repainted from the
+        current lookup, already showed the right agent. A lookup that resolves
+        nothing leaves the built panel alone: a transient miss is not a
+        different pane.
+
+        Resolves through ``_find_own_window_snapshot`` (t1382), so a minimonitor
+        started in a window renamed off the ``agent-`` prefix builds its panel at
+        all — previously the AGENT-only lookup returned ``None`` on every cycle
+        and the panel was never built. The header then reads "this window"
+        instead of "this agent", so the uncategorized state is legible rather
+        than looking like a missing agent. A window renamed *after* the panel
+        built keeps the old header and name — for the SAME pane the panel is
+        one-shot by design and is not re-read. The prioritized-mark glyph is the
+        sole exception — it is repainted per tick by ``_refresh_own_live_state``
+        (t1383, t1420).
+        """
+        own_snap = self._find_own_window_snapshot()
+        if own_snap is None:
+            return  # not resolved yet (or a transient miss) — try next cycle
+        if (self._own_panel_built
+                and own_snap.pane.pane_id
+                == getattr(self, "_own_panel_pane_id", None)):
+            return  # same pane: the identity stays as built, through renames
+        is_agent = own_snap.pane.category == PaneCategory.AGENT
+        label = "this agent" if is_agent else "this window"
+        # The repo signal for the followed agent, mirroring the pane list's
+        # `format_session_divider` rows (t1580). Shown unconditionally, NOT
+        # gated on multi_session: the divider is multi-session-only, so in
+        # single-session mode this is the only repo signal on screen.
+        session = self._own_header_session(own_snap)
+        # Freeze the identity here; only the mark glyph tracks reality after.
+        self._own_identity_text = self._own_agent_identity_text(own_snap)
+        self._own_mark_state = self._mark_kind(own_snap) if is_agent else None
+        self._own_frozen_state = self._own_frozen_at(own_snap)
+        self._own_phase_state = (
+            "" if self._own_frozen_state is not None
+            else self._own_phase_text(own_snap))
+        card = Static(
+            self._own_card_text(self._own_mark_state, self._own_phase_state,
+                                self._own_frozen_state),
+            classes="mini-own-card"
+        )
+        panel = self.query_one("#mini-own-agent", VerticalScroll)
+        await panel.remove_children()
+        await panel.mount_all([
+            Static(_own_header_text(label, session, self._target_width),
+                   classes="mini-own-header"),
+            card,
+        ])
+        # Load-bearing (t1499): the rule ships `display: none` so an empty
+        # panel costs zero rows before the own window resolves. This is the
+        # only line that ever reveals it — drop it and the panel is invisible
+        # forever while every widget-state assertion still passes.
+        panel.display = True
+        # Equally load-bearing (t1566), and here rather than in the stylesheet
+        # so the cap sits beside the row-by-row derivation that produces it.
+        # Drop this line and the chrome is unbounded — a pathological window
+        # name would push the pane list off the screen — which is what
+        # guard_own_panel_cap_is_applied exists to catch.
+        panel.styles.max_height = _OWN_PANEL_MAX_ROWS
+        self._schedule_short_mode_refresh()
+        self._own_card = card
+        self._own_panel_built = True
+        self._own_panel_pane_id = own_snap.pane.pane_id
+
+    def _build_list_entries(self) -> list[_ListEntry]:
+        """This tick's general list as entries, in mount order (t2183).
+
+        Pure with respect to the DOM: it decides WHAT the list shows, and the
+        two consumers decide HOW — `_plan_in_place_list_update` diffs it against
+        the mounted widgets, `_rebuild_pane_list` mounts it from scratch.
+        """
+        # Two sections, mirroring MonitorApp._rebuild_pane_list: AGENT panes
+        # first, then uncategorized (OTHER) ones under their own header (t1382).
+        # Without the second section a window renamed off the `agent-` prefix
+        # vanished from minimonitor entirely. PaneCategory.TUI is rendered by
+        # neither, same as in the full monitor.
+        #
+        # Both sections exclude the followed pane \u2014 it lives in the docked
+        # #mini-own-agent panel \u2014 and both resolve it through
+        # `_find_own_window_snapshot`, so a renamed own window is excluded from
+        # the OTHER section rather than being shown twice.
+        #
+        # Sort by (session_name, window_name, window_index, pane_index) so
+        # session grouping is stable across refreshes; single-session mode
+        # degrades to (window_name, …) because every snapshot shares the same
+        # session. The name leads the window slot (t1679) because the index is
+        # only launch order, while the name is what the cards show; it compares
+        # NATURALLY, and the two indices — which compare numerically — survive
+        # as the tiebreak for two windows sharing a name. Both are string fields
+        # off the tmux gateway, so a plain comparison ordered agent 10 before
+        # agent 2 (t1659).
+        #
+        # The status/phase filter (t2217) is applied here too. It is a DISPLAY
+        # use of the advisory phase — it narrows what is listed and never gates
+        # an action (aidocs/framework/shadow_agent.md). Each live agent's task
+        # info and phase are resolved ONCE per tick, in `phases` (pane id ->
+        # (info, phase)), and handed to the card text.
+        status_filter = self._status_filter
+        self._entries_filter = status_filter
+        own_snap = self._find_own_window_snapshot()
+        own_pane_id = own_snap.pane.pane_id if own_snap else None
+        agents: list[PaneSnapshot] = []
+        others: list[PaneSnapshot] = []
+        phases: dict[str, tuple] = {}
+        for s in self._snapshots.values():
+            if s.pane.pane_id == own_pane_id:
+                continue
+            if s.pane.category == PaneCategory.AGENT:
+                inactive = s.parked or s.frozen
+                if status_filter == "frozen":
+                    # Frozen wins over parked, as on the card itself: a pane
+                    # that is both renders `frozen`. An explicit filter shows
+                    # its rows even while `P` hides inactive agents.
+                    if not s.frozen:
+                        continue
+                elif status_filter == "parked":
+                    if not s.parked or s.frozen:
+                        continue
+                elif inactive:
+                    if status_filter != "all" or self._hide_inactive:
+                        # A phase filter: inactive rows have no phase. `all`:
+                        # the `P` filter (t1685 parked, t1705_7 frozen).
+                        continue
+                else:
+                    info, phase = self._live_task_phase(s)
+                    phases[s.pane.pane_id] = (info, phase)
+                    if status_filter in _PHASE_FILTERS and (
+                        phase is None or phase.phase != status_filter
+                    ):
+                        continue
+                agents.append(s)
+            elif s.pane.category == PaneCategory.OTHER:
+                if status_filter == "all":
+                    # OTHER panes have no phase or state: hidden under any
+                    # filter, header included.
+                    others.append(s)
+
+        sort_key = lambda s: pane_sort_key(s.pane)  # noqa: E731
+        agents.sort(key=sort_key)
+        others.sort(key=sort_key)
+
+        multi_mode = bool(self._monitor and self._multi_session)
+        entries: list[_ListEntry] = []
+
+        def append_group(snaps: list[PaneSnapshot], text_fn) -> None:
+            """Emit one section's card entries, with a session divider per group.
+
+            Shared by both sections rather than copied: the divider rule (multi
+            mode only, emitted when the session changes) has to stay identical
+            for the two, and each section restarts its own grouping.
+            """
+            current_session: str | None = None
+            for snap in snaps:
+                if multi_mode and snap.pane.session_name != current_session:
+                    current_session = snap.pane.session_name
+                    label = current_session or "?"
+                    divider = format_session_divider(label)
+                    entries.append(_ListEntry(
+                        "divider", divider, divider, "mini-session-divider"))
+                pane_id = snap.pane.pane_id
+                entries.append(_ListEntry("card", pane_id, text_fn(snap)))
+
+        # Build-scoped, never left behind: a stale map would hand a later
+        # direct caller last build's phase.
+        self._build_phases = phases
+        try:
+            append_group(agents, self._agent_card_text)
+        finally:
+            self._build_phases = {}
+        if others:
+            # Only the OTHER section is headed. The agent section deliberately
+            # has none \u2014 minimonitor never had one, and the session bar already
+            # carries the agent count.
+            header = format_section_header(f"other ({len(others)})")
+            entries.append(_ListEntry(
+                "header", header, header, "mini-section-header"))
+            append_group(others, self._other_card_text)
+        return entries
+
+    async def _rebuild_pane_list(self, entries: list[_ListEntry] | None = None) -> None:
+        """Tear the list down and mount ``entries`` (built now when omitted).
+
+        Runs when the card set changed (t2183) — and from callers and tests that
+        want the full rebuild directly. Records what it mounted so the next tick
+        can be planned against it.
+        """
+        container = self.query_one("#mini-pane-list", VerticalScroll)
+        if entries is None:
+            entries = self._build_list_entries()
+        # Clear existing content and wait for the prune to complete before
+        # mounting new cards — otherwise focus restoration can race removal.
+        await container.remove_children()
+        widgets = [
+            MiniPaneCard(e.key, e.text) if e.kind == "card"
+            else Static(e.text, classes=e.classes)
+            for e in entries
+        ]
+        if widgets:
+            await container.mount_all(widgets)
+        self._list_record = _ListRecord(
+            tuple((e.kind, e.key) for e in entries), tuple(widgets))
+
+    def _plan_in_place_list_update(self, entries: list[_ListEntry]):
+        """Plan this tick's list update against what is mounted (t2183).
+
+        Returns ``None`` when only a full rebuild is correct, otherwise a list of
+        ``(card, text, layout)`` updates — empty when nothing changed. ``None``
+        when the seam is off, nothing was recorded yet, the ``(kind, key)`` shape
+        differs (an agent added/removed/reordered, a divider or ``other (N)``
+        change, the `P` filter, multi-session), or any recorded widget is no
+        longer mounted in the list — someone removed it out from under the
+        record, and `_FakeContainer` test widgets were never mounted at all.
+
+        A card is updated only when its text differs from ``card.content``, and
+        ``layout`` is False only when `card_height_stable` proves its height
+        cannot change.
+        """
+        record = getattr(self, "_list_record", None)
+        if not self._IN_PLACE_LIST_UPDATES or record is None:
+            return None
+        if tuple((e.kind, e.key) for e in entries) != record.keys:
+            return None
+        try:
+            container = self.query_one("#mini-pane-list", VerticalScroll)
+        except NoMatches:
+            return None
+        if not all(w.is_attached and w.parent is container
+                   for w in record.widgets):
+            return None
+        updates = []
+        for entry, widget in zip(entries, record.widgets):
+            if entry.kind != "card":
+                continue          # keyed by its text: equal key, equal text
+            old = widget.content
+            if old == entry.text:
+                continue
+            stable = self._card_height_stable(widget, old, entry.text)
+            updates.append((widget, entry.text, not stable))
+        return updates
+
+    def _card_height_stable(self, card: MiniPaneCard, old, new: str) -> bool:
+        """`card_height_stable` at this card's ACTUAL content width."""
+        return card_height_stable(old, new, card.content_size.width)
+
+    @staticmethod
+    def _apply_list_updates(updates) -> None:
+        for card, text, layout in updates:
+            card.update(text, layout=layout)
+
+    # -- Key handling ----------------------------------------------------------
+
+    def on_key(self, event) -> None:
+        key = event.key
+
+        # Let modal screens handle their own keys
+        if isinstance(self.screen, ModalScreen):
+            return
+
+        if key == "tab":
+            self._focus_sibling_pane()
+            event.stop()
+            event.prevent_default()
+            return
+
+        if key == "enter":
+            self._send_enter_to_sibling()
+            event.stop()
+            event.prevent_default()
+            return
+
+        # Up/Down navigate within pane list
+        if key == "up":
+            self._nav(-1)
+            event.stop()
+            event.prevent_default()
+        elif key == "down":
+            self._nav(1)
+            event.stop()
+            event.prevent_default()
+
+    def _nav(self, direction: int) -> None:
+        """Move focus up/down within the general pane list."""
+        cards = list(self.query("#mini-pane-list MiniPaneCard"))
+        if not cards:
+            return
+        focused = self.focused
+        try:
+            idx = cards.index(focused)
+        except ValueError:
+            cards[0].focus()
+            return
+        new_idx = max(0, min(len(cards) - 1, idx + direction))
+        cards[new_idx].focus()
+
+    # -- Status/phase filter (t2217) -------------------------------------------
+
+    def action_filter_next(self) -> None:
+        self._cycle_status_filter(1)
+
+    def action_filter_prev(self) -> None:
+        self._cycle_status_filter(-1)
+
+    def _cycle_status_filter(self, direction: int) -> None:
+        """Step the filter through `_STATUS_FILTERS`, wrapping both ways.
+
+        A filter change swaps the whole result set, so it is NAVIGATION, not a
+        passive refresh: `_filter_nav_target` asks the next tick built under
+        this filter to drop the old view's scroll anchor and bottom pin and to
+        select the first result (see `_consume_filter_navigation`). Left to the
+        passive restore, two disjoint result sets have no surviving anchor, so
+        `_restore_list_scroll` falls back to `max_scroll_y` while
+        `_restore_focus` focuses card 0 without scrolling — the selection lands
+        off-screen.
+        """
+        try:
+            idx = _STATUS_FILTERS.index(self._status_filter)
+        except ValueError:
+            idx = 0
+        new = _STATUS_FILTERS[(idx + direction) % len(_STATUS_FILTERS)]
+        self._status_filter = new
+        # The newest press wins: a second press before the tick lands simply
+        # retargets the navigation.
+        self._filter_nav_target = new
+        self.notify(f"Filter: {new}", timeout=3)
+        self._set_filter_banner()
+        self.call_later(self._refresh_data)
+
+    def _filter_banner_text(self) -> Content | str:
+        """The filter line's text, DOM-free; ``""`` while the filter is `all`.
+
+        A ``Content``, never a markup string: the keys are user-rebindable, and
+        a key rebound to ``[`` would be parsed as a tag. The keys come from the
+        App's COMPOSED bindings, so a rebind reaches this line.
+        """
+        status_filter = getattr(self, "_status_filter", "all")
+        if status_filter == "all":
+            return ""
+        keymap = self._active_keymap()
+        keys = join_keys(
+            key_display(keymap.get(a, ""))
+            for a in ("filter_prev", "filter_next") if keymap.get(a)
+        )
+        return Content(f"filter: {status_filter}  {keys}".rstrip())
+
+    def _set_filter_banner(self) -> None:
+        """Show or hide `#mini-filter-status` for the current filter.
+
+        Suppressed for the same reason as the other banner setters: unit tests
+        drive the write site against apps with no DOM.
+        """
+        text = self._filter_banner_text()
+        with contextlib.suppress(Exception):
+            widget = self.query_one("#mini-filter-status", Static)
+            widget.update(text)
+            widget.display = bool(text)
+        self._schedule_short_mode_refresh()
+
+    def _consume_filter_navigation(self) -> bool:
+        """True exactly once per filter change: on the first tick whose entries
+        were built under the filter the keypress asked for.
+
+        Keyed on the filter the ENTRIES were built with, not on "a refresh
+        ran": a tick already in flight when the key was pressed built its
+        entries under the OLD filter, and consuming the navigation there would
+        spend it on the wrong result set. That tick leaves the target alone;
+        the next one — built under the new filter — consumes it.
+        """
+        target = self._filter_nav_target
+        if target is None or target != self._entries_filter:
+            return False
+        self._filter_nav_target = None
+        self._filter_retick_for = None
+        return True
+
+    async def _navigate_list_after_filter(self, entries) -> None:
+        """Mount a filter's new result set as navigation (t2217).
+
+        Retires any restore an earlier tick left pending and releases the
+        bottom pin BEFORE the rebuild — an armed pin would let the compositor
+        carry the old view's bottom position into the new results. Then it
+        takes the same lock / generation / fail-safe timer as the passive path,
+        so Textual's own scrolls during the rebuild are still refused, focuses
+        the FIRST result and hands the viewport to
+        `_finish_filter_navigation`.
+        """
+        self._abandon_scroll_restore()
+        container = self.query_one("#mini-pane-list", VerticalScroll)
+        with contextlib.suppress(Exception):
+            container.release_anchor()
+        gen = self._scroll_restore_gen = self._scroll_restore_gen + 1
+        self._list_scroll_lock = True
+        self._stop_scroll_lock_timer()
+        self._scroll_lock_timer = self.set_timer(
+            self._SCROLL_LOCK_TIMEOUT,
+            lambda: self._abandon_scroll_restore(gen),
+        )
+        await self._rebuild_pane_list(entries)
+        first = self._first_list_card()
+        if first is None:
+            self._focused_pane_id = None
+        else:
+            first.focus(scroll_visible=False)
+            self._focused_pane_id = first.pane_id
+        self.call_after_refresh(self._finish_filter_navigation, gen, 0)
+
+    def _finish_filter_navigation(self, gen: int, attempt: int = 0) -> None:
+        """Bring the selected first result into view, then unlock.
+
+        Mirrors `_restore_list_scroll`: the same superseded-generation guard
+        and the same layout-readiness retry, because a target computed before
+        the rebuilt list has geometry reads 0 for everything. The target is
+        the top of the list when the first card fits the viewport from there
+        (it keeps its session divider in view), else the card's own row.
+        """
+        if gen != self._scroll_restore_gen:
+            return          # a newer tick, or the user, owns the list now
+        try:
+            container = self.query_one("#mini-pane-list", VerticalScroll)
+        except NoMatches:
+            self._abandon_scroll_restore(gen)
+            return
+        cards = [c for c in container.query(MiniPaneCard)
+                 if hasattr(c, "pane_id")]
+        if (attempt < self._SCROLL_RESTORE_MAX_ATTEMPTS
+                and list_layout_pending([c.virtual_region.y for c in cards])):
+            self.call_after_refresh(self._finish_filter_navigation, gen,
+                                    attempt + 1)
+            return
+        try:
+            target = 0
+            if cards:
+                region = cards[0].virtual_region
+                if region.bottom > container.size.height:
+                    target = region.y
+            container.scroll_to(
+                y=target, animate=False, immediate=True, force=True)
+        finally:
+            self._stop_scroll_lock_timer()
+            self.call_after_refresh(self._release_list_scroll_lock, gen)
+
+    # -- Project jump (t2217) --------------------------------------------------
+
+    def action_jump_project_next(self) -> None:
+        self._jump_project(1)
+
+    def action_jump_project_prev(self) -> None:
+        self._jump_project(-1)
+
+    def _agent_groups(self, container) -> list[tuple[Widget, list[MiniPaneCard]]]:
+        """The agent section's session groups, in list order.
+
+        A `.mini-session-divider` starts a group and the cards after it belong
+        to it; the walk stops at the OTHER section's header, so only agent
+        groups are jump targets. Dividers exist only in multi-session mode, so
+        single-session mode yields no groups at all.
+        """
+        groups: list[tuple[Widget, list[MiniPaneCard]]] = []
+        for child in container.children:
+            if child.has_class("mini-section-header"):
+                break
+            if child.has_class("mini-session-divider"):
+                groups.append((child, []))
+            elif isinstance(child, MiniPaneCard) and groups:
+                groups[-1][1].append(child)
+        return [g for g in groups if g[1]]
+
+    def _jump_project(self, direction: int) -> None:
+        """Scroll the next/previous project's group to the top and select it.
+
+        A true no-op when the list already fits (nothing to scroll), or when
+        there are fewer than two agent groups. Wraps at both ends.
+
+        The scroll goes through `scroll_to` WITHOUT `force` — the
+        `MiniPaneList._scroll_to` funnel every user gesture takes (t1539) — so
+        it retires any pending restore instead of being overwritten by it, and
+        `scroll_to` releases the bottom pin like any scroll away (t1653). It is
+        never `scroll_to_region`, which the rebuild lock refuses as uninvited.
+        Focus then moves without a second scroll (`scroll_visible=False`).
+        """
+        try:
+            container = self.query_one("#mini-pane-list", VerticalScroll)
+        except NoMatches:
+            return
+        if container.max_scroll_y <= 0:
+            return
+        groups = self._agent_groups(container)
+        if len(groups) < 2:
+            return
+        current: int | None = None
+        focused = self.focused
+        if isinstance(focused, MiniPaneCard):
+            for i, (_div, cards) in enumerate(groups):
+                if focused in cards:
+                    current = i
+                    break
+        if current is None:
+            current = 0
+            for i, (divider, _cards) in enumerate(groups):
+                if divider.virtual_region.y <= container.scroll_y:
+                    current = i
+        divider, cards = groups[(current + direction) % len(groups)]
+        container.scroll_to(y=divider.virtual_region.y, animate=False)
+        cards[0].focus(scroll_visible=False)
+        self._focused_pane_id = cards[0].pane_id
+
+    def _find_sibling_pane_id(self) -> str | None:
+        """Return the pane_id of the agent this minimonitor follows.
+
+        Guarantee (t986), held by BOTH rungs: a shadow, scratchpad or other
+        helper pane sharing the window is never mistaken for the agent. Shared by
+        the Tab focus handler and the Enter send handler; notifies and returns
+        None on failure (not in tmux, tmux error, no agent pane).
+
+        **Rung 1 — the followed-pane snapshot** (pane-id exact), through
+        ``_find_own_window_snapshot`` (t1382), not the AGENT-only lookup, so a
+        window renamed off the ``agent-`` prefix still resolves here. Helpers
+        never reach ``_snapshots`` (discovery drops them), so this rung is
+        helper-blind by construction — and a frozen stand-in, which discovery
+        keeps, is selectable.
+
+        **Rung 2 — a raw ``list-panes -t $TMUX_PANE``** when no confirmed
+        snapshot resolves (before the first confirmed refresh, or on a tick
+        whose own-window query failed). It refuses unless the listing contains
+        this pane's own record (t2227) — so it confirms the window for itself
+        rather than trusting a cached or seeded window id.
+        It used to take the first pane that was not this minimonitor, so a
+        shadow could receive the Enter keystroke (t1388). It now classifies the
+        window with :func:`classify_window_panes` — the ONE definition shared
+        with ``kill_agent_pane_smart``, ``agent_freeze`` and (by the parity
+        test) the cleanup hook — and returns the first non-self pane that is not
+        a helper. That inherits the bound-helper rule (shadow + scratchpad), the
+        companion identity (marker, then cmdline) and the frozen-first
+        precedence: a frozen stand-in carrying a retained helper marker is still
+        the agent, never skipped. **Decision (t1388): companions ARE filtered**,
+        so a second minimonitor in the window is never chosen. The sitrep TUI
+        (``WindowPane.is_sitrep_tui``, t2211_2) is skipped too: it shares the
+        sitrep agent's window but is not an agent.
+        """
+        # An ACTION seam (Tab focus, Enter send), so rung 1 requires this tick's
+        # confirmed membership (t2227); an unconfirmed tick falls to rung 2,
+        # which confirms for itself.
+        own_snap = self._find_own_window_snapshot(confirmed_only=True)
+        if own_snap is not None:
+            return own_snap.pane.pane_id
+        own_pane = os.environ.get("TMUX_PANE", "")
+        if not own_pane or self._monitor is None:
+            self.notify("Not inside tmux", severity="warning")
+            return None
+        # Rung 2 targets `$TMUX_PANE`, NOT the cached / mount-seeded
+        # `_own_window_id` (t2227): tmux resolves a pane id given as a window
+        # target to the window that pane is in NOW, so a seeded id from another
+        # socket, or a window this pane has since been moved out of, cannot
+        # steer the keystroke.
+        rc, stdout = self._monitor.tmux_run([
+            "list-panes", "-t", own_pane,
+            "-F", FROZEN_AWARE_PANE_FORMAT,
+        ])
+        if rc != 0:
+            self.notify("tmux list-panes failed", severity="error")
+            return None
+        # And the listing must independently confirm it is OUR window: one of
+        # its raw records is this pane. Checked on the raw records, not on
+        # `classify_window_panes`' output, which silently drops a malformed row
+        # — and a dropped own row is exactly the unconfirmed case.
+        if not any(line.split("\t", 1)[0] == own_pane
+                   for line in stdout.splitlines()):
+            self.notify("Own window not confirmed", severity="warning")
+            return None
+        # Unstripped on purpose: `classify_window_panes` must see the final
+        # record's empty trailing field (see its docstring).
+        for pane in classify_window_panes(stdout):
+            # The sitrep TUI keeps the window alive but is never the agent to
+            # follow (t2211_2) — so it is skipped here, unlike in the occupancy
+            # counts that share this classifier.
+            if (pane.pane_id != own_pane and not pane.is_helper
+                    and not pane.is_sitrep_tui):
+                return pane.pane_id
+        self.notify("No agent pane in this window", severity="warning")
+        return None
+
+    def _focus_sibling_pane(self) -> None:
+        """Move tmux focus to the sibling pane in the minimonitor's window."""
+        sibling = self._find_sibling_pane_id()
+        if sibling is None or self._monitor is None:
+            return
+        rc, _ = self._monitor.tmux_run(["select-pane", "-t", sibling])
+        if rc != 0:
+            self.notify("select-pane failed", severity="error")
+
+    def _send_enter_to_sibling(self) -> None:
+        """Send an Enter keystroke to the sibling pane in our tmux window."""
+        if self._monitor is None:
+            self.notify("Monitor not ready", severity="warning")
+            return
+        sibling = self._find_sibling_pane_id()
+        if sibling is None:
+            return
+        if not self._monitor.send_keys(sibling, "Enter"):
+            self.notify("send-keys failed", severity="error")
+
+    # -- Focus tracking --------------------------------------------------------
+
+    def on_descendant_focus(self, event) -> None:
+        widget = event.widget
+        if isinstance(widget, MiniPaneCard):
+            self._focused_pane_id = widget.pane_id
+
+    def _get_focused_pane_id(self) -> str | None:
+        """Get pane_id from the currently focused widget."""
+        focused = self.focused
+        if isinstance(focused, MiniPaneCard):
+            return focused.pane_id
+        return None
+
+    def _switcher_selected_session(self) -> str | None:
+        """Pre-select the followed agent's session in the TUI switcher.
+
+        The minimonitor follows one specific agent — the one sharing its tmux
+        window, shown in the static, unselectable docked panel
+        (``#mini-own-agent``). The switcher should open with *that* agent's
+        project as the default, not whichever general-list card happens to be
+        focused: the focused card cycles as the user navigates and is an agent
+        the user is only glancing at, so keying the default project off it gave
+        an unpredictable initial selection (t947). Returns ``None`` (attached
+        session) when no followed agent is detected. ``_find_own_agent_snapshot``
+        already filters on ``PaneCategory.AGENT``, so no category check is needed.
+        """
+        snap = self._find_own_agent_snapshot()
+        if snap is None:
+            return None
+        return snap.pane.session_name or None
+
+    def _switcher_narrow(self) -> bool:
+        """Minimonitor lives in a narrow tmux pane — its switcher dialogs use
+        the small-pane layout, matching the pick / sibling / concern dialogs
+        that already pass ``narrow=True``."""
+        return True
+
+    # -- Actions ---------------------------------------------------------------
+
+    def action_focus_sibling_pane(self) -> None:
+        """No-op — Tab is handled in on_key. Exists for Binding registration."""
+
+    def action_send_enter_to_sibling(self) -> None:
+        """No-op — Enter is handled in on_key. Exists for Binding registration."""
+
+    # -- Followed-agent kill / next (own agent only) ---------------------------
+
+    def action_kill_own_agent(self) -> None:
+        """Kill the agent this minimonitor follows (its own-window agent).
+
+        Scoped to the followed agent regardless of which general-list card is
+        focused. Because the minimonitor is a companion pane in that agent's
+        window, killing the last non-companion pane collapses the whole window
+        — which also tears down this minimonitor.
+        """
+        if self._monitor is None:
+            self.notify("Monitor not ready", severity="warning")
+            return
+        snap = self._find_own_agent_snapshot()
+        if snap is None:
+            self.notify("No followed agent in this window", severity="warning")
+            return
+        if self._is_frozen(snap):
+            # A frozen pane holds a stand-in viewer, not an agent: there is no
+            # process to kill, and what the user means by `k` here is "retire
+            # this record and its capture". Routed to `aitask_frozen.sh drop`,
+            # which is leased and preflighted — see `_drop_frozen` (t1705_7).
+            self._confirm_drop_frozen(snap)
+            return
+        task_info = None
+        task_id = self._task_cache.get_task_id_for_pane(snap.pane)
+        if task_id:
+            task_info = self._task_cache.get_task_info(task_id, snap.pane.session_name)
+        pane_id = snap.pane.pane_id
+        self.push_screen(
+            KillConfirmDialog(snap, task_info, show_preview=False),
+            callback=lambda ok: self._on_own_kill_confirmed(ok, pane_id),
+        )
+
+    def _confirm_drop_frozen(self, snap) -> None:
+        """Confirm before retiring a frozen record — the capture is the only
+        copy of that agent's output, and dropping deletes it."""
+        window = snap.pane.window_name
+
+        def confirmed(yes: bool | None) -> None:
+            if yes:
+                self._drop_frozen(snap)
+
+        self.push_screen(
+            FreezeConfirmDialog(
+                "Drop this frozen agent?",
+                # NOT "restore or re-pick it instead": a VERIFIED restore or
+                # re-pick deletes the capture too (`agent_sessions.py`, the
+                # `ack = "hook"` branch). Only a failed or liveness-only one
+                # keeps it, so the only reliable way to keep the transcript is
+                # to copy it out of the viewer (t1777).
+                #
+                # The window name sits directly before `[/]`, so it is a
+                # `$variable`, never interpolated (t2017).
+                Content.from_markup(
+                    "[bold]$window[/]\n\n"
+                    "[bold red]Its captured output is deleted[/] along with "
+                    "the record, and the stand-in pane is closed. This cannot "
+                    "be undone. A verified restore or re-pick deletes it too "
+                    "— copy it first.",
+                    window=window,
+                ),
+                # The button must name THIS verb, not the screen's default one:
+                # a "Freeze" button here would read as the reversible operation
+                # while deleting the only copy of the agent's output (t1705_7).
+                confirm_label="Drop",
+                destructive=True,
+            ),
+            confirmed,
+        )
+
+    def _close_live_after_harvest(self, identity) -> None:
+        """`h`'s live close (t2175_5): the guarded run kill, then `k`'s tail.
+
+        The run kill is pane-only, so this minimonitor survives it and closes
+        itself once it verifiably sits alone (`_check_auto_close`). The
+        `killed_window` branch stays for parity with `_on_own_kill_confirmed`.
+        """
+        pane_id = identity.pane_id
+        snap = self._snapshots.get(pane_id)
+        name = snap.pane.window_name if snap else pane_id
+        status, killed_window = self._guarded_close(identity)
+        if status != "killed":
+            return
+        self._focused_pane_id = None
+        if not killed_window:
+            self.notify(f"Closed {name}", markup=False)
+            self.call_later(self._refresh_data)
+
+    def _default_sitrep_target(self):
+        """`S` with no followed agent: this companion's project and session."""
+        return self._project_root, self._session
+
+    def _on_own_kill_confirmed(self, confirmed: bool | None, pane_id: str) -> None:
+        if not confirmed or self._monitor is None:
+            return
+        snap = self._snapshots.get(pane_id)
+        name = snap.pane.window_name if snap else pane_id
+        # Re-read at kill time, not when `k` opened the dialog: the agent may
+        # have been frozen since, and a frozen pane would take the smart kill's
+        # unleased kill-then-drop (t2065, as t2057 did for `n`/`p`).
+        state = self._kill_target_state(pane_id)
+        if state == "frozen":
+            self.notify(f"{name} is frozen — not killed; press k again to "
+                        "drop it", severity="warning", markup=False)
+            return
+        if state != "live":
+            self.notify(f"Could not confirm {name} is still live — not killed",
+                        severity="warning", markup=False)
+            return
+        ok, killed_window = self._monitor.kill_agent_pane_smart(pane_id)
+        if ok:
+            self._focused_pane_id = None
+            # If the window collapsed, this minimonitor pane is being torn down
+            # with it — the notify/refresh may never render. Otherwise drop the
+            # killed card on the next refresh.
+            if not killed_window:
+                # Window names are tmux-side input; unstyled (t2017).
+                self.notify(f"Killed {name}", markup=False)
+                self.call_later(self._refresh_data)
+        else:
+            self.notify(f"Failed to kill {name}", severity="error",
+                        markup=False)
+
+    def action_pick_next_for_own(self) -> None:
+        """Find and launch the next sibling task for the followed agent.
+
+        Scoped to the followed agent (own-window), mirroring the full monitor's
+        ``action_pick_next_sibling`` but resolving the target from the docked
+        agent rather than the focused list card.
+        """
+        if self._monitor is None:
+            self.notify("Monitor not ready", severity="warning")
+            return
+        snap = self._find_own_agent_snapshot()
+        if snap is None:
+            self.notify("No followed agent in this window", severity="warning")
+            return
+        task_id = self._task_cache.get_task_id_for_pane(snap.pane)
+        if not task_id:
+            self.notify("No task ID in window name", severity="warning")
+            return
+        sess = snap.pane.session_name
+        self._task_cache.invalidate(task_id, sess)
+        current_info = self._task_cache.get_task_info(task_id, sess)
+        # If the task file is gone it was likely archived (Done) — still allow.
+        current_title = current_info.title if current_info else f"(archived t{task_id})"
+        current_status = current_info.status if current_info else "Done"
+
+        result = self._task_cache.find_next_sibling(task_id, sess)
+        if not result:
+            self.notify("No ready siblings or children found", severity="warning")
+            return
+        suggested_id, suggested_title, suggested_kind = result
+        parent_id = self._task_cache.get_parent_id(task_id) or task_id
+
+        pane_id = snap.pane.pane_id
+        self.push_screen(
+            NextSiblingDialog(
+                task_id, current_title, current_status,
+                suggested_id, suggested_title, parent_id,
+                narrow=True,
+                suggested_followup_kind=suggested_kind,
+            ),
+            callback=lambda r: self._on_own_next_result(r, pane_id, task_id, sess),
+        )
+
+    def _on_own_next_result(
+        self, result: tuple[str, str] | None, pane_id: str, task_id: str, sess: str
+    ) -> None:
+        if result is None:
+            return
+        action, payload = result
+        if action == "pick":
+            self._launch_pick_for_own(payload, pane_id, task_id, sess)
+            return
+        # action == "choose": payload is parent_id; open the sibling picker.
+        siblings = self._task_cache.find_ready_siblings(task_id, sess)
+        if not siblings:
+            self.notify("No Ready siblings to choose from", severity="warning")
+            return
+
+        def _on_picked(sib_id: str | None) -> None:
+            if sib_id:
+                self._launch_pick_for_own(sib_id, pane_id, task_id, sess)
+
+        self.push_screen(
+            ChooseSiblingModal(payload, siblings, narrow=True), callback=_on_picked
+        )
+
+    def _launch_pick_for_own(
+        self, target_id: str, pane_id: str, task_id: str, sess: str
+    ) -> None:
+        """Launch ``/aitask-pick <target_id>`` for the followed agent's session.
+
+        Unlike the full monitor (which kills the current pane *before* launching
+        because it lives in a separate window), the minimonitor shares the
+        followed agent's window — killing it would tear down this minimonitor.
+        So launch the next agent FIRST, then kill the current window per the
+        same heuristic (parent-split-into-children / archived / Done).
+        """
+        if self._monitor is None:
+            return
+        snap = self._snapshots.get(pane_id)
+        if snap is None:
+            self.notify("Followed agent no longer exists", severity="warning")
+            return
+        # Read the status BEFORE the dialog opens: a task completing while
+        # AgentCommandScreen is up must not flip the kill decision.
+        current_info = self._task_cache.get_task_info(task_id, sess)
+        is_parent_with_children = "_" not in task_id
+        should_kill = (
+            is_parent_with_children
+            or not current_info
+            or current_info.status == "Done"
+        )
+        self._launch_pick(
+            target_id,
+            self._root_for_snap(snap),
+            pane_id if should_kill else None,
+        )
+
+    def _launch_pick(
+        self, target_id: str, target_root: Path, kill_pane_id: str | None
+    ) -> None:
+        """Open the launch dialog for ``/aitask-pick <target_id>`` and run it.
+
+        Shared by ``n`` (:meth:`_launch_pick_for_own`, which derives
+        ``kill_pane_id`` from the followed task's status) and ``p``
+        (:meth:`action_pick_task_by_number`, where the user ticks a checkbox) —
+        one implementation so the two keys cannot drift.
+
+        ``kill_pane_id`` is killed only **after** a successful launch. That
+        order is load-bearing: unlike the full monitor, the minimonitor shares
+        the followed agent's window, so killing first would tear this app down
+        before the next agent exists. It is killed only when
+        :meth:`_kill_target_state` proves it live at that moment; a frozen or
+        unverifiable target is left alone with a warning (t2057). A kill that
+        fails is reported as an error and leaves focus where it was (t2078).
+        """
+        if self._monitor is None:
+            return
+        # Shared dialog construction with board, trails and monitor (t1946).
+        # It resolves the operation's configured agent (no agent_string), so
+        # this launch keeps starting the configured agent rather than a record's.
+        screen = build_pick_screen(target_root, target_id, narrow=True)
+        if screen is None:
+            self.notify(
+                f"Failed to resolve pick command for t{target_id}", severity="error"
+            )
+            return
+
+        def on_pick_result(pick_result):
+            if isinstance(pick_result, TmuxLaunchConfig):
+                # 1. Launch the incoming agent FIRST (new window) so it survives
+                #    even if killing the current window tears down this app.
+                _, err = launch_in_tmux(screen.full_command, pick_result)
+                if err:
+                    # tmux's stderr names the session (t2017).
+                    self.notify(f"Launch failed: {err}", severity="error",
+                                markup=False)
+                    return
+                if pick_result.new_window:
+                    maybe_spawn_minimonitor(pick_result.session, pick_result.window)
+                self.notify(f"Launched agent for t{target_id}")
+                # 2. Only now kill the outgoing agent, if the caller asked —
+                #    and only if it is still a LIVE agent. Re-read here, not
+                #    when the dialogs opened: it may have been frozen since
+                #    (t2059), and `n` never checked at all (t2058).
+                if kill_pane_id and self._monitor is not None:
+                    state = self._kill_target_state(kill_pane_id)
+                    if state == "live":
+                        ok, _ = self._monitor.kill_agent_pane_smart(
+                            kill_pane_id)
+                        if ok:
+                            self._focused_pane_id = None
+                        else:
+                            # The outgoing agent is still running: report it
+                            # and keep focus (t2078). Window names are
+                            # tmux-side input; unstyled (t2017).
+                            snap = self._snapshots.get(kill_pane_id)
+                            name = (snap.pane.window_name if snap
+                                    else kill_pane_id)
+                            self.notify(f"Failed to kill {name}",
+                                        severity="error", markup=False)
+                    elif state == "frozen":
+                        self.notify(
+                            "Followed agent is frozen — launched without "
+                            "kill; drop it with k",
+                            severity="warning",
+                        )
+                    else:
+                        self.notify(
+                            "Could not confirm the followed agent is still "
+                            "live — launched without kill",
+                            severity="warning",
+                        )
+            self.call_later(self._refresh_data)
+
+        self.push_screen(screen, on_pick_result)
+
+    def action_pick_task_by_number(self) -> None:
+        """Pick any task by typing its number, then launch it (t1310).
+
+        The end-of-run case ``n`` cannot serve: an agent reports the follow-up
+        tasks it created, or the one to pick next, as bare numbers — and ``n``
+        only ever resolves the followed pane's next *Ready sibling*. Two
+        dialogs: a number prompt, then the task's details with an opt-in
+        "kill followed agent" checkbox. The launch and the kill both go through
+        the same :meth:`_launch_pick` ``n`` uses.
+        """
+        if self._monitor is None:
+            # Guard at the ENTRY, not at launch: _launch_pick's own
+            # `self._monitor is None` return is silent, so without this the
+            # user would complete both dialogs and see nothing happen.
+            self.notify("Monitor not ready", severity="warning")
+            return
+        snap = self._find_own_agent_snapshot()
+        target_root = self._root_for_snap(snap) if snap else self._project_root
+        sess = snap.pane.session_name if snap else self._session
+
+        self.push_screen(
+            TaskNumberInputModal(narrow=True),
+            callback=lambda raw: self._on_pick_number_entered(
+                raw, snap, target_root, sess
+            ),
+        )
+
+    def _on_pick_number_entered(
+        self, raw: str | None, snap: PaneSnapshot | None, target_root: Path, sess: str
+    ) -> None:
+        """Validate the typed id, resolve it, and open the confirm dialog."""
+        if not raw:
+            return  # cancelled
+        target_id = raw.strip().lstrip("t")
+        if not _PICK_TASK_ID_RE.fullmatch(target_id):
+            # Validate BEFORE resolving: TaskInfoCache._resolve interpolates the
+            # id into a `Path.glob` pattern, so a metacharacter ("12*") would
+            # match an unrelated task file and the dialog would describe a
+            # different task than the one `/aitask-pick <raw>` launches.
+            self.notify(f"Not a task number: {raw.strip()!r}", severity="warning")
+            return
+
+        self._task_cache.invalidate(target_id, sess)
+        info = self._task_cache.get_task_info(target_id, sess)
+        if info is None:
+            self.notify(f"Task t{target_id} not found", severity="warning")
+            return
+        blocking = self._task_cache.blocking_dependencies(info, sess)
+        already = self._find_running_agent_line(target_id, sess)
+
+        kill_label = None
+        # No kill offer on a FROZEN followed agent: its pane holds the stand-in
+        # viewer, and `kill_agent_pane_smart`'s frozen path is unleased and
+        # deletes the capture without a word. Retiring it is `k`'s job — the
+        # leased drop, behind a warning that names what is lost (t2054).
+        kill_offered = snap is not None and not self._is_frozen(snap)
+        if kill_offered:
+            own_id = self._task_cache.get_task_id_for_pane(snap.pane)
+            own_info = None
+            if own_id:
+                # Refresh for the same reason blocking_dependencies does: this
+                # status is what the user reads before ticking a box that closes
+                # the agent down, and a stale "Done" would actively encourage
+                # killing an agent that is still working.
+                self._task_cache.invalidate(own_id, sess)
+                own_info = self._task_cache.get_task_info(own_id, sess)
+            own_status = own_info.status if own_info else "unknown"
+            kill_label = (
+                f"t{own_id or '?'} · {own_status} · {snap.pane.window_name}"
+            )
+        # Tied to the offer, not to `snap`: with no checkbox there is nothing
+        # to kill, whatever the dialog's payload says.
+        pane_id = snap.pane.pane_id if kill_offered else None
+
+        self.push_screen(
+            TaskPickConfirmDialog(
+                info,
+                kill_target_label=kill_label,
+                already_running=already,
+                blocking=blocking,
+                narrow=True,
+            ),
+            callback=lambda result: self._on_pick_confirmed(
+                result, target_id, target_root, pane_id, sess
+            ),
+        )
+
+    def _find_running_agent_line(self, target_id: str, sess: str) -> str | None:
+        """Warning text when an agent for ``target_id`` is already running.
+
+        Scoped to ``sess``: task ids come from the window name alone, so in
+        multi-session mode an unscoped scan would match an unrelated ``t<id>``
+        in another project. One tmux session maps to exactly one project root,
+        so the session scope IS the project scope — the same rule
+        :meth:`_find_own_agent_snapshot` uses.
+
+        A FROZEN stand-in keeps ``category == AGENT`` but runs nothing, so it
+        is not "already running" (t2057). It still gets its own note rather
+        than silence: launching a fresh pick beside a frozen agent of the same
+        task duplicates its work, and restoring or re-picking it from its
+        viewer is usually what the user wants instead. A live match outranks a
+        frozen one — that is the stronger warning.
+        """
+        frozen_line = None
+        for snap in self._snapshots.values():
+            if snap.pane.category != PaneCategory.AGENT:
+                continue
+            if snap.pane.session_name not in ("", sess):
+                continue
+            if self._task_cache.get_task_id_for_pane(snap.pane) != target_id:
+                continue
+            window = f"window {snap.pane.window_index}:{snap.pane.window_name}"
+            if self._is_frozen(snap):
+                if frozen_line is None:
+                    # Kept as short as the live line: the dialog's docked
+                    # area does not scroll, so at 40x20 a longer note pushes
+                    # its own first lines — the word "frozen" — off the top.
+                    frozen_line = (
+                        f"⚠ t{target_id} frozen in {window} — "
+                        "restore/re-pick in its viewer"
+                    )
+                continue
+            return f"⚠ t{target_id} is already running in this session, {window}"
+        return frozen_line
+
+    def _on_pick_confirmed(
+        self,
+        result: tuple[str, object] | None,
+        target_id: str,
+        target_root: Path,
+        pane_id: str | None,
+        sess: str,
+    ) -> None:
+        if not result:
+            return
+        action, payload = result
+        if action == "column":
+            # The seam is a subprocess and this is a synchronous push_screen
+            # callback, so the work has to move onto a worker.
+            self.run_worker(
+                self._open_column_picker(target_id, target_root, sess),
+                exclusive=False,
+                exit_on_error=False,
+                group="board-column",
+            )
+            return
+        kill = payload
+        kill_pane_id = None
+        if kill and pane_id:
+            if pane_id in self._snapshots:
+                kill_pane_id = pane_id
+            else:
+                self.notify(
+                    "Followed agent no longer exists — launching without kill",
+                    severity="warning",
+                )
+        self._launch_pick(target_id, target_root, kill_pane_id)
+
+    async def _run_board_column_cmd(self, args: list[str]) -> tuple[int, str]:
+        """Run the headless board-column seam off the event loop.
+
+        Mirrors :meth:`AgentMarksMixin._run_marks_cmd`, including its contract:
+        **total — never raises, always terminates.** It is reached from a
+        keypress handler, so an unhandled ``OSError`` from a missing wrapper
+        would propagate out of the pick flow, and a child that never exits would
+        wedge the worker forever. Both are normalised to ``(rc, "ERROR:…")`` and
+        callers treat the result as data. Tests override this method.
+        """
+        proc = None
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                str(_BOARD_COLUMN_SH), *args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            out, _ = await asyncio.wait_for(
+                proc.communicate(), timeout=_BOARD_COLUMN_CMD_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            # Kill the child, then reap it so it cannot become a zombie.
+            try:
+                proc.kill()
+                await proc.wait()
+            except Exception:  # noqa: BLE001 - already exited / unkillable
+                pass
+            return 1, (
+                f"ERROR:board column command timed out after "
+                f"{_BOARD_COLUMN_CMD_TIMEOUT}s"
+            )
+        except OSError as exc:
+            return 1, f"ERROR:cannot run {_BOARD_COLUMN_SH.name}: {exc}"
+        return proc.returncode or 0, out.decode("utf-8", "replace").strip()
+
+    @staticmethod
+    def _parse_column_lines(out: str) -> list[tuple[str, str, str]]:
+        """`COLUMN:<id>|<colour>|<title>` lines → `(id, colour, title)`.
+
+        Split on the first two separators only: the title is emitted last
+        precisely because a configured title may legitimately contain ``|``.
+        """
+        columns: list[tuple[str, str, str]] = []
+        for line in out.splitlines():
+            if not line.startswith("COLUMN:"):
+                continue
+            parts = line[len("COLUMN:"):].split("|", 2)
+            if len(parts) != 3:
+                continue
+            columns.append((parts[0], parts[1], parts[2]))
+        return columns
+
+    async def _open_column_picker(
+        self, target_id: str, target_root: Path, sess: str
+    ) -> None:
+        """Read the board's columns and the task's current one, then pick.
+
+        ``target_root`` rather than ``self._project_root``: in multi-session
+        mode the followed pane may belong to a different project entirely.
+        ``--task-dir`` is deliberately left at its default — a foreign project's
+        layout is not discoverable from here.
+        """
+        root = str(target_root)
+        rc, out = await self._run_board_column_cmd(
+            ["list-columns", "--root", root, "--include-unordered"]
+        )
+        first = out.splitlines()[0] if out else ""
+        if rc:
+            self.notify(
+                f"Board columns unavailable: {first or f'exit {rc}'}",
+                severity="warning", markup=False,
+            )
+            return
+        columns = self._parse_column_lines(out)
+        if not columns:
+            self.notify("No board columns configured", severity="warning")
+            return
+
+        rc, out = await self._run_board_column_cmd(
+            ["current-column", "--root", root, "--task", target_id]
+        )
+        first = out.splitlines()[0] if out else ""
+        if rc:
+            # Defensive: the dialog already omits the button for a child id, so
+            # `not_a_parent_task` should be unreachable from the UI. Surface the
+            # stable reason token rather than prose either way.
+            self.notify(
+                f"Cannot move t{target_id}: {first or f'exit {rc}'}",
+                severity="warning", markup=False,
+            )
+            return
+        current = first[len("CURRENT:"):].rsplit("|", 1)[-1] if first else ""
+
+        titles = {col_id: title for col_id, _c, title in columns}
+        self.push_screen(
+            ColumnPickerModal(target_id, columns, current=current, narrow=True,
+                              allow_new=True),
+            callback=lambda result: self._on_column_chosen(
+                result, target_id, target_root, sess, current, titles
+            ),
+        )
+
+    def _on_column_chosen(
+        self,
+        result: tuple[str, str | None] | None,
+        target_id: str,
+        target_root: Path,
+        sess: str,
+        current: str,
+        titles: dict[str, str],
+    ) -> None:
+        # `result` is the picker's tagged tuple (t1377_3). Branch on the TAG,
+        # never on truthiness: both ("existing", id) and ("new", None) are truthy,
+        # so a truthiness test would send the create action down the move path.
+        if not result:
+            return
+        action, col_id = result
+        if action == "new":
+            self.push_screen(
+                NewColumnTitleModal(narrow=True),
+                callback=lambda title: self._on_new_column_title(
+                    title, target_id, target_root, sess
+                ),
+            )
+            return
+        title = titles.get(col_id, col_id)
+        if col_id == current:
+            # `markup=False`: Textual parses a notification's message as markup
+            # by default, and the title is user-authored config. A column named
+            # `Backlog [/]` raises MarkupError; `a[b]c` is silently swallowed to
+            # `ac`. The picker escapes its own renderables, but a toast is a
+            # separate sink and needed its own fix (t1377_2).
+            self.notify(f"t{target_id} is already in {title}", markup=False)
+            return
+        self.run_worker(
+            self._apply_column_move(target_id, target_root, sess, col_id, title),
+            exclusive=False,
+            exit_on_error=False,
+            group="board-column",
+        )
+
+    def _on_new_column_title(
+        self, title: str | None, target_id: str, target_root: Path, sess: str,
+    ) -> None:
+        """Callback for NewColumnTitleModal (t1377_3).
+
+        A blank title cannot normally arrive — the modal rejects it in place and
+        stays mounted — but the guard is kept so a programmatic dismissal cannot
+        reach the seam with nothing to create.
+        """
+        if not title or not title.strip():
+            return
+        self.run_worker(
+            self._create_and_move(target_id, target_root, sess, title.strip()),
+            exclusive=False,
+            exit_on_error=False,
+            group="board-column",
+        )
+
+    async def _create_and_move(
+        self, target_id: str, target_root: Path, sess: str, title: str,
+    ) -> None:
+        """Create a board column, then move the task into it in one gesture.
+
+        The colour is deliberately not passed: the seam auto-assigns the next
+        unused palette entry, which is what keeps this a single title prompt in a
+        pane too small for a swatch palette.
+        """
+        rc, out = await self._run_board_column_cmd(
+            ["create", "--root", str(target_root), "--title", title]
+        )
+        first = out.splitlines()[0] if out else ""
+        if rc or not first.startswith("CREATED:"):
+            self.notify(
+                f"Create failed: {first or f'exit {rc}'}",
+                severity="warning", markup=False,
+            )
+            return
+        # Title LAST, so split on the first two separators only.
+        parts = first[len("CREATED:"):].split("|", 2)
+        if len(parts) != 3:
+            self.notify(f"Create failed: malformed response {first}",
+                        severity="warning", markup=False)
+            return
+        col_id, _color, new_title = parts
+        moved = await self._apply_column_move(
+            target_id, target_root, sess, col_id, new_title)
+        if not moved:
+            # The column exists even though the task did not move — say so, or
+            # the user re-runs and creates a duplicate.
+            self.notify(f"Column {new_title} was created but t{target_id} "
+                        f"was not moved into it",
+                        severity="warning", markup=False)
+
+    async def _apply_column_move(
+        self, target_id: str, target_root: Path, sess: str,
+        col_id: str, title: str,
+    ) -> bool:
+        rc, out = await self._run_board_column_cmd(
+            ["move", "--root", str(target_root),
+             "--task", target_id, "--column", col_id]
+        )
+        first = out.splitlines()[0] if out else ""
+        if rc or not first.startswith("MOVED:"):
+            self.notify(
+                f"Move failed: {first or f'exit {rc}'}",
+                severity="warning", markup=False,
+            )
+            return False
+        # `TaskInfoCache` would reject the stale entry on its (st_mtime_ns,
+        # st_size) identity gate anyway, but a same-size edit inside the same
+        # second is real, and every explicit gesture in this flow invalidates.
+        self._task_cache.invalidate(target_id, sess)
+        self.notify(f"Moved t{target_id} → {title}", markup=False)
+        return True
+
+    def action_launch_shadow(self) -> None:
+        """Spawn the shadow companion agent for the followed coding agent.
+
+        Builds ``/aitask-shadow <followed_pane_id> [<task_id>]`` and launches
+        the ``shadow`` codeagent — by default a new pane in the followed
+        agent's window, or a separate window when ``tmux.shadow_same_window``
+        is false. The launcher passes only the pane id; the shadow skill
+        captures the followed pane on demand. After spawn it stamps
+        ``@aitask_shadow_target`` on the new pane (the t986_1 classifier that
+        keeps the shadow out of agent lists and binds its lifecycle) and wires
+        the followed agent's ``pane-died`` cleanup hook so the shadow dies with
+        its agent.
+        """
+        if self._monitor is None:
+            return
+        snap = self._find_own_agent_snapshot()
+        if snap is None:
+            self.notify("No followed agent to shadow", severity="warning")
+            return
+        followed_pane = snap.pane.pane_id
+        if not followed_pane:
+            self.notify("Followed agent pane id unavailable", severity="warning")
+            return
+        # One shadow per followed agent (the @aitask_shadow_target option is the
+        # lifecycle binding). Refuse a duplicate so the concern picker's reverse
+        # lookup stays unambiguous by construction (t1037_4). Sync lookup — this
+        # action is sync and already issues sync tmux_run calls.
+        if find_shadow_pane(self._monitor, followed_pane):
+            self.notify(
+                "A shadow is already running for this agent", severity="warning"
+            )
+            return
+        task_id = self._task_cache.get_task_id_for_pane(snap.pane)
+
+        target_root = self._root_for_snap(snap)
+        args = [followed_pane] + ([task_id] if task_id else [])
+        full_cmd = resolve_dry_run_command(target_root, "shadow", *args)
+        if not full_cmd:
+            self.notify("Failed to resolve shadow command", severity="error")
+            return
+        self._spawn_shadow(full_cmd, followed_pane, task_id, target_root, snap)
+
+    def action_launch_shadow_pick(self) -> None:
+        """Open the agent/model picker, then spawn the shadow with the choice.
+
+        Same as ``action_launch_shadow`` (duplicate guard, specialized
+        same-window split placement, ``@aitask_shadow_target`` stamp + cleanup
+        hook) but opens the narrow ``AgentCommandScreen`` first so the user can
+        confirm / change the code agent and model before the shadow starts —
+        the ``E`` (shift-e) analogue of the switcher's t1148 ``X`` explore-pick
+        shortcut. Cancelling the dialog launches nothing.
+
+        The dialog's own returned placement is intentionally discarded: the
+        shadow's split-target-the-followed-AGENT-pane geometry is richer than
+        the dialog's tmux tab can express, so placement stays handler-controlled
+        in ``_spawn_shadow`` and only the (possibly agent-overridden)
+        ``full_command`` is consumed.
+        """
+        if self._monitor is None:
+            return
+        snap = self._find_own_agent_snapshot()
+        if snap is None:
+            self.notify("No followed agent to shadow", severity="warning")
+            return
+        followed_pane = snap.pane.pane_id
+        if not followed_pane:
+            self.notify("Followed agent pane id unavailable", severity="warning")
+            return
+        # Duplicate guard runs BEFORE opening the dialog (don't pop a picker just
+        # to fail). Same sync reverse-lookup as action_launch_shadow.
+        if find_shadow_pane(self._monitor, followed_pane):
+            self.notify(
+                "A shadow is already running for this agent", severity="warning"
+            )
+            return
+        task_id = self._task_cache.get_task_id_for_pane(snap.pane)
+        target_root = self._root_for_snap(snap)
+        args = [followed_pane] + ([task_id] if task_id else [])
+        full_cmd = resolve_dry_run_command(target_root, "shadow", *args)
+        if not full_cmd:
+            self.notify("Failed to resolve shadow command", severity="error")
+            return
+        agent_string = resolve_agent_string(target_root, "shadow")
+        screen = AgentCommandScreen(
+            "Shadow (pick agent)",
+            full_cmd,
+            "/aitask-shadow " + " ".join(args),
+            project_root=target_root,
+            operation="shadow",
+            operation_args=args,
+            default_agent_string=agent_string,
+            narrow=True,
+        )
+
+        def on_shadow_result(result):
+            # Confirm returns a TmuxLaunchConfig; its placement is discarded (see
+            # docstring). Use screen.full_command (post-override), not the
+            # captured full_cmd. None (cancel) / "run" launch nothing, mirroring
+            # _launch_pick_for_own.
+            if isinstance(result, TmuxLaunchConfig):
+                self._spawn_shadow(
+                    screen.full_command, followed_pane, task_id, target_root, snap
+                )
+
+        self.push_screen(screen, on_shadow_result)
+
+    def _spawn_shadow(
+        self,
+        full_cmd: str,
+        followed_pane: str,
+        task_id: str | None,
+        target_root: Path,
+        snap: PaneSnapshot,
+    ) -> str | None:
+        """Apply **this app's** shadow-spawn policy, then delegate the mechanics.
+
+        Shared by the fire-and-forget ``e`` shortcut (``action_launch_shadow``)
+        and the pick-agent ``E`` shortcut (``action_launch_shadow_pick``).
+        ``full_cmd`` is the already-resolved shadow command (with any agent /
+        model override baked in).
+
+        Kept as a per-app method deliberately — it is **not** a pass-through
+        seam. The two safety-critical decisions below (which pane the cleanup
+        hook despawns, and whether the launch may steal the client's window)
+        differ between the two apps, and inlining them at the two call sites in
+        each app would replicate them four times instead of twice (t1216_4).
+        """
+        if self._monitor is None:
+            return None
+        return spawn_shadow(
+            self._monitor,
+            full_cmd=full_cmd,
+            followed_pane=followed_pane,
+            followed_window=snap.pane.window_name,
+            session=snap.pane.session_name or self._session,
+            task_id=task_id,
+            target_root=target_root,
+            # This minimonitor IS the followed agent's companion and shares its
+            # window, so the cleanup hook must despawn US once the agent's window
+            # holds no real agent — not the shadow, which job 1 already kills via
+            # its @aitask_shadow_target marker.
+            companion_pane=os.environ.get("TMUX_PANE") or None,
+            # This client is already on the followed agent's window, so selecting
+            # it is a no-op — keep the historical argv.
+            select_window=True,
+            notify=self.notify,
+            schedule_refresh=lambda: self.call_later(self._refresh_data),
+            # Stamped before spawn_shadow returns, so a shadow that reads
+            # `--phase` before the first refresh tick still sees the checkpoint
+            # it was launched for (t1420).
+            phase_signal=self._phase_signal_for_pane(snap),
+        )
+
+    def action_open_scratchpad(self) -> None:
+        """Open the scratchpad notes editor beside the followed agent (t2073_4).
+
+        A vertical split of the followed agent's pane (``monitor_core.
+        spawn_scratchpad``), bound to that agent like a shadow. A task agent
+        (`agent-pick|qa|resume-<id>`) gets the task's persistent pad; any other
+        agent an UNSAVED pad, said here because it is this press's surprise.
+        No pre-check: there is no dialog to wait through, so the live duplicate
+        lookup inside ``spawn_scratchpad`` runs right before the launch.
+        """
+        if self._monitor is None:
+            return
+        snap = self._find_own_agent_snapshot()
+        if snap is None:
+            self.notify("No followed agent for a scratchpad", severity="warning")
+            return
+        followed_pane = snap.pane.pane_id
+        if not followed_pane:
+            self.notify("Followed agent pane id unavailable", severity="warning")
+            return
+        task_id = self._task_cache.get_task_id_for_pane(snap.pane)
+        if task_id is None:
+            self.notify("Not a task agent — notes will not be saved",
+                        severity="warning")
+        self._spawn_scratchpad(
+            followed_pane, task_id, self._root_for_snap(snap), snap)
+
+    def _spawn_scratchpad(
+        self,
+        followed_pane: str,
+        task_id: str | None,
+        target_root: Path,
+        snap: PaneSnapshot,
+    ) -> str | None:
+        """Apply **this app's** spawn policy, then delegate the mechanics.
+
+        The same two per-app decisions as ``_spawn_shadow``, for the same
+        reasons: the cleanup hook despawns THIS minimonitor (the agent's
+        companion) once the window holds no real agent — the pad itself is
+        killed by its @aitask_scratchpad_target binding — and the client is
+        already on the agent's window, so selecting it is a no-op.
+        """
+        if self._monitor is None:
+            return None
+        return spawn_scratchpad(
+            self._monitor,
+            followed_pane=followed_pane,
+            followed_window=snap.pane.window_name,
+            session=snap.pane.session_name or self._session,
+            task_id=task_id,
+            target_root=target_root,
+            companion_pane=os.environ.get("TMUX_PANE") or None,
+            select_window=True,
+            notify=self.notify,
+            schedule_refresh=lambda: self.call_later(self._refresh_data),
+        )
+
+    def _phase_signal_for_pane(self, snap: PaneSnapshot):
+        """Advisory phase for a pane, or ``None`` when it cannot be resolved.
+
+        ``None`` is a legitimate answer that simply leaves the pane option
+        unwritten — the per-tick re-stamp fills it in shortly after.
+        """
+        try:
+            task_id = self._task_cache.get_task_id_for_pane(snap.pane)
+            if not task_id:
+                return None
+            info = self._task_cache.get_task_info(task_id, snap.pane.session_name)
+            if info is None:
+                return None
+            return self._phase_for_snap(snap, info)
+        except Exception:
+            return None
+
+    # -- Shadow concern picker (t1037_4) ---------------------------------------
+
+    def _set_shadow_stale_banner(self, text: str) -> None:
+        """Update the live staleness warning line; no-op if unmounted (t1104).
+
+        Records the last-set text on ``_shadow_stale_banner_text`` (a test seam so
+        the warning is assertable without a mounted DOM) and best-effort updates
+        the ``#mini-shadow-stale`` Static — suppressed if the widget is not
+        mounted (e.g. unit tests), matching the panel's best-effort UX.
+
+        **The ``display`` toggle is load-bearing (t1499), not cosmetic.** The
+        rule ships ``display: none`` because an empty Static with
+        ``height: auto`` still occupies one row; this line is the only thing
+        that ever turns the banner on, and clearing the text must turn it off
+        again or the widget keeps its rows forever. Note the seam above is
+        exactly what let this surface ship dead — assert on the composited
+        frame, not on ``_shadow_stale_banner_text``.
+        """
+        self._shadow_stale_banner_text = text
+        with contextlib.suppress(Exception):
+            widget = self.query_one("#mini-shadow-stale", Static)
+            widget.update(text)
+            widget.display = bool(text)
+        self._schedule_short_mode_refresh()
+
+    async def _restamp_shadow_phase(self, shadow_pane: str, snap: PaneSnapshot) -> None:
+        """Push the followed agent's current advisory phase onto its shadow.
+
+        Resolves the task the same way every display site does
+        (``get_task_id_for_pane``), so t1389's move to stamped pane options stays
+        a drop-in. A pane with no resolvable task, or any failure at all, simply
+        leaves the previous stamp standing.
+        """
+        with contextlib.suppress(Exception):
+            task_id = self._task_cache.get_task_id_for_pane(snap.pane)
+            if not task_id:
+                return
+            info = self._task_cache.get_task_info(task_id, snap.pane.session_name)
+            if info is None:
+                return
+            await refresh_shadow_phase_stamp_async(
+                self._monitor, shadow_pane, self._phase_for_snap(snap, info))
+
+    @property
+    def _shadow_feedback_stale(self) -> bool | None:
+        """Read-recency verdict — the tri-state, without its timestamp (t1104).
+
+        Read-only since t1493: the verdict and the ``analyzed_at`` that produced
+        it are written together as :class:`ReadRecency`, so there is exactly one
+        writable source and they cannot desync. Kept under the original name
+        because it is the established read surface (tests, and t1159_2's planned
+        review loop). Writers assign ``_shadow_read_recency``.
+        """
+        return getattr(self, "_shadow_read_recency", _UNKNOWN_RECENCY).stale
+
+    def _shadow_freshness_eps(self) -> float:
+        """Epsilon absorbing the monitor's up-to-one-tick detection lag.
+
+        One definition, shared by the read-recency compare and the block-age
+        compare — they answer questions about the same clock and must not
+        disagree about how much jitter is tolerable.
+        """
+        return max(2.0, float(getattr(self, "_refresh_seconds", 3)))
+
+    async def _update_shadow_freshness(
+        self, shadow_pane: str, followed_pane: str
+    ) -> None:
+        """Refresh the shadow's READ-RECENCY verdict (t1104).
+
+        The comparison itself is :func:`monitor_core.compute_shadow_staleness`
+        (shared with the full monitor, t1216_1). The tri-state it returns is
+        what makes the display failure-safe: ``None`` means "could not tell" —
+        an unreadable / malformed stamp, or a followed pane not observed yet —
+        and must leave the recorded verdict exactly as it was. Only an explicit
+        ``True``/``False`` is recorded.
+
+        **Banner writes are deliberately not here** (t1493). This method is
+        throttled to every other tick because it costs a tmux ``get_pane_option``;
+        the banner must also reflect *block age*, which is free to compute from
+        the capture the auto-offer already takes every tick. So the banner is
+        owned by :meth:`_refresh_shadow_stale_banner`, and this method's only job
+        is to keep ``_shadow_read_recency`` current.
+        """
+        stale, analyzed_at = await compute_shadow_staleness(
+            self._monitor, shadow_pane, followed_pane, self._shadow_freshness_eps()
+        )
+        if stale is None:
+            return  # indeterminate — preserve prior state
+        self._shadow_read_recency = ReadRecency(stale, analyzed_at)
+        if stale is False:
+            # Review-loop edge accumulator (t1159_2, review round 4): a False
+            # recorded here may be overwritten before the loop's next
+            # committed evidence tick; latch it so the edge is never lost.
+            self._loop_stale_false_pending = True
+
+    def _refresh_shadow_stale_banner(
+        self, snap: PaneSnapshot, shadow_pane: str, capture_text: str
+    ) -> None:
+        """Combine read recency with block age and repaint the banner (t1493).
+
+        Takes the followed snapshot and the shadow pane rather than a bare
+        followed-pane id (t1573): the gate in
+        :meth:`_record_banner_staleness` needs the agent's advisory phase (from
+        ``snap``) and the pane the feedback is on, and deriving them here keeps
+        one call at the tick site.
+
+        Runs on **every** tick, unlike the throttled read-recency compare, and
+        costs no tmux traffic: ``capture_text`` is the capture the auto-offer
+        already took, and ``get_last_change_wall`` is an in-process dict lookup.
+
+        This is the surface that owns the *became-stale* transition. The
+        auto-offer toast cannot: it returns early on an unchanged block (the
+        round-qualified dedup), which is precisely the shape of the defect —
+        the shadow re-reads, emits nothing, and the same block sits there
+        ageing. A toast is a "new concerns arrived" announcement and re-firing
+        it every tick would be wrong; a live banner is the right home.
+        """
+        recency = getattr(self, "_shadow_read_recency", _UNKNOWN_RECENCY)
+        # Cost gate, mirroring the one inside `compute_shadow_staleness`: with
+        # no block on the pane there is no age to compare, so do not query the
+        # followed pane's last-change at all.
+        last_change = None
+        monitor = self._monitor
+        if (contains_block_evidence(capture_text) and monitor is not None
+                and hasattr(monitor, "get_last_change_wall")):
+            with contextlib.suppress(Exception):
+                last_change = monitor.get_last_change_wall(snap.pane.pane_id)
+        age = compute_block_age_staleness(
+            capture_text, last_change, self._shadow_freshness_eps()
+        )
+        self._record_banner_staleness(
+            snap, shadow_pane, capture_text, age,
+            combine_staleness(recency.stale, age),
+            # narrow=True (t1566): #mini-shadow-stale is a one-row surface.
+            format_shadow_stale_banner(
+                recency.stale, age, parse_block_meta(capture_text),
+                recency.analyzed_at, time.time(), narrow=True,
+            ),
+        )
+
+    def _record_combined_staleness(
+        self, combined: bool | None, banner_text: str
+    ) -> None:
+        """Persist the combined verdict + banner under the preserve rule (t1493).
+
+        The rule is *"never clear a standing **warning**"* — and a warning is
+        specifically a recorded ``True``. Preserving a prior ``False`` as well
+        would be wrong in the one direction that matters: a pane that had no
+        block (verdict ``False``, correctly) and then grows a pre-round-header
+        block moves to ``None``, and swallowing that transition would present
+        an unverifiable block as current — precisely the defect this signal
+        exists to remove. ``None`` over ``False`` is an escalation, not a
+        clear, so it is always recorded.
+
+        One method rather than the condition inlined at each site: the tick
+        path and the picker path must apply the identical rule, and two copies
+        of a three-way condition is how they would diverge.
+        """
+        if combined is None and getattr(self, "_shadow_stale_combined", None) is True:
+            return  # would clear a standing warning — preserve it
+        self._shadow_stale_combined = combined
+        self._set_shadow_stale_banner(banner_text)
+
+    @staticmethod
+    def _shadow_feedback_key(capture_text: str) -> int | None:
+        """Identity of the feedback the shadow pane is currently showing (t1573).
+
+        ``hash`` of the block's own region text — the same idiom as the review
+        loop's ``hash(raw_tail)`` ring. A new round changes the ``Round:`` header
+        (and usually the items), so a new key is exactly what "the shadow said
+        something new" looks like from here.
+
+        ``None`` when no region can be established at all (a head-truncated
+        capture: a block is plainly present but its extent is not). Callers must
+        read that as "cannot identify" and fall back to *showing* the warning —
+        never as "no feedback", which is :attr:`BlockAge.applicable`'s question.
+        """
+        region = block_region(capture_text)
+        return hash(region) if region else None
+
+    def _feedback_phase_retired(
+        self, snap: PaneSnapshot, shadow_pane: str, capture_text: str
+    ) -> bool:
+        """Has the followed agent moved past the phase THIS feedback belongs to?
+
+        Concerns raised about a *plan* stop mattering once the agent is
+        implementing, and concerns from an implementation review stop mattering
+        at post-review (t1573). So the banner retires a warning while the agent
+        is positively observed in a different known phase than the one its
+        feedback was produced under::
+
+            retired  <=>  the block is identifiable
+                     AND  its origin phase is bound and KNOWN
+                     AND  the current phase is KNOWN
+                     AND  current != origin
+
+        **Derived, not latched — and that is the whole design.** A latch keyed on
+        "a known->known transition happened" cannot recover: ``PLAN ->
+        IMPLEMENT`` retires the block and ``IMPLEMENT -> PLAN`` is *also* a
+        known->known transition, so a single misclassification would re-retire
+        the same unchanged block and hide a still-relevant warning permanently.
+        That would break the advisory anti-gating rule
+        (``aidocs/framework/shadow_agent.md``, "Phase detection (advisory)"),
+        which requires a wrong or ``UNKNOWN`` phase to cost the user almost
+        nothing. Evaluating the predicate every tick instead makes every
+        direction free:
+
+        - the agent flaps back to the origin phase   -> warning returns
+        - the phase degrades to ``UNKNOWN`` (either side) -> warning shows
+        - a new round arrives                        -> rebind, warning shows
+        - the shadow pane is replaced                -> rebind, warning shows
+
+        The binding is keyed on ``(shadow_pane, block_key)`` so a *replacement*
+        shadow starts unretired by construction — even in the worst case where
+        its first block is byte-identical to the previous pane's — rather than
+        depending on some reset having run first.
+
+        Cost: the ledger half of the phase is mtime-cached
+        (``GateSummaryCache._entry_for``); this adds one ``workflow_phase.compose``
+        over the followed pane's already-captured text per tick, and only on ticks
+        where a block is actually present (the caller's existence gate runs first).
+        No tmux traffic.
+        """
+        key = self._shadow_feedback_key(capture_text)
+        if key is None:
+            return False  # cannot identify the feedback ⇒ never suppress it
+        signal = self._phase_signal_for_pane(snap)
+        phase = getattr(signal, "phase", workflow_phase.UNKNOWN_PHASE)
+        known = bool(phase) and phase != workflow_phase.UNKNOWN_PHASE
+        bound = getattr(self, "_shadow_feedback_phase", None)
+        if bound is None or bound[0] != shadow_pane or bound[1] != key:
+            # First sighting of this feedback on this pane. Bind its origin only
+            # from a KNOWN phase; an UNKNOWN one leaves it unbound so a later
+            # tick can bind it, and nothing is retired meanwhile.
+            self._shadow_feedback_phase = (
+                (shadow_pane, key, phase) if known else None
+            )
+            return False
+        return known and phase != bound[2]
+
+    def _record_banner_staleness(
+        self, snap: PaneSnapshot, shadow_pane: str, capture_text: str,
+        age: "BlockAge", combined: bool | None, banner_text: str,
+    ) -> None:
+        """Banner-only gate in front of the shared preserve rule (t1573).
+
+        The banner asserts something *about feedback* ("shadow feedback is
+        stale"), so its precondition is that feedback exists. Read recency
+        answers a different question — "has the shadow re-read since the agent
+        last changed?" — which stays well-defined for an explain-only shadow
+        that never emitted a block, and ``combine_staleness`` correctly returns
+        it untouched when block age is inapplicable. The result was a banner
+        warning about feedback that was never produced: the existence gate
+        protected one *input* while the banner consumed the *join*. Hence the
+        gate belongs here, at the banner, and NOT in ``combine_staleness``,
+        whose other callers (both monitor picker paths) are correct today.
+
+        Two suppressions, in cost order, both recorded as explicit ``False``
+        clears through :meth:`_record_combined_staleness` so the fail-safe join
+        keeps exactly one home and is not weakened:
+
+        1. ``not age.applicable`` — no block evidence on the pane. This is
+           ``compute_block_age_staleness``'s own applicability verdict, which
+           that function documents as the single decider of the question, so the
+           existence predicate is reused rather than re-derived.
+        2. :meth:`_feedback_phase_retired` — the agent has moved past the phase
+           this block belongs to.
+
+        Both write sites (the per-tick refresh and the ``c`` picker) go through
+        here, so they cannot diverge.
+        """
+        if not age.applicable:
+            self._record_combined_staleness(False, "")
+            return
+        if self._feedback_phase_retired(snap, shadow_pane, capture_text):
+            self._record_combined_staleness(False, "")
+            return
+        self._record_combined_staleness(combined, banner_text)
+
+    # -- Auto-recheck loop (t1159_2) --------------------------------------
+
+    def _set_loop_banner(self, text: str) -> None:
+        """Update the loop status line; no-op if unmounted.
+
+        Records the last-set text on ``_loop_banner_text`` (DOM-free test
+        seam, mirroring ``_shadow_stale_banner_text``) and best-effort updates
+        the ``#mini-loop-status`` Static.
+
+        The ``display`` toggle is load-bearing for the same reason as in
+        :meth:`_set_shadow_stale_banner` (t1499) — see that docstring.
+        """
+        self._loop_banner_text = text
+        with contextlib.suppress(Exception):
+            widget = self.query_one("#mini-loop-status", Static)
+            widget.update(text)
+            widget.display = bool(text)
+        self._schedule_short_mode_refresh()
+
+    def _derive_agent_presence(self, snap: PaneSnapshot | None) -> bool | None:
+        """Tri-state followed-agent presence from discovery-level liveness.
+
+        Committed snapshots DROP panes whose content capture failed, so a
+        missing snapshot alone is not departure (the discovery-facts seam
+        exists precisely for this — see monitor_core `_record_discovery_facts`).
+        True = snapshot present; False = the session was enumerated and the
+        agent window is verifiably gone; None = capture failed while the
+        agent is still discovered, or discovery itself is indeterminate.
+        """
+        if snap is not None:
+            return True
+        monitor = self._monitor
+        window_name = self._own_window_name
+        if monitor is None or not window_name:
+            return None
+        with contextlib.suppress(Exception):
+            if (self._session, window_name) in monitor.last_discovered_agents():
+                return None  # pane exists, its capture failed this cycle
+            if self._session in monitor.last_enumerated_sessions():
+                return False  # verified: enumerated, and the agent is gone
+        return None
+
+    def _loop_event_context(self) -> dict:
+        """Identifying fields attached to every durable loop event (t1606).
+
+        Best-effort by construction: this runs on a teardown path, so a failure
+        to describe the situation must never replace the record OF the
+        situation. Anything unreadable is simply omitted.
+        """
+        ctrl = self._review_loop
+        context: dict[str, object] = {
+            "state": getattr(ctrl, "state", None),
+            "rounds_fired": getattr(ctrl, "rounds_fired", None),
+            "session": self._session,
+            "window": self._own_window_name,
+        }
+        # The followed/shadow pair this event happened to (t1606). Without it
+        # a reason says WHAT went wrong but not to WHICH agent — and a user
+        # runs several followed/shadow pairs at once, so correlating a recorded
+        # disarm back to a pane is most of the diagnostic value. Carried as
+        # last-observed identity rather than re-queried: this runs on a
+        # teardown path, where a fresh tmux lookup could fail (or be the very
+        # thing that failed) and would replace the record with nothing.
+        context.update(self._loop_identity)
+        with contextlib.suppress(Exception):
+            context["project_root"] = str(self._project_root)
+        return context
+
+    def _note_loop_identity(self, *, agent=None, shadow_agent=None,
+                            shadow_pane=None) -> None:
+        """Record best-known identities for the next durable loop event.
+
+        Updated incrementally as `_service_review_loop` learns them, so an
+        early-returning teardown still carries whatever was known by then
+        instead of nothing. Only non-empty values overwrite: a tick that could
+        not resolve the shadow's agent must not erase the answer the previous
+        tick had.
+        """
+        for key, value in (("agent", agent), ("shadow_agent", shadow_agent),
+                           ("shadow_pane", shadow_pane)):
+            if value:
+                self._loop_identity[key] = value
+
+    def _loop_auto_disarm(self, reason_code: str | None = None, *,
+                          subject: str = "", detail: dict | None = None) -> None:
+        """Visible auto-disarm: banner off, baseline/ring cleared, one toast.
+
+        The ONE teardown. Before t1606 two further copies were open-coded in
+        :meth:`_service_review_loop`, and both omitted
+        ``_loop_shadow_settle_until = None`` — a live divergence no test
+        covered.
+
+        ``reason_code`` is a ``review_loop.DISARM_*`` code. Passing ``None`` is
+        how the tick-originated call site hands off: the controller carries the
+        code on ``last_disarm_reason``, which is what lets one helper serve
+        both the delivery failures (explicit code) and the absence disarms.
+
+        **Snapshot before the teardown.** ``ctrl.disarm()`` deliberately does
+        not clear ``last_disarm_reason`` (see the controller's ``__init__``),
+        but resolving the code into a local FIRST means the order is correct
+        even if that ever changes — the failure it guards against is silent,
+        and would restore exactly the ambiguity t1606 removes.
+
+        ``detail`` carries a delivery's own diagnostics (t2001: pane-mode
+        reading, pre-Enter verdict) into the record. Only the delivery call
+        site passes it.
+        """
+        ctrl = self._review_loop
+        code = reason_code or ctrl.last_disarm_reason or "unknown"
+        context = {**self._loop_event_context(), **(detail or {})}
+
+        ctrl.disarm()
+        self._loop_baseline = None
+        self._loop_shadow_hash = None
+        self._loop_shadow_hash_streak = 0
+        self._loop_shadow_settle_until = None
+        self._loop_hold_reason = None
+        self._set_loop_banner("")
+
+        recorded = review_loop_log.record_event(
+            review_loop_log.KIND_DISARM, code, subject=subject or None,
+            **context)
+        message = review_loop.loop_reason_message(code, subject=subject)
+        if not recorded:
+            # A diagnostic nobody can see is not a diagnostic. The user gets
+            # told once that the durable record did not land, so a silently
+            # unwritable log cannot masquerade as "it never happened".
+            message += " (not recorded)"
+        # `message` can embed the shadow's pane command (`subject`); the
+        # toast carries no styling, so it is never parsed (t2017).
+        self.notify(f"Auto-recheck loop disarmed: {message}",
+                    severity="warning", markup=False)
+
+    def _loop_hold(self, reason_code: str, *,
+                   detail: dict | None = None, live: bool = True) -> None:
+        """Visible, non-fatal hold: the delivery was vetoed, the loop lives.
+
+        t1525 chose a *visible* auto-disarm over a *silent* hold, so the
+        replacement for the disarm must be a visible hold — never a quiet one.
+
+        **Edge-triggered on the reason.** The loop holds for many ticks by
+        design, so toasting and recording on every tick would bury the signal
+        under its own repetition. Only a CHANGE of reason surfaces. Recovery
+        clears ``_loop_hold_reason``, so the same reason recurring later is a
+        new edge and does surface again — edge-triggering must not permanently
+        swallow a reason it has seen once.
+
+        ``live=False`` is a hold from a SUPERSEDED delivery (t2009): the hold
+        state and the banner belong to whatever lifecycle replaced it, so the
+        event is recorded and nothing else is touched. Each superseded
+        delivery returns once, so its record needs no edge-trigger. A failed
+        record is still reported.
+        """
+        if live:
+            if self._loop_hold_reason == reason_code:
+                return
+            self._loop_hold_reason = reason_code
+
+        recorded = review_loop_log.record_event(
+            review_loop_log.KIND_HOLD, reason_code,
+            **{**self._loop_event_context(), **(detail or {})})
+
+        banner = review_loop.loop_hold_banner(reason_code) if live else ""
+        message = review_loop.loop_reason_message(reason_code)
+        if not recorded:
+            # Same rule as `_loop_auto_disarm`, and it matters MORE here: the
+            # ambiguous pre-Enter reads t1606 rerouted are holds, so an
+            # unwritable store would leave the next occurrence with no durable
+            # trace at all — the exact gap this task exists to close — while
+            # the banner and toast fade. A failed record is a fault in its own
+            # right, so it is surfaced even for a hold that otherwise stays
+            # quiet; a hold is edge-triggered, so this cannot repeat per tick.
+            if banner:
+                self._set_loop_banner(banner)
+            self.notify(f"Auto-recheck loop holding: {message} (not recorded)",
+                        severity="warning")
+            return
+        if not banner:
+            # A hold with no banner is a normal lifecycle event, not a fault —
+            # a user pressing `L` mid-delivery supersedes it, and scolding them
+            # for a state they caused is precisely the false message t1606
+            # Deliverable 3 removes. Recorded, not surfaced.
+            return
+        self._set_loop_banner(banner)
+        self.notify(f"Auto-recheck loop holding: {message}",
+                    severity="warning")
+
+    def _clear_loop_hold(self) -> None:
+        """Recovery: the loop is no longer holding for a vetoed delivery."""
+        self._loop_hold_reason = None
+
+    def _apply_shadow_settle_latch(self, state: str,
+                                   shadow_ready: bool | None) -> bool | None:
+        """Hold readiness for a wall-clock settle window after any interaction.
+
+        The shadow's empty composer is not by itself evidence that the agent is
+        idle: it is also what the pane shows in the gap between an interaction
+        leaving the screen and work resuming. Firing there sends a prompt plus
+        Enter into an agent that has not finished, which is the failure this
+        loop exists to avoid.
+
+        Two design points, both from measurement (t1509):
+
+        * **Armed by anything that is not READY or WORKING**, never by "a
+          dialog pattern matched". Codex's startup update prompt is a real
+          on-screen interaction that NO prompt pattern matches, and the same
+          holds for any future un-patterned dialog. The predicate therefore
+          depends on no pattern coverage at all, and additionally covers a
+          shadow holding user-typed text — where injecting would concatenate
+          onto what the user typed.
+        * **Released by a monotonic deadline**, never by a tick count: the
+          caller's evidence cadence is user-configurable and floors at 1.0s
+          (see ``review_loop.SHADOW_SETTLE_SECONDS``).
+
+        A positive ``WORKING`` observation clears the latch early — the shadow
+        demonstrably resumed. The deadline is itself the escape hatch, and it
+        always expires, so an interaction answered in a way that produces no
+        work at all (measured: after the update prompt, no work EVER follows)
+        cannot wedge the armed loop.
+        """
+        if state == review_loop.SHADOW_WORKING:
+            self._loop_shadow_settle_until = None
+            return shadow_ready
+        now = self._loop_now()
+        if state != review_loop.SHADOW_READY:
+            self._loop_shadow_settle_until = now + review_loop.SHADOW_SETTLE_SECONDS
+            return shadow_ready
+        # READY, with the latch possibly armed.
+        deadline = self._loop_shadow_settle_until
+        if deadline is None:
+            return shadow_ready
+        if now < deadline:
+            return False
+        self._loop_shadow_settle_until = None
+        return shadow_ready
+
+    async def _resolve_shadow_agent_key(
+        self, command: str, pid: int, pane_id: str
+    ) -> str:
+        """Two-rung shadow-agent resolution, off the Textual event loop (t1509).
+
+        Deliberately NOT routed through ``TmuxMonitor._run_offloaded``: that
+        seam's contract is "pure compute over plain data", and rung 2 shells out
+        to ``pgrep`` + ``ps`` (2s cap each). Returns ``""`` for "could not
+        resolve" — never "not an agent"; callers must degrade, not conclude.
+
+        Overridable so tests drive resolution order deterministically instead of
+        sleeping.
+        """
+        return await asyncio.to_thread(
+            workflow_phase.agent_key_from_pane, command, pid, pane_id)
+
+    async def action_toggle_review_loop(self) -> None:
+        """Arm/disarm the shadow auto-recheck loop (t1159_2).
+
+        Arming refuses visibly on capability gaps on BOTH sides: the followed
+        agent needs live prompt tiers (the trigger), the shadow agent needs a
+        readiness detector (the delivery). Both are agent-capability gates —
+        never phase gates (advisory-only contract).
+        """
+        ctrl = self._review_loop
+        if ctrl.armed:
+            ctrl.disarm()
+            self._loop_hold_reason = None
+            self._set_loop_banner("")
+            self.notify("Auto-recheck loop disarmed")
+            return
+        snap = self._find_own_agent_snapshot()
+        if snap is None or not snap.pane.pane_id:
+            self.notify("Auto-recheck unavailable: no followed agent pane",
+                        severity="warning")
+            return
+        # `snap.agent_key` is the value that actually scoped this pane's prompt
+        # matching (t1467) — re-deriving it here could disagree with it.
+        followed_key = snap.agent_key
+        if not followed_key:
+            # `""` means "could not resolve", never "not an agent" (agent_keys
+            # contract), so this must not read as a capability refusal: a
+            # Claude pane whose tmux command is `2.1.306` used to be told the
+            # loop "supports claude" (t2096). A miss is usually transient.
+            self.notify(
+                f"Auto-recheck unavailable: could not identify the followed "
+                f"agent from pane command "
+                f"'{snap.pane.current_command or 'unknown'}' — try again in a "
+                f"moment",
+                severity="warning", markup=False)  # pane command (t2017)
+            return
+        if not review_loop.review_loop_agent_supported(followed_key):
+            # Deliberately NOT `live_tiers_available`: that answers "can an
+            # advisory phase hint be derived", while this loop INJECTS into the
+            # shadow pane, so each agent earns arming with its own live evidence
+            # (t1518 added codex and opencode on measured boundaries). An agent
+            # wired into AGENT_KEYS ahead of that evidence lands here.
+            #
+            # The supported set is INTERPOLATED, never spelled out: the previous
+            # wording hardcoded "Claude-only", which silently became false the
+            # moment the tuple widened.
+            supported = ", ".join(review_loop.REVIEW_LOOP_AGENTS)
+            self.notify(
+                f"Auto-recheck unavailable for '{followed_key}' — the recheck "
+                f"loop supports {supported}",
+                severity="warning", markup=False)  # agent key (t2017)
+            return
+        ok, shadow_pane, shadow_command, shadow_pid = (
+            await find_shadow_pane_info_async(
+                self._monitor, snap.pane.pane_id))
+        if not ok:
+            self.notify(
+                "Auto-recheck unavailable: could not query the shadow pane — "
+                "try again", severity="warning")
+            return
+        if not shadow_pane:
+            self.notify(
+                "Auto-recheck unavailable: no shadow pane — press 'e' to "
+                "launch one", severity="warning")
+            return
+        # Two-rung resolution, off the event loop (t1509). Rung 1 alone can
+        # never answer `codex`: it installs as a node wrapper, so the pane
+        # reports `node`. The lookup shells out to pgrep+ps (2s cap each) on a
+        # cache miss, so it must not run on the Textual loop — the async
+        # refresh path already offloads the same call (`_classify_batch`).
+        armed_gen = ctrl.generation
+        shadow_key = await self._resolve_shadow_agent_key(
+            shadow_command, shadow_pid, shadow_pane)
+        if ctrl.armed or ctrl.generation != armed_gen:
+            # The lifecycle moved while we were off-loop (another arm path, or
+            # a second keypress). Abandon silently rather than arm on stale
+            # evidence or double-notify.
+            return
+        if not shadow_key:
+            # "" means COULD NOT RESOLVE, never "not an agent" (agent_keys
+            # contract), and the miss is retried on a backoff — a shadow
+            # launched moments ago resolves late. Say so; do not claim the
+            # agent lacks a detector.
+            self.notify(
+                "Auto-recheck unavailable: could not resolve the shadow's "
+                "agent yet — try again", severity="warning")
+            return
+        if shadow_key not in review_loop.SHADOW_READY_DETECTORS:
+            self.notify(
+                f"Auto-recheck unavailable: shadow agent "
+                f"'{shadow_command or 'unknown'}' has no readiness detection "
+                "yet", severity="warning", markup=False)  # pane command (t2017)
+            return
+        # Arm. pending_work covers an episode already pending at arm time via
+        # the explicit user action; a fresh arm keeps the work latch closed so
+        # an arm-time selection-only redraw cannot fire (review hardening 6).
+        ctrl.arm(pending_work=(self._shadow_feedback_stale is True))
+        self._loop_stale_false_pending = False  # pre-arm state, not ours
+        # Seed the classifier baseline from the arm-time snapshot (review
+        # hardening 9): a sub-tick response right after arming must still
+        # classify as work on the first tick.
+        self._loop_baseline = (snap.content, snap.awaiting_input_kind,
+                              snap.pane.pane_id, snap.pane.history_size,
+                              (snap.pane.width, snap.pane.height))
+        self._loop_shadow_hash = None
+        self._loop_shadow_hash_streak = 0
+        # A fresh lifecycle never inherits a settle deadline (t1509), and
+        # likewise never inherits a hold reason (t1606) — otherwise the first
+        # tick would repaint a hold banner for a delivery that belonged to the
+        # previous lifecycle, and the edge-trigger would suppress the real
+        # hold when it recurred.
+        self._loop_shadow_settle_until = None
+        self._loop_hold_reason = None
+        # Nor the previous lifecycle's IDENTITIES. `_note_loop_identity` only
+        # overwrites non-empty values — deliberately, so a tick that cannot
+        # re-resolve the shadow does not erase what the last one knew — but
+        # that same stickiness would carry a stale pair ACROSS an `L`-`L`
+        # cycle onto a different followed/shadow pair. An immediate absence or
+        # a failed re-resolution would then record the new agent beside the
+        # old shadow, i.e. an event naming a pair that never existed.
+        #
+        # Cleared and re-seeded here rather than merely cleared: this branch
+        # has already resolved and validated all three, so a first-tick
+        # teardown still names the right pair instead of nothing.
+        self._loop_identity = {}
+        self._note_loop_identity(agent=snap.agent_key,
+                                 shadow_agent=shadow_key,
+                                 shadow_pane=shadow_pane)
+        self._loop_last_service_at = None
+        self._set_loop_banner("⟳ auto-recheck ARMED")
+        self.notify("Auto-recheck loop armed — press 'L' again to disarm")
+
+    async def _service_review_loop(
+        self, snap: PaneSnapshot | None, shadow_ok: bool,
+        shadow_pane: str | None, shadow_command: str,
+        tick_text: str | None, shadow_pid: int = 0,
+    ) -> None:
+        """Per-tick loop service, called from ALL THREE branches of
+        `_maybe_offer_concerns` so absence is observed, not inferred.
+
+        ``shadow_ok`` False means the lookup itself failed (or was not made
+        this tick) — the loop pauses; only ``(True, None)`` is a verified
+        shadow absence (review hardening 2).
+        """
+        ctrl = self._review_loop
+        if not ctrl.armed:
+            return
+
+        # Serialize the evidence ticks (review round 2): overlapping
+        # refreshes invoke this service concurrently, and each invocation
+        # would otherwise count as its own debounce/hash-stability tick.
+        # One committed evidence tick per half refresh period, minimum 1s.
+        # MUST run before any evidence mutation (review round 3): a throttled
+        # invocation that classified and advanced the baseline would consume
+        # a work observation without ever delivering it to the controller —
+        # the next committed tick would then see "no change" and the episode
+        # would be permanently lost. A skipped invocation touches nothing.
+        now_mono = time.monotonic()
+        min_interval = max(
+            1.0, 0.5 * float(getattr(self, "_refresh_seconds", 3)))
+        if (self._loop_last_service_at is not None
+                and now_mono - self._loop_last_service_at < min_interval):
+            return
+        self._loop_last_service_at = now_mono
+
+        agent_presence = self._derive_agent_presence(snap)
+        # Learned as early as possible so even an early-returning
+        # teardown carries them (t1606).
+        self._note_loop_identity(
+            agent=(snap.agent_key if snap is not None else None),
+            shadow_pane=(shadow_pane if shadow_ok else None))
+
+        # Baseline maintenance + work classification (hardenings 6/8/9).
+        # Only here, on a committed evidence tick — arm() seeds the baseline,
+        # so no upkeep is needed while disarmed.
+        work_signal = review_loop.UNKNOWN
+        if snap is not None:
+            base = self._loop_baseline
+            if base is not None and base[2] != snap.pane.pane_id:
+                base = None  # followed pane identity replaced
+            if base is not None:
+                work_signal = review_loop.classify_followed_change(
+                    base[0], base[1], snap.content, snap.awaiting_input_kind,
+                    snap.awaiting_input,
+                    snap.agent_key,
+                    base[3], snap.pane.history_size,
+                    base[4], (snap.pane.width, snap.pane.height),
+                )
+            self._loop_baseline = (snap.content, snap.awaiting_input_kind,
+                                   snap.pane.pane_id, snap.pane.history_size,
+                                   (snap.pane.width, snap.pane.height))
+        elif agent_presence is False:
+            self._loop_baseline = None
+        # agent_presence None: baseline PRESERVED (hardening 8) — a response
+        # produced during a capture-failure gap still classifies as work.
+
+        # Snapshot the lifecycle generation BEFORE the first suspension point
+        # below: a disarm/re-arm during any await starts a NEW lifecycle, and
+        # this invocation's evidence (classified against the OLD baseline) must
+        # never be injected into it (review round 7). The agent-key resolution
+        # (t1509) is now also an await, so the snapshot moved above it — an
+        # auto-disarm decided on pre-suspension evidence would otherwise destroy
+        # a freshly armed lifecycle.
+        lifecycle_gen = ctrl.generation
+
+        # Mid-loop shadow-agent re-resolution (capability, not phase).
+        shadow_key = ""
+        if shadow_ok and shadow_pane:
+            shadow_key = await self._resolve_shadow_agent_key(
+                shadow_command, shadow_pid, shadow_pane)
+            if ctrl.generation != lifecycle_gen:
+                return  # superseded lifecycle — abandon, mutate nothing
+            if not shadow_key:
+                # "" is "could not resolve", not "unsupported" — and it is
+                # frequently a TIMING answer (the wrapper spawns its child
+                # asynchronously; misses are retried on a backoff). HOLD, as
+                # for a transient tmux failure. Disarming here would destroy
+                # the user's armed state over a process-table race.
+                return
+            self._note_loop_identity(shadow_agent=shadow_key)
+            if shadow_key not in review_loop.SHADOW_READY_DETECTORS:
+                self._loop_auto_disarm(
+                    review_loop.DISARM_NO_DETECTOR,
+                    subject=shadow_command or "unknown")
+                return
+
+        # Shadow readiness over a raw tail + hash ring (only while armed —
+        # this is the loop's one extra tmux read per tick). `lifecycle_gen` was
+        # snapshotted above, before the first await.
+        shadow_ready: bool | None = None
+        raw_tail: str | None = None
+        if shadow_ok and shadow_pane:
+            raw_tail = await capture_raw_tail(self._monitor, shadow_pane)
+            if ctrl.generation != lifecycle_gen:
+                return  # superseded lifecycle — abandon, mutate nothing
+            if raw_tail is None:
+                self._loop_shadow_hash = None
+                self._loop_shadow_hash_streak = 0
+            else:
+                tail_hash = hash(raw_tail)
+                if tail_hash == self._loop_shadow_hash:
+                    self._loop_shadow_hash_streak += 1
+                else:
+                    self._loop_shadow_hash_streak = 0
+                self._loop_shadow_hash = tail_hash
+            hash_stable = (raw_tail is not None
+                           and self._loop_shadow_hash_streak >= 1)
+            shadow_ready = review_loop.shadow_prompt_ready(
+                raw_tail, shadow_key, hash_stable)
+            shadow_ready = self._apply_shadow_settle_latch(
+                review_loop.shadow_state(raw_tail, shadow_key), shadow_ready)
+
+        # Unmounted apps (unit tests) have an empty screen stack; treat that
+        # as "no modal" rather than crashing the service.
+        try:
+            modal_open = isinstance(self.screen, ModalScreen)
+        except Exception:
+            modal_open = False
+        # Deliver a False the recency writer recorded between committed
+        # ticks (review round 4): the controller must observe every recorded
+        # transition or a FIRED state can wedge. Consumed exactly once, on a
+        # committed tick only — throttled invocations returned above.
+        # ORDERED delivery (review round 5): the latched False is OLDER than
+        # this tick's evidence. When the current verdict has moved on (True /
+        # None), replay the False in its own controller tick FIRST — with no
+        # work signal, since that older instant carried none — so a WORK
+        # classified this tick is not consumed by an artificial same-instant
+        # True→False edge (the shadow never read that newer output).
+        # Consume the latched edge ONLY when the controller will actually
+        # process observations this tick (review round 6): an indeterminate
+        # presence returns at the controller's presence guard before any
+        # observation runs, and discarding the flag there would lose the
+        # only False — FIRED would wedge after recovery. Verified absence
+        # auto-disarms before observations too, and a dead loop's flag is
+        # re-seeded at the next arm, so True/True is the consumption gate.
+        can_consume = (agent_presence is True
+                       and bool(shadow_ok and shadow_pane))
+        stale_input = self._shadow_feedback_stale
+        if self._loop_stale_false_pending and can_consume:
+            self._loop_stale_false_pending = False
+            if stale_input is False:
+                pass  # the current tick itself delivers the False
+            else:
+                # The replay CANNOT auto-disarm, and the block that used to
+                # handle that case here was deleted in t1606 as dead code:
+                # `can_consume` above forces `agent_presence is True` and a
+                # truthy `shadow_pane`, so both presence arguments below are
+                # True, while tick()'s only ACTION_AUTO_DISARM producer needs
+                # one of them to be False. Enumerated exhaustively — exactly
+                # one input combination reaches this call, and it returns
+                # ACTION_NONE.
+                #
+                # `test_review_loop.ReplayDisarmUnreachabilityTests` is what
+                # makes the deletion safe: widen `can_consume` so the replay
+                # can observe an absence and that test fails, saying the
+                # branch must be reinstated.
+                ctrl.tick(
+                    agent_present=agent_presence,
+                    shadow_present=(None if not shadow_ok
+                                    else bool(shadow_pane)),
+                    awaiting_input=None,
+                    stale=False,
+                    work_signal=review_loop.UNKNOWN,
+                    shadow_ready=None,
+                    modal_open=modal_open,
+                    now=now_mono,
+                )
+        action = ctrl.tick(
+            agent_present=agent_presence,
+            shadow_present=(None if not shadow_ok else bool(shadow_pane)),
+            awaiting_input=(snap.awaiting_input if snap is not None else None),
+            stale=stale_input,
+            work_signal=work_signal,
+            shadow_ready=shadow_ready,
+            modal_open=modal_open,
+            now=time.monotonic(),
+        )
+
+        if action == review_loop.ACTION_AUTO_DISARM:
+            # No reason code passed: the controller carries it on
+            # `last_disarm_reason`, which is what distinguishes a departed
+            # followed agent from a departed shadow — one message for two
+            # different failures, before t1606.
+            self._loop_auto_disarm()
+            return
+
+        if action == review_loop.ACTION_FIRE:
+            token = ctrl.delivery_token
+            outcome, reason = await self._fire_shadow_recheck(
+                shadow_pane, snap, shadow_key, raw_tail, tick_text, token)
+            detail = self._loop_delivery_detail
+            if outcome == "sent":
+                # Recovery: a delivery landed, so any standing hold is over —
+                # but only THIS lifecycle's. A non-BUSY post-Enter read returns
+                # "sent" with no token re-check, so a disarm + re-arm during
+                # that drain/capture makes it stale: `confirm_fire` refuses it,
+                # and the hold reason now belongs to the fresh lifecycle —
+                # clearing it would drop its banner and re-fire its
+                # edge-triggered record (t2009).
+                if ctrl.confirm_fire(token, time.monotonic()):
+                    self._clear_loop_hold()
+            elif outcome == "not_ready":
+                # The delivery was vetoed but nothing is broken — abort back
+                # to WAITING and HOLD, visibly. Before t1606 the ambiguous
+                # pre-Enter verdicts routed to the disarm below instead, which
+                # destroyed the user's armed state on a read the loop's own
+                # contract calls indeterminate ("disarm only on verified
+                # absence; pause on uncertainty").
+                #
+                # A superseded delivery is still RECORDED (t1606: a lifecycle
+                # event, not a fault), but its abort is refused and the hold
+                # state is the fresh lifecycle's — overwriting it with a
+                # banner-less HOLD_DELIVERY_SUPERSEDED would blank that
+                # lifecycle's banner (t2009).
+                live = ctrl.abort_fire(token)
+                self._loop_hold(reason, detail=detail, live=live)
+            else:  # transport failure — never leave the loop armed (hardening 1)
+                # Every "failed" lands here and disarms, with no lifecycle
+                # check — which is why the delivery methods re-check the token
+                # after their last await and before deciding ANY outcome
+                # (t2001): a stale fatal code would kill a fresh arm.
+                self._loop_auto_disarm(reason, detail=detail)
+                return
+
+        # Banner reflects the post-decision state every tick.
+        if ctrl.state == review_loop.FIRED:
+            self._clear_loop_hold()
+            self._set_loop_banner(
+                f"⟳ recheck #{ctrl.rounds_fired} sent — waiting for shadow")
+        elif ctrl.state == review_loop.DELIVERING:
+            self._set_loop_banner("⟳ auto-recheck: delivering…")
+        elif self._loop_hold_reason is not None and review_loop.loop_hold_banner(
+                self._loop_hold_reason):
+            # A standing hold outranks the generic ARMED line: the loop is
+            # armed but is NOT simply waiting, and saying "ARMED" here would
+            # make a vetoed delivery invisible — the silent hold t1525
+            # deliberately rejected.
+            self._set_loop_banner(
+                review_loop.loop_hold_banner(self._loop_hold_reason))
+        elif ctrl.holding_for_shadow:
+            self._set_loop_banner("⟳ waiting for shadow to settle")
+        else:
+            self._set_loop_banner("⟳ auto-recheck ARMED")
+
+    async def _fire_shadow_recheck(
+        self, shadow_pane: str, snap: PaneSnapshot | None, shadow_key: str,
+        tick_raw_tail: str | None, tick_text: str | None, token,
+    ) -> tuple[str, str]:
+        """Verified delivery into the SHADOW pane.
+
+        Returns ``('sent' | 'not_ready' | 'failed', detail)``. Receives no
+        followed pane id — structurally incapable of writing the followed
+        pane (safety contract item 1). Enter is NEVER sent after a failed
+        prompt write (it would submit foreign composer text or answer a
+        dialog); readiness is revalidated on a fresh capture immediately
+        before sending, with the delivery token re-checked after the await
+        (review hardenings 1+4).
+
+        This method owns everything up to and including the literal prompt
+        write; :meth:`_submit_shadow_prompt` owns the Enter, the drain that
+        makes it land, and the capture that verifies it went (t1525).
+
+        **The pane must not be in a tmux mode (t2001).** In copy-mode — entered
+        by a mouse-wheel scroll-back over an inline shadow — ``send-keys`` goes
+        to the MODE's key table: the prompt would run as copy-mode commands
+        (cursor motion, ``space`` = begin-selection, ``:`` = a command prompt
+        on the user's client), nothing would reach the agent, and tmux would
+        still return rc 0. ``capture-pane`` reads the underlying screen, so the
+        readiness above cannot see it; the mode is read immediately before the
+        write instead, and an unreadable mode authorises nothing.
+        """
+        ctrl = self._review_loop
+        self._loop_delivery_detail = {}
+        fresh = await capture_raw_tail(self._monitor, shadow_pane)
+        if not ctrl.delivery_valid(token):
+            return "not_ready", review_loop.HOLD_DELIVERY_SUPERSEDED
+        # The fresh capture must be ready AND match the tail the decision was
+        # made on — a shadow that changed between tick and delivery is not
+        # the shadow we validated.
+        hash_stable = (fresh is not None and tick_raw_tail is not None
+                       and fresh == tick_raw_tail)
+        # The settle latch applies HERE TOO, and the delivery capture is a
+        # real observation that must feed it (t1509 review).
+        #
+        # Without this, refusing the send was not enough: the observation that
+        # caused the refusal was DISCARDED. The controller returned to WAITING
+        # and — as `test_presend_revalidation_refuses_a_changed_shadow`
+        # documents — "the aborted episode completes on the next clean tick",
+        # i.e. roughly one evidence tick after an interaction was seen on the
+        # shadow, with no settle hold at all. Feeding this capture to the latch
+        # makes the tick-time and send-time guards enforce the same invariant
+        # over the same state.
+        #
+        # ACCEPTED RESIDUAL, stated precisely: an interaction that appears AND
+        # is answered entirely between the tick capture and this one, leaving a
+        # BYTE-IDENTICAL tail, is not closed by this or any other check here —
+        # it is undecidable from the captures, since by construction neither
+        # observation differs. It is also vanishingly narrow (the two captures
+        # are one await apart). Anything that leaves a visible trace is caught.
+        state = review_loop.shadow_state(fresh, shadow_key)
+        ready = review_loop.shadow_prompt_ready(fresh, shadow_key, hash_stable)
+        if self._apply_shadow_settle_latch(state, ready) is not True:
+            return "not_ready", review_loop.HOLD_SHADOW_NOT_SETTLED
+        meta = parse_block_meta(tick_text) if tick_text else None
+        expected_round = (meta.round + 1) if meta else None
+        phase = None
+        if snap is not None:
+            with contextlib.suppress(Exception):
+                task_id = self._task_cache.get_task_id_for_pane(snap.pane)
+                if task_id:
+                    info = self._task_cache.get_task_info(
+                        task_id, snap.pane.session_name)
+                    if info is not None:
+                        phase = self._phase_for_snap(snap, info).phase
+        prompt = review_loop.compose_recheck_prompt(phase, expected_round)
+        monitor = self._monitor
+        if monitor is None:
+            return "failed", review_loop.DISARM_NO_MONITOR
+        # Pane-mode precondition, as close to the write as it can sit (t2001).
+        # A new await, so the token is re-checked after it and BEFORE the mode
+        # verdict: supersession always wins. Never cancel the mode — the user
+        # is reading the shadow.
+        #
+        # Release, traced: while the pane is moded the underlying screen is
+        # static and reads READY, so nothing re-arms the settle latch and
+        # `abort_fire` stamps no cooldown. Every tick re-reserves, re-reads the
+        # mode, and holds; the first tick after the user leaves the mode
+        # delivers. The one gate is the mode itself.
+        #
+        # Accepted residual: a mode entered between this read and the
+        # `send_keys` below (one round trip) is not closed. The pre-Enter read
+        # and the Fix-5 record fields make it identifiable from the log.
+        in_mode, mode_name = await query_pane_mode(monitor, shadow_pane)
+        self._loop_delivery_detail = _pane_mode_detail(in_mode, mode_name)
+        if not ctrl.delivery_valid(token):
+            return "not_ready", review_loop.HOLD_DELIVERY_SUPERSEDED
+        if in_mode is None:
+            return "not_ready", review_loop.HOLD_SHADOW_MODE_UNREADABLE
+        if in_mode:
+            return "not_ready", review_loop.HOLD_SHADOW_IN_MODE
+        if not monitor.send_keys(shadow_pane, prompt, literal=True):
+            return "failed", review_loop.DISARM_PROMPT_WRITE_FAILED
+        return await self._submit_shadow_prompt(
+            monitor, shadow_pane, shadow_key, prompt, token)
+
+    async def _submit_shadow_prompt(
+        self, monitor, shadow_pane: str, shadow_key: str, prompt: str, token,
+    ) -> tuple[str, str]:
+        """Submit an already-written recheck prompt, and VERIFY that it went.
+
+        Returns ``('sent' | 'failed', detail)``. Called with the prompt text
+        already in the shadow's composer.
+
+        **Why this exists (t1525).** The two `send_keys` calls used to be
+        adjacent, and codex-cli coalesces that input burst: the Enter is
+        consumed as part of the literal text, the prompt is left unsubmitted,
+        and BOTH calls still return True. The loop therefore reported "sent",
+        entered FIRED, and then held forever on a shadow that reads
+        SHADOW_BUSY -- silently, because the leftover-text message below was
+        reachable only from a non-zero send rc.
+
+        Two gates, and they deliberately answer different questions:
+
+        * **Before each Enter** -- authorises an ACTION, so it fails CLOSED.
+          ``SHADOW_BUSY`` (the composer holding the text we just wrote) is the
+          ONLY verdict that permits the keystroke. A dialog would eat the
+          Enter; an indeterminate read is no evidence at all; READY/WORKING
+          mean our text is not where we put it. The two refusals carry
+          different messages because the two situations differ -- with
+          dialog/unknown the text is presumed still sitting there, with
+          ready/working it demonstrably is not.
+        * **After each Enter** -- only decides what to CLAIM about a key
+          already sent, so it fails OPEN-BUT-LOUD. Only WORKING/READY are
+          positive evidence of a submit. ``SHADOW_DIALOG`` must NOT be read as
+          "submitted": `_ordered_state` sweeps the prompt patterns over the
+          whole tail before the composer scan, so a dialog string in the
+          shadow's own transcript masks a still-busy composer -- claiming
+          "sent" there would silently reproduce the very failure above. It and
+          UNKNOWN are reported as unverified, with a warning naming the
+          verdict.
+
+        The post-Enter capture is deliberately NOT fed to
+        `_apply_shadow_settle_latch`: the controller is in DELIVERING/FIRED
+        behind the fire cooldown, and a post-delivery dialog or working
+        observation is the EXPECTED consequence of this fire, not an
+        interaction that should hold the next one.
+
+        **The pane-mode gate (t2001).** A ``SHADOW_BUSY`` read authorises the
+        Enter only if the pane is also not in a tmux mode: the user can scroll
+        the shadow back during the drain, and an Enter sent into vi copy-mode
+        is copy-pipe-and-cancel — it clobbers their clipboard, exits their mode,
+        and submits nothing. The text IS in the composer then, so the hold says
+        so; it releases when the user submits (the recheck re-stamps
+        staleness, whose True→False edge closes the work latch — no duplicate
+        round) or clears it (READY again: once the settle deadline the BUSY
+        ticks armed has passed, the next tick re-fires). An unreadable mode is
+        treated the same way. The mode is read on every attempt, before the
+        readiness dispatch, so a fatal READY/WORKING record carries it too.
+
+        **Supersession is checked before ANY outcome is decided, not only
+        before the Enter.** The caller disarms on every ``"failed"`` without a
+        lifecycle check, so a stale delivery that returned a fatal code after
+        an await would kill the lifecycle that replaced it — a disarm + re-arm
+        with `L` during a drain did exactly that via a READY read until t2001,
+        because the readiness dispatch ran before the check. The check
+        therefore sits after each attempt's last await (drain, capture, mode
+        read) and ahead of every branch, and again before the budget-exhausted
+        return. No await separates it from the Enter, so it still covers that
+        keystroke. An earlier draft also re-checked at the top of the loop; it
+        was removed once its negative control proved unfalsifiable (this check
+        catches that case first), rather than kept as unreachable belt-and-
+        braces. A superseded delivery may leave the prompt in the composer;
+        the fresh lifecycle then reads ``SHADOW_BUSY`` and holds.
+
+        The one outcome NOT re-checked is ``"sent"`` from a non-BUSY post-Enter
+        read: it is a claim about a key already sent, and the caller's
+        ``confirm_fire`` refuses a stale token and gates the hold clear on that
+        answer (t2009). A BUSY post-Enter read (the Enter was swallowed) still
+        passes a token check — the retry's, or the one before the
+        budget-exhausted return.
+        """
+        ctrl = self._review_loop
+        for _attempt in range(review_loop.SHADOW_SUBMIT_RETRIES + 1):
+            await _composer_drain(review_loop.COMPOSER_DRAIN_SECONDS)
+            before = review_loop.shadow_state(
+                await capture_raw_tail(monitor, shadow_pane), shadow_key)
+            in_mode, mode_name = await query_pane_mode(monitor, shadow_pane)
+            self._loop_delivery_detail = {
+                **_pane_mode_detail(in_mode, mode_name),
+                "pre_enter_verdict": before,
+            }
+            if not ctrl.delivery_valid(token):
+                # The user disarmed (or re-armed) during one of the awaits.
+                # This is supersession, not failure — and reporting it as one
+                # was actively harmful: it routed to the auto-disarm, so a
+                # disarm-then-RE-ARM in this window had the stale delivery
+                # kill the FRESH arm. First, ahead of every verdict below, for
+                # the same reason: a fatal READY/WORKING decided here would do
+                # the same thing. Its sibling checks in `_fire_shadow_recheck`
+                # return "not_ready" too.
+                return "not_ready", review_loop.HOLD_DELIVERY_SUPERSEDED
+            if before != review_loop.SHADOW_BUSY:
+                # The VETO is unchanged — no key is sent on any verdict here.
+                # Only the CONSEQUENCE differs, and only for the two AMBIGUOUS
+                # verdicts (t1606):
+                #
+                #   DIALOG  — `_ordered_state` sweeps the prompt patterns over
+                #             the whole tail before the composer scan, so a
+                #             dialog string in the shadow's own transcript
+                #             masks a still-busy composer. The shadow's job on
+                #             "refetch and recheck" is to RUN COMMANDS, so an
+                #             exec-approval dialog appearing between the write
+                #             and this read is a normal consequence of the
+                #             fire, not a fault.
+                #   UNKNOWN — the capture failed. That is no evidence at all,
+                #             and disarming on it directly contradicted the
+                #             rule this subsystem states for itself in
+                #             `find_shadow_pane_info_async`: "a transient tmux
+                #             failure pauses the loop, only a verified absence
+                #             disarms it".
+                #
+                # Both collapse through `_ready_from_state` to a not-True
+                # readiness, so the aborted loop provably HOLDS rather than
+                # re-firing — pinned by
+                # `test_review_loop.AmbiguousVerdictsHoldTests`.
+                #
+                # READY/WORKING stay FATAL, and that asymmetry is deliberate.
+                # There the text is demonstrably not where we put it, and
+                # READY collapses to ready-True: aborting would re-permit on
+                # the very next tick and re-WRITE the prompt, an unbounded
+                # key-injection spin. Their message was already true.
+                if before == review_loop.SHADOW_DIALOG:
+                    return "not_ready", review_loop.HOLD_PRE_ENTER_DIALOG
+                if before == review_loop.SHADOW_UNKNOWN:
+                    return "not_ready", review_loop.HOLD_PRE_ENTER_UNREADABLE
+                return "failed", review_loop.DISARM_TEXT_NOT_IN_COMPOSER
+            # BUSY authorises the Enter only outside a tmux mode (t2001). The
+            # text IS in the composer here, so both holds say so; neither
+            # cancels the user's mode.
+            if in_mode is None:
+                return "not_ready", review_loop.HOLD_PRE_ENTER_MODE_UNREADABLE
+            if in_mode:
+                return "not_ready", review_loop.HOLD_PRE_ENTER_IN_MODE
+            if not monitor.send_keys(shadow_pane, "Enter"):
+                # Genuine transport failure after a successful write: the text
+                # IS sitting in the composer, so the leftover-text message is
+                # true here.
+                return "failed", review_loop.DISARM_ENTER_SEND_FAILED
+            await _composer_drain(review_loop.COMPOSER_DRAIN_SECONDS)
+            state = review_loop.shadow_state(
+                await capture_raw_tail(monitor, shadow_pane), shadow_key)
+            if state == review_loop.SHADOW_BUSY:
+                continue  # the Enter was swallowed — retry while budget lasts
+            if state in (review_loop.SHADOW_DIALOG, review_loop.SHADOW_UNKNOWN):
+                self.notify(
+                    f"recheck sent, but submission could not be verified "
+                    f"(shadow reads '{state}')", severity="warning")
+            return "sent", prompt
+        # The last capture above was an await with no token check after it,
+        # and the return below is fatal: a disarm + re-arm during it would
+        # have this stale delivery kill the fresh arm (t2001).
+        if not ctrl.delivery_valid(token):
+            return "not_ready", review_loop.HOLD_DELIVERY_SUPERSEDED
+        # Budget exhausted: every Enter was swallowed and the composer read
+        # positively BUSY each time, so the text IS still sitting there — the
+        # leftover-text message is true — and this is the case t1525
+        # deliberately made a VISIBLE auto-disarm rather than a silent hold.
+        # It stays fatal.
+        return "failed", review_loop.DISARM_SUBMIT_UNCONFIRMED
+
+    async def action_pick_concerns(self) -> None:
+        """Forward the shadow agent's concerns to the followed agent (via clipboard).
+
+        Captures the bound shadow pane, parses its concern block, opens the picker
+        modal, and on confirm copies the selected concerns (with a preamble) to the
+        clipboard. The hotkey path uses the forgiving ``parse_concerns`` — the user
+        deliberately asked to look now; the refresh-tick auto-offer uses the strict
+        ``has_concern_block`` trigger instead (see :meth:`_maybe_offer_concerns`).
+        """
+        snap = self._find_own_agent_snapshot()
+        if snap is None:
+            self.notify("No followed agent in this window", severity="warning")
+            return
+        shadow_pane = await find_shadow_pane_async(self._monitor, snap.pane.pane_id)
+        if not shadow_pane:
+            self.notify(
+                "No shadow agent running — press 'e' to launch one",
+                severity="warning",
+            )
+            return
+        text = await capture_shadow_text(shadow_pane)
+        if text is None:
+            self.notify("Could not read the shadow pane", severity="warning")
+            return
+        concerns = parse_concerns(text)
+        if not concerns and block_head_truncated(text):
+            # The block is there but the window started inside it. This is the
+            # explicit user action, so pay for ONE much deeper re-capture rather
+            # than reporting a false "no concerns" (t1187).
+            deeper = await capture_shadow_text(
+                shadow_pane, lines=_SHADOW_DEEP_RETRY_LINES
+            )
+            if deeper is not None:
+                text = deeper
+                concerns = parse_concerns(text)
+            if not concerns:
+                self.notify(_SHADOW_TRUNCATED_MSG, severity="warning")
+                return
+        if not concerns:
+            # A block whose markers are ALL malformed parses to nothing, so the
+            # bland "no concerns" message would be a lie — the shadow did emit a
+            # block, none of it survived. Say that instead (t1274).
+            lost = unrecovered_markers(text)
+            if lost:
+                self.notify(unparsed_concerns_msg(len(lost)), severity="warning")
+                # No picker means no banner to hang the `u` affordance off, so
+                # open the raw view directly — the user pressed `c` deliberately
+                # and this is the only thing left to show them (t1293).
+                self.push_screen(
+                    ConcernBlockInspectModal(lost, block_region(text) or "")
+                )
+            elif is_metadata_only_block(text):
+                # A CERTIFIED metadata-only block is the shadow's record of a
+                # clean round (t1159_1) — name the round instead of the
+                # generic line. Strict on purpose: an unclosed header-only
+                # stream may be about to emit items, and header+dropped-prose
+                # is malformed output — neither is a clean round.
+                meta = parse_block_meta(text)
+                self.notify(
+                    f"Clean review (round {meta.round}) — no concerns"
+                )
+            elif ((meta := parse_block_meta(text)) is not None
+                    or has_invalid_round_header(text)):
+                # A round header without certification: dropped non-item
+                # content, a still-streaming header-only block, or a
+                # Round:-shaped header that fails the grammar (meta None,
+                # but the producer TRIED to emit metadata). "No concerns"
+                # would hide emitted output — warn and show the raw block,
+                # like the lost-markers case above.
+                self.notify(
+                    uncertified_round_block_msg(meta.round if meta else None),
+                    severity="warning",
+                )
+                self.push_screen(
+                    ConcernBlockInspectModal([], block_region(text) or "")
+                )
+            else:
+                self.notify("No concerns detected on the shadow pane")
+            return
+        # Recomputed here, from THIS action's capture — never the tick cache
+        # (t1493). The cached verdict describes the tick's capture; by now the
+        # pane may carry a newer round, and `text` may have been replaced by the
+        # deeper re-capture above. Labelling round 2's concerns with round 1's
+        # freshness is the same snapshot incoherence the `block_meta=` wiring
+        # below exists to prevent, so both must come from one capture. The user
+        # pressed `c` deliberately, which is the same reasoning that already
+        # pays for that deeper re-capture.
+        eps = self._shadow_freshness_eps()
+        read_stale, analyzed_at = await compute_shadow_staleness(
+            self._monitor, shadow_pane, snap.pane.pane_id, eps
+        )
+        last_change = None
+        if self._monitor is not None and hasattr(
+            self._monitor, "get_last_change_wall"
+        ):
+            with contextlib.suppress(Exception):
+                last_change = self._monitor.get_last_change_wall(snap.pane.pane_id)
+        age = compute_block_age_staleness(text, last_change, eps)
+        stale = combine_staleness(read_stale, age)
+        block_meta = parse_block_meta(text)
+        # Write-back, one rule per value. Read recency preserves on ITS own
+        # indeterminate; the combined verdict goes through the shared
+        # preserve rule (a standing True is never cleared, everything else is
+        # recorded). A combined True driven by block age alone is a positive
+        # finding and must be established even when read recency is None.
+        if read_stale is not None:
+            self._shadow_read_recency = ReadRecency(read_stale, analyzed_at)
+        # The BANNER goes through the t1573 gate; the `stale=` handed to the
+        # modal below deliberately does NOT. The picker's warning is about the
+        # block the user is looking at right now, which by construction exists
+        # and which they asked to act on — it is correct today and stays
+        # ungated.
+        self._record_banner_staleness(
+            snap, shadow_pane, text, age, stale,
+            # narrow=True (t1566) — same one-row surface as the tick path.
+            format_shadow_stale_banner(
+                read_stale, age, block_meta, analyzed_at, time.time(),
+                narrow=True,
+            ),
+        )
+        # Resolved and stashed here: the dismissal callback receives only the
+        # result, so the followed pane — the sole source of a task id — is out
+        # of reach by then (t1427_2).
+        self._concern_pick_task_id = self._task_cache.get_task_id_for_pane(snap.pane)
+        entries = await self._fetch_rejected_entries(self._concern_pick_task_id)
+        self.push_screen(
+            ConcernPickerModal(
+                concerns,
+                narrow=True,
+                stale=stale,
+                unrecovered=unrecovered_markers(text),
+                raw_block=block_region(text) or "",
+                rejected_entries=entries,
+                store_unavailable=not self._concern_pick_task_id,
+                block_meta=block_meta,
+                stale_detail=format_staleness_detail(age, block_meta),
+            ),
+            callback=self._on_concerns_picked,
+        )
+
+    def _on_concerns_picked(self, result) -> None:
+        """Modal callback: forward and/or persist the user's dispositions.
+
+        ``result`` is a ``ConcernPickResult`` on confirm, or ``None`` on
+        cancel — in which case nothing is written (no side effect before an
+        explicit confirm). The body is shared with the full monitor via
+        ``ShadowRejectionsMixin``; this app holds no pick guard to release.
+        """
+        self.apply_concern_pick_result(
+            result, getattr(self, "_concern_pick_task_id", None)
+        )
+
+    async def _maybe_offer_concerns(self) -> None:
+        """Proactively hint when a fresh, complete concern block appears on the shadow.
+
+        Strict trigger: ``has_concern_block`` (requires a *closing* fence + >=1
+        concern) so a still-streaming, unclosed block does not fire mid-stream.
+        De-duped per shadow pane on the *parsed* payload — not the raw capture —
+        so unrelated pane churn around an unchanged block does not re-hint.
+        Best-effort and event-loop safe: any capture/query failure silently skips
+        the tick without touching the de-dup state.
+
+        NOTE: if continuous detection proves noisy in live use, the documented
+        fallback is to drop this and rely on the 'c' hotkey alone (verified by the
+        t1037_5 manual-verification sibling).
+        """
+        snap = self._find_own_agent_snapshot()
+        if snap is None or not snap.pane.pane_id:
+            # Review-loop service runs on EVERY branch (t1159_2): absence is
+            # observed, never inferred. shadow_ok=False = "not looked" — the
+            # loop pauses rather than reading it as a verified shadow absence.
+            await self._service_review_loop(None, False, None, "", None)
+            return
+        shadow_ok, shadow_pane, shadow_command, shadow_pid = (
+            await find_shadow_pane_info_async(
+                self._monitor, snap.pane.pane_id))
+        if not shadow_pane:
+            # No shadow (offer path keeps the pre-t1159_2 fail-open collapse:
+            # a failed lookup and a verified absence both land here — nothing
+            # to show either way): nothing can be stale — clear any standing
+            # warning. The loop service DOES discriminate via shadow_ok.
+            self._shadow_read_recency = _UNKNOWN_RECENCY
+            self._shadow_stale_combined = None
+            self._set_shadow_stale_banner("")
+            # Hygiene only (t1573): the phase binding is keyed on the shadow
+            # pane, so a later shadow can never inherit this one's origin phase
+            # even if this branch never runs.
+            self._shadow_feedback_phase = None
+            await self._service_review_loop(snap, shadow_ok, None, "", None)
+            return
+        # Freshness (t1104) — independent of whether a concern block is present,
+        # so the warning tracks staleness even when the block is unchanged.
+        # Throttled to every other tick (halves the extra pane reads); a skipped
+        # tick simply leaves the last computed state on screen. Cost-gated +
+        # failure-safe inside.
+        self._shadow_freshness_tick = getattr(
+            self, "_shadow_freshness_tick", 0
+        ) + 1
+        if self._shadow_freshness_tick % 2 == 1:
+            await self._update_shadow_freshness(shadow_pane, snap.pane.pane_id)
+        # Re-stamp the advisory phase on the same pass (t1420). Every tick, not
+        # throttled with the freshness check: the shadow re-reads it on every
+        # refetch, and a frozen hint is the one failure mode the pane-option
+        # channel exists to avoid. Best-effort inside; never raises here.
+        await self._restamp_shadow_phase(shadow_pane, snap)
+        text = await capture_shadow_text(shadow_pane)
+        # Review-loop service, main path (t1159_2): before the text-None
+        # return so a failed cleaned capture still services the tick.
+        await self._service_review_loop(
+            snap, shadow_ok, shadow_pane, shadow_command, text, shadow_pid)
+        if text is None:
+            return
+        # Combine read recency with block age and repaint, EVERY tick and before
+        # any early return below: a pane whose block never changes is exactly
+        # the case that must still go stale, and a pane with no block at all
+        # must keep behaving as it did before block age existed (t1493).
+        self._refresh_shadow_stale_banner(snap, shadow_pane, text)
+        if not has_concern_block(text):
+            # A block whose opening fence fell outside the window looks exactly
+            # like "no concerns" to the strict predicate. Say so once per pane
+            # instead of staying silent (t1187) — the user can then deepen the
+            # window or press 'c', which retries deeper on its own.
+            if block_head_truncated(text):
+                if shadow_pane not in self._truncation_warned:
+                    self._truncation_warned.add(shadow_pane)
+                    self.notify(_SHADOW_TRUNCATED_MSG, severity="warning")
+                return
+            # A complete block whose markers are ALL malformed yields no concern,
+            # so the strict predicate reads it as "nothing here" — the same class
+            # of silent false negative as the truncation case, and equally worth
+            # one warning per pane (t1274).
+            lost = unrecovered_markers(text)
+            if lost and shadow_pane not in self._unparsed_warned:
+                self._unparsed_warned.add(shadow_pane)
+                self.notify(unparsed_concerns_msg(len(lost)), severity="warning")
+            return
+        # A complete block arrived: re-arm the warnings for this pane.
+        self._truncation_warned.discard(shadow_pane)
+        self._unparsed_warned.discard(shadow_pane)
+        concerns = parse_concerns(text)
+        if not concerns:
+            return
+        payload = build_clipboard_payload(concerns)
+        # Round-qualified dedup (t1159_1): a repeat round re-raising the same
+        # concerns is NEWS (the shadow re-reviewed and stands by them), so the
+        # round header lifts the payload dedup. No header ⇒ the key is the bare
+        # payload, byte-identical to the pre-header behavior.
+        meta = parse_block_meta(text)
+        dedup_key = (
+            f"round={meta.round}@{meta.reviewed_at}\n{payload}" if meta
+            else payload
+        )
+        if self._last_concern_block_payload.get(shadow_pane) == dedup_key:
+            return
+        self._last_concern_block_payload[shadow_pane] = dedup_key
+        round_suffix = f" (round {meta.round})" if meta else ""
+        # The COMBINED verdict, tri-state (t1493). This toast fires only when a
+        # NEW block is announced — the dedup return above is deliberate — so it
+        # reports the freshness of the block it is announcing. The
+        # became-stale-later transition belongs to the live banner, which is the
+        # only surface that re-renders on an unchanged block.
+        combined = getattr(self, "_shadow_stale_combined", None)
+        if combined is True:
+            stale_suffix = " (⚠ STALE — agent moved on)"
+        elif combined is None:
+            stale_suffix = " (⚠ freshness unknown)"
+        else:
+            stale_suffix = ""
+        # Name the disposition split up front (t1274) so the toast already says
+        # how much of the block is actually asking for action.
+        actionable = sum(1 for c in concerns if needs_addressing(c))
+        info = len(concerns) - actionable
+        info_suffix = f" (+{info} informational)" if info else ""
+        self.notify(
+            f"Shadow raised {actionable} concern(s){info_suffix} — press 'c' to pick"
+            + round_suffix + stale_suffix,
+            severity="information",
+        )
+
+    def action_switch_to(self) -> None:
+        """Switch tmux focus to the focused pane's window (prefer minimonitor pane)."""
+        if self._monitor is None:
+            return
+        pane_id = self._get_focused_pane_id()
+        if pane_id is None:
+            self.notify("Focus a pane first", severity="warning")
+            return
+        if self._monitor.switch_to_pane(pane_id, prefer_companion=True):
+            snap = self._snapshots.get(pane_id)
+            name = f"{snap.pane.window_name}" if snap else pane_id
+            self.notify(f"Switched to {name}", markup=False)
+        else:
+            self.notify("Failed to switch", severity="error")
+
+    def action_cycle_compare_mode(self) -> None:
+        """Cycle the focused pane's idle-detection compare mode."""
+        if self._monitor is None:
+            self.notify("Monitor not ready", severity="warning")
+            return
+        pane_id = self._focused_pane_id
+        if not pane_id:
+            self.notify("Focus an agent pane first", severity="warning")
+            return
+        # The pane list has held non-agent cards since t1382, so "focused card ⇒
+        # agent" is no longer an invariant. Idle detection only runs for AGENT
+        # panes (`_apply_bookkeeping`), so an override set here for anything else
+        # would be written and never read.
+        snap = self._snapshots.get(pane_id)
+        if snap is not None and snap.pane.category != PaneCategory.AGENT:
+            self.notify(
+                "Idle detection applies to agent panes only", severity="warning"
+            )
+            return
+        if getattr(self._monitor, "cycle_compare_mode_async", None) is not None:
+            # The client (t2037_3): the authoritative answer comes from the
+            # server, so wait for it in a worker — never on the App pump.
+            self.run_worker(
+                self._cycle_compare_mode_async(pane_id, "Idle detect"),
+                group="compare-mode", exclusive=False, exit_on_error=False,
+            )
+            return
+        new_mode, is_default = self._monitor.cycle_compare_mode(pane_id)
+        suffix = " (default)" if is_default else " (override)"
+        self.notify(f"Idle detect: {new_mode}{suffix}", timeout=3)
+        self.call_later(self._refresh_data)
+
+    def action_toggle_multi_session(self) -> None:
+        """Flip the multi-session view ON/OFF in memory.
+
+        Mirrors MonitorApp.action_toggle_multi_session: in-memory only (no
+        config write), client view state only (t2034_2 — the producer always
+        scans every session and is left untouched), and schedules a refresh to
+        repaint.
+        """
+        if self._monitor is None:
+            return
+        self._multi_session = not self._multi_session
+        state = "ON" if self._multi_session else "OFF"
+        self.notify(f"Multi-session {state}", timeout=3)
+        self.call_later(self._refresh_data)
+
+    def _show_task_info_for(self, snap: PaneSnapshot) -> None:
+        """Open the task detail dialog for ``snap``'s pane, refreshing the cache.
+
+        Shared by ``i`` (focused list card) and ``I`` (followed agent) — same
+        dialog, two different target resolutions.
+        """
+        task_id = self._task_cache.get_task_id_for_pane(snap.pane)
+        if not task_id:
+            self.notify("No task ID in window name", severity="warning")
+            return
+        # Force refresh cache to get latest content
+        sess = snap.pane.session_name
+        self._task_cache.invalidate(task_id, sess)
+        info = self._task_cache.get_task_info(task_id, sess)
+        if not info:
+            self.notify(f"Task t{task_id} not found", severity="error")
+            return
+        self.push_screen(TaskDetailDialog(info))
+
+    def action_show_task_info(self) -> None:
+        """Show task detail dialog for the focused agent pane."""
+        pane_id = self._get_focused_pane_id()
+        if not pane_id:
+            self.notify("Focus an agent pane first", severity="warning")
+            return
+        snap = self._snapshots.get(pane_id)
+        if not snap:
+            return
+        # Since t1382 the list can hold non-agent cards. Without this the call
+        # would degrade incidentally to "No task ID in window name", which reads
+        # like a broken agent rather than a pane that has no task by nature.
+        if snap.pane.category != PaneCategory.AGENT:
+            self.notify("Not an agent pane", severity="warning")
+            return
+        self._show_task_info_for(snap)
+
+    def action_show_own_task_info(self) -> None:
+        """Show task detail dialog for the agent this minimonitor follows.
+
+        The followed agent lives in the static, non-focusable #mini-own-agent
+        panel and is excluded from the selectable list, so the focus-scoped
+        ``i`` can never reach it — and since ``_auto_select_own_window`` always
+        focuses a list card when one exists, a "nothing focused" fallback on
+        ``i`` would be dead code whenever another agent is running (t1282).
+        Hence its own key, scoped to the followed agent regardless of which
+        list card is focused — the same resolution as ``action_kill_own_agent``
+        / ``action_pick_next_for_own``.
+        """
+        snap = self._find_own_agent_snapshot()
+        if snap is None:
+            self.notify("No followed agent in this window", severity="warning")
+            return
+        self._show_task_info_for(snap)
+
+    def _current_agent_snapshot(self):
+        """This companion follows exactly one agent — its docked panel's.
+
+        The same target `k` (kill) and `space` (mark) already act on, so the
+        frozen keys need no new notion of "selected". The pane list's other rows
+        are read-only here and are deliberately NOT reachable: an action on a
+        row you merely scrolled past is what the user asked us not to build.
+        """
+        return self._find_own_agent_snapshot()
+
+    async def action_toggle_mark(self) -> None:
+        """Toggle the prioritized mark on the agent this minimonitor follows.
+
+        Overrides ``AgentMarksMixin.action_toggle_mark``, which resolves through
+        live focus. Deliberately NOT the focused list card, and deliberately not
+        a *second* key beside the inherited one (t1383): a minimonitor is a
+        companion pane bound to exactly one agent, so ``space`` here means "the
+        agent I am watching" — one key, one target, whatever the list
+        highlights. The full monitor keeps the inherited focus-resolved action;
+        it follows nothing, so focus is its only target and it stays the way to
+        mark any *other* agent.
+
+        List rows still render ★/☆ so marks set from ``ait monitor`` or another
+        repo remain visible here; they are simply read-only.
+
+        Same resolution as ``action_kill_own_agent`` / ``action_pick_next_for_own``
+        / ``action_show_own_task_info``, including the AGENT-only refusal in a
+        window renamed off the ``agent-`` prefix.
+        """
+        snap = self._find_own_agent_snapshot()
+        if snap is None:
+            self.notify("No followed agent in this window", severity="warning")
+            return
+        await self._cycle_mark_for(snap)
+
+    def action_switch_to_monitor(self) -> None:
+        """Switch to the full monitor window with the companion agent focused.
+
+        Writes the companion agent's window name to the tmux session
+        environment so the full monitor can auto-focus the matching card on
+        its next refresh, then selects (or creates) the monitor window.
+        """
+        if not os.environ.get("TMUX"):
+            self.notify("Not inside tmux", severity="warning")
+            return
+        if not self._own_window_name:
+            self.notify("Own window not detected yet", severity="warning")
+            return
+
+        if self._monitor is None:
+            self.notify("Monitor not ready", severity="warning")
+            return
+
+        # Record the focus request on the tmux session so monitor_app can
+        # pick it up on its next refresh.
+        rc, _ = self._monitor.tmux_run([
+            "set-environment", "-t", tmux_session_target(self._session),
+            "AITASK_MONITOR_FOCUS_WINDOW", self._own_window_name,
+        ])
+        if rc != 0:
+            self.notify("tmux set-environment failed", severity="error")
+            return
+
+        # Does the monitor window already exist in the session?
+        rc, stdout = self._monitor.tmux_run([
+            "list-windows", "-t", tmux_session_target(self._session),
+            "-F", "#{window_name}",
+        ])
+        if rc != 0:
+            self.notify("tmux list-windows failed", severity="error")
+            return
+        monitor_running = "monitor" in stdout.strip().splitlines()
+
+        if monitor_running:
+            rc, _ = self._monitor.tmux_run([
+                "select-window", "-t",
+                tmux_window_target(self._session, "monitor"),
+            ])
+            if rc != 0:
+                self.notify("select-window failed", severity="error")
+        else:
+            # Trailing colon forces tmux to treat the target as a session.
+            rc, _ = self._monitor.tmux_run([
+                "new-window", "-t", tmux_window_target(self._session, ""),
+                "-n", "monitor", "ait monitor",
+            ])
+            if rc != 0:
+                self.notify("new-window failed", severity="error")
+
+
+# The bands rendered with the DEFAULT keys — what the existing suites read, and
+# the substring audit `test_key_hints_surface_every_binding` runs over. Derived
+# from the same table and the class's bindings the App renders from, never a
+# second literal (t2212).
+KEY_HINTS_TEXT = render_hints(
+    FULL_HINT_LINES, binding_keymap(MiniMonitorApp.BINDINGS)
+)
+KEY_HINTS_COLLAPSED_TEXT = render_hints(
+    (COLLAPSED_HINT_LINE,), binding_keymap(MiniMonitorApp.BINDINGS)
+)
+
+
+def _detect_tmux_session() -> str | None:
+    """Auto-detect the current tmux session name, or None if not inside tmux."""
+    if not os.environ.get("TMUX"):
+        return None
+    try:
+        result = subprocess.run(
+            ["tmux", *TMUX_CLIENT_FLAGS, "display-message", "-p", "#S"],
+            capture_output=True, timeout=5, **tmux_text_kwargs(),
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    except Exception:
+        pass
+    return None
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Compact tmux agent monitor TUI")
+    parser.add_argument("--session", "-s", default=None, help="tmux session name")
+    parser.add_argument("--interval", "-i", type=int, default=None, help="refresh interval in seconds")
+    args = parser.parse_args()
+
+    project_root = Path(__file__).resolve().parents[2]
+    config = load_monitor_config(project_root)
+    tmux_config = load_project_tmux_config(project_root)
+
+    # Resolve session: CLI > current tmux session > config > default. A
+    # blank/null value means the default, exactly as `ait ide` resolves it.
+    configured_session = load_tmux_defaults(project_root)["default_session"]
+    if args.session:
+        session = args.session
+    else:
+        session = _detect_tmux_session()
+        if session is None:
+            session = configured_session
+
+    refresh_seconds = args.interval if args.interval is not None else tmux_config.get("monitor", {}).get("refresh_seconds", 3)
+    # The shared status server (t2037_3) ticks at the projects' configured
+    # interval and cannot honour a per-instance override, so an explicit
+    # --interval keeps THIS instance in-process.
+    monitor_server = False if args.interval is not None else None
+
+    # Same config key the spawner reads (agent_launch_utils.maybe_spawn_minimonitor);
+    # the app re-pins its pane to this width on resize.
+    mm_cfg = tmux_config.get("minimonitor", {})
+    target_width = int(mm_cfg["width"]) if isinstance(mm_cfg, dict) and "width" in mm_cfg else 40
+    # Sibling of `width`, same guard shape so a malformed `minimonitor:` value
+    # falls back instead of raising (t1566). Default off: the followed agent,
+    # not a counter, owns the top of a 40-column companion pane.
+    session_bar = (
+        bool(mm_cfg["session_bar"])
+        if isinstance(mm_cfg, dict) and "session_bar" in mm_cfg
+        else False
+    )
+
+    app = MiniMonitorApp(
+        session=session,
+        project_root=project_root,
+        refresh_seconds=refresh_seconds,
+        capture_lines=config.get("capture_lines", 30),
+        idle_threshold=config.get("idle_threshold", 5.0),
+        agent_prefixes=config.get("agent_prefixes"),
+        tui_names=config.get("tui_names"),
+        compare_mode_default=config.get("compare_mode_default", "stripped"),
+        target_width=target_width,
+        mark_pane=True,   # production launcher only — see MiniMonitorApp.__init__
+        session_bar=session_bar,
+        # Per-user, fail-soft (t2212): a missing or malformed userconfig opens
+        # the full band.
+        key_hints_collapsed=userconfig_persist.get_minimonitor_key_hints_collapsed(),
+        monitor_server=monitor_server,
+    )
+    app.run()
+
+
+if __name__ == "__main__":
+    main()

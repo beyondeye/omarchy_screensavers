@@ -1,0 +1,1163 @@
+"""Agent registration helpers for the brainstorm engine.
+
+Provides functions to register brainstorm agents (explorer, comparator,
+synthesizer, initializer, module_decomposer/merger/syncer) into a
+brainstorm crew with properly assembled input context.
+
+Each register_* function:
+1. Reads node data using brainstorm_dag functions
+2. Assembles input markdown via _assemble_input_*
+3. Calls ``ait crew addwork`` via subprocess
+4. Overwrites the placeholder _input.md with assembled content
+5. Returns the agent name
+"""
+
+from __future__ import annotations
+
+import hashlib
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+# Allow importing sibling packages
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lib"))
+
+from agentcrew.agentcrew_utils import (  # noqa: E402
+    crew_git_timeout,
+    crew_merge_state,
+    crew_worktree_path,
+    git_cmd,
+)
+from bounded_run import run_bounded  # noqa: E402
+from config_utils import load_layered_config  # noqa: E402
+from launch_modes import DEFAULT_LAUNCH_MODE, VALID_LAUNCH_MODES  # noqa: E402
+
+from .brainstorm_dag import (  # noqa: E402
+    NODES_DIR,
+    PROPOSALS_DIR,
+    get_head,
+    is_ancestor_subgraph,
+    _node_module,
+    _read_graph_state,
+    next_node_id,
+    read_node,
+    read_proposal,
+)
+from .brainstorm_sections import parse_sections, get_section_by_name  # noqa: E402
+from .brainstorm_schemas import extract_dimensions, is_dimension_field  # noqa: E402
+
+TEMPLATE_DIR = Path(__file__).parent / "templates"
+
+BRAINSTORM_AGENT_TYPES = {
+    "explorer": {"max_parallel": 2, "launch_mode": "interactive"},
+    "comparator": {"max_parallel": 1, "launch_mode": "interactive"},
+    "synthesizer": {"max_parallel": 1, "launch_mode": "interactive"},
+    "initializer": {"max_parallel": 1, "launch_mode": "interactive"},
+    "module_decomposer": {"max_parallel": 1, "launch_mode": "interactive"},
+    "module_merger": {"max_parallel": 1, "launch_mode": "interactive"},
+    "module_syncer": {"max_parallel": 1, "launch_mode": "interactive"},
+}
+
+def get_agent_types(config_root: Path | None = None) -> dict[str, dict]:
+    """Return brainstorm agent types with agent_string from codeagent config.
+
+    Each type's agent_string MUST come from codeagent_config.json (layered:
+    project <- local) under the brainstorm-<type> key.  Resource defaults
+    (max_parallel, launch_mode) are hardcoded in BRAINSTORM_AGENT_TYPES;
+    launch_mode can be overridden via brainstorm-<type>-launch-mode config key.
+
+    Raises RuntimeError if codeagent_config.json is unreadable or missing
+    a required brainstorm-<type> key.
+
+    Args:
+        config_root: Repository root path. Defaults to two levels up from this file.
+    """
+    import copy
+    result = copy.deepcopy(BRAINSTORM_AGENT_TYPES)
+    if config_root is None:
+        config_root = Path(__file__).resolve().parents[2]
+    config_path = config_root / "aitasks" / "metadata" / "codeagent_config.json"
+    try:
+        config = load_layered_config(str(config_path))
+    except Exception as exc:
+        raise RuntimeError(
+            f"Cannot load codeagent_config.json at {config_path}: {exc}. "
+            "Run 'ait setup' or create the file manually."
+        ) from exc
+    defaults = config.get("defaults", {})
+    for agent_type, info in result.items():
+        config_key = f"brainstorm-{agent_type}"
+        if config_key not in defaults:
+            raise RuntimeError(
+                f"Missing codeagent_config.json default for {config_key}; "
+                "run 'ait setup' or add the key manually."
+            )
+        info["agent_string"] = defaults[config_key]
+        launch_key = f"brainstorm-{agent_type}-launch-mode"
+        if launch_key in defaults:
+            val = defaults[launch_key]
+            if isinstance(val, str) and val in VALID_LAUNCH_MODES:
+                info["launch_mode"] = val
+            else:
+                print(
+                    f"warning: invalid {launch_key}={val!r}, expected one of "
+                    f"{sorted(VALID_LAUNCH_MODES)}; falling back to framework "
+                    f"default ({info.get('launch_mode', DEFAULT_LAUNCH_MODE)})",
+                    file=sys.stderr,
+                )
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+
+def _group_seq(group_name: str) -> str:
+    """Extract the trailing sequence part from a group name.
+
+    ``explore_001`` -> ``001``. Splits on the **last** underscore so multi-token
+    op names round-trip too: ``module_sync_001`` -> ``001`` (NOT ``sync_001``).
+    A first-underscore split silently mis-names module-op agents so the
+    auto-apply poller can no longer resolve their group (the group↔agent name
+    round-trip via ``_agent_to_group_name`` breaks).
+    """
+    if "_" in group_name:
+        return group_name.rsplit("_", 1)[1]
+    return group_name
+
+
+# Registration deadline (t2024). ait crew addwork makes two network round-trips
+# (fetch + push), each bounded by crew_git_timeout() inside the script; the
+# headroom covers its local work.
+_ADDWORK_LOCAL_HEADROOM_S = 60
+# After the deadline, how long addwork may take to finish the step it is in.
+_ADDWORK_STOP_GRACE_S = 60
+
+_HUNG_STEP = ("a git hook or commit signing in the crew worktree did not finish; "
+              "fix that first")
+_MERGE_STATE_TEXT = {
+    "merge_in_progress": "an unfinished merge",
+    "rebase_in_progress": "an unfinished rebase",
+    "unmerged_paths": "unmerged paths",
+    "probe_failed": "a state git could not report",
+}
+
+
+def _addwork_timeout() -> int:
+    """Seconds _run_addwork waits before asking ait crew addwork to stop."""
+    return 2 * crew_git_timeout() + _ADDWORK_LOCAL_HEADROOM_S
+
+
+def _addwork_outcome(crew_id: str, agent_name: str, limit: int) -> str:
+    """Report what a killed ``ait crew addwork`` left in the crew worktree.
+
+    Reached only when addwork was still running ``_ADDWORK_STOP_GRACE_S`` after
+    the stop request — a local step hung — so its process group was killed. The
+    outcome is read back from the worktree, never guessed. A committed
+    registration counts as success: no command removes an agent, so raising for
+    it would leave an agent brainstorm could have recorded unrecorded.
+
+    Returns:
+        Agent name when the registration commit exists.
+
+    Raises:
+        RuntimeError: naming the state left behind and its remedy.
+    """
+    wt = crew_worktree_path(crew_id)
+    head = (f"ait crew addwork for agent '{agent_name}' was killed after "
+            f"{limit + _ADDWORK_STOP_GRACE_S}s: {_HUNG_STEP}.")
+    state = crew_merge_state(wt)
+    if state:
+        raise RuntimeError(
+            f"{head} It left {_MERGE_STATE_TEXT.get(state, state)} in {wt}, which "
+            f"`git -C {wt} status` shows; an interrupted rebase is undone with "
+            f"`git -C {wt} rebase --abort`, which keeps every commit made before it. "
+            "The crew runner holds until it is resolved. If the branch then holds "
+            f"agent '{agent_name}', it stays registered, but brainstorm did not "
+            "record it or write its input."
+        )
+    committed = git_cmd(wt, "cat-file", "-e", f"HEAD:{agent_name}_status.yaml", check=False)
+    if committed.returncode == 0:
+        return agent_name  # registered; the next crew push publishes it
+    if os.path.exists(os.path.join(wt, f"{agent_name}_status.yaml")):
+        raise RuntimeError(
+            f"{head} Agent '{agent_name}' is written and staged in {wt} but not "
+            "committed. A running crew runner reads agents from these files and "
+            f"commits whatever it finds, so '{agent_name}' may still be launched "
+            "with placeholder input. Complete it with "
+            f"`git -C {wt} commit -m \"crew: Add agent '{agent_name}' to crew "
+            f"'{crew_id}'\"`, or discard it: `git -C {wt} rm -q --cached -- "
+            f"'{agent_name}_*'`, delete {wt}/{agent_name}_*, and revert its entries "
+            f"in _crew_meta.yaml / _groups.yaml (`git -C {wt} diff --cached` "
+            "shows them)."
+        )
+    raise RuntimeError(f"{head} Nothing was registered; retry once it is fixed.")
+
+
+def _run_addwork(
+    crew_id: str,
+    agent_name: str,
+    agent_type: str,
+    group_name: str,
+    work2do_path: Path,
+    launch_mode: str = DEFAULT_LAUNCH_MODE,
+) -> str:
+    """Register agent via subprocess call to ait crew addwork.
+
+    Bounded (t2024): after ``_addwork_timeout()`` seconds addwork is sent a stop
+    request (SIGTERM to it alone). It then finishes the step it is in — writing
+    and committing the registration and the rebase are never cut — and skips
+    publishing; a registration committed that way is a success, like one whose
+    push failed. Only an addwork still running ``_ADDWORK_STOP_GRACE_S`` later
+    is killed, and ``_addwork_outcome`` reports what it left behind.
+
+    Returns:
+        Agent name on success.
+
+    Raises:
+        RuntimeError: If addwork command fails.
+    """
+    cmd = [
+        "./ait", "crew", "addwork",
+        "--crew", crew_id,
+        "--name", agent_name,
+        "--work2do", str(work2do_path),
+        "--type", agent_type,
+        "--group", group_name,
+        "--launch-mode", launch_mode,
+        "--batch",
+    ]
+    limit = _addwork_timeout()
+    try:
+        result = run_bounded(cmd, limit, stop_grace=_ADDWORK_STOP_GRACE_S)
+    except subprocess.TimeoutExpired:
+        return _addwork_outcome(crew_id, agent_name, limit)
+    if result.returncode != 0:
+        stopped = (f" (asked to stop at its {limit}s deadline)"
+                   if getattr(result, "stopped", False) else "")
+        raise RuntimeError(
+            f"ait crew addwork failed for agent '{agent_name}'{stopped}: {result.stderr}"
+        )
+    for line in result.stdout.strip().splitlines():
+        if line.startswith("ADDED:"):
+            return line.split(":", 1)[1]
+    return agent_name
+
+
+def _write_agent_input(
+    session_path: Path,
+    agent_name: str,
+    input_content: str,
+) -> None:
+    """Overwrite the agent's _input.md file with assembled content."""
+    input_path = session_path / f"{agent_name}_input.md"
+    input_path.write_text(input_content, encoding="utf-8")
+
+
+def _format_reference_files(reference_files: list[str]) -> str:
+    """Format reference_files into Local and Remote (cached) sections.
+
+    Separates local file paths from URLs. For URLs, generates cache
+    file path references with source URL annotation.
+    """
+    local_refs: list[str] = []
+    remote_refs: list[str] = []
+    for ref in reference_files:
+        if ref.startswith("http://") or ref.startswith("https://"):
+            url_hash = hashlib.md5(ref.encode()).hexdigest()[:8]
+            cache_path = f"br_url_cache/{url_hash}.md"
+            remote_refs.append(f"- {cache_path} (source: {ref})")
+        else:
+            local_refs.append(f"- {ref}")
+
+    sections: list[str] = []
+    if local_refs:
+        sections.append("### Local\n" + "\n".join(local_refs))
+    if remote_refs:
+        sections.append("### Remote (cached)\n" + "\n".join(remote_refs))
+    return "\n\n".join(sections)
+
+
+# ---------------------------------------------------------------------------
+# Input assembly (one per agent type)
+# ---------------------------------------------------------------------------
+
+
+def _subgraph_context_lines(session_path: Path, node_id: str) -> list[str]:
+    """Front-matter naming the op's module subgraph (default ``_umbrella``).
+
+    Derived from the op's primary node so the agent stays within the subgraph
+    boundary; the op templates instruct the agent to honour it.
+    """
+    module = _node_module(session_path, node_id)
+    return ["", "## Subgraph Context", f"subgraph context: {module}"]
+
+
+def _assemble_input_explorer(
+    session_path: Path,
+    base_node_id: str,
+    mandate: str,
+    active_dimensions: list[str],
+    assigned_node_id: str,
+    target_sections: list[str] | None = None,
+) -> str:
+    """Assemble explorer _input.md content with file path references."""
+    node_data = read_node(session_path, base_node_id)
+    ref_files = node_data.get("reference_files", []) or []
+
+    node_yaml_path = f"{session_path}/{NODES_DIR}/{base_node_id}.yaml"
+    proposal_path = f"{session_path}/{PROPOSALS_DIR}/{base_node_id}.md"
+
+    lines = [
+        "# Explorer Input",
+        "",
+        "## Exploration Mandate",
+        mandate,
+        "",
+        "## Baseline Node",
+        f"- Metadata: {node_yaml_path}",
+        f"- Proposal: {proposal_path}",
+    ]
+
+    lines.extend(_subgraph_context_lines(session_path, base_node_id))
+
+    lines.extend(["", "## Reference Files"])
+    if ref_files:
+        lines.append(_format_reference_files(ref_files))
+    else:
+        lines.append("No reference files.")
+
+    # The session's active_dimensions list only ever grows and is shared by
+    # every branch. Offer only the dimension keys the baseline still carries,
+    # so a key pruned from (or never on) this lineage is not handed back to the
+    # explorer to re-add. Entries that are not dimension-shaped pass through.
+    dims = extract_dimensions(node_data)
+    baseline_active = [
+        d for d in active_dimensions
+        if not is_dimension_field(d) or d in dims
+    ]
+    lines.extend([
+        "",
+        "## Active Dimensions",
+        ", ".join(baseline_active) if baseline_active else "(none)",
+    ])
+
+    # Dimension keys for section markers
+    if dims:
+        lines.extend(["", "## Dimension Keys",
+                      "Use these dimension keys in section markers:"])
+        for k in sorted(dims.keys()):
+            lines.append(f"- {k}")
+
+    if target_sections:
+        try:
+            proposal_text = read_proposal(session_path, base_node_id)
+        except FileNotFoundError:
+            proposal_text = None
+        if proposal_text:
+            parsed = parse_sections(proposal_text)
+            targeted = [s for s in parsed.sections if s.name in target_sections]
+            if targeted:
+                lines.extend(["", "## Targeted Section Content",
+                             "Focus exploration on these sections from the baseline:"])
+                for s in targeted:
+                    dim_str = f" [dimensions: {', '.join(s.dimensions)}]" if s.dimensions else ""
+                    lines.extend(["", f"### Section: {s.name}{dim_str}", s.content])
+
+    lines.extend([
+        "",
+        "## Assigned Node ID",
+        assigned_node_id,
+        "",
+        "Use this exact value as the `node_id` field of your output YAML.",
+        "Do not invent a different id or modify it in any way.",
+    ])
+
+    return "\n".join(lines) + "\n"
+
+
+def _assemble_input_comparator(
+    session_path: Path,
+    node_ids: list[str],
+    dimensions: list[str],
+    target_sections: list[str] | None = None,
+) -> str:
+    """Assemble comparator _input.md with node file paths and dimension list."""
+    lines = [
+        "# Comparator Input",
+        "",
+        "## Comparison Request",
+        f"Nodes: {', '.join(node_ids)}",
+        f"Dimensions: {', '.join(dimensions)}",
+        "",
+        "## Node Files",
+    ]
+    for nid in node_ids:
+        lines.append(f"- {session_path}/{NODES_DIR}/{nid}.yaml")
+
+    if node_ids:
+        lines.extend(_subgraph_context_lines(session_path, node_ids[0]))
+
+    if target_sections:
+        lines.extend(["", "## Section Focus",
+                      "Compare only content within these sections across nodes:"])
+        for name in target_sections:
+            lines.append(f"- {name}")
+
+    return "\n".join(lines) + "\n"
+
+
+def _assemble_input_synthesizer(
+    session_path: Path,
+    parent_node_ids: list[str],
+    merge_rules: str,
+    assigned_node_id: str,
+) -> str:
+    """Assemble synthesizer _input.md with source node paths and merge rules."""
+    lines = [
+        "# Synthesizer Input",
+        "",
+        "## Merge Rules",
+        merge_rules,
+        "",
+        "## Source Nodes",
+    ]
+
+    all_refs: list[str] = []
+    seen_refs: set[str] = set()
+    all_dims: dict[str, object] = {}
+
+    for nid in parent_node_ids:
+        node_data = read_node(session_path, nid)
+        lines.extend([
+            f"### {nid}",
+            f"- Metadata: {session_path}/{NODES_DIR}/{nid}.yaml",
+            f"- Proposal: {session_path}/{PROPOSALS_DIR}/{nid}.md",
+            "",
+        ])
+        for ref in node_data.get("reference_files", []) or []:
+            if ref not in seen_refs:
+                seen_refs.add(ref)
+                all_refs.append(ref)
+        for dk, dv in extract_dimensions(node_data).items():
+            if dk not in all_dims:
+                all_dims[dk] = dv
+
+    if parent_node_ids:
+        lines.extend(_subgraph_context_lines(session_path, parent_node_ids[0]))
+
+    lines.append("## Reference Files (merged from all source nodes, deduplicated)")
+    if all_refs:
+        lines.append(_format_reference_files(all_refs))
+    else:
+        lines.append("No reference files.")
+
+    if all_dims:
+        lines.extend(["", "## Dimension Keys",
+                      "Use these dimension keys in section markers:"])
+        for k in sorted(all_dims.keys()):
+            lines.append(f"- {k}")
+
+    lines.extend([
+        "",
+        "## Assigned Node ID",
+        assigned_node_id,
+        "",
+        "Use this exact value as the `node_id` field of your output YAML.",
+        "Do not invent a different id or modify it in any way.",
+    ])
+
+    return "\n".join(lines) + "\n"
+
+
+def _module_node_id_lines(module_node_ids: dict[str, str]) -> list[str]:
+    lines = ["", "## Assigned Module Node IDs"]
+    for module, node_id in module_node_ids.items():
+        lines.append(f"- {module}: {node_id}")
+    lines.extend([
+        "",
+        "Use these exact values as each module root's `node_id`.",
+        "Do not invent different ids or modify them in any way.",
+    ])
+    return lines
+
+
+def _module_infer_directive_lines() -> list[str]:
+    """Infer-mode directive for when no module names were supplied (t929_2).
+
+    Replaces the ``## Modules`` + ``## Assigned Module Node IDs`` sections: the
+    agent proposes the module set itself and omits ``node_id`` (the orchestrator
+    assigns IDs after the names come back — see
+    ``assign_inferred_module_node_ids``).
+    """
+    return [
+        "",
+        "## Decomposition Mode: infer",
+        "",
+        "No module names were supplied. Identify the module set yourself from "
+        "the source proposal's `<!-- section: -->` markers, its `component_*` "
+        "dimensions, and the `## Decomposition Plan` below. Choose a concise, "
+        "distinct name for each module and emit it as that block's "
+        "`MODULE_NAME`.",
+        "",
+        "Do NOT include a `node_id` in any NODE_YAML block — the orchestrator "
+        "assigns each module's node id after you propose the names.",
+    ]
+
+
+_STEER_PREAMBLE = (
+    "A previous decomposition was already produced from the inputs above "
+    "(including the Decomposition Plan, if any). The operator reviewed that "
+    "attempt and is requesting the revisions below.\n\n"
+    "Composition rule: the Decomposition Plan above still applies, EXCEPT where "
+    "these steering instructions contradict it. On any conflict, the steering "
+    "instructions WIN. Treat this as a correction of the previous attempt, not a "
+    "fresh unrelated request. Where multiple revisions are listed, a later "
+    "revision overrides an earlier one."
+)
+
+
+def _steer_section_lines(steer: list[str] | None) -> list[str]:
+    """Render the ``## Steering`` override section for a re-run.
+
+    ``steer`` is the ordered list of operator revision notes accumulated across
+    re-runs (Revision 1, 2, …). Returns ``[]`` when there is nothing to steer,
+    so the assembled input is byte-identical to a first run. The composition
+    rule (Decomposition Plan applies except where Steering contradicts it; on
+    conflict Steering wins; later revisions override earlier ones) is stated
+    once here and mirrored in ``templates/module_decomposer.md``.
+    """
+    revisions = [r for r in (steer or []) if r and r.strip()]
+    if not revisions:
+        return []
+    lines = [
+        "",
+        "## Steering (latest revision OVERRIDES the Decomposition Plan above)",
+        "",
+        _STEER_PREAMBLE,
+    ]
+    for i, rev in enumerate(revisions, start=1):
+        lines.extend(["", f"### Revision {i}", rev.strip()])
+    return lines
+
+
+def _assemble_input_module_decomposer(
+    session_path: Path,
+    source_node_id: str,
+    modules: list[str],
+    module_node_ids: dict[str, str],
+    from_sections: bool,
+    link_to_task: bool,
+    instructions: str,
+    steer: list[str] | None = None,
+) -> str:
+    source_data = read_node(session_path, source_node_id)
+    source_module = _node_module(session_path, source_node_id)
+    ref_files = source_data.get("reference_files", []) or []
+    dims = extract_dimensions(source_data)
+
+    lines = [
+        "# Module Decomposer Input",
+        "",
+        "## Source Subgraph",
+        source_module,
+        "",
+        "## Source Node",
+        source_node_id,
+        "",
+        "## Source Node Files",
+        f"- Metadata: {session_path}/{NODES_DIR}/{source_node_id}.yaml",
+        f"- Proposal: {session_path}/{PROPOSALS_DIR}/{source_node_id}.md",
+    ]
+    if modules:
+        lines.extend(["", "## Modules", *[f"- {module}" for module in modules]])
+    lines.extend([
+        "",
+        "## Options",
+        f"from_sections: {str(from_sections).lower()}",
+        f"link_to_task: {str(link_to_task).lower()}",
+    ])
+    # Names given → tell the agent the exact assigned IDs; no names → infer mode,
+    # the agent proposes the module set and IDs are assigned later (t929_2).
+    if modules:
+        lines.extend(_module_node_id_lines(module_node_ids))
+    else:
+        lines.extend(_module_infer_directive_lines())
+    if dims:
+        lines.extend(["", "## Dimension Keys"])
+        lines.extend(f"- {k}" for k in sorted(dims.keys()))
+    if ref_files:
+        lines.extend(["", "## Reference Files", _format_reference_files(ref_files)])
+    if instructions:
+        lines.extend(["", "## Decomposition Plan", instructions])
+    lines.extend(_steer_section_lines(steer))
+    return "\n".join(lines) + "\n"
+
+
+def _assemble_input_module_merger(
+    session_path: Path,
+    source_module: str,
+    destination_module: str,
+    source_head: str,
+    destination_head: str,
+    merge_rules: str,
+    assigned_node_id: str,
+) -> str:
+    return "\n".join([
+        "# Module Merger Input",
+        "",
+        "## Source Subgraph",
+        source_module,
+        "",
+        "## Destination Subgraph",
+        destination_module,
+        "",
+        "## Source HEAD",
+        source_head,
+        "",
+        "## Source Node Files",
+        f"- Metadata: {session_path}/{NODES_DIR}/{source_head}.yaml",
+        f"- Proposal: {session_path}/{PROPOSALS_DIR}/{source_head}.md",
+        "",
+        "## Destination HEAD",
+        destination_head,
+        "",
+        "## Destination Node Files",
+        f"- Metadata: {session_path}/{NODES_DIR}/{destination_head}.yaml",
+        f"- Proposal: {session_path}/{PROPOSALS_DIR}/{destination_head}.md",
+        "",
+        "## Assigned Node ID",
+        assigned_node_id,
+        "",
+        "## Merge-Up Rules",
+        merge_rules,
+    ]) + "\n"
+
+
+def _assemble_input_initializer(
+    session_path: Path,
+    imported_path: str,
+    task_file: str,
+) -> str:
+    """Assemble initializer _input.md with imported proposal + task file paths.
+
+    The initializer has no baseline node and no active dimensions —
+    n000_init is the target, not a derivative.
+    """
+    lines = [
+        "# Initializer Input",
+        "",
+        "## Imported Proposal",
+        f"- Path: {imported_path}",
+        "Read this file. Do not modify it.",
+        "",
+        "## Originating Task",
+        f"- Path: {task_file}",
+        "",
+        "## Mandate",
+        "Reformat the imported proposal into the brainstorm node format:",
+        "a flat-YAML node metadata block and a sectioned proposal markdown",
+        "body. Preserve all substantive content and every assumption from",
+        "the source. Emit dimension fields (requirements_* / assumption_* /",
+        "component_* / tradeoff_*) only where justified by the text.",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# Registration functions
+# ---------------------------------------------------------------------------
+
+
+def register_explorer(
+    session_dir: Path,
+    crew_id: str,
+    mandate: str,
+    base_node_id: str,
+    group_name: str,
+    agent_suffix: str = "",
+    launch_mode: str = DEFAULT_LAUNCH_MODE,
+    target_sections: list[str] | None = None,
+) -> str:
+    """Register an Explorer agent in the brainstorm crew.
+
+    Args:
+        session_dir: Path to crew worktree.
+        crew_id: Crew identifier (e.g., "brainstorm-419").
+        mandate: Exploration mandate text.
+        base_node_id: Node ID to explore from (baseline).
+        group_name: Operation group name (e.g., "explore_001").
+        agent_suffix: Optional letter suffix for parallel explorers (e.g., "a").
+        launch_mode: Launch mode for the agent; one of VALID_LAUNCH_MODES
+            (defaults to DEFAULT_LAUNCH_MODE).
+
+    Returns:
+        Agent name (e.g., "explorer_001a").
+    """
+    seq = _group_seq(group_name)
+    agent_name = f"explorer_{seq}{agent_suffix}"
+
+    gs = _read_graph_state(session_dir)
+    active_dimensions = gs.get("active_dimensions", []) or []
+
+    node_num = next_node_id(session_dir)
+    assigned_node_id = f"n{node_num:03d}_{agent_name}"
+
+    input_content = _assemble_input_explorer(
+        session_dir, base_node_id, mandate, active_dimensions,
+        assigned_node_id,
+        target_sections=target_sections,
+    )
+
+    work2do_path = TEMPLATE_DIR / "explorer.md"
+    _run_addwork(
+        crew_id, agent_name, "explorer", group_name, work2do_path,
+        launch_mode=launch_mode,
+    )
+    _write_agent_input(session_dir, agent_name, input_content)
+
+    return agent_name
+
+
+def register_comparator(
+    session_dir: Path,
+    crew_id: str,
+    node_ids: list[str],
+    dimensions: list[str],
+    group_name: str,
+    launch_mode: str = DEFAULT_LAUNCH_MODE,
+    target_sections: list[str] | None = None,
+) -> str:
+    """Register a Comparator agent in the brainstorm crew.
+
+    Args:
+        session_dir: Path to crew worktree.
+        crew_id: Crew identifier.
+        node_ids: List of node IDs to compare.
+        dimensions: List of dimension keys to compare across nodes.
+        group_name: Operation group name (e.g., "compare_001").
+        launch_mode: Launch mode for the agent; one of VALID_LAUNCH_MODES
+            (defaults to DEFAULT_LAUNCH_MODE).
+
+    Returns:
+        Agent name (e.g., "comparator_001").
+    """
+    seq = _group_seq(group_name)
+    agent_name = f"comparator_{seq}"
+
+    input_content = _assemble_input_comparator(
+        session_dir, node_ids, dimensions,
+        target_sections=target_sections,
+    )
+
+    work2do_path = TEMPLATE_DIR / "comparator.md"
+    _run_addwork(
+        crew_id, agent_name, "comparator", group_name, work2do_path,
+        launch_mode=launch_mode,
+    )
+    _write_agent_input(session_dir, agent_name, input_content)
+
+    return agent_name
+
+
+def register_synthesizer(
+    session_dir: Path,
+    crew_id: str,
+    parent_node_ids: list[str],
+    merge_rules: str,
+    group_name: str,
+    launch_mode: str = DEFAULT_LAUNCH_MODE,
+) -> str:
+    """Register a Synthesizer agent in the brainstorm crew.
+
+    Args:
+        session_dir: Path to crew worktree.
+        crew_id: Crew identifier.
+        parent_node_ids: List of source node IDs to merge.
+        merge_rules: User's merge instructions.
+        group_name: Operation group name (e.g., "synthesize_001").
+        launch_mode: Launch mode for the agent; one of VALID_LAUNCH_MODES
+            (defaults to DEFAULT_LAUNCH_MODE).
+
+    Returns:
+        Agent name (e.g., "synthesizer_001").
+    """
+    seq = _group_seq(group_name)
+    agent_name = f"synthesizer_{seq}"
+
+    node_num = next_node_id(session_dir)
+    assigned_node_id = f"n{node_num:03d}_{agent_name}"
+
+    input_content = _assemble_input_synthesizer(
+        session_dir, parent_node_ids, merge_rules, assigned_node_id,
+    )
+
+    work2do_path = TEMPLATE_DIR / "synthesizer.md"
+    _run_addwork(
+        crew_id, agent_name, "synthesizer", group_name, work2do_path,
+        launch_mode=launch_mode,
+    )
+    _write_agent_input(session_dir, agent_name, input_content)
+
+    return agent_name
+
+
+def register_module_decomposer(
+    session_dir: Path,
+    crew_id: str,
+    source_node_id: str,
+    modules: list[str],
+    group_name: str,
+    from_sections: bool = False,
+    link_to_task: bool = False,
+    instructions: str = "",
+    steer: list[str] | None = None,
+    launch_mode: str = DEFAULT_LAUNCH_MODE,
+) -> str:
+    """Register a Module Decomposer agent that creates one root per module.
+
+    ``steer`` is the ordered list of operator revision notes from the
+    review-gate Re-run loop (t929_1). When non-empty, the assembled input gains
+    a ``## Steering`` section that overrides the original Decomposition Plan on
+    conflict; see ``_steer_section_lines``.
+    """
+    seq = _group_seq(group_name)
+    agent_name = f"module_decomposer_{seq}"
+
+    module_node_ids: dict[str, str] = {}
+    for module in modules:
+        node_num = next_node_id(session_dir)
+        safe_module = "".join(ch if ch.isalnum() else "_" for ch in module).strip("_")
+        module_node_ids[module] = f"n{node_num:03d}_{agent_name}_{safe_module}"
+
+    input_content = _assemble_input_module_decomposer(
+        session_dir,
+        source_node_id,
+        modules,
+        module_node_ids,
+        from_sections,
+        link_to_task,
+        instructions,
+        steer,
+    )
+
+    work2do_path = TEMPLATE_DIR / "module_decomposer.md"
+    _run_addwork(
+        crew_id, agent_name, "module_decomposer", group_name, work2do_path,
+        launch_mode=launch_mode,
+    )
+    _write_agent_input(session_dir, agent_name, input_content)
+
+    return agent_name
+
+
+def register_module_merger(
+    session_dir: Path,
+    crew_id: str,
+    source_module: str,
+    destination_module: str,
+    merge_rules: str,
+    group_name: str,
+    launch_mode: str = DEFAULT_LAUNCH_MODE,
+) -> str:
+    """Register a Module Merger agent after enforcing the up-only guard."""
+    if not is_ancestor_subgraph(session_dir, source_module, destination_module):
+        raise ValueError(
+            f"module_merge requires an ancestor destination; "
+            f"{destination_module!r} is not above {source_module!r}"
+        )
+
+    source_head = get_head(session_dir, module=source_module)
+    destination_head = get_head(session_dir, module=destination_module)
+    if not source_head or not destination_head:
+        raise ValueError("module_merge requires source and destination HEADs")
+
+    seq = _group_seq(group_name)
+    agent_name = f"module_merger_{seq}"
+    node_num = next_node_id(session_dir)
+    assigned_node_id = f"n{node_num:03d}_{agent_name}"
+
+    input_content = _assemble_input_module_merger(
+        session_dir,
+        source_module,
+        destination_module,
+        source_head,
+        destination_head,
+        merge_rules,
+        assigned_node_id,
+    )
+
+    work2do_path = TEMPLATE_DIR / "module_merger.md"
+    _run_addwork(
+        crew_id, agent_name, "module_merger", group_name, work2do_path,
+        launch_mode=launch_mode,
+    )
+    _write_agent_input(session_dir, agent_name, input_content)
+
+    return agent_name
+
+
+# Soft ceiling on the scoped-diff bundle so a long-lived linked task cannot
+# produce a multi-megabyte agent input. The horizon (`last_synced_at`) usually
+# keeps this small; the cap is a backstop for the first sync of a busy task.
+_SYNC_DIFF_MAX_CHARS = 60000
+
+
+def _resolve_linked_plan_path(task_id: str) -> Path | None:
+    """Resolve the live (or archived) plan file for a linked module task.
+
+    ``task_id`` may be a child id (``756_8`` → ``aiplans/p756/p756_8_*.md``) or a
+    parent id (``905`` → ``aiplans/p905_*.md``). Live location is preferred over
+    the archived copy. Returns ``None`` if no plan file exists.
+    """
+    if "_" in task_id:
+        parent = task_id.split("_", 1)[0]
+        dirs = [Path("aiplans") / f"p{parent}", Path("aiplans/archived") / f"p{parent}"]
+    else:
+        dirs = [Path("aiplans"), Path("aiplans/archived")]
+    pattern = f"p{task_id}_*.md"
+    for d in dirs:
+        if d.is_dir():
+            matches = sorted(d.glob(pattern))
+            if matches:
+                return matches[0]
+    return None
+
+
+def _sync_touched_files(task_id: str, since: str | None) -> list[str]:
+    """Files touched by the linked task's commits since the last sync horizon.
+
+    Uses the ``(t<id>)`` commit-suffix convention (see
+    ``aitask_issue_update.sh``); the parentheses delimit so ``(t905)`` does not
+    match ``(t905_1)``. Restricted to ``--since`` when a horizon is set. Only
+    still-existing paths are returned. Runs from the repo root (the brainstorm
+    process cwd), matching ``_create_linked_module_task``.
+    """
+    cmd = ["git", "log", f"--grep=(t{task_id})", "--name-only", "--pretty=format:"]
+    if since:
+        cmd += ["--since", since]
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    if res.returncode != 0:
+        return []
+    seen: list[str] = []
+    for line in res.stdout.splitlines():
+        f = line.strip()
+        if f and f not in seen and Path(f).exists():
+            seen.append(f)
+    return sorted(seen)
+
+
+def _sync_scoped_diff(task_id: str, since: str | None, files: list[str]) -> str:
+    """Combined patch of the linked task's commits restricted to ``files``.
+
+    Truncated to ``_SYNC_DIFF_MAX_CHARS`` with an explicit marker so a busy
+    task's first sync cannot produce a pathological agent input.
+    """
+    if not files:
+        return ""
+    cmd = ["git", "log", f"--grep=(t{task_id})", "-p"]
+    if since:
+        cmd += ["--since", since]
+    cmd += ["--", *files]
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    if res.returncode != 0:
+        return ""
+    out = res.stdout
+    if len(out) > _SYNC_DIFF_MAX_CHARS:
+        out = (
+            out[:_SYNC_DIFF_MAX_CHARS]
+            + "\n\n[... scoped diff truncated at "
+            + f"{_SYNC_DIFF_MAX_CHARS} chars ...]\n"
+        )
+    return out
+
+
+def _sync_explain_context(files: list[str], max_plans: int) -> str:
+    """Shell out to the canonical explain-context scanner (REUSE — never fork).
+
+    Returns its stdout, or a short notice if the helper is unavailable so a sync
+    can still proceed with the plan + diff streams.
+    """
+    if not files:
+        return ""
+    cmd = [
+        "./.aitask-scripts/aitask_explain_context.sh",
+        "--max-plans",
+        str(max_plans),
+        *files,
+    ]
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    if res.returncode != 0:
+        return f"(explain-context unavailable: {res.stderr.strip()})"
+    return res.stdout
+
+
+def _assemble_input_module_syncer(
+    session_path: Path,
+    module: str,
+    source_head: str,
+    assigned_node_id: str,
+    linked_task_id: str,
+    last_synced_display: str,
+    plan_text: str,
+    diff_text: str,
+    explain_text: str,
+    instructions: str,
+) -> str:
+    lines = [
+        "# Module Syncer Input",
+        "",
+        "## Source Subgraph",
+        module,
+        "",
+        "## Source HEAD",
+        source_head,
+        "",
+        "## Source Node Files",
+        f"- Metadata: {session_path}/{NODES_DIR}/{source_head}.yaml",
+        f"- Proposal: {session_path}/{PROPOSALS_DIR}/{source_head}.md",
+        "",
+        "## Assigned Node ID",
+        assigned_node_id,
+        "",
+        "## Linked Task",
+        f"- task: t{linked_task_id}",
+        f"- last_synced_at: {last_synced_display}",
+        "",
+        "## Sync Sources",
+        "",
+        "### Linked Task Plan (emphasize Final Implementation Notes / Post-Review Changes)",
+        plan_text.strip() or "(no plan file found for the linked task)",
+        "",
+        "### Scoped Git Diff (linked task commits since last sync)",
+        "```diff",
+        diff_text.strip() or "(no scoped changes found since last sync)",
+        "```",
+        "",
+        "### Historical Context (aitask_explain_context)",
+        explain_text.strip() or "(no explain-context available)",
+    ]
+    if instructions:
+        lines.extend(["", "## Sync Instructions", instructions])
+    return "\n".join(lines) + "\n"
+
+
+def register_module_syncer(
+    session_dir: Path,
+    crew_id: str,
+    module: str,
+    group_name: str,
+    max_plans: int = 5,
+    instructions: str = "",
+    launch_mode: str = DEFAULT_LAUNCH_MODE,
+) -> str:
+    """Register a Module Syncer agent that reconciles a linked module's design.
+
+    Refuses unless the module has a ``module_tasks`` entry (a linked aitask) —
+    free-form context belongs to ``patch``. Bundles three read-only streams for
+    the agent: the linked task's plan, a scoped git diff of its commits, and the
+    explain-context historical scan. Read-only on the aitask side.
+    """
+    gs = _read_graph_state(session_dir)
+    tasks = gs.get("module_tasks")
+    tasks = tasks if isinstance(tasks, dict) else {}
+    linked_task_id = tasks.get(module)
+    if not linked_task_id:
+        raise ValueError(
+            f"module_sync requires a linked task; module {module!r} has no "
+            f"module_tasks entry"
+        )
+    linked_task_id = str(linked_task_id)
+
+    source_head = get_head(session_dir, module=module)
+    if not source_head:
+        raise ValueError(f"module_sync requires a HEAD for subgraph {module!r}")
+
+    last_synced = gs.get("last_synced_at")
+    last_synced = last_synced if isinstance(last_synced, dict) else {}
+    since = last_synced.get(module)
+    since = str(since) if since else None
+
+    plan_path = _resolve_linked_plan_path(linked_task_id)
+    plan_text = (
+        plan_path.read_text(encoding="utf-8")
+        if plan_path and plan_path.is_file() else ""
+    )
+    touched = _sync_touched_files(linked_task_id, since)
+    diff_text = _sync_scoped_diff(linked_task_id, since, touched)
+    explain_text = _sync_explain_context(touched, max_plans)
+
+    seq = _group_seq(group_name)
+    agent_name = f"module_syncer_{seq}"
+    node_num = next_node_id(session_dir)
+    assigned_node_id = f"n{node_num:03d}_{agent_name}"
+
+    input_content = _assemble_input_module_syncer(
+        session_dir,
+        module,
+        source_head,
+        assigned_node_id,
+        linked_task_id,
+        since or "(never)",
+        plan_text,
+        diff_text,
+        explain_text,
+        instructions,
+    )
+
+    work2do_path = TEMPLATE_DIR / "module_syncer.md"
+    _run_addwork(
+        crew_id, agent_name, "module_syncer", group_name, work2do_path,
+        launch_mode=launch_mode,
+    )
+    _write_agent_input(session_dir, agent_name, input_content)
+
+    return agent_name
+
+
+def register_initializer(
+    session_dir: Path,
+    crew_id: str,
+    imported_path: str,
+    task_file: str,
+    group_name: str = "bootstrap",
+    agent_suffix: str = "",
+    launch_mode: str = DEFAULT_LAUNCH_MODE,
+) -> str:
+    """Register an Initializer agent in the brainstorm crew.
+
+    The initializer reformats an imported markdown proposal into the
+    brainstorm node format and overwrites n000_init. There is exactly
+    one initializer per session, named ``initializer_bootstrap``
+    (no sequence suffix).
+
+    Args:
+        session_dir: Path to crew worktree.
+        crew_id: Crew identifier (e.g., "brainstorm-573").
+        imported_path: Path to the imported markdown proposal.
+        task_file: Path to the originating aitask file.
+        group_name: Operation group name (defaults to "bootstrap").
+        agent_suffix: Optional suffix for uncommon re-runs (typically "").
+        launch_mode: Launch mode for the agent; one of VALID_LAUNCH_MODES
+            (defaults to DEFAULT_LAUNCH_MODE).
+
+    Returns:
+        Agent name ("initializer_bootstrap" by default).
+    """
+    agent_name = f"initializer_bootstrap{agent_suffix}"
+
+    input_content = _assemble_input_initializer(
+        session_dir, imported_path, task_file,
+    )
+
+    work2do_path = TEMPLATE_DIR / "initializer.md"
+    _run_addwork(
+        crew_id, agent_name, "initializer", group_name, work2do_path,
+        launch_mode=launch_mode,
+    )
+    _write_agent_input(session_dir, agent_name, input_content)
+
+    return agent_name

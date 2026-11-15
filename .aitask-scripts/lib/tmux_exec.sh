@@ -1,0 +1,265 @@
+#!/usr/bin/env bash
+# tmux_exec.sh - Shell tmux command gateway (mirror of lib/tmux_exec.py).
+#
+# The single place shell code routes a `tmux` invocation through, so the
+# socket flag and exact-match target formatting live in ONE source. Mirrors
+# the Python gateway's contract (t952_1, t953):
+#   * AITASKS_TMUX_SOCKET selects the socket — unset => `-L ait` (the
+#     dedicated ait socket); non-empty => `-L <value>` (`default` is the
+#     explicit opt-out: tmux's default socket is literally named `default`);
+#     set-but-empty => no flag (legacy escape hatch, follows $TMUX — used by
+#     the test isolation harness).
+#   * targets are exact-match `=session` / `=session:window`.
+#   * every tmux client passes `-u` (AIT_TMUX_CLIENT_FLAGS, t2236): a client
+#     with no UTF-8 locale rewrites every non-printable / non-ASCII byte of its
+#     output to `_` — the TAB separator of a -F format, `ó` in a path. Shell
+#     callers get no locale coercion, so they hit it whenever the locale is
+#     unset. Bytes pass through the shell undecoded; nothing else is needed.
+#   * every tmux client carries ait_spawn_path_normalize of the caller's PATH
+#     (lib/spawn_path.sh): tmux copies the issuing client's PATH into a new
+#     pane, so this is what makes a pane's PATH independent of its spawner
+#     (t1689). Unchanged — no PATH prefix at all — when normalization moves
+#     nothing (no mise entry, or ~/.local/bin already behind every one).
+#
+# Usage (sourced):
+#     source "$SCRIPT_DIR/lib/tmux_exec.sh"
+#     ait_tmux has-session -t "$(ait_tmux_session_target "$s")"
+#     # exec / compound-command sites cannot use the function form (a shell
+#     # function cannot be exec'd, and the wrapper must not mangle the `\;`
+#     # separator) — use the client-args emitter instead (client flags + socket
+#     # flag; never the bare socket emitter, which omits `-u`):
+#     exec tmux $(ait_tmux_client_args) attach -t "$t" \; select-window -t "$w"
+#     # A -F format's TAB separator must be a REAL byte: tmux keeps a
+#     # single-quoted `\t` as a literal backslash-t.
+#     ait_tmux list-sessions -F "#{session_name}"$'\t'"#{session_id}"
+#
+# Depends on terminal_compat.sh for die/warn/info (sourced below, one-way).
+# terminal_compat.sh in turn pulls THIS file in lazily inside
+# ait_tmux_new_session_persistent (guarded), so there is no file-scope cycle.
+
+# Guard against double-sourcing.
+if [[ -n "${_AIT_TMUX_EXEC_LOADED:-}" ]]; then
+    # shellcheck disable=SC2317  # `return` is reachable when sourced.
+    return 0 2>/dev/null || true
+fi
+_AIT_TMUX_EXEC_LOADED=1
+
+_TMUX_EXEC_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Pull in die/warn/info. terminal_compat.sh is a file-scope leaf (it never
+# sources us back at file scope), so this one-way edge has no cycle.
+# shellcheck source=terminal_compat.sh disable=SC1091
+source "$_TMUX_EXEC_LIB_DIR/terminal_compat.sh"
+# The pane-PATH normalizer (side-effect-free leaf). Unguarded on purpose: a
+# missing lib must fail loudly, never silently skip normalization.
+# shellcheck source=spawn_path.sh disable=SC1091
+source "$(dirname "${BASH_SOURCE[0]}")/spawn_path.sh"
+
+# The dedicated socket name every ait-managed tmux session lives on when the
+# env var is unset (t953). Mirrored verbatim in lib/tmux_exec.py.
+AIT_DEDICATED_SOCKET="ait"
+
+# Client flags every tmux invocation carries, ahead of the socket flag (t2236).
+# Mirrored verbatim in lib/tmux_exec.py (TMUX_CLIENT_FLAGS). `-u` is a CLIENT
+# flag: unlike forcing LC_CTYPE it never leaks into the panes tmux creates, and
+# it needs no installed C.UTF-8 locale (macOS has none). An array so a test can
+# blank it (`AIT_TMUX_CLIENT_FLAGS=()`) for a pre-fix control.
+AIT_TMUX_CLIENT_FLAGS=(-u)
+
+# ait_tmux_socket_args
+# Emit the socket flag for every tmux invocation, from one source (mirror of
+# tmux_exec.py::tmux_socket_args). One argument per line (t953 semantics):
+#   * unset AITASKS_TMUX_SOCKET => `-L` then `ait` (the dedicated default);
+#   * non-empty => `-L` then the value (`default` = explicit opt-out to the
+#     user's default server);
+#   * set-but-empty/whitespace => nothing (legacy escape hatch, follows $TMUX
+#     — used by the test isolation harness).
+# `-L` (socket name) not `-S` (socket path) so the value composes with
+# tmux's standard tmpdir resolution and the test isolation harness.
+ait_tmux_socket_args() {
+    if [[ -z "${AITASKS_TMUX_SOCKET+x}" ]]; then
+        printf '%s\n' "-L" "$AIT_DEDICATED_SOCKET"
+        return 0
+    fi
+    local sock="$AITASKS_TMUX_SOCKET"
+    # Trim surrounding whitespace to match the Python .strip().
+    sock="${sock#"${sock%%[![:space:]]*}"}"
+    sock="${sock%"${sock##*[![:space:]]}"}"
+    [[ -n "$sock" ]] && printf '%s\n' "-L" "$sock"
+    return 0
+}
+
+# ait_tmux_client_args
+# Emit the client flags (`-u`), then the socket flag — one argument per line —
+# for `exec` / compound `\;` sites that cannot use the ait_tmux function form.
+# The *_socket_args emitters stay pure (parity-pinned with Python's
+# tmux_socket_args); this is the one an exec site uses.
+ait_tmux_client_args() {
+    # Guarded: `printf '%s\n'` with no operands still prints one empty line,
+    # which a reader would take for an empty argument.
+    if (( ${#AIT_TMUX_CLIENT_FLAGS[@]} )); then
+        printf '%s\n' "${AIT_TMUX_CLIENT_FLAGS[@]}"
+    fi
+    ait_tmux_socket_args
+}
+
+# ait_tmux_socket_name
+# Echo the resolved socket *name* the gateway targets (`ait`, a custom value,
+# or empty when the legacy no-flag escape hatch is active). Single source of
+# truth for callers that need to compare against the attached server's socket
+# (e.g. the `ait ide` socket-identity check, t953).
+ait_tmux_socket_name() {
+    if [[ -z "${AITASKS_TMUX_SOCKET+x}" ]]; then
+        printf '%s' "$AIT_DEDICATED_SOCKET"
+        return 0
+    fi
+    local sock="$AITASKS_TMUX_SOCKET"
+    sock="${sock#"${sock%%[![:space:]]*}"}"
+    sock="${sock%"${sock##*[![:space:]]}"}"
+    printf '%s' "$sock"
+}
+
+# ait_tmux_legacy <args...>
+# Run `tmux` against the user's LEGACY default server (`-L default`),
+# bypassing the gateway socket. Migration-window probes only (t953): detect a
+# pre-dedicated-socket session so the user is not stranded. Lives here so the
+# raw-tmux lint guard (tests/test_no_raw_tmux.sh) keeps a single allowlisted
+# home for raw spawns.
+ait_tmux_legacy() {
+    command tmux ${AIT_TMUX_CLIENT_FLAGS[@]+"${AIT_TMUX_CLIENT_FLAGS[@]}"} -L default "$@"
+}
+
+# ait_tmux_legacy_socket_args
+# Emitter form of ait_tmux_legacy for `exec tmux ... attach \; ...` sites
+# (a shell function cannot be exec'd). One argument per line. Socket flag only:
+# the exec site prepends "${AIT_TMUX_CLIENT_FLAGS[@]}" itself.
+ait_tmux_legacy_socket_args() {
+    printf '%s\n' "-L" "default"
+}
+
+# ait_tmux <args...>
+# Function form: run `tmux` with the client flags (`-u`) and the socket flag
+# prepended. For captured /
+# plain call sites. Returns tmux's exit code. (exec / compound sites use the
+# ait_tmux_socket_args emitter instead — see header.) The tmux client runs with
+# the normalized spawn PATH when that differs from ours — but it is still the
+# tmux binary OUR PATH resolves (ait_spawn_exe), so the reorder can never swap
+# in a different tmux.
+ait_tmux() {
+    local -a _argv=(tmux ${AIT_TMUX_CLIENT_FLAGS[@]+"${AIT_TMUX_CLIENT_FLAGS[@]}"})
+    local _line
+    while IFS= read -r _line; do _argv+=("$_line"); done < <(ait_tmux_socket_args)
+    _argv+=("$@")
+    ait_spawn_path_normalize "${PATH-}"
+    if [[ "$AIT_SPAWN_PATH" == "${PATH-}" ]]; then
+        command "${_argv[@]}"
+    else
+        ait_spawn_exe tmux "${PATH-}" "$AIT_SPAWN_PATH"
+        _argv[0]="$AIT_SPAWN_EXE"
+        PATH="$AIT_SPAWN_PATH" command "${_argv[@]}"
+    fi
+}
+
+# ait_tmux_session_target <session>  -> "=<session>"
+# Exact-match `-t` session target. tmux resolves `-t <name>` as a prefix match
+# by default, so the `=` prefix is mandatory whenever prefix-sharing session
+# names (e.g. `aitasks` vs `aitasks_mob`) can run side by side.
+ait_tmux_session_target() {
+    printf '=%s' "$1"
+}
+
+# ait_tmux_window_target <session> <window>  -> "=<session>:<window>"
+# Only the session part is anchored with `=`. Pass window="" for the
+# trailing-colon `new-window` idiom ("create in this session").
+ait_tmux_window_target() {
+    printf '=%s:%s' "$1" "$2"
+}
+
+# Bound on the parent walk in ait_tmux_pane_for_pid. A process tree deeper than
+# this between a pid and its pane means the pid is not a descendant of any pane,
+# which the helper's non-zero return already says.
+AIT_TMUX_PANE_WALK_MAX=20
+
+# ait_tmux_pane_for_pid <pid>
+# Echo "<pane_id>\t<session>:<window_id>.<pane_id>" for the gateway pane owning
+# <pid>, or return 1.
+#
+# The target string's shape is NOT free choice: it must match how the agent
+# session listing renders a pane, because the adapter joins the two. Measured on
+# this framework's own sessions, a listing row reads `tmux aitasks:@2.%2` for a
+# pane whose tmux `window_index` is 3 and whose `window_id` is `@2` — so the
+# middle field is `#{window_id}` (which already carries its own '@'), never
+# `@#{window_index}`. Using the index would produce a target that looks right and
+# matches nothing.
+#
+# pane_pid FIRST: the framework launches every agent as its pane's own process
+# (lib/agent_launch_utils.py::launch_in_tmux passes the bare CLI command with no
+# wrapper), so a lock anchored by get_session_anchor_pid rung 2 IS a pane_pid and
+# hits directly. The ancestor walk is the fallback for rung 1 — an
+# AIT_AGENT_PID-anchored lock whose PID is a descendant of the pane process.
+#
+# Only the gateway socket is searched. An agent on some other tmux server is
+# invisible here and returns 1; that is the honest boundary, since the framework
+# launches every managed agent on the gateway socket.
+#
+# Callers: aitask_live_endpoint.sh (live note delivery) and aitask_sync.sh (the
+# deferral record's `pane` field and the --require-waiting re-probe).
+ait_tmux_pane_for_pid() {
+    local want="${1:-}" panes ppid hops
+    [[ "$want" =~ ^[0-9]+$ ]] && (( want > 0 )) || return 1
+
+    panes="$(ait_tmux list-panes -a -F \
+        "#{pane_pid}"$'\t'"#{pane_id}"$'\t'"#{session_name}:#{window_id}.#{pane_id}" \
+        2>/dev/null || true)"
+    [[ -n "$panes" ]] || return 1
+
+    hops=0
+    while [[ "$want" =~ ^[0-9]+$ ]] && (( want > 1 && hops <= AIT_TMUX_PANE_WALK_MAX )); do
+        local line
+        line="$(printf '%s\n' "$panes" | awk -F'\t' -v p="$want" '$1 == p { print $2 "\t" $3; exit }')"
+        if [[ -n "$line" ]]; then
+            printf '%s' "$line"
+            return 0
+        fi
+        ppid="$(ps -o ppid= -p "$want" 2>/dev/null | tr -d '[:space:]')"
+        [[ "$ppid" =~ ^[0-9]+$ ]] || return 1
+        want="$ppid"
+        hops=$(( hops + 1 ))
+    done
+    return 1
+}
+
+# ait_tmux_self_pane_pid
+# Echo the PID of the tmux pane THIS process is running in; return 1 when it
+# cannot be established (not in a pane, unreadable pane, foreign server).
+#
+# Why this is worth a helper: the framework launches every agent as the pane's
+# OWN process — lib/agent_launch_utils.py::launch_in_tmux hands new-window /
+# split-window the bare `claude …` / `codex …` / `opencode …` command string,
+# with no wrapper — so a pane's pid IS the agent CLI process. It is therefore
+# the one PID reachable at task-claim time whose lifetime tracks the agent
+# session, which is what makes it usable as the task-lock anchor
+# (lib/pid_anchor.sh::get_session_anchor_pid, t1465).
+#
+# Same-server guard: pane ids (%N) are per-server and collide across servers,
+# so an inherited or stale $TMUX_PANE could name a stranger's pane on another
+# socket. $TMUX is "<socket-path>,<server-pid>,<session-index>" and
+# `#{socket_path}` is the queried server's socket; asking for both the socket
+# and the pid in ONE display-message keeps this to a single round-trip.
+# (aitask_shadow_capture.sh::shadow_self_target applies the same guard for the
+# shadow binding; it keeps its own copy because its return contract is a
+# classification string, not a pid.)
+ait_tmux_self_pane_pid() {
+    local own_pane="${TMUX_PANE:-}" own_sock="${TMUX:-}"
+    [[ -n "$own_pane" ]] || return 1
+    own_sock="${own_sock%%,*}"
+    [[ -n "$own_sock" ]] || return 1
+    local out sock pid
+    out="$(ait_tmux display-message -p -t "$own_pane" \
+        "#{socket_path}"$'\t'"#{pane_pid}" 2>/dev/null || true)"
+    [[ "$out" == *$'\t'* ]] || return 1
+    sock="${out%%$'\t'*}"
+    pid="${out#*$'\t'}"
+    [[ "$sock" == "$own_sock" ]] || return 1
+    [[ "$pid" =~ ^[0-9]+$ ]] && (( pid > 1 )) || return 1
+    printf '%s' "$pid"
+}

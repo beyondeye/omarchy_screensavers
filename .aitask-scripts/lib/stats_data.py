@@ -1,0 +1,1491 @@
+"""Base-layer module: the pure data extraction layer for ait stats.
+
+No rendering, no plotext — just dataclasses, parsers, and `collect_stats()`.
+Consumed by the CLI text/CSV report (`aitask_stats.py`), the stats TUI
+(`stats/stats_app.py` and its panes) and `lib/work_report_gather.py`.
+
+It lived under ``stats/`` for historical reasons only; it sits in ``lib/``
+because every layer above depends on it and it depends on none of them —
+`archive_iter`, `config_utils`, `gate_ledger` and `task_category` are all
+base-layer siblings (t1235, t1544_3).
+``tests/test_no_lib_to_tui_import.sh`` freezes that direction.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import sys
+from collections import Counter, defaultdict
+from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta
+from pathlib import Path
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+
+# Make lib/ importable however this module is loaded (path-loaded by a test, or
+# imported bare with lib/ on sys.path). Every module imported below now lives
+# beside this one — it reaches into no sibling package.
+_LIB_DIR = os.path.dirname(os.path.abspath(__file__))
+if _LIB_DIR not in sys.path:
+    sys.path.insert(0, _LIB_DIR)
+from archive_iter import iter_all_archived_markdown  # noqa: E402
+from config_utils import task_dir as _config_task_dir  # noqa: E402
+
+# Shared gate-ledger parser (t635_8). Content-level primitives only — the active
+# scan must never open a path (it operates on the content it already read), so it
+# stays deterministic under a rebased project_root / TASK_DIR.
+from gate_ledger import (  # noqa: E402
+    archive_status_from_text,
+    derive_gate_runs,
+    has_gate_markers,
+)
+
+# The unified category axis (t1544_2). Safe at module scope: task_category's
+# display half is dependency-free and it imports the retro-classifier lazily
+# inside resolve_category, so this adds no eager dependency here.
+from task_category import has_invalid_followup_kind, resolve_category  # noqa: E402
+
+# Date-correct month / prev_month / week / recent windows over the per-model
+# usagestats / verifiedstats buckets (t2194). `recent_aggregate` is re-exported:
+# `aitask_stats.py` lists it among its public names.
+from model_stats_windows import (  # noqa: E402,F401
+    WINDOW_NAMES as _RESOLVED_WINDOWS,
+    recent_aggregate,
+    resolve_windows,
+)
+
+# Honor the framework-wide TASK_DIR override via the canonical resolver rather
+# than hardcoding "aitasks": a caller that scans one task tree for membership
+# must not silently read a different tree's archive for completion history.
+TASK_DIR = _config_task_dir()
+ARCHIVE_DIR = TASK_DIR / "archived"
+TASK_TYPES_FILE = TASK_DIR / "metadata" / "task_types.txt"
+
+#: Default horizon, in weeks, for the backlog level / net-flow series (t1544_3).
+#: The SINGLE source for it: the CLI's `--backlog-weeks` default and the stats
+#: TUI's backlog pane both read this, so the two surfaces cannot show different
+#: windows for the same metric. Render-time only — the stored flows are
+#: unclamped full history, so changing it never invalidates collected data.
+BACKLOG_WEEKS_DEFAULT = 8
+
+
+def _paths_for(project_root: Optional[Path]) -> Tuple[Path, Path, Path]:
+    """Resolve (task_dir, archive_dir, metadata_dir) for an optional project root.
+
+    `project_root=None` reuses the module-level constants, which follow
+    `TASK_DIR` (defaulting to the cwd-relative `aitasks` every existing caller
+    already depends on). A non-None `project_root` rebases all three paths
+    under it (used by the multi-session TUI to scan a different project's
+    archive), where the `aitasks` layout is the cross-project convention.
+    """
+    if project_root is None:
+        return TASK_DIR, ARCHIVE_DIR, TASK_DIR / "metadata"
+    task_dir = project_root / "aitasks"
+    return task_dir, task_dir / "archived", task_dir / "metadata"
+
+DAY_NAMES = ["", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+DAY_FULL_NAMES = [
+    "",
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+    "Sunday",
+]
+
+AGENT_DISPLAY_NAMES = {
+    "claudecode": "Claude Code",
+    "codex": "Codex",
+    "opencode": "OpenCode",
+    "unknown": "Unknown",
+}
+
+# Historic values found in archived tasks before the wrapper settled on the
+# current normalized agent/model names.
+LEGACY_IMPLEMENTED_WITH_CLI_IDS = {
+    "codex/gpt-5": "gpt-5",
+    "codex/gpt5": "gpt-5",
+    "opencode/openai_gpt_5_3_codex": "openai/gpt-5.3-codex",
+    "opencode/zen_gpt_5_4": "gpt-5.4",
+}
+
+
+@dataclass
+class TaskRecord:
+    completed_date: date
+    task_id: str
+    labels: List[str]
+    issue_type: str
+    task_type: str
+
+
+@dataclass
+class SessionTotals:
+    """Per-tmux-session task totals for the multi-session comparison pane."""
+    session: str          # tmux session name
+    project_name: str     # project_root basename, used as the chart label
+    tasks_today: int
+    tasks_7d: int
+    tasks_30d: int
+
+
+@dataclass
+class InflightData:
+    """In-flight 'completed, awaiting gates' series (t635_20 D-2).
+
+    Active (non-archived) tasks whose implementation was reviewed
+    (``review_approved`` pass) but whose archival is gate-blocked. Kept strictly
+    separate from the archived totals — never summed into ``total_tasks``.
+    """
+    count: int
+    daily_counts: Counter            # date -> count (by review_approved ts)
+    task_ids: List[str]
+
+
+@dataclass
+class PhaseTimings:
+    """Time-in-phase span samples derived from ledger timestamps (t635_20 D-3).
+
+    Spans are computed only from ``## Gate Runs`` ``run=`` stamps (uniform UTC
+    second precision) with passing endpoints — never the day-granular archival
+    date. Each span carries its own sample, so the two legitimately differ in N
+    (e.g. current-branch tasks contribute to implement but not review→merge).
+    """
+    implement_hours: List[float]     # plan_approved -> review_approved
+    review_merge_hours: List[float]  # review_approved -> merge_approved
+
+
+@dataclass
+class StatsData:
+    total_tasks: int
+    tasks_7d: int
+    tasks_30d: int
+    daily_counts: Counter
+    daily_tasks: Dict[date, List[str]]
+    dow_counts_thisweek: Counter
+    dow_counts_30d: Counter
+    dow_counts_total: Counter
+    label_counts_total: Counter
+    label_week_counts: Counter
+    label_dow_counts_30d: Counter
+    type_week_counts: Counter
+    label_type_week_counts: Counter
+    codeagent_week_counts: Counter
+    model_week_counts: Counter
+    all_labels: set
+    all_codeagents: set
+    all_models: set
+    codeagent_display_names: Dict[str, str]
+    model_display_names: Dict[str, str]
+    csv_rows: List[List[str]]
+    session_breakdown: Optional[List[SessionTotals]] = None
+    inflight: Optional[InflightData] = None
+    phase_timings: Optional[PhaseTimings] = None
+
+    # --- backlog level / net flow (t1544_3) -------------------------------
+    # FLOWS ONLY — the open-task *level* is derived at render time by
+    # backlog_levels(). Storing flows rather than a stock is what keeps
+    # merge_stats_data() a plain additive Counter.update: a stock derived from
+    # summed flows equals the sum of the stocks, so multi-project aggregation
+    # needs no new merge semantic.
+    #: (category, week_offset) -> tasks created that week. Unclamped history.
+    backlog_arrivals: Counter = field(default_factory=Counter)
+    #: (category, week_offset) -> tasks that departed that week.
+    backlog_departures: Counter = field(default_factory=Counter)
+    #: ("parent"|"child", week_offset) -> same flows split by task scope, so the
+    #: TOTAL OPEN row can carry a (parents / children) breakdown. A task is
+    #: simultaneously a category and a scope, so this cannot live in the
+    #: category key; it reuses backlog_levels() unchanged.
+    backlog_scope_arrivals: Counter = field(default_factory=Counter)
+    backlog_scope_departures: Counter = field(default_factory=Counter)
+    #: reason -> count. Every reason names tasks that contributed to NEITHER
+    #: flow, except `negative_level`, which counts clamped OUTPUT CELLS.
+    backlog_excluded: Counter = field(default_factory=Counter)
+
+
+@dataclass(frozen=True)
+class ImplementationInfo:
+    raw: str
+    codeagent_key: str
+    codeagent_display: str
+    model_key: str
+    model_display: str
+
+
+@dataclass
+class VerifiedModelEntry:
+    """A single model's verified score for ranking display."""
+    cli_id: str
+    display_name: str
+    provider: str  # agent name or "all_providers"
+    score: int     # round(score_sum / runs)
+    runs: int
+
+
+@dataclass
+class VerifiedRankingData:
+    """Verified model rankings by operation, provider, and time window."""
+    # {operation: {provider_or_"all_providers": {window: [VerifiedModelEntry, ...]}}}
+    by_window: Dict[str, Dict[str, Dict[str, List[VerifiedModelEntry]]]]
+    operations: List[str]  # sorted list of discovered operations
+
+
+@dataclass
+class UsageModelEntry:
+    """A single model's usage count for ranking display."""
+    cli_id: str
+    display_name: str
+    provider: str  # agent name or "all_providers"
+    runs: int
+
+
+@dataclass
+class UsageRankingData:
+    """Usage rankings by operation, provider, and time window."""
+    # {operation: {provider_or_"all_providers": {window: [UsageModelEntry, ...]}}}
+    by_window: Dict[str, Dict[str, Dict[str, List[UsageModelEntry]]]]
+    operations: List[str]
+
+
+WINDOW_KEYS: Tuple[str, ...] = ("all_time", "recent", "month", "prev_month", "week")
+
+
+def bucket_avg(runs: int, score_sum: int) -> int:
+    """Compute rounded average from verifiedstats bucket values."""
+    if runs <= 0:
+        return 0
+    return round(score_sum / runs)
+
+
+def week_start_for(d: date, week_start_dow: int) -> date:
+    offset = (d.isoweekday() - week_start_dow + 7) % 7
+    return d - timedelta(days=offset)
+
+
+def week_offset_for(completed: date, today: date, week_start_dow: int) -> int:
+    comp = week_start_for(completed, week_start_dow)
+    curr = week_start_for(today, week_start_dow)
+    if comp > curr:
+        return -1
+    return (curr - comp).days // 7
+
+
+def backlog_week_offsets(weeks: int) -> List[int]:
+    """Output column offsets for a `weeks`-wide backlog horizon: [weeks-1 … 1, 0].
+
+    Oldest first, current week last — the same ordering
+    ``stats/panes/labels.py`` builds inline for its 4-week heatmap, generalized
+    so the horizon is a parameter rather than a constant.
+    """
+    return list(range(weeks - 1, -1, -1))
+
+
+def week_end_for_offset(today: date, week_start_dow: int, offset: int) -> date:
+    """The last day of the week `offset` weeks back from `today`'s week.
+
+    Derived from :func:`week_start_for` so there is exactly one week-boundary
+    definition in the module.
+    """
+    return week_start_for(today, week_start_dow) - timedelta(days=7 * offset) + timedelta(days=6)
+
+
+def backlog_levels(
+    arrivals: Counter,
+    departures: Counter,
+    out_offsets: Sequence[int],
+    excluded: Optional[dict] = None,
+) -> Counter:
+    """Open-task level per ``(key, week_offset)``, derived from the two flows.
+
+    ``out_offsets`` selects **OUTPUT COLUMNS ONLY**. The cumulation always runs
+    over every offset present in ``arrivals`` / ``departures``, however old.
+
+    Level at offset ``w`` = Σ arrivals at offsets >= ``w`` − Σ departures at
+    offsets >= ``w`` (a larger offset is an older week).
+
+    Cumulating over ``out_offsets`` instead of the full keyspace would drop
+    every task created before the horizon: measured on the real corpus, 1628 of
+    2279 arrivals sit outside the default 8-week window, so the rendered series
+    would be a fabricated hockey stick with the negative that proves it wrong
+    hidden by the clamp below.
+
+    ``excluded`` is an optional counter (the same opt-in sink shape as
+    ``task_category.resolve_category``'s ``tally``). The clamp is deliberately
+    **not** silent: a negative level is impossible from consistent flows, so
+    counting it is what turns a future regression into a visible signal instead
+    of a plausible-looking zero. Note it counts clamped OUTPUT CELLS, not tasks
+    — do not sum it into a task-count column.
+
+    Generic over the first key element, so it serves both the category axis and
+    the parent/child scope split.
+    """
+    per_key: Dict[str, Counter] = defaultdict(Counter)
+    for (key, off), n in arrivals.items():
+        per_key[key][off] += n
+    for (key, off), n in departures.items():
+        per_key[key][off] -= n
+
+    out = set(out_offsets)
+    levels: Counter = Counter()
+    for key, deltas in per_key.items():
+        running = 0
+        # Single suffix scan, oldest offset first. The delta at `off` is added
+        # BEFORE the membership test, so week w's own arrivals count toward
+        # level w.
+        for off in sorted(set(deltas) | out, reverse=True):
+            running += deltas.get(off, 0)
+            if off in out:
+                if running < 0 and excluded is not None:
+                    excluded["negative_level"] += 1
+                levels[(key, off)] = max(0, running)
+    return levels
+
+
+def split_frontmatter(content: str) -> Tuple[Dict[str, str], str]:
+    """Flat frontmatter scan that also returns the body after the terminator.
+
+    Same scanner as :func:`parse_frontmatter` (which now calls this), extended
+    to hand back the prose. `followup_backfill_classify.classify()` keys several
+    of its provenance rules on body headings, so it needs the text that follows
+    the closing ``---`` — and it must be *only* that text.
+
+    The body is taken as the lines after the terminator, never by a substring
+    split on ``content.split('---', 2)[2]``. That shortcut agrees with this on
+    almost every task in the corpus, but it is wrong on the real archived tasks
+    whose first line is ``--- effort:med pri:hi``: it splits on that pseudo
+    delimiter and returns garbage, whereas the line scan correctly reports "no
+    frontmatter". The classifier's anti-false-positive guarantee rests on the
+    body starting after the frontmatter *terminator*, which only the line scan
+    knows.
+
+    Returns ``({}, content)`` when the first line is not exactly ``---`` (no
+    frontmatter: the whole file is body), and ``(parsed, "")`` when the block
+    never terminates (the scanner consumed the file as frontmatter, so there is
+    no body to hand back).
+    """
+    lines = content.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return {}, content
+
+    result: Dict[str, str] = {}
+    for i, line in enumerate(lines[1:], start=1):
+        stripped = line.strip()
+        if stripped == "---":
+            return result, "\n".join(lines[i + 1:])
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        result[key.strip()] = value.strip()
+    return result, ""
+
+
+def parse_frontmatter(content: str) -> Dict[str, str]:
+    """Lightweight string-map frontmatter reader (every value stays a string).
+
+    NOT `task_yaml.parse_frontmatter` — since t1235 the two live side by side in
+    ``lib/``, but they are not interchangeable: that one is the YAML-backed
+    parser returning typed values, this one is the flat scanner the stats
+    aggregation path uses. Import the one you mean, explicitly.
+
+    A thin caller of :func:`split_frontmatter` that discards the body, so the
+    frontmatter/body boundary has exactly one definition.
+    """
+    return split_frontmatter(content)[0]
+
+
+def parse_labels(raw: Optional[str]) -> List[str]:
+    if not raw:
+        return ["(unlabeled)"]
+
+    cleaned = raw.strip()
+    if cleaned.startswith("[") and cleaned.endswith("]"):
+        cleaned = cleaned[1:-1]
+
+    labels = [part.strip() for part in cleaned.split(",") if part.strip()]
+    return labels if labels else ["(unlabeled)"]
+
+
+def parse_completed_date(frontmatter: Dict[str, str]) -> Optional[date]:
+    completed_at = frontmatter.get("completed_at", "")
+    status = frontmatter.get("status", "")
+
+    if not completed_at and status in {"Done", "Completed"}:
+        completed_at = frontmatter.get("updated_at", "")
+
+    if not completed_at:
+        return None
+
+    date_str = completed_at[:10]
+    try:
+        return date.fromisoformat(date_str)
+    except ValueError:
+        return None
+
+
+# Ledger checkpoint gates whose run= timestamp dates "when the work landed",
+# in precedence order (t635_20 D-1). merge_approved is the shared/canonical
+# "landed in main" event; review_approved is the fallback for current-branch
+# profiles (fast) where Step 9 records no merge.
+_COMPLETION_GATES = ("merge_approved", "review_approved")
+
+
+def format_duration(hours: float) -> str:
+    """Human-friendly span: minutes under 1h, hours under a day, else days.
+
+    Shared by the CLI report and the TUI Pipeline pane (t635_20) so the two
+    surfaces format ledger-derived span durations identically.
+    """
+    if hours < 1:
+        return f"{round(hours * 60)}m"
+    if hours < 24:
+        return f"{hours:.1f}h"
+    return f"{hours / 24:.1f}d"
+
+
+def _ledger_ts_to_date(run_id: str) -> Optional[date]:
+    """Parse a gate-run ``run=`` ISO-8601-Z stamp to a calendar date.
+
+    Day granularity (slice ``[:10]``) matches the precision the rest of stats
+    already uses for ``completed_at`` / ``updated_at``; see the design doc's
+    accepted UTC-vs-local approximation note.
+    """
+    try:
+        return date.fromisoformat(run_id[:10])
+    except (ValueError, TypeError):
+        return None
+
+
+def _ledger_ts_to_datetime(run_id: str) -> Optional[datetime]:
+    """Parse a gate-run ``run=`` ISO-8601-Z stamp to a full UTC datetime.
+
+    Used only for phase-timing span deltas (uniform second precision); returns
+    None on any malformed value so a bad marker drops the sample rather than
+    crashing the report.
+    """
+    try:
+        return datetime.fromisoformat(run_id.replace("Z", "+00:00"))
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
+def resolve_completion_date(content: str, frontmatter: Dict[str, str]) -> Optional[date]:
+    """Ledger-aware completion date (t635_20 D-1).
+
+    Prefers a passing ledger checkpoint (``merge_approved`` → ``review_approved``)
+    so deferred archival no longer misdates work; falls back to the legacy
+    frontmatter dating (``parse_completed_date``) for pre-gates / no-ledger tasks.
+
+    **Pass-only, resolver-only:** a checkpoint marker is honored only when its
+    *current* derived status is ``pass`` (``derive_gate_runs`` is last-wins, so a
+    ``fail``→``pass`` retry counts via its final ``pass``; a marker left ``fail`` /
+    ``error`` is skipped to the next rung). There is no whole-task exclusion — a
+    task with an unrelated lingering failure still dates by its passing checkpoint
+    and stays counted.
+    """
+    if has_gate_markers(content):
+        runs = derive_gate_runs(content)
+        for gate in _COMPLETION_GATES:
+            run = runs.get(gate)
+            if run is not None and run.status == "pass":
+                d = _ledger_ts_to_date(run.run_id)
+                if d is not None:
+                    return d
+    return parse_completed_date(frontmatter)
+
+
+def load_model_cli_ids(project_root: Optional[Path] = None) -> Dict[Tuple[str, str], str]:
+    result: Dict[Tuple[str, str], str] = {}
+    _, _, metadata_dir = _paths_for(project_root)
+
+    for agent in ("claudecode", "codex", "opencode"):
+        path = metadata_dir / f"models_{agent}.json"
+        if not path.exists():
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+
+        for model in payload.get("models", []):
+            name = model.get("name")
+            cli_id = model.get("cli_id")
+            if isinstance(name, str) and isinstance(cli_id, str) and name and cli_id:
+                result[(agent, name)] = cli_id
+
+    return result
+
+
+def load_verified_rankings(
+    project_root: Optional[Path] = None,
+    today: Optional[date] = None,
+) -> VerifiedRankingData:
+    """Load verifiedstats from all models_*.json and build rankings.
+
+    Returns rankings by operation, provider, and time window, plus
+    all_providers aggregation using canonical_model_id() normalization.
+    The month / prev_month / week / recent windows are resolved against
+    `today` (default: the wall clock) by `model_stats_windows`, so a bucket a
+    writer has not rolled over yet never counts as recent.
+    """
+    _, _, metadata_dir = _paths_for(project_root)
+    agents = ("claudecode", "codex", "opencode")
+
+    # Collect raw verifiedstats: {(agent, cli_id): {op: {window: {runs, score_sum}}}},
+    # the dated windows already resolved against `today`.
+    raw: Dict[Tuple[str, str], Dict[str, Dict[str, dict]]] = {}
+    cli_id_set: Dict[Tuple[str, str], str] = {}  # (agent, cli_id) -> cli_id for display
+
+    for agent in agents:
+        path = metadata_dir / f"models_{agent}.json"
+        if not path.exists():
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        for model in payload.get("models", []):
+            cli_id = model.get("cli_id", "")
+            vstats = model.get("verifiedstats")
+            if not isinstance(vstats, dict) or not vstats or not cli_id:
+                continue
+            key = (agent, cli_id)
+            cli_id_set[key] = cli_id
+            raw[key] = {}
+            for op, buckets in vstats.items():
+                if not isinstance(buckets, dict):
+                    continue
+                # Handle both new bucketed format and old flat format
+                if "all_time" in buckets:
+                    at = buckets["all_time"]
+                elif "runs" in buckets and "all_time" not in buckets:
+                    # Old flat format: {runs, score_sum} at top level
+                    at = buckets
+                else:
+                    continue
+                at_runs = at.get("runs", 0)
+                if at_runs <= 0:
+                    continue
+                raw[key][op] = {
+                    "all_time": {"runs": at_runs, "score_sum": at.get("score_sum", 0)},
+                    **resolve_windows(buckets, today),
+                }
+
+    if not raw:
+        return VerifiedRankingData(by_window={}, operations=[])
+
+    # Discover all operations
+    all_ops: set = set()
+    for entry_ops in raw.values():
+        all_ops.update(entry_ops.keys())
+
+    # Build per-provider entries
+    by_window: Dict[str, Dict[str, Dict[str, List[VerifiedModelEntry]]]] = {}
+    for op in sorted(all_ops):
+        by_window[op] = {}
+        for (agent, cli_id), entry_ops in raw.items():
+            if op not in entry_ops:
+                continue
+            buckets = entry_ops[op]
+            if agent not in by_window[op]:
+                by_window[op][agent] = {w: [] for w in WINDOW_KEYS}
+            display = model_display_from_cli_id(cli_id)
+            at = buckets["all_time"]
+            by_window[op][agent]["all_time"].append(
+                VerifiedModelEntry(cli_id, display, agent, bucket_avg(at["runs"], at["score_sum"]), at["runs"])
+            )
+            for win in _RESOLVED_WINDOWS:
+                wb = buckets[win]
+                if wb["runs"] > 0:
+                    by_window[op][agent][win].append(
+                        VerifiedModelEntry(cli_id, display, agent, bucket_avg(wb["runs"], wb["score_sum"]), wb["runs"])
+                    )
+
+    # All-providers aggregation: group by canonical_model_id. Every resolved
+    # window already carries today's period, so the providers' windows simply
+    # sum — no per-period matching is needed.
+    for op in sorted(all_ops):
+        # Collect per-canonical: {canonical: {window: {runs, score_sum}}}
+        grouped: Dict[str, Dict[str, dict]] = defaultdict(lambda: {
+            w: {"runs": 0, "score_sum": 0} for w in ("all_time",) + _RESOLVED_WINDOWS
+        })
+        canonical_display: Dict[str, str] = {}
+        canonical_cli: Dict[str, str] = {}
+        for (agent, cli_id), entry_ops in raw.items():
+            if op not in entry_ops:
+                continue
+            canon = canonical_model_id(cli_id)
+            if canon not in canonical_display:
+                canonical_display[canon] = model_display_from_cli_id(cli_id)
+                canonical_cli[canon] = cli_id
+            buckets = entry_ops[op]
+            for win, g in grouped[canon].items():
+                g["runs"] += buckets[win]["runs"]
+                g["score_sum"] += buckets[win]["score_sum"]
+
+        ap_entries: Dict[str, List[VerifiedModelEntry]] = {w: [] for w in WINDOW_KEYS}
+        for canon, windows in grouped.items():
+            for win, wb in windows.items():
+                if wb["runs"] > 0:
+                    ap_entries[win].append(
+                        VerifiedModelEntry(
+                            canonical_cli.get(canon, canon),
+                            canonical_display.get(canon, canon),
+                            "all_providers",
+                            bucket_avg(wb["runs"], wb["score_sum"]),
+                            wb["runs"],
+                        )
+                    )
+        by_window[op]["all_providers"] = ap_entries
+
+    # Sort all entry lists: score desc, display_name asc
+    def _sort_key(e: VerifiedModelEntry) -> Tuple[int, str]:
+        return (-e.score, e.display_name)
+
+    for op in by_window:
+        for provider in by_window[op]:
+            for win in by_window[op][provider]:
+                by_window[op][provider][win].sort(key=_sort_key)
+
+    return VerifiedRankingData(by_window=by_window, operations=sorted(all_ops))
+
+
+def load_usage_rankings(
+    project_root: Optional[Path] = None,
+    today: Optional[date] = None,
+) -> UsageRankingData:
+    """Load usagestats from all models_*.json and build rankings.
+
+    Mirrors load_verified_rankings shape (by_window[op][provider][window]),
+    but reads usagestats and carries no score field. Window keys match
+    WINDOW_KEYS. The dated windows are resolved against `today` (default: the
+    wall clock) by `model_stats_windows`, and recent is the resolved current
+    plus previous month.
+    """
+    _, _, metadata_dir = _paths_for(project_root)
+    agents = ("claudecode", "codex", "opencode")
+
+    raw: Dict[Tuple[str, str], Dict[str, Dict[str, dict]]] = {}
+    for agent in agents:
+        path = metadata_dir / f"models_{agent}.json"
+        if not path.exists():
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        for model in payload.get("models", []):
+            cli_id = model.get("cli_id", "")
+            ustats = model.get("usagestats")
+            if not isinstance(ustats, dict) or not ustats or not cli_id:
+                continue
+            key = (agent, cli_id)
+            raw[key] = {}
+            for op, buckets in ustats.items():
+                if not isinstance(buckets, dict):
+                    continue
+                at = buckets.get("all_time")
+                if not isinstance(at, dict):
+                    continue
+                at_runs = at.get("runs", 0)
+                if at_runs <= 0:
+                    continue
+                raw[key][op] = {
+                    "all_time": {"runs": at_runs},
+                    **resolve_windows(buckets, today),
+                }
+
+    if not raw:
+        return UsageRankingData(by_window={}, operations=[])
+
+    all_ops: set = set()
+    for entry_ops in raw.values():
+        all_ops.update(entry_ops.keys())
+
+    by_window: Dict[str, Dict[str, Dict[str, List[UsageModelEntry]]]] = {}
+    for op in sorted(all_ops):
+        by_window[op] = {}
+        for (agent, cli_id), entry_ops in raw.items():
+            if op not in entry_ops:
+                continue
+            buckets = entry_ops[op]
+            if agent not in by_window[op]:
+                by_window[op][agent] = {w: [] for w in WINDOW_KEYS}
+            display = model_display_from_cli_id(cli_id)
+            at = buckets["all_time"]
+            by_window[op][agent]["all_time"].append(
+                UsageModelEntry(cli_id, display, agent, at["runs"])
+            )
+            for win in _RESOLVED_WINDOWS:
+                w_runs = buckets[win]["runs"]
+                if w_runs > 0:
+                    by_window[op][agent][win].append(
+                        UsageModelEntry(cli_id, display, agent, w_runs)
+                    )
+
+        # All-providers aggregation by canonical model id. The resolved
+        # windows all carry today's period, so they simply sum.
+        grouped: Dict[str, Dict[str, int]] = defaultdict(lambda: {
+            w: 0 for w in ("all_time",) + _RESOLVED_WINDOWS
+        })
+        canonical_display: Dict[str, str] = {}
+        canonical_cli: Dict[str, str] = {}
+        for (agent, cli_id), entry_ops in raw.items():
+            if op not in entry_ops:
+                continue
+            canon = canonical_model_id(cli_id)
+            if canon not in canonical_display:
+                canonical_display[canon] = model_display_from_cli_id(cli_id)
+                canonical_cli[canon] = cli_id
+            buckets = entry_ops[op]
+            for win in grouped[canon]:
+                grouped[canon][win] += buckets[win]["runs"]
+
+        ap_entries: Dict[str, List[UsageModelEntry]] = {w: [] for w in WINDOW_KEYS}
+        for canon, windows in grouped.items():
+            for win, runs in windows.items():
+                if runs > 0:
+                    ap_entries[win].append(
+                        UsageModelEntry(
+                            canonical_cli.get(canon, canon),
+                            canonical_display.get(canon, canon),
+                            "all_providers",
+                            runs,
+                        )
+                    )
+        by_window[op]["all_providers"] = ap_entries
+
+    def _sort_key(e: UsageModelEntry) -> Tuple[int, str]:
+        return (-e.runs, e.display_name)
+
+    for op in by_window:
+        for provider in by_window[op]:
+            for win in by_window[op][provider]:
+                by_window[op][provider][win].sort(key=_sort_key)
+
+    return UsageRankingData(by_window=by_window, operations=sorted(all_ops))
+
+
+def canonical_model_id(cli_id: str) -> str:
+    if "/" in cli_id:
+        cli_id = cli_id.split("/", 1)[1]
+    cli_id = re.sub(r"-preview$", "", cli_id)
+    cli_id = re.sub(r"-\d{8}$", "", cli_id)
+    return cli_id
+
+
+def slugify_key(value: str) -> str:
+    return re.sub(r"_+", "_", re.sub(r"[^a-z0-9]+", "_", value.lower())).strip("_") or "unknown"
+
+
+def titleize_words(value: str) -> str:
+    parts = re.split(r"[-_]+", value)
+    return " ".join(part.upper() if part in {"gpt", "glm"} else part.capitalize() for part in parts if part)
+
+
+def model_key_from_cli_id(cli_id: str) -> str:
+    value = canonical_model_id(cli_id)
+
+    match = re.match(r"^gpt-([0-9]+)(?:\.([0-9]+))?(?:-(.+))?$", value)
+    if match:
+        major = match.group(1)
+        minor = match.group(2)
+        suffix = match.group(3)
+        key = f"gpt{major}"
+        if minor:
+            key += f"_{minor}"
+        if suffix:
+            parts = suffix.split("-")
+            key += parts[0]
+            for part in parts[1:]:
+                key += f"_{part}"
+        return key
+
+    match = re.match(r"^claude-([a-z]+)-([0-9]+)-([0-9]+)$", value)
+    if match:
+        family, major, minor = match.groups()
+        return f"{family}{major}_{minor}"
+
+    match = re.match(r"^claude-([0-9]+)-([0-9]+)-([a-z]+)$", value)
+    if match:
+        major, minor, family = match.groups()
+        return f"{family}{major}_{minor}"
+
+    return slugify_key(value)
+
+
+def model_display_from_cli_id(cli_id: str) -> str:
+    value = canonical_model_id(cli_id)
+
+    match = re.match(r"^gpt-([0-9]+)(?:\.([0-9]+))?(?:-(.+))?$", value)
+    if match:
+        major = match.group(1)
+        minor = match.group(2)
+        suffix = match.group(3)
+        label = f"GPT{major}"
+        if minor:
+            label += f".{minor}"
+        if suffix:
+            for part in suffix.split("-"):
+                label += f"-{part.upper() if part in {'gpt', 'glm'} else part.capitalize()}"
+        return label
+
+    match = re.match(r"^claude-([a-z]+)-([0-9]+)-([0-9]+)$", value)
+    if match:
+        family, major, minor = match.groups()
+        return f"{family.capitalize()} {major}.{minor}"
+
+    match = re.match(r"^claude-([0-9]+)-([0-9]+)-([a-z]+)$", value)
+    if match:
+        major, minor, family = match.groups()
+        return f"{family.capitalize()} {major}.{minor}"
+
+    return titleize_words(value)
+
+
+def normalize_implemented_with(
+    raw: Optional[str], model_cli_ids: Optional[Dict[Tuple[str, str], str]] = None
+) -> ImplementationInfo:
+    cleaned = (raw or "").strip()
+    if not cleaned:
+        return ImplementationInfo("", "unknown", AGENT_DISPLAY_NAMES["unknown"], "unknown", "Unknown")
+
+    agent_match = re.match(r"^([a-z]+)/([A-Za-z0-9_.-]+)$", cleaned)
+    if not agent_match:
+        return ImplementationInfo(
+            cleaned, "unknown", AGENT_DISPLAY_NAMES["unknown"], "unknown", "Unknown"
+        )
+
+    agent, model = agent_match.groups()
+    codeagent_key = agent if agent in AGENT_DISPLAY_NAMES else "unknown"
+    codeagent_display = AGENT_DISPLAY_NAMES.get(codeagent_key, AGENT_DISPLAY_NAMES["unknown"])
+
+    if model_cli_ids is None:
+        model_cli_ids = load_model_cli_ids()
+
+    cli_id = model_cli_ids.get((agent, model))
+    if cli_id is None:
+        cli_id = LEGACY_IMPLEMENTED_WITH_CLI_IDS.get(cleaned)
+
+    if cli_id is None:
+        return ImplementationInfo(cleaned, codeagent_key, codeagent_display, "unknown", "Unknown")
+
+    return ImplementationInfo(
+        cleaned,
+        codeagent_key,
+        codeagent_display,
+        model_key_from_cli_id(cli_id),
+        model_display_from_cli_id(cli_id),
+    )
+
+
+def is_child_task(filename: str) -> bool:
+    return bool(re.match(r"^t\d+_\d+_", filename))
+
+
+def iter_archived_markdown_files(
+    project_root: Optional[Path] = None,
+) -> Iterable[Tuple[str, str]]:
+    _, archive_dir, _ = _paths_for(project_root)
+    return iter_all_archived_markdown(archive_dir)
+
+
+def iter_active_markdown_files(
+    project_root: Optional[Path] = None,
+) -> Iterable[Tuple[str, str]]:
+    """Yield ``(basename, content)`` for active (non-archived) task files.
+
+    Walks ``<task_dir>`` (parent ``t*.md`` plus child ``t<N>/t<N>_*.md``),
+    pruning ``archived/``, ``metadata/`` and ``new/``. The content is read here
+    so the caller classifies from the body alone — no second open — keeping the
+    scan correct under a rebased ``project_root`` (t635_20 D-2). Unreadable
+    files are skipped silently (best-effort, like the archive iterator).
+
+    ``new/`` holds drafts, which are not active tasks: a draft dropped there
+    would otherwise become a phantom backlog arrival (t1544_3). The prune must
+    live HERE rather than in a caller, because this generator yields the bare
+    ``os.walk`` basename — by the time a caller sees a file its directory is
+    already lost.
+    """
+    task_dir, _, _ = _paths_for(project_root)
+    if not task_dir.exists():
+        return
+    for root, dirs, files in os.walk(task_dir):
+        dirs[:] = [d for d in dirs if d not in ("archived", "metadata", "new")]
+        for name in files:
+            if not name.startswith("t") or not name.endswith(".md"):
+                continue
+            try:
+                content = (Path(root) / name).read_text(encoding="utf-8")
+            except OSError:
+                continue
+            yield name, content
+
+
+def get_valid_task_types(project_root: Optional[Path] = None) -> List[str]:
+    task_dir, _, _ = _paths_for(project_root)
+    types_file = task_dir / "metadata" / "task_types.txt"
+    if types_file.exists():
+        try:
+            types = sorted(
+                {line.strip() for line in types_file.read_text().splitlines() if line.strip()}
+            )
+            if types:
+                return types
+        except OSError:
+            pass
+    return ["bug", "feature", "refactor"]
+
+
+def codeagent_display_name(key: str) -> str:
+    return AGENT_DISPLAY_NAMES.get(key, titleize_words(key))
+
+
+def sorted_weekly_keys(keys: Iterable[str], weekly_counts: Counter, display_lookup) -> List[str]:
+    return sorted(
+        keys,
+        key=lambda key: (
+            -sum(weekly_counts.get((key, wk), 0) for wk in range(4)),
+            display_lookup(key),
+        ),
+    )
+
+
+def week_start_display_name(week_start_dow: int) -> str:
+    if 1 <= week_start_dow < len(DAY_FULL_NAMES):
+        return DAY_FULL_NAMES[week_start_dow]
+    return "Monday"
+
+
+def build_chart_title(subject: str, timeframe: str, week_start_dow: Optional[int] = None) -> str:
+    title = f"{subject} - {timeframe}"
+    if week_start_dow is not None:
+        title += f" (week starts {week_start_display_name(week_start_dow)})"
+    return title
+
+
+def chart_totals(
+    weekly_counts: Counter,
+    display_lookup,
+    week_offsets: Sequence[int],
+    limit: Optional[int] = None,
+) -> Tuple[List[str], List[int]]:
+    totals: Dict[str, int] = defaultdict(int)
+    for (key, week_offset), count in weekly_counts.items():
+        if week_offset in week_offsets:
+            totals[key] += count
+
+    items = sorted(totals.items(), key=lambda item: (-item[1], display_lookup(item[0])))
+    if limit is not None and len(items) > limit:
+        visible = items[: limit - 1]
+        other_total = sum(count for _, count in items[limit - 1:])
+        if other_total:
+            visible.append(("__other__", other_total))
+        items = visible
+
+    labels = ["Other" if key == "__other__" else display_lookup(key) for key, _ in items]
+    values = [count for _, count in items]
+    return labels, values
+
+
+def _span_hours(runs: dict, start_gate: str, end_gate: str) -> Optional[float]:
+    """Hours between two passing ledger checkpoints, or None.
+
+    Both markers must exist and be ``pass``, and both timestamps must parse;
+    otherwise the task contributes no sample to this span (never zero — zero
+    would bias the median).
+    """
+    start, end = runs.get(start_gate), runs.get(end_gate)
+    if start is None or end is None:
+        return None
+    if start.status != "pass" or end.status != "pass":
+        return None
+    t0 = _ledger_ts_to_datetime(start.run_id)
+    t1 = _ledger_ts_to_datetime(end.run_id)
+    if t0 is None or t1 is None:
+        return None
+    delta = (t1 - t0).total_seconds() / 3600.0
+    return delta if delta >= 0 else None
+
+
+def _accumulate_phase_timings(
+    content: str, implement_hours: List[float], review_merge_hours: List[float]
+) -> None:
+    """Append this task's phase-span samples (t635_20 D-3), ledger stamps only."""
+    if not has_gate_markers(content):
+        return
+    runs = derive_gate_runs(content)
+    imp = _span_hours(runs, "plan_approved", "review_approved")
+    if imp is not None:
+        implement_hours.append(imp)
+    rm = _span_hours(runs, "review_approved", "merge_approved")
+    if rm is not None:
+        review_merge_hours.append(rm)
+
+
+def _parse_frontmatter_date(raw: str) -> Optional[date]:
+    """Parse a `YYYY-MM-DD[ HH:MM]` frontmatter timestamp to a date.
+
+    Same tolerance as :func:`parse_completed_date` (leading 10 chars, then
+    ``date.fromisoformat``) so an arrival and a departure are read by the same
+    rule.
+    """
+    if not raw:
+        return None
+    try:
+        return date.fromisoformat(raw[:10])
+    except ValueError:
+        return None
+
+
+def _accumulate_backlog(
+    filename: str,
+    frontmatter: Dict[str, str],
+    body: str,
+    today: date,
+    week_start_dow: int,
+    *,
+    archived: bool,
+    arrivals: Counter,
+    departures: Counter,
+    scope_arrivals: Counter,
+    scope_departures: Counter,
+    excluded: Counter,
+) -> Optional[str]:
+    """Book one task's arrival and departure into the backlog flows (t1544_3).
+
+    **One event clock, one population rule.** A task has departed iff
+    :func:`parse_completed_date` returns a date (``completed_at``, else
+    ``updated_at`` when the status is Done/Completed). The identical rule
+    applies to archived and live files — there is no archived-vs-live special
+    case.
+
+    Deliberately NOT :func:`resolve_completion_date`: that one prefers the
+    ``merge_approved`` / ``review_approved`` ledger stamps, which on a *live*
+    file mean "in flight", not "gone". A `status: Ready` task with a passing
+    review_approved marker and no completed_at resolves to a date weeks in the
+    past under that function, booking a departure for a task sitting open on the
+    board.
+
+    **Exclusions skip entirely on BOTH axes and are always tallied.** Keeping an
+    arrival whose departure was dropped leaves the task open forever, so every
+    guard below returns before either flow is touched.
+
+    **Returns the category it resolved, or ``None`` on every exclusion**
+    (t1585). This is what keeps any one archived file from being classified
+    *twice*: the caller carries this value down to the file's csv row instead
+    of calling ``resolve_category`` a second time.
+    ``None`` means "not classified *here*", **not** "no category" —
+    a task can be excluded from the flows and still have a row (a ``folded``
+    task whose ``merge_approved`` stamp dates it), so the caller must fall back
+    to a direct call rather than emit an empty cell.
+    """
+    if not frontmatter:
+        excluded["no_frontmatter"] += 1
+        return None
+
+    # Folded tasks never get a completed_at, and the file is DELETED when the
+    # primary archives — counting them would make the historical series
+    # irreproducible (re-running next month would give different numbers for the
+    # same past week). Either signal alone is sufficient.
+    if frontmatter.get("status") == "Folded" or "folded_into" in frontmatter:
+        excluded["folded"] += 1
+        return None
+
+    # A present-but-unrecognised followup_kind must EXCLUDE, not merely count:
+    # resolve_category tallies it and then falls through to a real category, so
+    # asking it to do both would leave the task in the flows while reporting it
+    # as excluded. Hence the check here, and tally=None below.
+    if has_invalid_followup_kind(frontmatter):
+        excluded["invalid_followup_kind"] += 1
+        return None
+
+    created = _parse_frontmatter_date(frontmatter.get("created_at", ""))
+    if created is None:
+        excluded["no_created_at"] += 1
+        return None
+
+    # Compare RAW DATES against today, never week_offset_for(...) < 0:
+    # week_offset_for compares week *starts*, so a date later than today inside
+    # the current week returns 0, and a phantom arrival would be counted as open
+    # now. The date form also guarantees every bucketed offset is >= 0, which is
+    # the invariant the renderers rely on.
+    if created > today:
+        excluded["future_created_at"] += 1
+        return None
+
+    departed = parse_completed_date(frontmatter)
+    if archived and departed is None:
+        # An archived task with no departure date would stay open forever. None
+        # exist today; if this ever fires it is a genuine data-quality signal.
+        excluded["archived_no_completed_at"] += 1
+        return None
+    if departed is not None and departed > today:
+        excluded["future_completed_at"] += 1
+        return None
+
+    category = resolve_category(frontmatter, body, filename, tally=None)
+    scope = "child" if is_child_task(filename) else "parent"
+
+    arrival_offset = week_offset_for(created, today, week_start_dow)
+    arrivals[(category, arrival_offset)] += 1
+    scope_arrivals[(scope, arrival_offset)] += 1
+
+    if departed is not None:
+        departure_offset = week_offset_for(departed, today, week_start_dow)
+        departures[(category, departure_offset)] += 1
+        scope_departures[(scope, departure_offset)] += 1
+
+    return category
+
+
+def collect_inflight(
+    today: date,
+    week_start_dow: int,
+    project_root: Optional[Path] = None,
+    on_file: Optional[Callable[[str, str], None]] = None,
+) -> InflightData:
+    """Count active tasks that are implementation-complete but gate-blocked.
+
+    Classifies purely from each file's content (t635_20 D-2): a gate ledger is
+    present, ``review_approved`` is ``pass``, and archival is ``BLOCKED`` (a
+    declared gate is not yet pass — t635_4's deferred-archival state). Tasks that
+    are merely mid-implementation (``plan_approved`` only) are excluded.
+
+    ``on_file`` is an optional per-file observer, called as
+    ``on_file(basename, content)`` for **every** file this walk yields, so a
+    caller needing the same live scan can share it instead of opening a second
+    one (t1544_3's backlog arrivals). It fires *before* the gate-marker filter
+    below — most active tasks carry no ledger at all, so an observer invoked
+    after the ``continue`` would see almost nothing. Do not move it.
+    """
+    daily_counts: Counter = Counter()
+    task_ids: List[str] = []
+    for filename, content in iter_active_markdown_files(project_root=project_root):
+        if on_file is not None:
+            on_file(filename, content)
+        if not has_gate_markers(content):
+            continue
+        runs = derive_gate_runs(content)
+        review = runs.get("review_approved")
+        if review is None or review.status != "pass":
+            continue
+        if archive_status_from_text(content)[0] != "BLOCKED":
+            continue
+        task_ids.append(Path(filename).stem)
+        reviewed = _ledger_ts_to_date(review.run_id)
+        if reviewed is not None:
+            daily_counts[reviewed] += 1
+    return InflightData(count=len(task_ids), daily_counts=daily_counts, task_ids=task_ids)
+
+
+def collect_stats(
+    today: date,
+    week_start_dow: int,
+    project_root: Optional[Path] = None,
+    with_backlog: bool = True,
+) -> StatsData:
+    """Collect every ait-stats series from the archived and active task trees.
+
+    ``with_backlog=False`` skips the backlog level / net-flow collection
+    (t1544_3). It is **purely subtractive**: every pre-existing field is
+    identical either way. What it saves is the per-file category classification
+    and bookkeeping over the whole corpus — order **~90 ms** on a ~2300-task
+    corpus (176 ms -> 268 ms; median of 5, one box, indicative only). It does
+    **not** save a live-tree walk: ``collect_inflight`` runs regardless and the
+    arrival scan rides along on it via ``on_file``.
+
+    Under ``with_backlog=True`` a file that needs a category is classified **at
+    most once** (t1585): ``_accumulate_backlog`` hands its resolved category
+    back and the csv-row producer consumes it, falling back to a direct
+    ``resolve_category`` call only for a file the booking excluded before
+    classifying. "At most", not "exactly": ``with_backlog=False`` classifies
+    nothing at all, and a file that is both excluded from the flows and absent
+    from ``csv_rows`` (an archived file with no resolvable completion date) is
+    never classified either. What is ruled out is classifying the same file
+    **twice** — which is what used to happen: on this corpus 4178 calls over
+    2316 files, of which 1865 were duplicates, costing ~61 ms on every
+    ``ait stats`` and every stats-TUI load.
+    """
+    daily_counts: Counter = Counter()
+    daily_tasks: Dict[date, List[str]] = defaultdict(list)
+    dow_counts_thisweek: Counter = Counter()
+    dow_counts_30d: Counter = Counter()
+    dow_counts_total: Counter = Counter()
+    label_counts_total: Counter = Counter()
+    label_week_counts: Counter = Counter()
+    label_dow_counts_30d: Counter = Counter()
+    type_week_counts: Counter = Counter()
+    label_type_week_counts: Counter = Counter()
+    codeagent_week_counts: Counter = Counter()
+    model_week_counts: Counter = Counter()
+    all_labels: set = set()
+    all_codeagents: set = set()
+    all_models: set = set()
+    codeagent_display_names: Dict[str, str] = {"unknown": AGENT_DISPLAY_NAMES["unknown"]}
+    model_display_names: Dict[str, str] = {"unknown": "Unknown"}
+    csv_rows: List[List[str]] = []
+    model_cli_ids = load_model_cli_ids(project_root=project_root)
+
+    total_tasks = 0
+    tasks_7d = 0
+    tasks_30d = 0
+    curr_week_start = week_start_for(today, week_start_dow)
+
+    implement_hours: List[float] = []
+    review_merge_hours: List[float] = []
+
+    backlog_arrivals: Counter = Counter()
+    backlog_departures: Counter = Counter()
+    backlog_scope_arrivals: Counter = Counter()
+    backlog_scope_departures: Counter = Counter()
+    backlog_excluded: Counter = Counter()
+
+    def _book_backlog(filename: str, frontmatter: Dict[str, str], body: str,
+                      *, archived: bool) -> Optional[str]:
+        return _accumulate_backlog(
+            filename, frontmatter, body, today, week_start_dow,
+            archived=archived,
+            arrivals=backlog_arrivals,
+            departures=backlog_departures,
+            scope_arrivals=backlog_scope_arrivals,
+            scope_departures=backlog_scope_departures,
+            excluded=backlog_excluded,
+        )
+
+    for filename, content in iter_archived_markdown_files(project_root=project_root):
+        # split_frontmatter rather than parse_frontmatter: identical metadata
+        # (the latter IS this call, discarding the body) but the retro-classifier
+        # needs the body. Booking happens BEFORE the `continue` below — an
+        # archived task with no resolvable completion date is exactly the case
+        # `no_frontmatter` / `archived_no_completed_at` exist to report.
+        frontmatter, body = split_frontmatter(content)
+        # PRODUCER of the single-pass memo (t1585). The category resolved by
+        # this file's booking is carried down to its csv row at the end of the
+        # SAME iteration, so no file is classified twice. `None` means
+        # the booking excluded the file before classifying it — the consumer
+        # must fall back, not emit an empty cell. Keep the two ends together:
+        # a `continue` inserted between them, or a binding hoisted out of the
+        # loop, silently restores the second pass or lands one file's category
+        # on another file's row.
+        booked_category: Optional[str] = None
+        if with_backlog:
+            booked_category = _book_backlog(filename, frontmatter, body, archived=True)
+        completed = resolve_completion_date(content, frontmatter)
+        if completed is None:
+            continue
+
+        _accumulate_phase_timings(content, implement_hours, review_merge_hours)
+
+        issue_type = frontmatter.get("issue_type") or "feature"
+        labels = parse_labels(frontmatter.get("labels"))
+        implementation = normalize_implemented_with(frontmatter.get("implemented_with"), model_cli_ids)
+        task_type = "child" if is_child_task(filename) else "parent"
+        task_id = Path(filename).stem
+        week_offset = week_offset_for(completed, today, week_start_dow)
+        dow = completed.isoweekday()
+
+        total_tasks += 1
+        daily_counts[completed] += 1
+        daily_tasks[completed].append(task_id)
+        dow_counts_total[dow] += 1
+
+        if week_start_for(completed, week_start_dow) == curr_week_start:
+            dow_counts_thisweek[dow] += 1
+
+        delta_days = (today - completed).days
+        if 0 <= delta_days < 7:
+            tasks_7d += 1
+        if 0 <= delta_days < 30:
+            tasks_30d += 1
+            dow_counts_30d[dow] += 1
+
+        for label in labels:
+            all_labels.add(label)
+            label_counts_total[label] += 1
+
+            if 0 <= week_offset <= 3:
+                label_week_counts[(label, week_offset)] += 1
+                label_type_week_counts[(label, issue_type, week_offset)] += 1
+
+            if 0 <= delta_days < 30:
+                label_dow_counts_30d[(label, dow)] += 1
+
+        if 0 <= week_offset <= 3:
+            type_week_counts[(task_type, week_offset)] += 1
+            type_week_counts[(issue_type, week_offset)] += 1
+            codeagent_week_counts[(implementation.codeagent_key, week_offset)] += 1
+            model_week_counts[(implementation.model_key, week_offset)] += 1
+            all_codeagents.add(implementation.codeagent_key)
+            all_models.add(implementation.model_key)
+            codeagent_display_names[implementation.codeagent_key] = implementation.codeagent_display
+            model_display_names[implementation.model_key] = implementation.model_display
+
+        # The two appended columns are the other half of a contract with
+        # `aitask_stats.write_csv`'s header -- edit them in lockstep (t1544_4).
+        # `category` is gated on `with_backlog` because that flag's measured
+        # contract is that it classifies NOTHING: work_report_gather.py is a
+        # live caller that passes False and never reads csv_rows. `created_at`
+        # needs no classification, so it is unconditional and the column is
+        # identical either way.
+        created = _parse_frontmatter_date(frontmatter.get("created_at", ""))
+        # CONSUMER of the single-pass memo (t1585) -- see the producer comment
+        # at the top of this loop. The fallback is gated INSIDE `with_backlog`
+        # so the zero-classification contract of the off path is untouched.
+        if not with_backlog:
+            category = ""
+        elif booked_category is not None:
+            category = booked_category
+        else:
+            # Reachable: the booking EXCLUDED this file before classifying it
+            # (e.g. a `folded` task whose merge_approved stamp still dates it,
+            # so it has no arrival but does have a row). Classify it directly
+            # rather than ship an empty cell. `is not None` rather than
+            # truthiness: resolve_category never returns "", and pinning the
+            # test to identity keeps that true by construction.
+            category = resolve_category(frontmatter, body, filename)
+        csv_rows.append(
+            [
+                completed.isoformat(),
+                DAY_NAMES[dow],
+                str(week_offset),
+                task_id,
+                ";".join(labels),
+                issue_type,
+                task_type,
+                implementation.raw,
+                implementation.codeagent_key,
+                implementation.model_key,
+                created.isoformat() if created else "",
+                category,
+            ]
+        )
+
+    # Hoisted out of the constructor below so the ordering is explicit: this is
+    # the walk that populates the backlog arrival counters, and relying on
+    # argument-evaluation order to fill counters passed earlier in the same call
+    # would be a silent trap.
+    def _observe_live(filename: str, content: str) -> None:
+        frontmatter, body = split_frontmatter(content)
+        _book_backlog(filename, frontmatter, body, archived=False)
+
+    inflight = collect_inflight(
+        today, week_start_dow, project_root=project_root,
+        on_file=_observe_live if with_backlog else None,
+    )
+
+    return StatsData(
+        total_tasks=total_tasks,
+        tasks_7d=tasks_7d,
+        tasks_30d=tasks_30d,
+        daily_counts=daily_counts,
+        daily_tasks=daily_tasks,
+        dow_counts_thisweek=dow_counts_thisweek,
+        dow_counts_30d=dow_counts_30d,
+        dow_counts_total=dow_counts_total,
+        label_counts_total=label_counts_total,
+        label_week_counts=label_week_counts,
+        label_dow_counts_30d=label_dow_counts_30d,
+        type_week_counts=type_week_counts,
+        label_type_week_counts=label_type_week_counts,
+        codeagent_week_counts=codeagent_week_counts,
+        model_week_counts=model_week_counts,
+        all_labels=all_labels,
+        all_codeagents=all_codeagents,
+        all_models=all_models,
+        codeagent_display_names=codeagent_display_names,
+        model_display_names=model_display_names,
+        csv_rows=csv_rows,
+        inflight=inflight,
+        backlog_arrivals=backlog_arrivals,
+        backlog_departures=backlog_departures,
+        backlog_scope_arrivals=backlog_scope_arrivals,
+        backlog_scope_departures=backlog_scope_departures,
+        backlog_excluded=backlog_excluded,
+        phase_timings=PhaseTimings(
+            implement_hours=implement_hours,
+            review_merge_hours=review_merge_hours,
+        ),
+    )
+
+
+def _empty_stats_data() -> StatsData:
+    return StatsData(
+        total_tasks=0,
+        tasks_7d=0,
+        tasks_30d=0,
+        daily_counts=Counter(),
+        daily_tasks=defaultdict(list),
+        dow_counts_thisweek=Counter(),
+        dow_counts_30d=Counter(),
+        dow_counts_total=Counter(),
+        label_counts_total=Counter(),
+        label_week_counts=Counter(),
+        label_dow_counts_30d=Counter(),
+        type_week_counts=Counter(),
+        label_type_week_counts=Counter(),
+        codeagent_week_counts=Counter(),
+        model_week_counts=Counter(),
+        all_labels=set(),
+        all_codeagents=set(),
+        all_models=set(),
+        codeagent_display_names={"unknown": AGENT_DISPLAY_NAMES["unknown"]},
+        model_display_names={"unknown": "Unknown"},
+        csv_rows=[],
+        inflight=InflightData(count=0, daily_counts=Counter(), task_ids=[]),
+        phase_timings=PhaseTimings(implement_hours=[], review_merge_hours=[]),
+        backlog_arrivals=Counter(),
+        backlog_departures=Counter(),
+        backlog_scope_arrivals=Counter(),
+        backlog_scope_departures=Counter(),
+        backlog_excluded=Counter(),
+    )
+
+
+def merge_stats_data(parts: List[StatsData]) -> StatsData:
+    """Sum/union per-session StatsData objects into one aggregate."""
+    if not parts:
+        return _empty_stats_data()
+
+    merged = _empty_stats_data()
+
+    for part in parts:
+        merged.total_tasks += part.total_tasks
+        merged.tasks_7d += part.tasks_7d
+        merged.tasks_30d += part.tasks_30d
+        merged.daily_counts.update(part.daily_counts)
+        for d, ids in part.daily_tasks.items():
+            merged.daily_tasks[d].extend(ids)
+        merged.dow_counts_thisweek.update(part.dow_counts_thisweek)
+        merged.dow_counts_30d.update(part.dow_counts_30d)
+        merged.dow_counts_total.update(part.dow_counts_total)
+        merged.label_counts_total.update(part.label_counts_total)
+        merged.label_week_counts.update(part.label_week_counts)
+        merged.label_dow_counts_30d.update(part.label_dow_counts_30d)
+        merged.type_week_counts.update(part.type_week_counts)
+        merged.label_type_week_counts.update(part.label_type_week_counts)
+        merged.codeagent_week_counts.update(part.codeagent_week_counts)
+        merged.model_week_counts.update(part.model_week_counts)
+        merged.all_labels |= part.all_labels
+        merged.all_codeagents |= part.all_codeagents
+        merged.all_models |= part.all_models
+        merged.codeagent_display_names.update(part.codeagent_display_names)
+        merged.model_display_names.update(part.model_display_names)
+        merged.csv_rows.extend(part.csv_rows)
+        merged.backlog_arrivals.update(part.backlog_arrivals)
+        merged.backlog_departures.update(part.backlog_departures)
+        merged.backlog_scope_arrivals.update(part.backlog_scope_arrivals)
+        merged.backlog_scope_departures.update(part.backlog_scope_departures)
+        merged.backlog_excluded.update(part.backlog_excluded)
+
+        if part.inflight is not None and merged.inflight is not None:
+            merged.inflight.count += part.inflight.count
+            merged.inflight.daily_counts.update(part.inflight.daily_counts)
+            merged.inflight.task_ids.extend(part.inflight.task_ids)
+        if part.phase_timings is not None and merged.phase_timings is not None:
+            merged.phase_timings.implement_hours.extend(part.phase_timings.implement_hours)
+            merged.phase_timings.review_merge_hours.extend(part.phase_timings.review_merge_hours)
+
+    return merged

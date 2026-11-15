@@ -1,0 +1,4033 @@
+#!/usr/bin/env bash
+# task_utils.sh - Shared task/plan resolution and extraction utilities
+# Source this file from aitask scripts; do not execute directly.
+
+# --- Guard against double-sourcing ---
+[[ -n "${_AIT_TASK_UTILS_LOADED:-}" ]] && return 0
+_AIT_TASK_UTILS_LOADED=1
+
+# Ensure terminal_compat.sh is loaded (for die/warn helpers)
+SCRIPT_DIR="${SCRIPT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+# Startup sources — contract: aidocs/framework/shell_conventions.md (source-on-startup); scanner: tests/lib/shell_startup_closure.py
+# shellcheck source=terminal_compat.sh
+source "${SCRIPT_DIR}/lib/terminal_compat.sh"
+# shellcheck source=archive_utils.sh
+source "${SCRIPT_DIR}/lib/archive_utils.sh"
+# shellcheck source=yaml_utils.sh
+source "${SCRIPT_DIR}/lib/yaml_utils.sh"
+# shellcheck source=python_resolve.sh
+source "${SCRIPT_DIR}/lib/python_resolve.sh"
+# data_symlinks.sh provides ait_main_worktree_root(), rung 3 of the data-worktree
+# resolution ladder below. It sources only terminal_compat.sh (self-anchored via
+# its own BASH_SOURCE, so no cwd dependency) and guards against double-sourcing,
+# so there is no cycle with aitask_setup.sh / aitask_init_data.sh, which source
+# it too.
+# shellcheck source=data_symlinks.sh
+source "${SCRIPT_DIR}/lib/data_symlinks.sh"
+# stale_lock.sh provides the framework's ONE mutex protocol (.gc-guarded
+# single-winner reclaim, live PIDs never displaced, owner-token release). The
+# data-worktree pull mutex below is an adapter over it, not a second protocol.
+# It is self-anchored via its own BASH_SOURCE and double-source guarded.
+# shellcheck source=stale_lock.sh
+source "${SCRIPT_DIR}/lib/stale_lock.sh"
+
+# --- Default directory variables (override before sourcing if needed) ---
+TASK_DIR="${TASK_DIR:-aitasks}"
+ARCHIVED_DIR="${ARCHIVED_DIR:-aitasks/archived}"
+PLAN_DIR="${PLAN_DIR:-aiplans}"
+ARCHIVED_PLAN_DIR="${ARCHIVED_PLAN_DIR:-aiplans/archived}"
+
+# --- Task Data Worktree Detection ---
+# Detects if task data lives in a separate worktree (.aitask-data/)
+# or on the current branch (legacy mode). All scripts use task_git()
+# for git operations on task/plan files.
+
+_AIT_DATA_WORKTREE=""
+
+# Detect whether task data lives in a separate worktree.
+# Sets _AIT_DATA_WORKTREE to the data worktree (branch mode) or "." (legacy).
+#
+# A FOUR-RUNG ladder, first hit wins. It used to be a single cwd-relative probe,
+# which silently answered "." — indistinguishable from a genuine legacy project —
+# for every caller whose cwd was not the repo root. None of the 15 scripts that
+# perform data-branch git ops cd to the root, so from `website/` the seam
+# operated on `main` and from an unlinked crew worktree on that worktree's own
+# branch, both reporting success while the data branch was never reconciled
+# (t1658_2).
+#
+#   1. ./.aitask-data/.git          -> ".aitask-data"          (the repo root)
+#   2. <toplevel>/.aitask-data/.git -> <toplevel>/.aitask-data  (a subdirectory)
+#   3. <main>/.aitask-data/.git     -> <main>/.aitask-data      (a linked worktree
+#                                      that was never --link-worktree'd)
+#   4. otherwise                    -> "."                      (legacy mode)
+#
+# Rung 1 stays a PURE FILESYSTEM PROBE and is byte-identical to the pre-ladder
+# behaviour at the repo root — which is every ./ait-dispatched invocation.
+#
+# The <root>/.aitask-data spelling is deliberately UNCANONICALIZED (not `pwd -P`)
+# so a task worktree's symlinked data dir keeps its friendly path in messages;
+# git follows the symlink either way.
+#
+# BOUNDARY: a submodule, or any nested repository, resolves to its OWN root and
+# therefore to legacy mode — never to the parent repo's data branch. That is
+# ait_main_worktree_root()'s same-repo property and it is the correct answer, not
+# an oversight; do not "fix" it by walking up past a repository boundary.
+# Pinned by Test 15 in tests/test_task_git.sh (t1674) — a plain nested checkout
+# and a real submodule, both inside a branch-mode parent, must answer "." there.
+_ait_detect_data_worktree() {
+    if [[ -n "$_AIT_DATA_WORKTREE" ]]; then return; fi
+    local root=""
+
+    # Rung 1 — today's fast path.
+    if [[ -d ".aitask-data/.git" || -f ".aitask-data/.git" ]]; then
+        _AIT_DATA_WORKTREE=".aitask-data"
+        return
+    fi
+
+    # Rung 2 — this checkout's toplevel. The `|| root=""` is load-bearing: a bare
+    # assignment from a command substitution that fails exits 128 under
+    # `set -euo pipefail` and kills the caller with no message at all, and every
+    # framework script runs with those options.
+    root="$(git rev-parse --show-toplevel 2>/dev/null)" || root=""
+    if [[ -n "$root" && ( -d "$root/.aitask-data/.git" || -f "$root/.aitask-data/.git" ) ]]; then
+        _AIT_DATA_WORKTREE="$root/.aitask-data"
+        return
+    fi
+
+    # Rung 3 — the MAIN worktree, for a linked worktree that was never
+    # --link-worktree'd (the crew case). ait_main_worktree_root has THREE states
+    # and they must not be conflated — that is the whole point of this rung:
+    #
+    #   0  resolved      -> probe <main>/.aitask-data
+    #   1  not a git repository at all -> legacy is a PROVEN answer
+    #   2  inside a repository, but the topology did not resolve
+    #
+    # State 2 is NOT a licence to answer legacy. `git init --separate-git-dir`
+    # is a documented layout that answers 2 (see the KNOWN LAYOUT BOUNDARY note
+    # in data_symlinks.sh), and an unlinked linked worktree of such a
+    # BRANCH-MODE primary would otherwise fall straight through to "." and
+    # operate on its own code branch — reinstating, in a different layout,
+    # exactly the silent legacy fallback this ladder exists to remove.
+    #
+    # It must be called in an `if`/`|| rc=$?` for the same set -e reason as
+    # rung 2.
+    local main_rc=0
+    ait_main_worktree_root "." || main_rc=$?
+    case "$main_rc" in
+        0)
+            if [[ -d "$AIT_WT_MAIN_ROOT/.aitask-data/.git" || -f "$AIT_WT_MAIN_ROOT/.aitask-data/.git" ]]; then
+                _AIT_DATA_WORKTREE="$AIT_WT_MAIN_ROOT/.aitask-data"
+                return
+            fi
+            ;;
+        1)
+            : # Not a repository — rung 4's legacy answer is correct.
+            ;;
+        *)
+            # Indeterminate. Legacy is only safe if we can PROVE this checkout
+            # owns its repository, i.e. it is the primary (or a plain
+            # subdirectory of it) — rung 2 already established that primary has
+            # no .aitask-data, so "." is then a proven answer rather than a
+            # guess. ait_linked_worktree_roots decides that on the
+            # git-dir-vs-git-common-dir predicate, which still works when the
+            # main root does not resolve: it returns 1 for "definitively NOT
+            # linked". (It cannot return 0 here — it calls
+            # ait_main_worktree_root itself and propagates this same failure —
+            # so 1 is the only safe state.)
+            local linked_rc=0
+            ait_linked_worktree_roots "." || linked_rc=$?
+            if [[ "$linked_rc" -ne 1 ]]; then
+                die "Cannot determine where task data lives: this is a git worktree whose main checkout could not be resolved (an unsupported layout such as 'git init --separate-git-dir'). Refusing rather than defaulting to legacy mode, which would commit task data to this worktree's own branch. Give this worktree its own .aitask-data (./ait setup, or aitask_init_data.sh --link-worktree <dir>), or run the command from the main checkout."
+            fi
+            ;;
+    esac
+
+    # Rung 4 — a genuine legacy-mode project.
+    _AIT_DATA_WORKTREE="."
+}
+
+# Anchor the process to the repository root — the same rule `ait` applies
+# (`cd "$AIT_DIR"`, ait:9) so relative paths like aitasks/metadata/... and ./ait
+# resolve. Call it ONCE, early, from an ENTRY-POINT script only; never from a
+# library, and never from a sourced helper.
+#
+# Deliberately does NOT honour AITASK_REPO_ROOT: that is a single-script test
+# hook read only by aitask_add_model.sh, and promoting it to a framework-wide
+# override here would silently broaden its blast radius.
+ait_cd_repo_root() {
+    local script_dir="${1:?ait_cd_repo_root: script dir required}" root
+    root="$(cd "$script_dir/.." && pwd)" || die "Cannot resolve repo root from $script_dir"
+    cd "$root" || die "Cannot cd to repo root $root"
+}
+
+# The git states that mean "this worktree is mid-operation". ONE named set: the
+# names were spelled out inline in both assert_data_worktree_clean and
+# task_git_health, and t1704 added a third reader (aitask_metadata_commit.sh's
+# --preflight, via ait_data_inprogress_state below) — a third copy of a list
+# whose members can only be verified against live git was not acceptable.
+#
+# Order is load-bearing for the FIRST-match readers: it is the order the two
+# pre-existing loops used, so the state a wedged worktree reports is unchanged.
+# rebase-merge and rebase-apply are directories; the other four are files —
+# `-e` covers both, which is why every reader uses it.
+AIT_GIT_INPROGRESS_STATES=(
+    rebase-merge rebase-apply MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD BISECT_LOG
+)
+
+# Resolve the data worktree's git-dir. Empty when in legacy mode or when the
+# git-dir cannot be resolved.
+#
+# ALWAYS returns 0: every caller does `gitdir="$(_ait_data_gitdir)"` under
+# `set -e`, so a non-zero status here aborts the caller with no message. An
+# unresolvable git-dir is an empty answer, not a failure (t1616).
+_ait_data_gitdir() {
+    _ait_detect_data_worktree
+    if [[ "$_AIT_DATA_WORKTREE" == "." ]]; then
+        printf ''
+        return 0
+    fi
+    # Fast path: the relative admin dir, correct from the primary checkout.
+    local gd=".git/worktrees/-aitask-data"
+    if [[ -d "$gd" ]]; then
+        printf '%s' "$gd"
+        return 0
+    fi
+    # From a linked worktree `.git` is a FILE, so the path above does not exist
+    # even though the data worktree is perfectly reachable through the
+    # .aitask-data symlink. Ask git, which resolves it from anywhere.
+    git -C "$_AIT_DATA_WORKTREE" rev-parse --absolute-git-dir 2>/dev/null || printf ''
+    return 0
+}
+
+# ait_data_mode — print `branch` or `legacy` for this repo's task-data layout.
+#
+# A named accessor rather than another reader of _AIT_DATA_WORKTREE: that global
+# is this library's cache, and a script outside it that reads the cache directly
+# inherits the responsibility for priming it. Callers want the classification,
+# not the path.
+#
+# ALWAYS returns 0, for the same `set -e` reason as _ait_data_gitdir.
+ait_data_mode() {
+    _ait_detect_data_worktree
+    if [[ "$_AIT_DATA_WORKTREE" == "." ]]; then
+        printf 'legacy'
+    else
+        printf 'branch'
+    fi
+    return 0
+}
+
+# Internal: print the FIRST AIT_GIT_INPROGRESS_STATES member present under
+# <gitdir>, or nothing when the dir is clean or <gitdir> is empty.
+#
+# The ONE loop. It used to be spelled out in ait_data_inprogress_state and again
+# in assert_data_worktree_clean; t1725_1 added a third reader (_data_wedge_state,
+# below) and a fourth copy of a list whose members can only be verified against
+# live git was not acceptable — the same reasoning that made
+# AIT_GIT_INPROGRESS_STATES one named set. task_git_health keeps its own loop on
+# purpose: it collects ALL hits rather than the first.
+#
+# The callers differ only in WHICH git-dir they hand it, which is exactly the
+# policy each one owns.
+#
+# ALWAYS returns 0: an empty answer means clean-or-uninspectable.
+_ait_inprogress_state_at() {
+    local gitdir="${1:-}" state
+    [[ -z "$gitdir" ]] && return 0
+    for state in "${AIT_GIT_INPROGRESS_STATES[@]}"; do
+        if [[ -e "$gitdir/$state" ]]; then
+            printf '%s' "$state"
+            return 0
+        fi
+    done
+    return 0
+}
+
+# ait_data_inprogress_state — print the FIRST in-progress git state the data
+# worktree is stuck in, or nothing when it is clean.
+#
+# Reports rather than refuses, which is what separates it from
+# assert_data_worktree_clean: a preflight has to be able to SAY "mid-merge"
+# without dying, and dying is that function's entire contract.
+#
+# Works in both modes — in legacy mode _ait_data_gitdir answers empty and this
+# prints nothing, which is the honest answer for "the data worktree" when there
+# is not a separate one. That is a DELIBERATE contract, not an oversight: when
+# you need a legacy-mode answer too, use _data_wedge_state() below.
+#
+# ALWAYS returns 0: an empty answer means clean-or-uninspectable, and every
+# caller distinguishes those by asking ait_data_mode as well.
+ait_data_inprogress_state() {
+    _ait_inprogress_state_at "$(_ait_data_gitdir)"
+}
+
+# Internal: the git-dir whose in-progress state describes where THIS PROCESS's
+# task-data git commands actually land — i.e. wherever _ait_data_git runs.
+#
+# Resolved by MODE, never by emptiness. _ait_data_gitdir answers empty for two
+# different situations — legacy mode, and a branch-mode git-dir that would not
+# resolve — and they need opposite handling: in legacy mode _ait_data_git runs
+# plain `git` in the code repo, so the code repo's git-dir IS the right answer;
+# in branch mode falling back to it would inspect the WRONG repository.
+#
+# ALWAYS returns 0 (same set -e reason as _ait_data_gitdir).
+_data_wedge_gitdir() {
+    if [[ "$(ait_data_mode)" == "legacy" ]]; then
+        git rev-parse --git-dir 2>/dev/null || printf ''
+        return 0
+    fi
+    _ait_data_gitdir
+}
+
+# _data_wedge_state — the first in-progress git state blocking task-data writes,
+# or nothing when clean. The legacy-aware sibling of ait_data_inprogress_state.
+#
+# Reports ALL SIX states, not just the two rebase ones: callers word their
+# message as "mid-<state>", and a merge or cherry-pick announced as a rebase
+# would be handed a recovery command that does not apply.
+#
+# ALWAYS returns 0.
+_data_wedge_state() {
+    _ait_inprogress_state_at "$(_data_wedge_gitdir)"
+}
+
+# Internal: run git against the task-data worktree (branch mode) or the current
+# repo (legacy mode). Unlike task_git() it skips the wedged-worktree assertion,
+# so it is safe for the read-only probes and for task_push, which asserts once
+# up front. LC_ALL=C keeps git's messages parseable by _task_push_classify.
+_ait_data_git() {
+    _ait_detect_data_worktree
+    if [[ "$_AIT_DATA_WORKTREE" != "." ]]; then
+        LC_ALL=C git -C "$_AIT_DATA_WORKTREE" "$@"
+    else
+        LC_ALL=C git "$@"
+    fi
+}
+
+# --- git argv shape (t1739) ---------------------------------------------------
+#
+# git accepts global options BEFORE the subcommand (`git -c a=b pull`,
+# `git --no-pager rebase --abort`), so anything that routes on `$1` misreads
+# those calls. ONE walker classifies the global-option region; the readers below
+# only consume its results, so the value-skip rule exists exactly once.
+
+# Git global options whose value is the NEXT token. The `--opt=value` spelling
+# consumes nothing extra and so is not listed. Probed against git 2.56: `-C` and
+# `-c` match exactly (`-cfoo=bar` is "unknown option"), and bare `--exec-path`
+# takes no value — it prints the exec path and exits.
+_ait_git_global_opt_takes_value() {
+    case "${1:-}" in
+        -C|-c|--git-dir|--work-tree|--namespace|--config-env|--attr-source) return 0 ;;
+    esac
+    return 1
+}
+
+# _ait_git_scan_globals <argv…> — walk git's global-option region once.
+#
+# Results are globals, so call it directly and NEVER inside $( ): a command
+# substitution's assignments die with the subshell.
+#   AIT_GIT_SUBCMD_IDX    1-based index of the first non-option token (the
+#                         subcommand); 0 when there is none — the fail-closed
+#                         answer, which classifies as neither readonly nor
+#                         recovery
+#   AIT_GIT_REDIRECT_OPT  the first option that retargets git away from the
+#                         repository it runs in (-C, --git-dir, --work-tree,
+#                         --namespace — either spelling, reported without its
+#                         `=value`), or ""
+#   AIT_GIT_CONFIG_OPTS   the config-bearing options, verbatim and in order:
+#                         `-c X`, `--config-env X`, `--config-env=X`
+#   AIT_GIT_OTHER_OPTS    every other global option, with its value, in order
+#
+# A value is never inspected as an option, so `-c -C=x status` redirects nothing.
+_ait_git_scan_globals() {
+    AIT_GIT_SUBCMD_IDX=0
+    AIT_GIT_REDIRECT_OPT=""
+    AIT_GIT_CONFIG_OPTS=()
+    AIT_GIT_OTHER_OPTS=()
+    local i=1 tok val
+    while (( i <= $# )); do
+        tok="${!i}"
+        case "$tok" in
+            -*) ;;
+            *)  AIT_GIT_SUBCMD_IDX=$i; return 0 ;;
+        esac
+        case "$tok" in
+            -C|--git-dir|--git-dir=*|--work-tree|--work-tree=*|--namespace|--namespace=*)
+                [[ -z "$AIT_GIT_REDIRECT_OPT" ]] && AIT_GIT_REDIRECT_OPT="${tok%%=*}" ;;
+        esac
+        if _ait_git_global_opt_takes_value "$tok"; then
+            i=$((i + 1))
+            # A trailing value-taking option has no value; git rejects it, and
+            # the walk simply ends with no subcommand found.
+            (( i <= $# )) || return 0
+            val="${!i}"
+            case "$tok" in
+                -c|--config-env) AIT_GIT_CONFIG_OPTS+=("$tok" "$val") ;;
+                *)               AIT_GIT_OTHER_OPTS+=("$tok" "$val") ;;
+            esac
+        else
+            case "$tok" in
+                --config-env=*) AIT_GIT_CONFIG_OPTS+=("$tok") ;;
+                *)              AIT_GIT_OTHER_OPTS+=("$tok") ;;
+            esac
+        fi
+        i=$((i + 1))
+    done
+    return 0
+}
+
+# ait_git_subcmd_index <argv…> — print the 1-based index of the git subcommand,
+# 0 when there is none. ALWAYS returns 0.
+ait_git_subcmd_index() {
+    _ait_git_scan_globals "$@"
+    printf '%s' "$AIT_GIT_SUBCMD_IDX"
+}
+
+# ait_git_redirect_opt <argv…> — print the first repository-redirecting global
+# option (see _ait_git_scan_globals), or nothing. ALWAYS returns 0.
+ait_git_redirect_opt() {
+    _ait_git_scan_globals "$@"
+    printf '%s' "$AIT_GIT_REDIRECT_OPT"
+}
+
+# Read-only git subcommands — the guard treats them as safe.
+# Both classifiers take the argv FROM the subcommand on; callers holding a full
+# git argv slice it at ait_git_subcmd_index first (assert_data_worktree_clean).
+_ait_git_subcmd_is_readonly() {
+    case "${1:-}" in
+        status|log|show|diff|rev-parse|ls-files|blame|grep|reflog) return 0 ;;
+        branch)
+            local a
+            for a in "${@:2}"; do
+                case "$a" in -d|-D|-m|-M|--delete|--move) return 1 ;; esac
+            done
+            return 0 ;;
+        tag)
+            local a
+            for a in "${@:2}"; do
+                case "$a" in -l|--list) return 0 ;; esac
+            done
+            return 1 ;;
+        stash)
+            [[ "${2:-}" == "list" || "${2:-}" == "show" ]] && return 0 || return 1 ;;
+    esac
+    return 1
+}
+
+# Recovery subcommands — must be allowed through even when the worktree is wedged.
+_ait_git_subcmd_is_recovery() {
+    case "${1:-}" in
+        rebase|merge|cherry-pick|revert)
+            local a
+            for a in "${@:2}"; do
+                case "$a" in --abort|--continue|--skip|--edit-todo|--quit) return 0 ;; esac
+            done
+            return 1 ;;
+        bisect)
+            [[ "${2:-}" == "reset" ]] && return 0 || return 1 ;;
+    esac
+    return 1
+}
+
+# Pre-flight: reject mutating ops while the data worktree is mid-rebase/merge/etc.
+# No-op in legacy mode and when the data worktree git-dir is missing.
+assert_data_worktree_clean() {
+    [[ "${AIT_GIT_SKIP_STATE_CHECK:-}" == "1" ]] && return 0
+    # Classify from the SUBCOMMAND, not from $1: `-c core.pager=cat rebase
+    # --abort` is the advertised recovery behind a global option (t1739).
+    local idx
+    idx="$(ait_git_subcmd_index "$@")"
+    # Never an unguarded "${@:idx}": with idx=0 that expands to $0 plus argv.
+    # `set --` rather than an array, so an empty argv never meets `set -u`.
+    if (( idx > 0 )); then set -- "${@:idx}"; else set --; fi
+    _ait_git_subcmd_is_recovery "$@" && return 0
+    _ait_git_subcmd_is_readonly "$@" && return 0
+
+    local hit
+    hit="$(ait_data_inprogress_state)"
+    [[ -z "$hit" ]] && return 0
+
+    die "$(cat <<EOF
+Data worktree (.aitask-data) is stuck mid-${hit}.
+'--abort' below discards only the partially replayed remote commits; your own
+committed work stays on the branch.
+Recover with one of:
+  ./ait git rebase --abort        (discard the in-progress rebase)
+  ./ait git rebase --continue     (resume if you were editing)
+  ./ait git merge --abort
+  ./ait git cherry-pick --abort
+  ./ait git revert --abort
+  ./ait git bisect reset
+Set AIT_GIT_SKIP_STATE_CHECK=1 to bypass this check.
+Run './ait git-health' for a full diagnostic.
+EOF
+)"
+}
+
+# assert_task_data_writable — refuse to EDIT a task/plan file while the data
+# worktree is mid-operation. Call it BEFORE the write, at the earliest point past
+# which a side effect becomes irreversible (t1725_2, findings 6 and 7).
+#
+# Why this exists when assert_data_worktree_clean already guards task_git: that
+# one fires at COMMIT time, which is too late. Mid-rebase the checked-out file is
+# origin's version, not the branch tip, so a writer seds stale content first and
+# only then discovers it cannot commit. On 2026-09-07 that flipped t1717 back to
+# `status: Ready` and dropped its materialized gates. Refusing before the write
+# is the "refused, not applied blind" half.
+#
+# Differences from assert_data_worktree_clean, both deliberate:
+#   - it reads _data_wedge_state, which is LEGACY-AWARE, so a legacy-mode repo
+#     mid-rebase is guarded too (ait_data_inprogress_state answers empty there);
+#   - it takes no git subcommand, because there is none to classify: every caller
+#     is about to write a file, so the readonly/recovery allowlists do not apply.
+#
+# The message shares assert_data_worktree_clean's '--abort' clause verbatim (the
+# two must not drift) but keeps a distinct first sentence, so a test can tell
+# which of the two guards refused.
+assert_task_data_writable() {
+    [[ "${AIT_GIT_SKIP_STATE_CHECK:-}" == "1" ]] && return 0
+
+    local hit
+    hit="$(_data_wedge_state)"
+    [[ -z "$hit" ]] && return 0
+
+    die "$(cat <<EOF
+Data worktree (.aitask-data) is mid-${hit}: the checked-out task files are not
+the branch tip, so writing now would land on stale content.
+'--abort' below discards only the partially replayed remote commits; your own
+committed work stays on the branch.
+If a sync is running right now, retry in a few seconds. Otherwise recover with:
+  ./ait git rebase --abort        (discard the in-progress rebase)
+  ./ait git rebase --continue     (resume if you were editing)
+  ./ait git merge --abort
+  ./ait git cherry-pick --abort
+  ./ait git revert --abort
+  ./ait git bisect reset
+Set AIT_GIT_SKIP_STATE_CHECK=1 to bypass this check.
+Run './ait git-health' for a full diagnostic.
+EOF
+)"
+}
+
+# Print human-readable health of the .aitask-data worktree. Informational only.
+task_git_health() {
+    _ait_detect_data_worktree
+    if [[ "$_AIT_DATA_WORKTREE" == "." ]]; then
+        info "Mode: legacy (no separate .aitask-data worktree) — nothing to check."
+        return 0
+    fi
+
+    local gitdir branch head_ref state
+    local hits=()
+    gitdir="$(_ait_data_gitdir)"
+    # Full ref, never --abbrev-ref: beside a same-named tag it answers
+    # "heads/<b>" (t2132). Detached reads HEAD, an unreadable HEAD '?'.
+    local ref_rc=0
+    branch="$(git -C .aitask-data symbolic-ref --quiet HEAD 2>/dev/null)" || ref_rc=$?
+    case "$ref_rc:$branch" in
+        0:refs/heads/?*) branch="${branch#refs/heads/}" ;;
+        0:* | 1:*)       branch="HEAD" ;;
+        *)               branch="?" ;;
+    esac
+    head_ref="$(git -C .aitask-data rev-parse --short HEAD 2>/dev/null || echo '?')"
+
+    info "Mode: branch (.aitask-data worktree present)"
+    info "Worktree path: .aitask-data"
+    info "Git-dir: ${gitdir:-<missing>}"
+    info "Branch: $branch"
+    info "HEAD commit: $head_ref"
+
+    if [[ -z "$gitdir" || ! -d "$gitdir" ]]; then
+        warn "Git-dir not found at expected path — worktree may be misregistered."
+        return 0
+    fi
+
+    for state in "${AIT_GIT_INPROGRESS_STATES[@]}"; do
+        [[ -e "$gitdir/$state" ]] && hits+=("$state")
+    done
+
+    if [[ "$branch" == "HEAD" ]]; then
+        warn "Detached HEAD."
+    fi
+    if (( ${#hits[@]} > 0 )); then
+        warn "In-progress operations: ${hits[*]}"
+        info "Recover with: ./ait git <rebase|merge|cherry-pick|revert> --abort  (or --continue)"
+    elif [[ "$branch" != "HEAD" ]]; then
+        success "Clean — no in-progress rebase/merge/cherry-pick/revert/bisect."
+    fi
+}
+
+# Run git commands targeting the task data worktree
+# In branch mode: git -C .aitask-data <args>
+# In legacy mode: git <args>
+task_git() {
+    _ait_detect_data_worktree
+    assert_data_worktree_clean "$@"
+    if [[ "$_AIT_DATA_WORKTREE" != "." ]]; then
+        git -C "$_AIT_DATA_WORKTREE" "$@"
+    else
+        git "$@"
+    fi
+}
+
+# task_git_gateway <argv…> — what `./ait git <argv>` runs.
+#
+# Policies on top of task_git, all keyed on the PARSED argv so a global option
+# in front of the subcommand cannot route around them (t1739, t2063):
+#   - repository-redirecting options are refused: they point git away from the
+#     data worktree, which defeats the gateway, and for a pull they would read
+#     the ownership evidence from the wrong git-dir. `-c name=value` redirects
+#     nothing and is kept;
+#   - a `pull` goes through task_git_pull, the workflow pull's cleanup;
+#   - a `push` goes through task_git_push, the best-effort task_push.
+task_git_gateway() {
+    local redirect idx
+    redirect="$(ait_git_redirect_opt "$@")"
+    if [[ -n "$redirect" ]]; then
+        die "./ait git: '$redirect' points git away from the task-data worktree, which is what this gateway exists to target. Use plain 'git $redirect ...' instead."
+    fi
+    idx="$(ait_git_subcmd_index "$@")"
+    if (( idx > 0 )) && [[ "${!idx}" == "pull" ]]; then
+        task_git_pull "$@"
+        return
+    fi
+    if (( idx > 0 )) && [[ "${!idx}" == "push" ]]; then
+        task_git_push "$@"
+        return
+    fi
+    task_git "$@"
+}
+
+# task_git_push <git argv…> — the `./ait git push` gateway: the best-effort
+# task_push (retries, a pull-rebase between attempts, reason reporting) whatever
+# global options precede `push` (t2063).
+#
+#   - Config the user supplied (`-c`, `--config-env`) reaches every git call of
+#     the cycle: the push attempts and their remote / upstream / unpushed probes
+#     (AIT_PUSH_GIT_OPTS), and the retry pull with its auto-merge continue and
+#     abort (AIT_RECONCILE_GIT_OPTS, framework pins last). A remote reached only
+#     through `-c url.….insteadOf` or `-c core.sshCommand` needs it on both.
+#   - Any OTHER global option is refused: carrying it to some of those calls and
+#     not others would be a half-contract, and none of them is needed to push.
+#   - Arguments after `push` are read as in the bare form: `--batch` adds the
+#     structured status line, everything else is ignored.
+task_git_push() {
+    _ait_git_scan_globals "$@"
+    local idx="$AIT_GIT_SUBCMD_IDX"
+    if (( ${#AIT_GIT_OTHER_OPTS[@]} )); then
+        die "./ait git push: '${AIT_GIT_OTHER_OPTS[0]}' is not supported before 'push' - only -c and --config-env are carried into the best-effort push (every attempt and the pull between attempts). Drop it, or use plain 'git -C .aitask-data ${AIT_GIT_OTHER_OPTS[0]} push'."
+    fi
+    local push_batch=0 arg
+    for arg in "${@:idx+1}"; do
+        if [[ "$arg" == "--batch" ]]; then push_batch=1; fi
+    done
+
+    # Function-local and dynamically scoped, exactly as in task_git_pull: the
+    # callees read both arrays while this frame is live; the globals are untouched.
+    local -a framework_opts=("${AIT_RECONCILE_GIT_OPTS[@]}")
+    local -a AIT_RECONCILE_GIT_OPTS=(${AIT_GIT_CONFIG_OPTS[@]+"${AIT_GIT_CONFIG_OPTS[@]}"} "${framework_opts[@]}")
+    local -a AIT_PUSH_GIT_OPTS=(${AIT_GIT_CONFIG_OPTS[@]+"${AIT_GIT_CONFIG_OPTS[@]}"})
+
+    task_push
+    if [[ "$push_batch" == "1" ]]; then task_push_report; fi
+    return 0
+}
+
+# --- `git pull` argument shape (t1739) ----------------------------------------
+#
+# task_git_pull must know three things the pull's own arguments decide — the
+# rebase mode, and whether --autostash or --edit is in force — and git decides
+# them with parse-options rules: the LAST occurrence wins, long options
+# abbreviate to any unique prefix, and an option that takes a value CONSUMES the
+# next token (`--server-option --rebase` passes "--rebase" as a server option;
+# it selects nothing). A scanner that ignored any of those rules would let a
+# value pose as a mode override. So the scan resolves every token exactly as
+# git 2.56 does, against git pull's own option table (from `git pull -h`).
+
+# Every long option of `git pull`. Abbreviations resolve against this list, so
+# it must be complete: a missing name could make a token look unique here while
+# git finds it ambiguous (git then refuses the whole pull — harmless), but never
+# the reverse.
+_AIT_GIT_PULL_LONG_OPTS="all allow-unrelated-histories append autostash cleanup \
+commit compact-summary deepen depth dry-run edit ff ff-only force gpg-sign ipv4 \
+ipv6 jobs keep log negotiation-include negotiation-restrict negotiation-tip \
+progress prune quiet rebase recurse-submodules refmap server-option set-upstream \
+shallow-exclude shallow-since show-forced-updates signoff squash stat strategy \
+strategy-option tags unshallow update-shallow upload-pack verbose verify \
+verify-signatures"
+# The ones taking a REQUIRED value, which may be the next token. (Optional-value
+# options — rebase, jobs, gpg-sign, log, recurse-submodules, signoff — only ever
+# take an attached `=value`.)
+_AIT_GIT_PULL_VALUE_OPTS=" cleanup deepen depth negotiation-include \
+negotiation-restrict negotiation-tip refmap server-option shallow-exclude \
+shallow-since strategy strategy-option upload-pack "
+# The three without a `--no-` form.
+_AIT_GIT_PULL_NO_NEGATION=" ff-only refmap unshallow "
+
+# _ait_git_pull_resolve_long <name> — the option a `--<name>` token means to git
+# (`no-<opt>` for a negation), or nothing when it is unknown or ambiguous: git
+# refuses the pull outright in both cases. An exact name beats any prefix match.
+_ait_git_pull_resolve_long() {
+    local name="$1" o cand hit="" count=0
+    for o in $_AIT_GIT_PULL_LONG_OPTS; do
+        for cand in "$o" "no-$o"; do
+            [[ "$cand" == "no-$o" && "$_AIT_GIT_PULL_NO_NEGATION" == *" $o "* ]] && continue
+            if [[ "$cand" == "$name" ]]; then
+                printf '%s' "$cand"
+                return 0
+            fi
+            if [[ "$cand" == "$name"* ]]; then
+                hit="$cand"
+                count=$((count + 1))
+            fi
+        done
+    done
+    (( count == 1 )) && printf '%s' "$hit"
+    return 0
+}
+
+# _ait_git_pull_scan_args <pull args…> — resolve the pull's own arguments once.
+# Results in globals (call it directly, NEVER inside $( )):
+#   AIT_PULL_REBASE_MODE   `true`, `false`, the given value (`i`, `interactive`,
+#                          `merges`, …), or "" when the arguments select none
+#                          (config then decides)
+#   AIT_PULL_AUTOSTASH     `autostash` / `no-autostash` / "" — the last one given
+#   AIT_PULL_AUTOSTASH_TOK the token that set it, verbatim
+#   AIT_PULL_EDIT          `edit` / `no-edit` / "" — the last one given
+#   AIT_PULL_EDIT_TOK      the token that set it, verbatim
+#
+# Probed against git 2.56 with logging editors: bare `--rebase`/`-r` mean `true`
+# (and override an interactive config); a short `-r` takes the REST of its
+# cluster as its value (`-qri` is interactive, `-rq` the invalid value `q`);
+# short -s/-X/-o take a required value (attached, or the next token), -S/-j an
+# optional attached one; `--` ends the options. An unrecognized short letter is
+# treated as a flag, and an unknown or ambiguous long option as a flag with no
+# value: git refuses the whole pull for either before running anything.
+_ait_git_pull_scan_args() {
+    AIT_PULL_REBASE_MODE=""
+    AIT_PULL_AUTOSTASH=""
+    AIT_PULL_AUTOSTASH_TOK=""
+    AIT_PULL_EDIT=""
+    AIT_PULL_EDIT_TOK=""
+    local tok name opt cluster c i=1
+    while (( i <= $# )); do
+        tok="${!i}"
+        case "$tok" in
+            --) break ;;
+            --?*)
+                name="${tok#--}"
+                name="${name%%=*}"
+                opt="$(_ait_git_pull_resolve_long "$name")"
+                case "$opt" in
+                    rebase)
+                        AIT_PULL_REBASE_MODE="true"
+                        [[ "$tok" == *=?* ]] && AIT_PULL_REBASE_MODE="${tok#*=}" ;;
+                    no-rebase)
+                        AIT_PULL_REBASE_MODE="false" ;;
+                    autostash|no-autostash)
+                        AIT_PULL_AUTOSTASH="$opt"; AIT_PULL_AUTOSTASH_TOK="$tok" ;;
+                    edit|no-edit)
+                        AIT_PULL_EDIT="$opt"; AIT_PULL_EDIT_TOK="$tok" ;;
+                    ?*)
+                        # A required-value option given without `=` consumes
+                        # the next token, whatever that token looks like.
+                        if [[ "$tok" != *=* && "$_AIT_GIT_PULL_VALUE_OPTS" == *" $opt "* ]]; then
+                            i=$((i + 1))
+                        fi ;;
+                esac ;;
+            -?*)
+                cluster="${tok#-}"
+                while [[ -n "$cluster" ]]; do
+                    c="${cluster:0:1}"; cluster="${cluster:1}"
+                    case "$c" in
+                        r) AIT_PULL_REBASE_MODE="${cluster:-true}"; break ;;
+                        s|X|o) [[ -z "$cluster" ]] && i=$((i + 1)); break ;;
+                        S|j) break ;;
+                    esac
+                done ;;
+        esac
+        i=$((i + 1))
+    done
+    return 0
+}
+
+# _ait_git_pull_cli_rebase_mode <pull args…> — print AIT_PULL_REBASE_MODE alone.
+# ALWAYS returns 0.
+_ait_git_pull_cli_rebase_mode() {
+    _ait_git_pull_scan_args "$@"
+    printf '%s' "$AIT_PULL_REBASE_MODE"
+}
+
+# task_git_pull <git argv…> — the `./ait git pull` gateway: the user's pull,
+# through _ait_owned_pull, so a conflicted rebase it started is auto-merged or
+# aborted exactly as the workflow pull's is, and nothing else is ever touched.
+#
+#   - Automatic stashing is always OFF. An autostash pull returns 0 even when
+#     re-applying the stash conflicts — leaving an unmerged index the cleanup
+#     never sees — and it would stash other sessions' uncommitted edits in the
+#     shared worktree; task_automerge.sh also relies on the pull refusing a dirty
+#     worktree. `--no-autostash` goes right after `pull` (the command line beats
+#     rebase.autoStash / merge.autoStash however they were set), and a user
+#     `--autostash` is refused because, coming later, it would win.
+#   - Config the user supplied (`-c`, `--config-env`) must reach the continue and
+#     the abort as well as the pull: a rebase begun with `-c user.email=…` cannot
+#     be continued without it. The user's config is prepended to
+#     AIT_RECONCILE_GIT_OPTS for this call only, framework pins LAST so they win.
+#     Other global options apply to the pull alone.
+#   - The git output is forwarded on stderr, as the workflow pull's is: the
+#     classifier needs both streams in one blob.
+#   - No editor ever opens. Its output is captured, so it would get no terminal:
+#     `--no-edit` goes right after `pull` (beating GIT_MERGE_AUTOEDIT=yes) and a
+#     user `--edit`, which would win as the later option, is refused; a merge
+#     commit takes git's default message.
+#   - Interactive rebase is refused BEFORE anything runs, whether the arguments
+#     or the config (`branch.<current>.rebase`, else `pull.rebase`, including the
+#     user's own -c) select it. The captured output takes the terminal away from
+#     the sequence editor, and an `edit` stop ends the pull with rc 0 and a rebase
+#     deliberately left in progress — which the gateway must neither abort nor
+#     report as a completed pull.
+#   - A merge-mode pull (t2064) is passed --own-merge, so a merge it provably
+#     started and that stopped in a RECOGNISED way (_ait_merge_stop_shaped) is
+#     aborted — never auto-merged — and reported as merge_aborted. A merge
+#     paused on purpose (`--no-commit`, rc 0) never reaches the cleanup; the
+#     completion postcondition reports it and leaves it alone.
+#
+# BOUNDS, deliberately not closed here:
+#   - a merge-mode stop whose output matches no recognised family is left in
+#     progress and reported as `mid-MERGE_HEAD` / data_midop, for a manual
+#     `./ait git merge --abort`. The family list is not exhaustive by design:
+#     an unrecognised stop fails closed. (One known case: under -q, a branch
+#     update rejected after the merge commit prints only a fatal that fetch also
+#     prints, so nothing marks it as this pull's merge.)
+#   - a conflict the auto-merge cannot resolve is aborted, so it cannot be
+#     resolved in place through the gateway. That is the invariant; plain
+#     `git -C .aitask-data pull` is the escape hatch.
+task_git_pull() {
+    _ait_detect_data_worktree
+    # A pre-existing wedge dies here, before any pull: pull is mutating.
+    assert_data_worktree_clean "$@"
+
+    _ait_git_scan_globals "$@"
+    local idx="$AIT_GIT_SUBCMD_IDX"
+    local -a pull_args=("${@:idx+1}")
+    _ait_git_pull_scan_args ${pull_args[@]+"${pull_args[@]}"}
+    if [[ "$AIT_PULL_AUTOSTASH" == "autostash" ]]; then
+        die "./ait git pull: '$AIT_PULL_AUTOSTASH_TOK' is not supported - automatic stashing would re-apply other sessions' uncommitted edits in the shared data worktree and can leave unmerged files behind a successful exit. Commit or set aside local changes first, or use plain 'git -C .aitask-data pull --autostash'."
+    fi
+    if [[ "$AIT_PULL_EDIT" == "edit" ]]; then
+        die "./ait git pull: '$AIT_PULL_EDIT_TOK' is not supported - the merge-message editor needs the terminal, which this gateway does not give it. The merge commit takes git's default message; use plain 'git -C .aitask-data pull --edit' to edit it."
+    fi
+
+    # Resolve the rebase mode exactly as git will: the arguments' last rebase
+    # option, else branch.<current>.rebase, else pull.rebase — the config read
+    # WITH the user's own -c / --config-env. A config read that fails for any
+    # reason other than "not set" (exit 1) refuses: the mode is then unknown.
+    local mode branch key cfg_rc mode_src="the pull arguments"
+    mode="$AIT_PULL_REBASE_MODE"
+    if [[ -z "$mode" ]]; then
+        # Full ref, never --short: beside a same-named tag --short answers
+        # "heads/<b>", and branch.heads/<b>.rebase would miss the branch's
+        # interactive setting (t2132).
+        branch="$(_ait_data_git symbolic-ref --quiet HEAD 2>/dev/null || true)"
+        case "$branch" in
+            refs/heads/?*) branch="${branch#refs/heads/}" ;;
+            *)             branch="" ;;
+        esac
+        for key in ${branch:+"branch.$branch.rebase"} pull.rebase; do
+            cfg_rc=0
+            mode="$(_ait_data_git ${AIT_GIT_CONFIG_OPTS[@]+"${AIT_GIT_CONFIG_OPTS[@]}"} \
+                        config --get "$key" 2>/dev/null)" || cfg_rc=$?
+            if [[ $cfg_rc -eq 0 ]]; then mode_src="config $key"; break; fi
+            mode=""
+            [[ $cfg_rc -eq 1 ]] || die "./ait git pull: could not read '$key' (git config exited $cfg_rc), so the rebase mode is unknown - refusing to pull."
+        done
+    fi
+    case "$mode" in
+        i|interactive)
+            die "./ait git pull: interactive rebase is not supported here (rebase mode '$mode' from $mode_src) - its editor needs the terminal, and an 'edit' stop would leave the shared data worktree mid-rebase. Use plain 'git -C .aitask-data pull --rebase=interactive', or pass --rebase to pull non-interactively." ;;
+    esac
+
+    # Merge mode — git's false spellings, or no setting at all — lets the
+    # cleanup claim a merge this pull started (t2064). Every other value,
+    # including one this list does not know, passes nothing: fail closed.
+    local -a own=()
+    case "$(printf '%s' "$mode" | tr '[:upper:]' '[:lower:]')" in
+        ""|false|no|off|0) own=(--own-merge) ;;
+    esac
+
+    # Function-local and dynamically scoped: ait_automerge_advance,
+    # ait_rebase_abort_if_ours and ait_merge_abort_if_ours read
+    # AIT_RECONCILE_GIT_OPTS while this frame is live, so the continue and the
+    # abort carry the user's config too. The global itself is untouched.
+    local -a framework_opts=("${AIT_RECONCILE_GIT_OPTS[@]}")
+    # ${a[@]+"${a[@]}"}: empty arrays stay safe under `set -u` on bash 3.2 too.
+    local -a AIT_RECONCILE_GIT_OPTS=(${AIT_GIT_CONFIG_OPTS[@]+"${AIT_GIT_CONFIG_OPTS[@]}"} "${framework_opts[@]}")
+
+    local blob rc=0 reason
+    blob="$(_ait_owned_pull ${own[@]+"${own[@]}"} "${AIT_RECONCILE_GIT_OPTS[@]}" ${AIT_GIT_OTHER_OPTS[@]+"${AIT_GIT_OTHER_OPTS[@]}"} \
+                pull --no-autostash --no-edit ${pull_args[@]+"${pull_args[@]}"} 2>&1)" || rc=$?
+    [[ -n "$blob" ]] && printf '%s\n' "$blob" >&2
+    if [[ $rc -ne 0 ]]; then
+        reason="$(_task_push_classify "" "$blob")"
+        if [[ "$reason" != "unknown" ]]; then
+            warn "./ait git pull did not complete (${reason}) — $(_task_push_reason_hint "$reason" "./ait git pull")"
+        fi
+    fi
+    return $rc
+}
+
+# --- Path-scoped commit (shared) ---
+
+# task_git_commit_scoped [--no-stage] <msg> <path>... — stage and commit ONLY
+# these paths.
+# Returns 0 = committed, 2 = verified nothing to commit, 1 = commit failed.
+#
+# `git commit -- <paths>` is a PARTIAL commit: it takes those paths' WORKTREE
+# content and ignores their index entry (verified: a staged-then-modified path
+# commits the on-disk version). That is deliberate for its callers — a claim's
+# own aitask_update.sh write is on disk — but it is a real change from an
+# index-wide commit, so it is stated rather than assumed.
+#
+# `--no-stage` (opt-in; default is unchanged) skips the `add` entirely, for a
+# caller that has already staged whatever needed staging and must not touch the
+# index for anything else. The `.aitask-data` index is SHARED by every session
+# on the machine, so an unconditional `add` of a tracked path can replace an
+# index entry another session staged and has not yet committed (t1599_3). A
+# caller in that position stages only the untracked paths itself — so it also
+# knows exactly which entries to unstage if the commit fails — and passes this
+# flag. `commit -o` needs no staging for a tracked path, so nothing is lost.
+#
+# Lives here rather than in one script because BOTH writers of the shared
+# contributor list commit through it (t1626): aitask_pick_own.sh (via its
+# _commit_scoped alias) and aitask_create.sh::add_email_to_file.
+#
+# On a `return 1` the reason git gave is left in AIT_COMMIT_SCOPED_ERR (t1725_2).
+# Callers that do not read it are unaffected.
+
+# Test seam, fired AFTER the preflight assert and BEFORE the guarded git call.
+# That position is load-bearing: it is the only window in which a "worktree
+# wedged mid-commit" race can be injected, and the only one whose refusal is owed
+# to task_git's OWN guard rather than to the preflight. Placed before the
+# preflight it would prove nothing — the preflight would die first, and swapping
+# task_git for the unguarded _ait_data_git would still look correct.
+#
+# TWO gates, matching aitask_sync.sh's _sync_test_seam (:275-287): the env var
+# alone must never be able to eval code, because this helper runs in four
+# production scripts. The on-disk marker means a stray or inherited variable is
+# inert outside a fixture that deliberately opted in, and the warn makes an
+# active seam impossible to mistake for normal operation.
+_ait_commit_scoped_seam_pregit() {
+    [[ -n "${AIT_COMMIT_SCOPED_SEAM_PREGIT:-}" ]] || return 0
+    local base
+    base="$(dirname "$(ait_lock_dir data_index)")" || return 0
+    [[ -f "$base/.ait_commit_scoped_test_seams" ]] || return 0
+    warn "task_git_commit_scoped: TEST SEAM ACTIVE - running pre_git hook"
+    eval "$AIT_COMMIT_SCOPED_SEAM_PREGIT" || true
+    return 0
+}
+task_git_commit_scoped() {
+    # Matched literally, so a message is never mistaken for the flag.
+    local do_stage=1
+    if [[ "${1:-}" == "--no-stage" ]]; then
+        do_stage=0; shift
+    fi
+    local msg="$1"; shift
+
+    # Cleared on ENTRY, never merely on failure: a caller that reads this after a
+    # later call must not be handed the previous call's text as if it described
+    # this one.
+    AIT_COMMIT_SCOPED_ERR=""
+    # Load-bearing: `git commit --` with no pathspec commits the WHOLE index,
+    # silently re-creating the cross-session swallow this exists to stop.
+    # `-o` below makes that case fatal rather than silent; this guard means it
+    # is never reached.
+    (( $# )) || return 2
+
+    # `add` is needed ONLY so an untracked path can be named by the pathspec;
+    # a pathspec cannot match a file git does not know about. Verified: a
+    # two-path `commit -o -- <new> <orig>` rename fails outright with
+    # "pathspec did not match any file(s) known to git" when <new> is untracked,
+    # while a pure deletion needs no staging at all.
+    #
+    # Its stderr is RECORDED rather than discarded (t1725_2): under an index.lock
+    # the `add` message names the real cause, while the commit below then fails
+    # with a downstream "pathspec did not match any file(s) known to git". The
+    # failure stays non-fatal, as before — only the text is kept.
+    # mktemp CAN fail (TMPDIR missing, full, read-only, or not a directory), and
+    # an unchecked assignment here would be fatal under the callers' set -e —
+    # exiting the process AFTER aitask_create.sh has written the file and claimed
+    # the id, which is exactly the retry-and-burn-an-id defect this change
+    # removes. So it degrades instead: no capture file means no diagnostic, and
+    # the helper still returns 1 for the caller's recoverable branch.
+    #
+    # _ait_cs_sink keeps ONE code path for both git calls; the rm at the end is
+    # guarded on _ait_cs_errf so it can never target /dev/null.
+    local _ait_cs_errf="" _ait_cs_sink
+    _ait_cs_errf="$(mktemp "${TMPDIR:-/tmp}/ait_commit_scoped_err.XXXXXX" 2>/dev/null)" \
+        || _ait_cs_errf=""
+    _ait_cs_sink="${_ait_cs_errf:-/dev/null}"
+    if (( do_stage )); then
+        # NOT a command substitution: task_git calls assert_data_worktree_clean,
+        # which die()s, and a die inside $( ) exits only the SUBSHELL — turning a
+        # wedged worktree into an ordinary "add failed" for every caller of this
+        # shared helper. Redirecting in the current shell keeps the die fatal.
+        # The explicit assert first means an already-wedged worktree reports on
+        # the terminal instead of into $_ait_cs_errf.
+        assert_data_worktree_clean add -- "$@"
+        local a_rc=0
+        task_git add -- "$@" >/dev/null 2>"$_ait_cs_sink" || a_rc=$?
+        # Keyed on the STATUS, not on "wrote something": git add warns on stderr
+        # in cases that succeeded, and recording those would put a warning in a
+        # failure diagnostic.
+        #
+        # On SUCCESS the text is dropped, exactly as the previous
+        # `2>&1 >/dev/null || true` dropped it — re-emitting it would start
+        # surfacing warnings that have been silent for every caller of this
+        # shared helper. Only a failure earns a diagnostic.
+        if (( a_rc != 0 )) && [[ -n "$_ait_cs_errf" ]]; then
+            AIT_COMMIT_SCOPED_ERR="$(<"$_ait_cs_errf")"
+            [[ -s "$_ait_cs_errf" ]] && cat "$_ait_cs_errf" >&2
+        fi
+        : > "$_ait_cs_sink"
+    fi
+
+    # Capture the status exit separately: a failing status with empty stdout
+    # must read as "unverified", never as "clean" (same shape as the guard in
+    # aitask_gate.sh's materialize-active).
+    local st st_rc=0
+    st="$(task_git status --porcelain -- "$@" 2>/dev/null)" || st_rc=$?
+    if [[ $st_rc -eq 0 && -z "$st" ]]; then
+        [[ -n "$_ait_cs_errf" ]] && rm -f "$_ait_cs_errf"
+        return 2
+    fi
+    [[ $st_rc -ne 0 ]] && warn "git status failed for $* — committing anyway"
+
+    # stdout to /dev/null: --quiet already silences the summary, but
+    # aitask_create.sh's stdout is a DATA channel (it prints the created task
+    # file path), so this helper must never be able to contaminate it.
+    # stderr is recorded AND re-emitted; see the `add` note above for why this
+    # is a redirect in the current shell and not a command substitution.
+    local c_rc=0
+    assert_data_worktree_clean commit -- "$@"
+
+    _ait_commit_scoped_seam_pregit
+    task_git commit -o -m "$msg" --quiet -- "$@" >/dev/null 2>"$_ait_cs_sink" || c_rc=$?
+    [[ -n "$_ait_cs_errf" && -s "$_ait_cs_errf" ]] && cat "$_ait_cs_errf" >&2
+    # Do NOT overwrite a message the `add` failure already recorded. Under an
+    # index.lock the add says "Unable to create '…/index.lock': File exists" —
+    # the actual cause — while the commit only reports the downstream "pathspec
+    # did not match any file(s) known to git".
+    if (( c_rc != 0 )) && [[ -z "$AIT_COMMIT_SCOPED_ERR" ]] && [[ -n "$_ait_cs_errf" ]]; then
+        AIT_COMMIT_SCOPED_ERR="$(<"$_ait_cs_errf")"
+    fi
+    [[ -n "$_ait_cs_errf" ]] && rm -f "$_ait_cs_errf"
+    (( c_rc == 0 )) || return 1
+}
+
+# Why git said no, on the most recent task_git_commit_scoped call that returned 1
+# — empty otherwise, and reset on every entry so a stale value can never be read
+# as describing the current call. Set from the `add` failure in preference to the
+# commit's, because the add names the cause and the commit only its consequence.
+# shellcheck disable=SC2034  # read by aitask_create.sh's commit-failure branch
+AIT_COMMIT_SCOPED_ERR=""
+
+# --- Scoped commit with owned staging (t1702) ---
+#
+# Paths THIS invocation staged, in order. A GLOBAL rather than a local, so a
+# caller can arm `trap 'ait_unstage_staged_by_us' EXIT` before its first call and
+# still unwind a run that dies mid-flight — assert_data_worktree_clean EXITS the
+# process, and an entry left in the shared .aitask-data index is worse than a
+# dirty file: it is invisible to `ait sync`'s ownerless report and rides along in
+# whoever commits next.
+# shellcheck disable=SC2034  # read by ait_unstage_staged_by_us / callers' traps
+AIT_STAGED_BY_US=()
+
+# ait_unstage_staged_by_us — the ONE cleanup path, used by every failure exit and
+# by the callers' EXIT traps. Every recorded entry was verified untracked before
+# staging, so the reset has no HEAD version to restore. Idempotent: it empties
+# the list, so a trap firing after an explicit cleanup is a no-op.
+ait_unstage_staged_by_us() {
+    (( ${#AIT_STAGED_BY_US[@]} )) || return 0
+    task_git reset -q -- "${AIT_STAGED_BY_US[@]}" >/dev/null 2>&1 || true
+    AIT_STAGED_BY_US=()
+}
+
+# ait_commit_paths_staging_untracked <msg> <path>... — commit exactly these
+# paths, staging ONLY the ones git does not track yet and unstaging exactly those
+# again on ANY failure.
+# Returns 0 = committed, 2 = verified nothing to commit, 1 = failed.
+#
+# The .aitask-data index is SHARED by every session on the machine, so an
+# unconditional `add` of a TRACKED path can replace an entry another session
+# staged. `commit -o` takes worktree content and needs no staging for a tracked
+# path (verified: a tracked-but-deleted path commits its deletion with an empty
+# index), so only an UNTRACKED path is ever added — and only because a pathspec
+# cannot name a file git does not know (verified: `commit -o -- <untracked>`
+# fails with "did not match any file(s) known to git").
+#
+# Two rules make the cleanup total, because a partial staging run and an aborted
+# process leave the same wreckage:
+#   1. Pre-flight the abort. assert_data_worktree_clean treats add/commit/reset as
+#      non-readonly and DIES — exiting the process — while ls-files is readonly.
+#      The first `add` is therefore the first call that can abort, and it can
+#      abort mid-loop. Calling the guard up front lands that die with nothing
+#      staged.
+#   2. Fail fast, then clean. A failing `add` cleans up and returns immediately
+#      rather than continuing into a commit that could not succeed anyway.
+# The residue — a signal, or an exit this function cannot foresee — is covered by
+# the caller's EXIT trap.
+ait_commit_paths_staging_untracked() {
+    local msg="$1"; shift
+    # Load-bearing, same as in task_git_commit_scoped: an empty pathspec is what
+    # makes `git commit` take the whole shared index.
+    (( $# )) || return 2
+
+    assert_data_worktree_clean commit
+
+    local p rc=0
+    for p in "$@"; do
+        task_git ls-files --error-unmatch -- "$p" >/dev/null 2>&1 && continue
+        # Record ownership BEFORE the mutating `add`, never after. A signal
+        # landing in between would otherwise run the EXIT trap with an empty
+        # ownership list, leaving a path git has ALREADY staged in the shared
+        # index for someone else's commit to collect (reproduced: a shim that
+        # signals right after the real `add` left the file staged).
+        #
+        # Over-recording is free: this can only name a path whose `add` then
+        # failed, and `git reset -- <paths>` tolerates a path it never staged —
+        # verified rc 0, the genuinely staged entries in the same set are still
+        # unstaged, and the worktree is untouched.
+        AIT_STAGED_BY_US+=("$p")
+        if ! task_git add -- "$p" >/dev/null 2>&1; then
+            ait_unstage_staged_by_us
+            return 1
+        fi
+    done
+
+    task_git_commit_scoped --no-stage "$msg" "$@" || rc=$?
+    if [[ $rc -ne 0 ]]; then
+        ait_unstage_staged_by_us
+    else
+        # The commit consumed them (verified: the index is clean for the
+        # committed paths afterwards, and a foreign entry is untouched).
+        AIT_STAGED_BY_US=()
+    fi
+    return $rc
+}
+
+# --- Shared metadata commits (t1677) ---
+
+# ait_metadata_commit_message <path>... — the commit subject for a shared
+# aitasks/metadata file. Prints it on stdout; returns 2 (printing nothing) when
+# given no paths.
+#
+# It names the FILE, never a task. Two sessions can dirty the same shared config
+# while each holds a different task lock, so only a file-naming message stays
+# true regardless of who wrote it — the same rule aitask_pick_own.sh applies to
+# the contributor list ("ait: Record contributor email").
+#
+# Single-sourced so the writers and aitask_sync.sh's prescriptive ownerless
+# report cannot drift: the report tells the user the command that produces this
+# very subject.
+ait_metadata_commit_message() {
+    (( $# )) || return 2
+    local first="${1##*/}"
+    if (( $# == 1 )); then
+        printf 'ait: Update %s' "$first"
+        return 0
+    fi
+    if (( $# <= 3 )); then
+        local p out=""
+        for p in "$@"; do
+            [[ -n "$out" ]] && out+=", "
+            out+="${p##*/}"
+        done
+        printf 'ait: Update %s' "$out"
+        return 0
+    fi
+    # Past three, listing every basename stops being a subject line.
+    printf 'ait: Update %s and %d more metadata files' "$first" "$(( $# - 1 ))"
+}
+
+# --- Contributor list (shared by both of its writers) ---
+
+# The one canonical path. aitask_pick_own.sh and aitask_create.sh each keep a
+# local EMAILS_FILE name, assigned from this, so their call sites are unchanged.
+AIT_EMAILS_FILE="aitasks/metadata/emails.txt"
+
+# ait_email_is_committed <email>
+# 0 = the address is in the COMMITTED contributor list.
+# 1 = it is not — INCLUDING when the answer cannot be established (no HEAD, the
+#     file untracked, a git failure).
+#
+# The failure direction is deliberate and is the whole point of t1626. Both
+# writers short-circuit on membership, and an address appended by a write whose
+# commit never happened is invisible to every later call: the short-circuit
+# returns before the "this call owes the file a commit" flag can be set, so the
+# one path that would commit it never runs again. Answering "not committed" when
+# unsure costs at most one task_git_commit_scoped call that returns 2 (verified
+# nothing to commit); answering "committed" when unsure is permanent.
+ait_email_is_committed() {
+    local email="$1" head_list="" rc=0
+    head_list="$(task_git show "HEAD:$AIT_EMAILS_FILE" 2>/dev/null)" || rc=$?
+    [[ $rc -eq 0 ]] || return 1
+    grep -qxF -- "$email" <<<"$head_list"
+}
+
+# --- Task data sync (best-effort, but never silent) ---
+#
+# Outcome of the most recent task_sync call. task_sync always returns 0 (the
+# best-effort contract: a failed sync must never abort a pick), so read these
+# when the outcome matters.
+#
+# BOTH counts are sampled AFTER the pull cycle and are read against the LOCAL
+# upstream ref. TASK_SYNC_UNPUSHED is authoritative (HEAD is local).
+# TASK_SYNC_UNPULLED is NOT: `git pull --rebase` refuses before it fetches when
+# the worktree is dirty, and an unreachable remote never updates the ref either,
+# so on a failed sync it reports the remote side as of the LAST SUCCESSFUL FETCH
+# and can read 0 while the remote has in fact moved. Never present it as a
+# current reading of the remote.
+TASK_SYNC_STATUS=""     # synced | up-to-date | no-remote | failed
+TASK_SYNC_REASON=""     # classifier code when failed (see _task_push_classify)
+TASK_SYNC_UNPUSHED=""   # local commits not on upstream; "" when undeterminable
+TASK_SYNC_UNPULLED=""   # cached upstream commits not merged; "" when undeterminable
+# 1 when THIS call's pull hit conflicts and auto-merged them all; "" otherwise.
+# Reset on entry like every field above — this is a process global and
+# aitask_pick_own.sh calls task_sync and task_push in the same process, so a
+# value left behind would make the NEXT, ordinary call report a merge that never
+# happened. "" (not 0) is the did-not-happen value, matching its siblings.
+TASK_SYNC_AUTOMERGED=""
+
+# Sync task data from remote (independent of code sync in branch mode)
+# Uses --rebase instead of --ff-only so sync succeeds even when local has
+# unpushed commits (e.g. from a previous failed push cycle).
+#
+# Deliberately does NOT call assert_data_worktree_clean: task_sync runs at the
+# top of every pick from aitask_pick_own.sh, which runs `set -euo pipefail`, so
+# a die() here would abort the pick. A wedged worktree instead surfaces as
+# reason=rebase_conflict with its recovery hint — loud, but still non-fatal.
+# shellcheck disable=SC2034  # the TASK_SYNC_* globals ARE the return value; they are read by callers in other files (aitask_pick_own.sh)
+task_sync() {
+    TASK_SYNC_STATUS=""
+    TASK_SYNC_REASON=""
+    TASK_SYNC_UNPUSHED=""
+    TASK_SYNC_UNPULLED=""
+    TASK_SYNC_AUTOMERGED=""
+
+    # A remote probe that FAILED is not "no remote" (t2070): report it with
+    # git's own line, the same way task_push does.
+    if ! _task_remote_probe; then
+        TASK_SYNC_STATUS="failed"
+        TASK_SYNC_REASON="unknown"
+        TASK_SYNC_UNPUSHED="$(_task_push_unpushed_count)"
+        TASK_SYNC_UNPULLED="$(_task_sync_unpulled_count)"
+        _task_sync_warn "$_TASK_REMOTE_DETAIL" ""
+        return 0
+    fi
+
+    # No remote at all (solo / offline-only repo): nothing to reconcile.
+    if [[ -z "$_TASK_REMOTE_LIST" ]]; then
+        TASK_SYNC_STATUS="no-remote"
+        return 0
+    fi
+
+    local before_head after_head pull_err="" detail=""
+    before_head="$(_task_sync_head)"
+
+    if pull_err="$(_task_pull_rebase 2>&1)"; then
+        case "$pull_err" in
+            *"$AIT_PULL_AUTOMERGED_SENTINEL"*) TASK_SYNC_AUTOMERGED=1 ;;
+        esac
+        _task_pull_report_automerge "$pull_err"
+        after_head="$(_task_sync_head)"
+        if [[ "$before_head" == "$after_head" ]]; then
+            TASK_SYNC_STATUS="up-to-date"
+        else
+            TASK_SYNC_STATUS="synced"
+        fi
+        TASK_SYNC_UNPUSHED="$(_task_push_unpushed_count)"
+        TASK_SYNC_UNPULLED="$(_task_sync_unpulled_count)"
+        return 0
+    fi
+
+    # Failure path: the notices still matter — a cap that gave up is the reason
+    # this sync failed, and _task_sync_warn's hint alone cannot say so.
+    _task_pull_report_automerge "$pull_err"
+
+    TASK_SYNC_STATUS="failed"
+    TASK_SYNC_REASON="$(_task_push_classify "" "$pull_err")"
+    TASK_SYNC_UNPUSHED="$(_task_push_unpushed_count)"
+    TASK_SYNC_UNPULLED="$(_task_sync_unpulled_count)"
+    local unverified
+    unverified="$(_task_pull_unverified_line "$pull_err")"
+    if [[ -n "$unverified" ]]; then
+        # The pull completed; only its verification failed. git's first line
+        # would describe the (successful) pull, not the problem.
+        detail=" (${unverified})"
+    elif [[ "$TASK_SYNC_REASON" == "unknown" ]]; then
+        detail="$(_task_push_first_line "$pull_err")"
+        if [[ -n "$detail" ]]; then
+            detail=" (git: ${detail})"
+        fi
+    fi
+    _task_sync_warn "$detail" "$unverified"
+    return 0
+}
+
+# Internal: current HEAD commit; empty when undeterminable. Returns 0 (see the
+# task_push probe note below).
+_task_sync_head() {
+    _ait_data_git rev-parse HEAD 2>/dev/null || true
+}
+
+# Internal: commits the upstream has that HEAD does not. Prints nothing when
+# the branch has no upstream.
+_task_sync_unpulled_count() {
+    _ait_data_git rev-list --count 'HEAD..@{upstream}' 2>/dev/null || true
+}
+
+# Internal: emit the user-facing warning for a failed sync cycle. Mirrors
+# _task_push_warn's policy — warn only when something is actually at risk, so
+# an offline or single-machine user does not get a warning on every pick.
+#   $1 = detail suffix
+#   $2 = the AIT_PULL_UNVERIFIED_SENTINEL line, if the pull carried one
+# An unverified pull warns REGARDLESS of the pending counts: it typically
+# follows a successful pull (0/0), and an unmerged or uninspectable worktree is
+# a local-state blocker exactly like the reasons in the zero-pending list below.
+_task_sync_warn() {
+    local detail="${1:-}" unverified="${2:-}" upstream hint
+    if [[ -n "$unverified" ]]; then
+        warn "task data sync: ${unverified}"
+        return 0
+    fi
+    upstream="$(_task_push_upstream)"
+    if [[ -n "$upstream" ]]; then
+        upstream=" with ${upstream}"
+    fi
+    hint="$(_task_push_reason_hint "$TASK_SYNC_REASON" "./ait sync")"
+
+    if [[ -z "$TASK_SYNC_UNPUSHED" && -z "$TASK_SYNC_UNPULLED" ]]; then
+        warn "task data sync failed (unreconciled commit counts unavailable) — ${hint}${detail}"
+        return 0
+    fi
+    if [[ "${TASK_SYNC_UNPUSHED:-0}" != "0" || "${TASK_SYNC_UNPULLED:-0}" != "0" ]]; then
+        # The remote count comes from the local upstream ref, which a failed
+        # sync may never have refreshed — say so rather than implying it is a
+        # current reading of the remote.
+        warn "task data not reconciled${upstream}: ${TASK_SYNC_UNPUSHED:-0} local unpushed, ${TASK_SYNC_UNPULLED:-0} remote unpulled (remote side as of the last successful fetch — this sync may not have refreshed it) — ${hint}${detail}"
+        return 0
+    fi
+    # Nothing is pending, but a local-state blocker keeps every future sync AND
+    # push failing, so it is still worth reporting.
+    case "$TASK_SYNC_REASON" in
+        dirty_worktree|rebase_conflict|rebase_in_progress|data_midop|pull_locked)
+            warn "task data sync failed — ${hint}${detail}" ;;
+    esac
+    return 0
+}
+
+# --- Task data push (best-effort, but never silent) ---
+#
+# task_push() returns 0 for EVERY push outcome — the best-effort contract the
+# workflow relies on. The single exception is the pre-flight
+# assert_data_worktree_clean guard, which die()s when the data worktree is
+# wedged mid-rebase/merge: that is a broken-worktree error rather than a push
+# outcome, and it is loud (bypass with AIT_GIT_SKIP_STATE_CHECK=1).
+#
+# The outcome is reported on three surfaces:
+#   in-process — the TASK_PUSH_* globals below
+#   human      — a warn() line on stderr; silent on success
+#   machine    — task_push_report(), one line (`ait git push --batch`)
+#
+# TASK_PUSH_UNPUSHED is sampled AFTER the push cycle, so it is a CURRENT count
+# ("how many commits are unpushed now"), not an atomic snapshot of the failure:
+# on a shared checkout another session can move refs in between.
+TASK_PUSH_STATUS=""     # pushed | up-to-date | no-remote | failed
+TASK_PUSH_REASON=""     # classifier code when failed (see _task_push_classify)
+TASK_PUSH_UNPUSHED=""   # unpushed commit count; "" when undeterminable
+# 1 when a pull during THIS push cycle's retries auto-merged conflicts; ""
+# otherwise. Reset on entry, for the same reason TASK_SYNC_AUTOMERGED is.
+TASK_PUSH_AUTOMERGED=""
+
+# An auto-merged rebase is PROGRESS, not a failed attempt (t1727): it cleared
+# the very conflict that made the push bounce, so the next push has a real
+# chance. Each such pull returns one attempt to the budget, up to this many —
+# bounded, so a persistently re-conflicting remote still terminates, at
+# max_attempts + this many pushes.
+_AIT_PUSH_PROGRESS_GRANTS=2
+
+# Push task data to remote with automatic pull-rebase on conflict.
+# Retries up to 3 times. Failures are non-fatal, but they are reported: a
+# failed push used to be indistinguishable from a successful one (no output,
+# exit 0), silently stranding archival and gate-ledger commits.
+task_push() {
+    TASK_PUSH_STATUS=""
+    TASK_PUSH_REASON=""
+    TASK_PUSH_UNPUSHED=""
+    TASK_PUSH_AUTOMERGED=""
+    assert_data_worktree_clean push
+
+    # A remote probe that FAILED is not an empty remote list (t2063): a `-c`
+    # without a section or a `--config-env` naming an unset variable makes git
+    # refuse every command. Report it with git's own line instead.
+    if ! _task_remote_probe; then
+        TASK_PUSH_STATUS="failed"
+        TASK_PUSH_REASON="unknown"
+        TASK_PUSH_UNPUSHED="$(_task_push_unpushed_count)"
+        _task_push_warn "$_TASK_REMOTE_DETAIL"
+        return 0
+    fi
+
+    # No remote at all (solo / offline-only repo): nothing to push to and
+    # nothing at risk — stay silent.
+    if [[ -z "$_TASK_REMOTE_LIST" ]]; then
+        TASK_PUSH_STATUS="no-remote"
+        return 0
+    fi
+
+    # TWO accumulators, deliberately (t1727). `rebase_err` keeps EVERYTHING the
+    # pulls said and feeds the user-facing `unknown` detail line. `rebase_block`
+    # keeps only what a pull that FAILED said, and is the sole input to the
+    # blocker classification.
+    #
+    # They must be separate because a pull can now succeed BY RESOLVING a
+    # conflict: `_task_pull_rebase` still forwards git's own "CONFLICT (content)"
+    # text even when the auto-merge then completed the rebase. Classifying that
+    # blob would hit _task_push_classify's `rebase_conflict` arm — which is
+    # ordered ahead of the remote/diverged arms — so a later push failing on an
+    # unreachable remote would be reported as a conflict that no longer exists,
+    # with a hint telling the user to reconcile a divergence that is not there.
+    #
+    # The rule is "a pull that succeeded describes no blocker", keyed on the exit
+    # status rather than on the auto-merge sentinel: it is the general statement,
+    # and it is behaviour-preserving for every pre-t1727 case, where rc 0 already
+    # implied git printed no conflict text.
+    local before_count push_err="" rebase_err="" rebase_block="" out="" detail=""
+    before_count="$(_task_push_unpushed_count)"
+
+    local max_attempts=3
+    local grants_left=$_AIT_PUSH_PROGRESS_GRANTS
+    local attempt
+    # Set when any retry pull in this cycle completed but could not be verified
+    # (t1739). Reported on BOTH exits and independent of the unpushed count: a
+    # later push can still succeed, and the uninspected worktree is a local
+    # concern either way — while a successful push otherwise prints nothing.
+    local unverified=""
+    for (( attempt=1; attempt<=max_attempts; attempt++ )); do
+        if push_err="$(_task_push_once 2>&1)"; then
+            if [[ "$before_count" == "0" ]]; then
+                TASK_PUSH_STATUS="up-to-date"
+            else
+                TASK_PUSH_STATUS="pushed"
+            fi
+            TASK_PUSH_UNPUSHED="$(_task_push_unpushed_count)"
+            [[ -n "$unverified" ]] && warn "task data push: ${unverified}"
+            return 0
+        fi
+        # Pull with rebase to incorporate remote changes, then retry.
+        # Accumulate every attempt's output: attempt 1 carries the real
+        # blocker, later attempts only echo the state it left behind.
+        if [[ $attempt -lt $max_attempts ]]; then
+            local pull_rc=0
+            out="$(_task_pull_rebase 2>&1)" || pull_rc=$?
+            rebase_err+="${out}"$'\n'
+            # Only a FAILED pull contributes to the blocker classification; see
+            # the two-accumulator note above.
+            [[ $pull_rc -ne 0 ]] && rebase_block+="${out}"$'\n'
+            [[ -z "$unverified" ]] && unverified="$(_task_pull_unverified_line "$out")"
+            _task_pull_report_automerge "$out"
+            case "$out" in
+                *"$AIT_PULL_AUTOMERGED_SENTINEL"*)
+                    # shellcheck disable=SC2034  # a TASK_PUSH_* result global, read by callers in other files
+                    TASK_PUSH_AUTOMERGED=1
+                    # Progress: this pull cleared the conflict the push bounced
+                    # on, so give the attempt back rather than spending the
+                    # budget on a blocker that no longer exists. Strictly
+                    # bounded by grants_left, so the loop still terminates.
+                    if (( grants_left > 0 )); then
+                        grants_left=$((grants_left - 1))
+                        attempt=$((attempt - 1))
+                    fi
+                    ;;
+            esac
+        fi
+    done
+
+    # All attempts exhausted — best-effort, so don't fail the workflow, but
+    # don't report silent success either.
+    TASK_PUSH_STATUS="failed"
+    TASK_PUSH_REASON="$(_task_push_classify "$push_err" "$rebase_block")"
+    TASK_PUSH_UNPUSHED="$(_task_push_unpushed_count)"
+    if [[ -n "$unverified" ]]; then
+        # git's first line would describe the (completed) pull, not the problem.
+        # _task_push_warn is silent at 0 unpushed, so that case gets its own line.
+        if [[ "$TASK_PUSH_UNPUSHED" == "0" ]]; then
+            warn "task data push: ${unverified}"
+        else
+            _task_push_warn " (${unverified})"
+        fi
+        return 0
+    fi
+    if [[ "$TASK_PUSH_REASON" == "unknown" ]]; then
+        detail="$(_task_push_first_line "${push_err}"$'\n'"${rebase_err}")"
+        if [[ -n "$detail" ]]; then
+            detail=" (git: ${detail})"
+        fi
+    fi
+    _task_push_warn "$detail"
+    return 0
+}
+
+# Print the structured one-line outcome of the last task_push call.
+# This is the cross-process surface (`ait git push --batch`): in-process callers
+# read the TASK_PUSH_* globals directly. Tokens reuse the vocabulary documented
+# for `ait sync --batch`.
+task_push_report() {
+    case "$TASK_PUSH_STATUS" in
+        pushed)     echo "PUSHED" ;;
+        up-to-date) echo "NOTHING" ;;
+        no-remote)  echo "NO_REMOTE" ;;
+        failed)     echo "FAILED:${TASK_PUSH_REASON}:${TASK_PUSH_UNPUSHED:-unknown}" ;;
+        *)          echo "ERROR:no-push-run" ;;
+    esac
+}
+
+# Options every git call of the PUSH CYCLE carries: each push attempt and the
+# remote / upstream / unpushed probes around it, so the preflight and the report
+# describe the same configuration the upload uses (a remote supplied only by
+# `-c remote.origin.url=…` must not read as "no remote"). Empty by default, so
+# task_sync / task_data_converge, which share the probes, run them unchanged.
+#
+# ONE sanctioned override: task_git_push re-declares this array function-locally
+# with the user's -c / --config-env options (t2063). Read it at CALL time.
+AIT_PUSH_GIT_OPTS=()
+
+# Internal: _ait_data_git with the push cycle's options in front.
+_task_push_git() {
+    _ait_data_git ${AIT_PUSH_GIT_OPTS[@]+"${AIT_PUSH_GIT_OPTS[@]}"} "$@"
+}
+
+# Internal: single push attempt
+_task_push_once() {
+    _task_push_git push --quiet
+}
+
+# --- The data-worktree pull mutex (t1725_1) ---------------------------------
+#
+# Serializes the pull-and-cleanup window in _task_pull_rebase. It exists because
+# the ownership evidence below cannot, on its own, separate two pulls that
+# started from the IDENTICAL HEAD: both record the same orig-head, so without
+# serialization either could abort the other's in-progress reconciliation. The
+# data worktree is shared by every session on the host, which is exactly the
+# incident this task fixes.
+#
+# An ADAPTER over stale_lock.sh, never a second protocol — that core already
+# has .gc-guarded single-winner reclaim, never displaces a live PID, and
+# releases by owner token.
+#
+# NOT registry_lock.sh, deliberately: that adapter keeps ONE lock per process in
+# a single slot and installs its own EXIT trap. aitask_sync.sh already holds one
+# (its "sync auto-commit" section), so a second acquire there would overwrite
+# the slot and lose that lock's release. This lib keeps its own private slot and
+# installs no trap.
+#
+# SCOPE — what this does and does NOT guarantee. It serializes every managed pull
+# against every other: _task_pull_rebase (the pick-time sync and the push retry,
+# by far the most frequent) and the `./ait git pull` gateway (task_git_pull),
+# which share _ait_owned_pull. It does NOT cover aitask_sync.sh or a raw `git`
+# run by hand; for those the ownership gate below still fails closed, and the
+# remaining exposure is documented on _task_pull_rebase itself.
+_AIT_PULL_MUTEX_DIR=""
+_AIT_PULL_MUTEX_TOKEN=""
+
+# ait_pull_mutex_acquire [<timeout_secs>] -> 0 held, 1 busy.
+#
+# MUST NOT be called inside $( ): stale_lock_acquire returns its owner token in
+# the STALE_LOCK_TOKEN global, and a command substitution runs in a subshell
+# whose assignment to it is discarded — the lock would be held with no token to
+# release it by (stale_lock.sh documents this).
+ait_pull_mutex_acquire() {
+    local timeout="${1:-10}" gitdir deadline remaining retries
+    gitdir="$(_data_wedge_gitdir)"
+    # No inspectable git-dir means no lock path; the caller's ownership gate is
+    # then the only protection, which is the pre-existing behaviour.
+    [[ -z "$gitdir" ]] && return 0
+    local dir="$gitdir/aitask-pull.lock"
+
+    deadline=$(( $(date +%s) + timeout ))
+    while :; do
+        remaining=$(( deadline - $(date +%s) ))
+        (( remaining < 0 )) && remaining=0
+        retries=$(( remaining * 20 ))
+        # Floor of 3, for the same reason registry_lock.sh documents: a reclaim
+        # consumes an attempt without acquiring, and there can be two (the
+        # guard, then the lock dir) before the acquiring mkdir.
+        (( retries < 3 )) && retries=3
+        if stale_lock_acquire "$dir" "$retries" 0.05 "task-data pull"; then
+            _AIT_PULL_MUTEX_DIR="$dir"
+            _AIT_PULL_MUTEX_TOKEN="$STALE_LOCK_TOKEN"
+            return 0
+        fi
+        # Re-arm until the deadline actually passes: stale_lock budgets ATTEMPTS,
+        # and a burst of dead-holder reclaims spends them without sleeping.
+        if (( $(date +%s) >= deadline )); then
+            return 1        # a live holder kept it — fail closed, pull nothing
+        fi
+    done
+}
+
+# ait_pull_mutex_release — release the lock this process holds, if any.
+# Idempotent and always returns 0 (a retained lock is warned about by the core).
+ait_pull_mutex_release() {
+    [[ -n "$_AIT_PULL_MUTEX_DIR" ]] || return 0
+    stale_lock_release "$_AIT_PULL_MUTEX_DIR" "$_AIT_PULL_MUTEX_TOKEN" \
+        || warn "ait_pull_mutex: '$_AIT_PULL_MUTEX_DIR' not fully released"
+    _AIT_PULL_MUTEX_DIR=""
+    _AIT_PULL_MUTEX_TOKEN=""
+    return 0
+}
+
+# ait_rebase_abort_if_ours <runner> <gitdir> <head_before> <state>
+#
+# The ownership gate: abort a conflicted rebase ONLY when this call can prove it
+# started it. Prints exactly one verdict token and ALWAYS returns 0:
+#
+#   aborted       we started it, aborted it, and the worktree is now clean
+#   abort_failed  we started it, ran the abort, and the state SURVIVED
+#   not_ours      no proof — nothing was touched, and the runner was never run
+#
+# <runner> is a command invoked as `"$runner" <git options> rebase --abort`
+# (AIT_RECONCILE_GIT_OPTS — so a stub runner must not key on $1), which works
+# for the data worktree (_ait_data_git) and for a plain repo (git) alike.
+#
+# The evidence is <gitdir>/<state>/orig-head, which git writes with the commit
+# HEAD was at when the rebase started — for both the merge and the apply
+# backend. Equal to the HEAD we read immediately before our own pull => ours.
+#
+# The "state is not a rebase" arm below is currently unreachable from
+# _task_pull_rebase, which checks that itself so it can emit a state-accurate
+# message. Keep it: it is the defensive half of this function's contract, it is
+# what makes the function safe for any future caller, and the unit tests drive
+# it directly.
+# ait_rebase_is_ours <gitdir> <head_before> <state>
+#
+# The ownership PROOF alone — signals 4 and 5 — with no side effect. 0 = this
+# call started the in-progress rebase; 1 = no proof.
+#
+# Split out of ait_rebase_abort_if_ours (t1727) because auto-merging and
+# `rebase --continue`-ing a rebase we did not start is exactly as dangerous as
+# aborting one, so the auto-merge path must clear the SAME gate. One
+# implementation, two consumers — never a second copy of the evidence rule.
+ait_rebase_is_ours() {
+    local gitdir="$1" head_before="$2" state="$3" recorded
+    case "$state" in
+        rebase-merge|rebase-apply) ;;
+        *) return 1 ;;
+    esac
+    recorded="$(cat "$gitdir/$state/orig-head" 2>/dev/null || true)"
+    [[ -n "$head_before" && -n "$recorded" && "$recorded" == "$head_before" ]]
+}
+
+ait_rebase_abort_if_ours() {
+    local runner="$1" gitdir="$2" head_before="$3" state="$4"
+    if ! ait_rebase_is_ours "$gitdir" "$head_before" "$state"; then
+        printf 'not_ours'
+        return 0
+    fi
+    "$runner" "${AIT_RECONCILE_GIT_OPTS[@]}" rebase --abort >/dev/null 2>&1 || true
+    # Verify the mutation landed. `|| true` above swallows a failed abort, and
+    # the rebase_conflict hint claims "nothing left in progress" — a false
+    # claim if the state is still there.
+    if [[ -n "$(_ait_inprogress_state_at "$gitdir")" ]]; then
+        printf 'abort_failed'
+    else
+        printf 'aborted'
+    fi
+    return 0
+}
+
+# ait_merge_is_ours <gitdir> <head_before> <state>
+#
+# The merge operation's ownership PROOF (t2064) — the counterpart of
+# ait_rebase_is_ours, with no side effect. 0 = the in-progress merge is the one
+# this pull's own merge started; 1 = no proof. Both must hold:
+#
+#   - ORIG_HEAD == the HEAD read just before the pull (git merge writes it when
+#     it starts);
+#   - the MERGE_HEAD SHA list == FETCH_HEAD's for-merge SHA list, in order and
+#     non-empty: the merge merged exactly what this pull fetched.
+#
+# All three live in the per-worktree git-dir. They are read as files, like the
+# rebase rule's orig-head: a ref backend that does not keep ORIG_HEAD as a file
+# (reftable) fails closed, leaving the merge in place.
+#
+# This proves WHAT the merge is, not that our pull's merge step created it — a
+# foreign merge of the same fetched tip from the same HEAD matches too. The
+# caller must first establish that our merge ran and stopped
+# (_ait_merge_stop_shaped). One implementation, one evidence rule.
+ait_merge_is_ours() {
+    local gitdir="$1" head_before="$2" state="$3" orig merge_heads fetch_heads="" line rest
+    [[ "$state" == "MERGE_HEAD" && -n "$head_before" ]] || return 1
+    orig="$(head -n1 "$gitdir/ORIG_HEAD" 2>/dev/null || true)"
+    [[ -n "$orig" && "$orig" == "$head_before" ]] || return 1
+    [[ -r "$gitdir/FETCH_HEAD" ]] || return 1
+    merge_heads="$(cat "$gitdir/MERGE_HEAD" 2>/dev/null || true)"
+    # FETCH_HEAD: "<sha>\t<''|not-for-merge>\t<desc>". Split by expansion, not
+    # IFS=$'\t' read — tab is IFS whitespace, so consecutive tabs would collapse.
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        rest="${line#*$'\t'}"
+        [[ "${rest%%$'\t'*}" == "not-for-merge" ]] && continue
+        fetch_heads+="${line%%$'\t'*}"$'\n'
+    done < "$gitdir/FETCH_HEAD"
+    fetch_heads="${fetch_heads%$'\n'}"
+    [[ -n "$merge_heads" && "$merge_heads" == "$fetch_heads" ]]
+}
+
+# ait_merge_abort_if_ours <runner> <gitdir> <head_before> <state>
+#
+# ait_rebase_abort_if_ours for a merge: the same verdict tokens (aborted /
+# abort_failed / not_ours), always rc 0, and the runner is never run without
+# proof. Runs `"$runner" <AIT_RECONCILE_GIT_OPTS> merge --abort` — the rerere
+# pin matters here too, because `merge --abort` runs `rerere clear`.
+ait_merge_abort_if_ours() {
+    local runner="$1" gitdir="$2" head_before="$3" state="$4"
+    if ! ait_merge_is_ours "$gitdir" "$head_before" "$state"; then
+        printf 'not_ours'
+        return 0
+    fi
+    "$runner" "${AIT_RECONCILE_GIT_OPTS[@]}" merge --abort >/dev/null 2>&1 || true
+    # Verify the mutation landed, exactly as the rebase variant does.
+    if [[ -n "$(_ait_inprogress_state_at "$gitdir")" ]]; then
+        printf 'abort_failed'
+    else
+        printf 'aborted'
+    fi
+    return 0
+}
+
+# --- Auto-merge during the workflow pull (t1727) -----------------------------
+#
+# THE one spelling of the "this pull auto-merged" sentinel. The emitter in
+# _task_pull_rebase_cleanup and BOTH matchers (task_sync, task_push) read this
+# constant — _task_pull_rebase runs inside `$( … 2>&1 )` in both callers, so a
+# global set there dies in the subshell and stderr is the only channel out. A
+# literal repeated in any of the three sites could drift and silently leave
+# TASK_*_AUTOMERGED unset while the merge itself worked.
+#
+# Lower-case "conflict(s)" is load-bearing: _task_push_classify matches
+# `*CONFLICT*` case-sensitively, so this text must never be classified as a
+# failure reason.
+AIT_PULL_AUTOMERGED_SENTINEL="auto-merged task-data conflict(s) during pull"
+
+# The companion sentinel for the round cap. Same rule, same reason: emitted by
+# lib/task_automerge.sh, matched here. Kept in THIS file rather than the library
+# because the matchers run whether or not the library was ever loaded, and a
+# matcher against an unset variable would match every string.
+AIT_AUTOMERGE_GAVE_UP_SENTINEL="auto-merge gave up after"
+
+# The completion-postcondition sentinel (t1739): emitted by _ait_owned_pull when
+# a pull that ended in rc 0 left unmerged paths, or when that check itself could
+# not run; matched by _task_push_classify (which gives it precedence over any
+# conflict text the same blob carries), task_sync and task_push. Same
+# one-spelling rule as the two above. Lower-case and free of every classifier
+# substring, so it can only ever be matched by its own arm.
+AIT_PULL_UNVERIFIED_SENTINEL="pull completed but its result could not be verified"
+
+# The merge-abort sentinel (t2064): emitted by _task_pull_rebase_cleanup when it
+# aborted a merge-mode gateway pull's own stopped merge; matched by
+# _task_push_classify -> merge_aborted. Same one-spelling rule. Free of
+# "rebase", "CONFLICT" and "the data worktree is mid-", so it can only ever be
+# matched by its own arm.
+AIT_PULL_MERGE_ABORTED_SENTINEL="merge aborted after it stopped"
+
+# Git config pinned onto the task-data reconciliation window (t1789).
+#
+# SCOPE: every PORCELAIN git command that feeds, starts, advances or aborts a
+# framework-owned rebase of the task data — the fetch the rebase replays
+# against, `pull --rebase`, `rebase --continue` / `--skip`, and every
+# `rebase --abort` — and the gateway's `merge --abort` (t2064), whose
+# `rerere clear` takes the same lock. Call sites: _task_pull_rebase,
+# ait_rebase_abort_if_ours and ait_merge_abort_if_ours in this file,
+# lib/task_automerge.sh::ait_automerge_advance, and
+# aitask_sync.sh's do_fetch, do_push refetch and do_pull_rebase.
+#
+# WHY — a multi-step rebase must not share the repository with background git
+# work, nor let the user's rerere configuration act on it:
+#
+#   rerere.enabled=false — the sequencer's rerere takes MERGE_RR.lock on every
+#     conflicted pick, and `rebase --abort`'s `rerere clear` takes it too. A
+#     detached `git maintenance run --auto` holds the same lock (its rerere-gc
+#     task runs whenever rr-cache has an entry), and the pick that loses dies
+#     half-applied with "Unable to create ... MERGE_RR.lock": the replay can no
+#     longer advance and is aborted (6 of 120 multi-round replays under load),
+#     or the abort itself dies and wedges the worktree. With rerere off no
+#     command of ours opens that lock, whoever holds it. It also keeps
+#     rerere.autoupdate from staging a replayed resolution behind the engine's
+#     --diff-filter=U probe, which would then read a conflict stop as a
+#     non-conflict failure. The merge driver is the authority for task data.
+#   maintenance.auto=false — each of these commands would otherwise spawn a
+#     detached maintenance run INSIDE the window, whose gc can also contend
+#     for ref locks while the rebase moves refs. Deferred, not disabled: the
+#     next ordinary git command runs it.
+#
+# NOT PINNED, deliberately: `merge --ff-only` convergence (aitask_sync.sh's
+# guarded merge and fast-forward step, task_data_converge) — no rebase follows
+# it and a fast-forward never invokes rerere — and the commits that precede the
+# window (the sync sweep, a claim commit before task_push). Background work
+# THOSE start can still contend on non-rerere locks: the same residual class as
+# the concurrency note on _task_pull_rebase. The MERGE_RR.lock failure is closed
+# for every source by the rerere half.
+#
+# The options go BEFORE the subcommand. task_git's guard classifies the
+# subcommand past them (ait_git_subcmd_index, t1739), but the framework's own
+# recovery calls still go through _ait_data_git: they run mid-rebase, exactly
+# when the guard refuses mutating verbs.
+#
+# ONE sanctioned override, made by the two gateways task_git_pull and
+# task_git_push: each re-declares this array function-locally
+# as (user -c / --config-env options, then these pins), so every callee that
+# reads it while that frame is live — the pull (for task_git_push, the retry
+# pull between push attempts), ait_automerge_advance's
+# continue/skip, ait_rebase_abort_if_ours, ait_merge_abort_if_ours — carries
+# the user's config, with the
+# pins last so they win. Read the array at CALL time; a copy taken at source time
+# would silently drop that config.
+AIT_RECONCILE_GIT_OPTS=(-c rerere.enabled=false -c maintenance.auto=false)
+
+# Internal: re-emit the pull's auto-merge notices on the CALLER's stderr.
+#
+# _task_pull_rebase writes them to its own stderr, but every caller captures
+# that with `$( … 2>&1 )` to feed _task_push_classify — so without this the
+# human sees nothing at all on the one path that silently rewrote their task
+# files, and nothing about a cap that gave up. Exactly one line each, only when
+# the corresponding sentinel is present.
+#   $1 = the captured blob
+_task_pull_report_automerge() {
+    local blob="$1" line
+    case "$blob" in
+        *"$AIT_PULL_AUTOMERGED_SENTINEL"*)
+            # Forward the emitted line verbatim: it carries the file count.
+            line="$(printf '%s\n' "$blob" | grep -F -m1 -- "$AIT_PULL_AUTOMERGED_SENTINEL" || true)"
+            [[ -n "$line" ]] && printf '%s\n' "${line#aitask: }" >&2
+            ;;
+    esac
+    case "$blob" in
+        *"$AIT_AUTOMERGE_GAVE_UP_SENTINEL"*)
+            line="$(printf '%s\n' "$blob" | grep -F -m1 -- "$AIT_AUTOMERGE_GAVE_UP_SENTINEL" || true)"
+            [[ -n "$line" ]] && printf '%s\n' "${line#aitask: }" >&2
+            ;;
+    esac
+    return 0
+}
+
+# Internal: load lib/task_automerge.sh on demand. 0 = available.
+#
+# LAZY, the pid_anchor.sh::_anchor_tmux_pane_pid pattern: task_utils.sh is
+# copied standalone into test fixtures (tests/lib/test_scaffold.sh) that carry
+# neither this library nor board/aitask_merge.py, so a missing library must
+# degrade to "no auto-merge" and never break sourcing. It also keeps a pull that
+# never conflicts from paying for the source at all.
+_ait_load_automerge() {
+    declare -F ait_automerge_rebase_loop >/dev/null 2>&1 && return 0
+    [[ -r "${SCRIPT_DIR}/lib/task_automerge.sh" ]] || return 1
+    # shellcheck source=task_automerge.sh disable=SC1091
+    source "${SCRIPT_DIR}/lib/task_automerge.sh" || return 1
+    declare -F ait_automerge_rebase_loop >/dev/null 2>&1
+}
+
+# Internal: pull with rebase to catch up with remote, cleaning up after ITSELF.
+#
+# The contract is symmetric and both halves matter: a conflict this call created
+# is aborted (otherwise every later ./ait git write dies in
+# assert_data_worktree_clean — the t1725 finding-5 incident), and anything this
+# call did NOT create is left strictly alone.
+#
+# Ownership is proven, never assumed. Five signals, evaluated in order, and ANY
+# miss leaves the worktree untouched:
+#
+#   0. the pull mutex was acquired (else no pull is even attempted);
+#   1. nothing was in progress before the pull;
+#   2. something is in progress after it;
+#   3. the pull's OWN output is conflict-shaped — a pull that refused before
+#      fetching (dirty worktree, no upstream) cannot have created what we see,
+#      so it belongs to somebody else. For a merge-mode gateway pull
+#      (--own-merge, t2064) a merge-specific stop marker counts too
+#      (_ait_merge_stop_shaped);
+#   4. that state is the pull's own kind — a rebase, or MERGE_HEAD for a
+#      --own-merge pull. Any other state (a merge after a rebase pull, a
+#      cherry-pick, …) must not be described as a rebase nor handed
+#      `rebase --abort`;
+#   5. the operation's own evidence rule proves it ours: ait_rebase_is_ours (the
+#      recorded orig-head is the HEAD we read just before pulling) or
+#      ait_merge_is_ours (ORIG_HEAD is that HEAD, and MERGE_HEAD is what the pull
+#      fetched).
+#
+# RESIDUAL: the mutex covers the two managed pulls — this one and the
+# `./ait git pull` gateway (task_git_pull), which share _ait_owned_pull. A
+# concurrent `ait sync` or a raw `git` can still start a rebase inside our
+# window, and if it started from an identical HEAD signals 1-5 cannot tell it
+# from ours. Even then `rebase --abort` restores orig-head, so no COMMITTED work
+# is lost — the exposure is conflict-resolution progress. Closing it needs the
+# sync-side change tracked as a t1725_1 follow-up.
+#
+# The pull's exit status is returned unchanged whenever a pull ran; the sentinels
+# go to stderr, which every caller captures with 2>&1 for _task_push_classify.
+#
+# --no-autostash (t1792, t1987): a user's rebase.autoStash would stash and
+# re-apply other live sessions' uncommitted edits in the shared worktree.
+# Without it the pull refuses on a dirty worktree, as under git's default.
+_task_pull_rebase() {
+    _ait_owned_pull "${AIT_RECONCILE_GIT_OPTS[@]}" pull --rebase --no-autostash --quiet
+}
+
+# _ait_owned_pull [--own-merge] <git argv…> — the ONE implementation of the
+# five-signal pull above, for any pull argv. Callers: _task_pull_rebase (the
+# workflow pull) and task_git_pull (the `./ait git pull` gateway, t1739). Never a
+# second copy of the ownership pipeline.
+#
+# --own-merge (t2064): the argv is a merge-mode pull, so a MERGE_HEAD it leaves
+# may be claimed by the merge evidence rule. Only task_git_pull passes it; the
+# workflow pull always rebases, so a merge seen there is never its own. Every
+# caller's argv starts with `-c`, so the flag cannot be mistaken for git argv.
+#
+# After a pull that ends in rc 0 it also checks, STILL HOLDING THE MUTEX, that no
+# rebase/merge is still in progress (an interactive `edit` stop returns 0) and
+# that no unmerged path was left behind (a failed autostash pop returns 0 too). Holding the mutex means no other MANAGED pull ran in
+# between; an unmanaged writer still could, which is why that check reports and
+# never cleans: the state is not proven ours. Both of its outcomes carry
+# AIT_PULL_UNVERIFIED_SENTINEL, which every caller recognizes explicitly.
+_ait_owned_pull() {
+    local before out rc=0 head_before gitdir own_merge=0
+    if [[ "${1:-}" == "--own-merge" ]]; then
+        own_merge=1
+        shift
+    fi
+
+    if ! ait_pull_mutex_acquire; then
+        printf 'aitask: another session is reconciling the task data right now; pull skipped\n' >&2
+        return 1
+    fi
+
+    gitdir="$(_data_wedge_gitdir)"
+    before="$(_ait_inprogress_state_at "$gitdir")"
+    # Read HEAD through the git-dir we will read orig-head from, so the two are
+    # answers about the same repository.
+    head_before="$(git --git-dir="$gitdir" rev-parse HEAD 2>/dev/null || true)"
+
+    out="$(_ait_data_git "$@" 2>&1)" || rc=$?
+    [[ -n "$out" ]] && printf '%s\n' "$out" >&2
+
+    if [[ $rc -ne 0 ]]; then
+        # ABSORBING CAPTURE: this library is sourced into scripts running
+        # `set -euo pipefail`, and the cleanup now returns 10 ("auto-merged, the
+        # pull effectively succeeded"). A bare call would abort the caller on
+        # exactly the successful path.
+        local recover_rc=0
+        _task_pull_rebase_cleanup "$gitdir" "$before" "$head_before" "$out" "$own_merge" || recover_rc=$?
+        # 10 is the resolve-verdict, not a failure: the conflict was merged and
+        # the rebase ran to completion, so the pull is a success to both callers.
+        [[ $recover_rc -eq 10 ]] && rc=0
+    fi
+
+    # Completion postcondition. The probe's own status is captured, never
+    # swallowed: an inspection that failed is not a verified success. Each line
+    # says what is actually there — HEAD and files may already have moved — and
+    # nothing is cleaned up. A state still in progress after rc 0 is checked
+    # first: an interactive `edit` stop ends the pull with rc 0 and the rebase
+    # deliberately paused, and that pause is reported, never aborted.
+    if [[ $rc -eq 0 ]]; then
+        local unmerged probe_rc=0 after_state
+        after_state="$(_ait_inprogress_state_at "$gitdir")"
+        if [[ -z "$after_state" ]]; then
+            unmerged="$(_ait_data_git diff --name-only --diff-filter=U 2>/dev/null)" || probe_rc=$?
+        fi
+        if [[ -n "$after_state" ]]; then
+            printf "aitask: %s: the data worktree is still mid-%s - left untouched; finish or abort it, or run './ait git-health'\n" \
+                "$AIT_PULL_UNVERIFIED_SENTINEL" "$after_state" >&2
+            rc=1
+        elif [[ $probe_rc -ne 0 ]]; then
+            printf "aitask: %s: 'git diff' exited %s while checking for unmerged paths - the pulled commits are in place; check './ait git status'\n" \
+                "$AIT_PULL_UNVERIFIED_SENTINEL" "$probe_rc" >&2
+            rc=1
+        elif [[ -n "$unmerged" ]]; then
+            printf "aitask: %s: unmerged paths remain in the data worktree - left untouched; resolve them or run './ait git-health'\n" \
+                "$AIT_PULL_UNVERIFIED_SENTINEL" >&2
+            rc=1
+        fi
+    fi
+
+    ait_pull_mutex_release
+    return $rc
+}
+
+# Internal: the first AIT_PULL_UNVERIFIED_SENTINEL line in a captured pull blob,
+# without its `aitask: ` prefix, or nothing. Same extraction as
+# _task_pull_report_automerge.
+_task_pull_unverified_line() {
+    local line
+    case "$1" in
+        *"$AIT_PULL_UNVERIFIED_SENTINEL"*)
+            line="$(printf '%s\n' "$1" | grep -F -m1 -- "$AIT_PULL_UNVERIFIED_SENTINEL" || true)"
+            printf '%s' "${line#aitask: }" ;;
+    esac
+    return 0
+}
+
+# _ait_merge_stop_shaped <pull output> — 0 when the output carries a marker only
+# git's MERGE step prints as it stops, 1 otherwise (t2064). Signal 3 for a
+# --own-merge pull: it establishes that this pull's own merge ran and stopped,
+# which the evidence rule (ait_merge_is_ours) cannot — a foreign merge of the
+# same fetched tip from the same HEAD carries identical ORIG_HEAD/MERGE_HEAD.
+#
+# The families, each probed against git 2.56 under LC_ALL=C (which _ait_data_git
+# sets), every one leaving MERGE_HEAD:
+#
+#   conflict           rc 1    CONFLICT (…) / Automatic merge failed
+#   commit refused     rc 1    Not committing merge — every pre-merge-commit,
+#                              commit-msg and prepare-commit-msg refusal, and an
+#                              emptied message
+#   commit not written rc 128  failed to write commit object — signing failure,
+#                              object write failure
+#   branch not updated rc 128  Merge made by … then a fatal from the ref update
+#                              (e.g. a rejecting reference-transaction hook)
+#
+# NOT EXHAUSTIVE, by design: output that matches no family fails closed — the
+# merge is left in place for manual recovery. A generic fatal is never a marker
+# on its own: `update aborted by the reference-transaction hook` is printed by
+# fetch as well, and a fetch-time hook can start a merge of the fetched tip that
+# every evidence gate attributes to us. So under -q, which suppresses `Merge
+# made by`, a rejected branch update stays unrecognised.
+_ait_merge_stop_shaped() {
+    case "$1" in
+        *CONFLICT*|*"Automatic merge failed"*) return 0 ;;
+        *"Not committing merge"*) return 0 ;;
+        *"failed to write commit object"*) return 0 ;;
+        *"Merge made by"*) return 0 ;;
+    esac
+    return 1
+}
+
+# Internal: the decide-and-clean half of _task_pull_rebase, split out only so
+# that function keeps a single exit point around the mutex.
+#   $1 gitdir  $2 state before the pull  $3 HEAD before the pull  $4 pull output
+#   $5 own_merge — 1 for a merge-mode gateway pull (--own-merge), else 0
+#
+# Returns 0 in every case EXCEPT one: 10 means the conflict was auto-merged and
+# the rebase completed, so the caller must treat the pull as successful. Callers
+# must absorb the status — see _task_pull_rebase above.
+_task_pull_rebase_cleanup() {
+    local gitdir="$1" before="$2" head_before="$3" out="$4" own_merge="${5:-0}" after verdict
+
+    # Signal 1: something was already in progress — not ours, whatever it is.
+    if [[ -n "$before" ]]; then
+        case "$before" in
+            rebase-merge|rebase-apply)
+                printf 'aitask: a rebase is already in progress in the data worktree (%s)\n' "$before" >&2 ;;
+            *)
+                printf 'aitask: the data worktree is mid-%s; leaving it untouched\n' "$before" >&2 ;;
+        esac
+        return 0
+    fi
+
+    # Signal 2: the pull failed without wedging anything (e.g. dirty_worktree).
+    after="$(_ait_inprogress_state_at "$gitdir")"
+    [[ -z "$after" ]] && return 0
+
+    # Signal 3: our pull must actually have hit a conflict — or, for a
+    # merge-mode gateway pull, its merge must have stopped in a recognised way
+    # (_ait_merge_stop_shaped, t2064). Anything else means the state appeared
+    # from elsewhere while we were failing for another reason, or that the merge
+    # stopped in a way this code does not recognise. Either way it is left
+    # untouched, and the wording names the ACTUAL state: a merge described as a
+    # rebase would be handed a recovery that does not apply (t1739).
+    local stopped=0
+    case "$out" in
+        *CONFLICT*|*"could not apply"*|*"Resolve all conflicts"*) stopped=1 ;;
+    esac
+    if [[ $stopped -eq 0 && "$own_merge" == "1" && "$after" == "MERGE_HEAD" ]] \
+        && _ait_merge_stop_shaped "$out"; then
+        stopped=1
+    fi
+    if [[ $stopped -eq 0 ]]; then
+        case "$after" in
+            rebase-merge|rebase-apply)
+                printf 'aitask: a rebase appeared in the data worktree during a pull that failed for another reason - leaving it untouched\n' >&2 ;;
+            *)
+                printf 'aitask: the data worktree is mid-%s; leaving it untouched\n' "$after" >&2 ;;
+        esac
+        return 0
+    fi
+
+    # Signal 4: only a rebase gets rebase wording and a rebase remedy; only a
+    # merge-mode gateway pull's MERGE_HEAD gets the merge evidence rule.
+    case "$after" in
+        rebase-merge|rebase-apply) ;;
+        MERGE_HEAD)
+            if [[ "$own_merge" == "1" ]]; then
+                # Signal 5 for a merge, then abort and verify. Never auto-merged:
+                # the auto-merge engine replays a rebase.
+                verdict="$(ait_merge_abort_if_ours _ait_data_git "$gitdir" "$head_before" "$after")"
+                case "$verdict" in
+                    aborted)
+                        printf 'aitask: %s - worktree restored, local commits kept\n' \
+                            "$AIT_PULL_MERGE_ABORTED_SENTINEL" >&2 ;;
+                    abort_failed)
+                        printf "aitask: merge --abort failed - the data worktree is mid-%s; finish or abort it, or run './ait git-health'\n" \
+                            "$after" >&2 ;;
+                    *)
+                        printf 'aitask: the data worktree is mid-%s; leaving it untouched\n' "$after" >&2 ;;
+                esac
+                return 0
+            fi
+            printf 'aitask: the data worktree is mid-%s; leaving it untouched\n' "$after" >&2
+            return 0 ;;
+        *)
+            printf 'aitask: the data worktree is mid-%s; leaving it untouched\n' "$after" >&2
+            return 0 ;;
+    esac
+
+    # Signal 5: prove it is ours. Auto-merging and `rebase --continue`-ing a
+    # rebase started elsewhere is exactly as dangerous as aborting one, so the
+    # resolve attempt below clears the SAME gate the abort does.
+    if ait_rebase_is_ours "$gitdir" "$head_before" "$after"; then
+        # RESOLVE FIRST, abort only what is left (t1727). This is what makes the
+        # workflow pull resolve the frontmatter-only collisions `ait sync`
+        # already resolves — through the same driver and the same advance logic.
+        # A missing library degrades to "no auto-merge" and falls straight
+        # through to the abort below.
+        if _ait_load_automerge; then
+            local loop_rc=0
+            ait_automerge_rebase_loop || loop_rc=$?
+            if [[ $loop_rc -eq 0 ]]; then
+                printf 'aitask: %s (%d file(s)) - rebase completed\n' \
+                    "$AIT_PULL_AUTOMERGED_SENTINEL" "$AIT_AUTOMERGE_RESOLVED" >&2
+                return 10
+            fi
+            # rc 1 (conflicts we cannot merge) and rc 2 (advance failed for a
+            # non-conflict reason) both fall through to the abort: the rebase is
+            # ours, so leaving it in progress is the one thing we must not do.
+        fi
+    fi
+
+    # Abort, and verify the abort landed.
+    verdict="$(ait_rebase_abort_if_ours _ait_data_git "$gitdir" "$head_before" "$after")"
+    case "$verdict" in
+        aborted)
+            printf 'aitask: rebase aborted after conflict - worktree restored, local commits kept\n' >&2 ;;
+        abort_failed)
+            printf 'aitask: rebase --abort failed - a rebase is still in progress in the data worktree\n' >&2 ;;
+        *)
+            printf 'aitask: a rebase started outside this pull is in progress in the data worktree - leaving it untouched\n' >&2 ;;
+    esac
+    return 0
+}
+
+# --- task_push probes (each returns 0: they are consumed via "$(...)" inside
+# --- scripts running `set -euo pipefail`, where a leaked non-zero status would
+# --- abort the caller with no visible error) ---
+
+# Internal: commits on HEAD that the upstream does not have. Prints nothing
+# when the branch has no upstream.
+_task_push_unpushed_count() {
+    _task_push_git rev-list --count '@{upstream}..HEAD' 2>/dev/null || true
+}
+
+# Internal: upstream ref name (e.g. origin/aitask-data); empty when unset.
+_task_push_upstream() {
+    _task_push_git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null || true
+}
+
+# Internal: query the configured remotes ONCE (t2063, t2070). Unlike the probes
+# above this one returns non-zero, because its answer gates a skip: a query that
+# FAILED is not an empty remote list. Git refuses every command when it cannot
+# read its configuration, and reading that refusal as "no remote" skipped the
+# pending push / sync / converge in silence. Call it as `if ! _task_remote_probe`.
+#   _TASK_REMOTE_LIST   — `git remote`'s stdout; empty means "no remote" only
+#                         when the probe returned 0
+#   _TASK_REMOTE_DETAIL — on failure, " (git: <git's first line>)"
+# Only a failed query runs again, for its stderr — a configuration error is
+# deterministic, so the rerun says what the first one hit.
+_TASK_REMOTE_LIST=""
+_TASK_REMOTE_DETAIL=""
+_task_remote_probe() {
+    local rc=0 err=""
+    _TASK_REMOTE_LIST=""
+    _TASK_REMOTE_DETAIL=""
+    _TASK_REMOTE_LIST="$(_task_push_git remote 2>/dev/null)" || rc=$?
+    [[ $rc -eq 0 ]] && return 0
+    err="$(_task_push_git remote 2>&1 >/dev/null || true)"
+    err="$(_task_push_first_line "$err")"
+    _TASK_REMOTE_DETAIL=" (git: ${err:-'git remote' exited ${rc}})"
+    return 1
+}
+
+# Internal: first non-blank line of a captured git output blob.
+_task_push_first_line() {
+    local line
+    while IFS= read -r line; do
+        if [[ -n "${line//[[:space:]]/}" ]]; then
+            printf '%s' "$line"
+            return 0
+        fi
+    done <<< "$1"
+    return 0
+}
+
+# Internal: classify a failed push cycle from the captured git output.
+# Pure (no git calls, no I/O) so every reason is unit-testable from fixtures.
+#   $1 = push stderr, $2 = accumulated `pull --rebase` stderr
+# Prints one reason code. The rebase blocker is matched BEFORE the push
+# rejection: the rejection is only the symptom, the blocker is why the
+# automatic recovery could not clear it.
+_task_push_classify() {
+    local push_err="$1" rebase_err="$2"
+    local blob="${push_err}"$'\n'"${rebase_err}"
+
+    # _task_pull_rebase's own sentinels come FIRST, and among them pull_locked is
+    # first of all: it means no pull was even attempted, so nothing git said
+    # afterwards describes this cycle. The three patterns are disjoint.
+    case "$rebase_err" in
+        *"reconciling the task data right now"*)
+            echo "pull_locked"; return 0 ;;
+    esac
+    # A pull that completed but could not be verified (t1739). Disjoint from
+    # pull_locked (that one means no pull ran) and AHEAD of every state and
+    # conflict arm: after an auto-merged conflict the blob still carries git's
+    # "CONFLICT (content)" text, and classifying that as rebase_conflict would
+    # hand the user a hint claiming the rebase "was aborted". The reason
+    # vocabulary is unchanged — `unknown` — and callers surface the sentinel
+    # line itself as the detail.
+    case "$rebase_err" in
+        *"$AIT_PULL_UNVERIFIED_SENTINEL"*)
+            echo "unknown"; return 0 ;;
+    esac
+    case "$rebase_err" in
+        *"in progress in the data worktree"*|*"appeared in the data worktree during a pull that failed"*)
+            echo "rebase_in_progress"; return 0 ;;
+    esac
+    case "$rebase_err" in
+        *"the data worktree is mid-"*)
+            echo "data_midop"; return 0 ;;
+    esac
+    # A merge-mode gateway pull aborted its own stopped merge (t2064). AHEAD of
+    # the conflict arm: the blob still carries git's CONFLICT text, and
+    # rebase_conflict would describe a merge as a rebase.
+    case "$rebase_err" in
+        *"$AIT_PULL_MERGE_ABORTED_SENTINEL"*)
+            echo "merge_aborted"; return 0 ;;
+    esac
+    case "$rebase_err" in
+        *"cannot pull with rebase"*|*"unstaged changes"*|*"uncommitted changes"*|*"local changes"*"would be overwritten"*)
+            echo "dirty_worktree"; return 0 ;;
+    esac
+    # Git's own "rebase-merge directory" / "rebase-apply" texts stay HERE rather
+    # than moving to the rebase_in_progress arm: when a wedge pre-existed, our
+    # sentinel is present too and the earlier arm already won. That ordering is
+    # also what task_push's accumulated rebase_err needs — an attempt-1 abort
+    # that failed makes attempt 2 report rebase_in_progress, the actionable
+    # verdict, rather than rebase_conflict.
+    case "$rebase_err" in
+        *CONFLICT*|*"could not apply"*|*"Resolve all conflicts"*|*"rebase-merge directory"*|*"rebase-apply"*)
+            echo "rebase_conflict"; return 0 ;;
+    esac
+    # A configured remote but no upstream for the current branch: `git push`
+    # says "has no upstream branch", `git pull` says "no tracking information".
+    # Neither substring overlaps another arm, so the position is not
+    # load-bearing.
+    case "$blob" in
+        *"no upstream branch"*|*"no tracking information"*)
+            echo "no_upstream"; return 0 ;;
+    esac
+    case "$blob" in
+        *"Could not read from remote repository"*|*"does not appear to be a git repository"*|\
+        *"Could not resolve host"*|*"Connection refused"*|*"Authentication failed"*|\
+        *"Permission denied"*|*"unable to access"*|*"No configured push destination"*|*"timed out"*)
+            echo "remote_unreachable"; return 0 ;;
+    esac
+    case "$push_err" in
+        *"non-fast-forward"*|*"fetch first"*|*"rejected"*|*"behind its remote"*)
+            echo "diverged"; return 0 ;;
+    esac
+    echo "unknown"
+}
+
+# Internal: actionable recovery hint for a reason code.
+#   $1 = reason code
+#   $2 = command to suggest retrying (default './ait git push'); task_sync
+#        passes './ait sync' so a failed pull is not sent to the push recovery.
+_task_push_reason_hint() {
+    local retry_cmd="${2:-./ait git push}"
+    case "$1" in
+        dirty_worktree)
+            echo "data worktree has unstaged changes blocking rebase; reconcile with 'ait syncer'" ;;
+        # The two converge-only codes below name './ait sync' — the
+        # non-interactive converger the recovery tests actually drive — rather
+        # than the 'ait syncer' TUI the older arms suggest.
+        ff_blocked)
+            echo "local edits to the same file(s) block the fast-forward; commit them or reconcile with './ait sync'" ;;
+        ff_ignored)
+            echo "an incoming commit would overwrite a local untracked or ignored file (e.g. userconfig.yaml); nothing was changed — move the local file aside, then reconcile with './ait sync'" ;;
+        local_diverged)
+            echo "local data branch has both unpushed and unpulled commits; reconcile with './ait sync'" ;;
+        # Since t1725_1 a conflicted pull ABORTS itself, so this code no longer
+        # means "a rebase is sitting there" — it means the rebase is gone and the
+        # two sides still diverge. Pointing at 'rebase --abort' here would name a
+        # recovery for a state that no longer exists.
+        rebase_conflict)
+            echo "rebase hit conflicts and was aborted (nothing left in progress); local and remote diverge — reconcile with 'ait syncer' or './ait sync'" ;;
+        rebase_in_progress)
+            echo "a rebase is in progress in the data worktree; './ait git rebase --abort' discards only the partially replayed remote commits (your committed work stays on the branch), or resolve and './ait git rebase --continue'" ;;
+        data_midop)
+            echo "the data worktree is mid-operation (merge, cherry-pick, revert or bisect); run './ait git-health' for the exact state, then finish it or abort it with the matching './ait git <op> --abort'" ;;
+        # Only the gateway reaches this (t2064). Like rebase_conflict it means the
+        # operation is GONE. Free of the word "rebase": the state was a merge.
+        merge_aborted)
+            echo "the merge stopped before completing (a conflict, a refused merge commit, or a failed commit or branch update) and was aborted (nothing left in progress); local and remote diverge — reconcile with './ait sync', or merge by hand with plain 'git -C .aitask-data merge @{upstream}'" ;;
+        pull_locked)
+            echo "another session is reconciling the task data right now; nothing was changed — retry in a moment, or run './ait git-health' if it persists" ;;
+        no_upstream)
+            # MUST be the './ait git' gateway form: in branch mode the branch
+            # needing an upstream is aitask-data inside .aitask-data, and a bare
+            # 'git branch' run at the repo root would retarget the CODE branch
+            # instead, leaving every later sync failing.
+            echo "task-data branch has no upstream; set one with './ait git branch --set-upstream-to=origin/<branch>' (or run 'ait setup' to repair the data branch)" ;;
+        remote_unreachable)
+            echo "remote unreachable (network, auth, or no configured destination); retry '${retry_cmd}' once connectivity is restored" ;;
+        diverged)
+            echo "remote has diverged (non-fast-forward) and the rebase retries did not resolve it; reconcile with 'ait syncer'" ;;
+        *)
+            echo "reason unknown; run './ait git-health' and inspect the data worktree manually" ;;
+    esac
+}
+
+# Internal: emit the user-facing warning for a failed push cycle. Warns only
+# when commits are actually stranded — an offline repo with nothing pending
+# stays as quiet as it was before this reporting existed.
+_task_push_warn() {
+    local detail="${1:-}" upstream hint
+    upstream="$(_task_push_upstream)"
+    if [[ -n "$upstream" ]]; then
+        upstream=" to ${upstream}"
+    fi
+    hint="$(_task_push_reason_hint "$TASK_PUSH_REASON")"
+
+    if [[ -z "$TASK_PUSH_UNPUSHED" ]]; then
+        warn "task data push failed (unpushed commit count unavailable) — ${hint}${detail}"
+    elif [[ "$TASK_PUSH_UNPUSHED" != "0" ]]; then
+        warn "${TASK_PUSH_UNPUSHED} commit(s) not pushed${upstream} — ${hint}${detail}"
+    fi
+}
+
+# --- Task data convergence (best-effort, but never silent) ---
+#
+# task_data_converge() reconciles the LOCAL data branch with its upstream in
+# both directions, without ever stashing or committing. It exists because the
+# metadata updaters push straight to origin from a throwaway clone, leaving the
+# local ref behind: the compensating `pull --rebase` refuses (exit 128) BEFORE
+# it fetches whenever the shared .aitask-data worktree is dirty, so nothing
+# converges and the next local commit creates real divergence.
+#
+# The reconcile seam is `fetch` + `merge --ff-only`, NOT `pull --rebase`
+# (measured on git 2.55.0 with the worktree dirty): the rebase refuses in every
+# dirty case, while the fast-forward succeeds when the dirty paths do not
+# overlap and fails closed ("would be overwritten by merge ... Aborting") when
+# they do. `--autostash` and a wholesale auto-commit are both rejected: each
+# would touch OTHER live sessions' uncommitted aitasks/ / aiplans/ edits in the
+# shared worktree. This function never stashes and never commits anything.
+#
+# The fast-forward pins two flags (t1792, t1987): `--no-autostash`, so a user's
+# merge.autoStash cannot stash and rewrite those same uncommitted files, and
+# `--no-overwrite-ignore`, so an incoming commit that writes an ignored local
+# file (userconfig.yaml) is refused instead of silently replacing it.
+#
+# Same contract as task_push(): always returns 0, outcome in globals, one
+# warn() on stderr, silent on success. It calls _ait_data_git / _task_push_once
+# directly rather than task_push(), so it inherits no die() pre-flight.
+TASK_CONVERGE_STATUS=""   # converged|fast-forwarded|pushed|diverged|blocked|no-remote|failed
+TASK_CONVERGE_REASON=""   # classifier code when blocked/diverged/failed
+TASK_CONVERGE_AHEAD=""    # local commits not on upstream (post-cycle)
+TASK_CONVERGE_BEHIND=""   # upstream commits not on HEAD (post-cycle)
+
+# A race can turn ahead-only into ahead-and-behind between our fetch and our
+# push. Two passes bound the retry; see the push arm below for the single
+# trigger that consumes the second one.
+_AIT_CONVERGE_MAX_PASSES=2
+
+task_data_converge() {
+    local context="${1:-}"
+    TASK_CONVERGE_STATUS=""
+    TASK_CONVERGE_REASON=""
+    TASK_CONVERGE_AHEAD=""
+    TASK_CONVERGE_BEHIND=""
+
+    # A remote probe that FAILED is not "no remote" (t2070).
+    if ! _task_remote_probe; then
+        TASK_CONVERGE_STATUS="failed"
+        TASK_CONVERGE_REASON="unknown"
+        TASK_CONVERGE_AHEAD="$(_task_push_unpushed_count)"
+        TASK_CONVERGE_BEHIND="$(_task_sync_unpulled_count)"
+        _task_converge_warn "$context" "$_TASK_REMOTE_DETAIL"
+        return 0
+    fi
+
+    # No remote at all (solo / offline-only repo): nothing to reconcile.
+    if [[ -z "$_TASK_REMOTE_LIST" ]]; then
+        TASK_CONVERGE_STATUS="no-remote"
+        return 0
+    fi
+
+    local upstream
+    upstream="$(_task_push_upstream)"
+    if [[ -z "$upstream" ]]; then
+        TASK_CONVERGE_STATUS="failed"
+        TASK_CONVERGE_REASON="no_upstream"
+        _task_converge_warn "$context"
+        return 0
+    fi
+
+    local pass fetch_err ahead behind ff_err push_err reason
+    for (( pass=1; pass<=_AIT_CONVERGE_MAX_PASSES; pass++ )); do
+        # A plain fetch never touches the worktree. This is the step the old
+        # `pull --rebase` never reached, because it refused first.
+        if ! fetch_err="$(_ait_data_git fetch --quiet 2>&1)"; then
+            TASK_CONVERGE_STATUS="failed"
+            TASK_CONVERGE_REASON="$(_task_push_classify "$fetch_err" "")"
+            TASK_CONVERGE_AHEAD="$(_task_push_unpushed_count)"
+            TASK_CONVERGE_BEHIND="$(_task_sync_unpulled_count)"
+            _task_converge_warn "$context"
+            return 0
+        fi
+
+        ahead="$(_task_push_unpushed_count)"
+        behind="$(_task_sync_unpulled_count)"
+        TASK_CONVERGE_AHEAD="$ahead"
+        TASK_CONVERGE_BEHIND="$behind"
+
+        # Both counts diverged: resolving needs a rebase, and a rebase needs the
+        # shared worktree. Report it and hand ownership to './ait sync'.
+        if [[ "${ahead:-0}" != "0" && "${behind:-0}" != "0" ]]; then
+            TASK_CONVERGE_STATUS="diverged"
+            TASK_CONVERGE_REASON="local_diverged"
+            _task_converge_warn "$context"
+            return 0
+        fi
+
+        if [[ "${behind:-0}" != "0" ]]; then
+            if ff_err="$(_ait_data_git merge --ff-only --no-autostash --no-overwrite-ignore \
+                    --quiet "$upstream" 2>&1)"; then
+                TASK_CONVERGE_STATUS="fast-forwarded"
+                TASK_CONVERGE_AHEAD="$(_task_push_unpushed_count)"
+                TASK_CONVERGE_BEHIND="$(_task_sync_unpulled_count)"
+                return 0
+            fi
+            # Terminal and fails closed: the worktree is still dirty, so another
+            # pass cannot change the answer. The classifier already maps git's
+            # "local changes ... would be overwritten by merge" to
+            # dirty_worktree; remap it so the hint names a merge, not a rebase.
+            # Git's "untracked working tree files would be overwritten" (an
+            # ignored or untracked local file the incoming commit writes) has
+            # no classifier arm; name it so the hint says to move the file.
+            reason="$(_task_push_classify "" "$ff_err")"
+            if [[ "$reason" == "dirty_worktree" ]]; then
+                reason="ff_blocked"
+            elif [[ "$ff_err" == *"untracked working tree files would be overwritten"* ]]; then
+                reason="ff_ignored"
+            fi
+            TASK_CONVERGE_STATUS="blocked"
+            TASK_CONVERGE_REASON="$reason"
+            _task_converge_warn "$context"
+            return 0
+        fi
+
+        if [[ "${ahead:-0}" != "0" ]]; then
+            if push_err="$(_task_push_once 2>&1)"; then
+                TASK_CONVERGE_STATUS="pushed"
+                TASK_CONVERGE_AHEAD="$(_task_push_unpushed_count)"
+                TASK_CONVERGE_BEHIND="$(_task_sync_unpulled_count)"
+                return 0
+            fi
+            reason="$(_task_push_classify "$push_err" "")"
+            # A non-fast-forward rejection here means another writer advanced
+            # origin between our fetch and our push. That is a LOST RACE, not a
+            # failure: the true state is now ahead-and-behind. Re-fetch and
+            # re-sample so it gets classified from the COUNTS as
+            # diverged/local_diverged. This `continue` is the ONLY thing that
+            # consumes a second pass — every other arm returns.
+            if [[ "$reason" == "diverged" ]]; then
+                continue
+            fi
+            # Not a race (remote_unreachable / no_upstream / unknown): another
+            # pass buys nothing.
+            TASK_CONVERGE_STATUS="failed"
+            TASK_CONVERGE_REASON="$reason"
+            _task_converge_warn "$context"
+            return 0
+        fi
+
+        TASK_CONVERGE_STATUS="converged"
+        return 0
+    done
+
+    # Passes exhausted: reached only when the last pass's push also lost the
+    # race. The final counts are the truth, not the push's error string — the
+    # same rule the ahead-and-behind arm above follows.
+    TASK_CONVERGE_AHEAD="$(_task_push_unpushed_count)"
+    TASK_CONVERGE_BEHIND="$(_task_sync_unpulled_count)"
+    if [[ "${TASK_CONVERGE_AHEAD:-0}" != "0" && "${TASK_CONVERGE_BEHIND:-0}" != "0" ]]; then
+        TASK_CONVERGE_STATUS="diverged"
+        TASK_CONVERGE_REASON="local_diverged"
+    else
+        TASK_CONVERGE_STATUS="failed"
+        TASK_CONVERGE_REASON="diverged"
+    fi
+    _task_converge_warn "$context"
+    return 0
+}
+
+# Internal: emit the user-facing warning for a non-success converge cycle.
+# Mirrors _task_sync_warn (:354). Success statuses emit nothing.
+#   $1 = caller context, $2 = detail suffix (e.g. " (git: <line>)"), optional
+_task_converge_warn() {
+    local context="${1:-}" detail="${2:-}" upstream hint
+    upstream="$(_task_push_upstream)"
+    if [[ -n "$upstream" ]]; then
+        upstream=" with ${upstream}"
+    fi
+    hint="$(_task_push_reason_hint "$TASK_CONVERGE_REASON" "./ait sync")"
+    if [[ -n "$context" ]]; then
+        context=" (${context})"
+    fi
+
+    # Both probes print nothing when the branch has no upstream, so a default of
+    # 0 would report "0 unpushed, 0 remote unpulled" — a concrete, false claim
+    # about a state where the counts are simply UNKNOWN. Say so instead, exactly
+    # as _task_sync_warn does.
+    if [[ -z "$TASK_CONVERGE_AHEAD" && -z "$TASK_CONVERGE_BEHIND" ]]; then
+        warn "task data not converged [${TASK_CONVERGE_STATUS}]${upstream} (unreconciled commit counts unavailable) — ${hint}${detail}${context}"
+        return 0
+    fi
+
+    # Name the status: unlike _task_sync_warn, which only ever reports "failed",
+    # this one line carries three distinct non-success outcomes (blocked /
+    # diverged / failed) and the hint alone does not separate them.
+    warn "task data not converged [${TASK_CONVERGE_STATUS}]${upstream}: ${TASK_CONVERGE_AHEAD:-0} local unpushed, ${TASK_CONVERGE_BEHIND:-0} remote unpulled — ${hint}${detail}${context}"
+}
+
+# --- YAML List Parsing ---
+
+# Parse a YAML inline list value to comma-separated string.
+# Strips brackets, quotes, and spaces: "['38', t85_2]" -> "38,t85_2"
+parse_yaml_list() {
+    local value="$1"
+    echo "$value" | tr -d "[]'\"" | tr -d ' '
+}
+
+# --- YAML List Formatting ---
+
+# Format a comma-separated string as a YAML inline list.
+# "1,3,5" -> "[1, 3, 5]"; empty input -> "[]".
+# Inverse of parse_yaml_list.
+format_yaml_list() {
+    local input="$1"
+    if [[ -z "$input" ]]; then
+        echo "[]"
+    else
+        echo "[$(echo "$input" | sed 's/,/, /g')]"
+    fi
+}
+
+# --- Label Vocabulary Management ---
+#
+# Canonical implementation of the label vocabulary seam (aitasks/metadata/
+# labels.txt). aitask_create.sh, aitask_update.sh, aitask_pr_import.sh,
+# aitask_issue_import.sh and aitask_labels.sh all call these — do NOT re-define
+# any of them in a caller: a later definition shadows the lib and the shared
+# behaviour silently disappears (tests/test_label_vocabulary_lib.sh pins this).
+
+# Resolve the vocabulary file path, honoring a caller-set LABELS_FILE.
+# Lazy on purpose: aitask_create.sh sets TASK_DIR *after* sourcing this lib, and
+# tests export a temp TASK_DIR before sourcing.
+labels_file_path() {
+    if [[ -n "${LABELS_FILE:-}" ]]; then
+        printf '%s' "$LABELS_FILE"
+    else
+        printf '%s' "${TASK_DIR:-aitasks}/metadata/labels.txt"
+    fi
+}
+
+# Canonicalize a single label: lowercase, non-[a-z0-9_-] -> "_", collapse runs
+# of "_", trim leading/trailing "_". "UI Stuff" -> "ui_stuff"; "!!!" -> "".
+# Matches github_map_labels() in aitask_pr_import.sh so imported and
+# locally-minted labels agree.
+#
+# Control characters are folded FIRST, before the line-oriented stages. `sed`
+# processes one line at a time, so an embedded newline would otherwise survive
+# the whole pipeline: `--add-label $'alpha\nbeta'` then wrote a two-line
+# `labels: [...]` inline list (which YAML folds to the space-bearing label
+# "alpha beta") while the CSV registration saw only the first line — the
+# frontmatter and the vocabulary disagreed, and labels.txt is itself
+# line-delimited. Folding to "_" rather than deleting keeps the two halves
+# distinguishable ("alpha_beta", not "alphabeta").
+#
+# A token that YAML would read as something other than a string sanitizes to ""
+# (rejected): see _label_reads_as_string. Labels are written unquoted by
+# format_yaml_list, which stays unquoted on purpose because it also writes id and
+# gate lists where integers must stay plain. So without this check `on` reached
+# every Python reader as True, `null` as None, and `010` as 8.
+sanitize_label() {
+    local label="$1" clean
+    clean=$(printf '%s' "$label" | tr '[:cntrl:]' '_' | tr '[:upper:]' '[:lower:]' \
+        | sed -e 's/[^a-z0-9_-]/_/g' -e 's/__*/_/g' -e 's/^_//' -e 's/_$//')
+    _label_reads_as_string "$clean" || clean=""
+    printf '%s' "$clean"
+}
+
+# _label_reads_as_string <sanitized-label> -> 0 when the token, written as a
+# plain flow scalar (`labels: [tok]`), reads back as the identical string. The
+# input is sanitize_label's output, so it holds only ASCII [a-z0-9_-]. Within
+# that charset the YAML 1.1 implicit non-strings are the bool/null words, ints
+# (decimal, octal, `1_000`, 0b binary, 0x hex) and dates. A float, `.inf`/`.nan`,
+# a sexagesimal or a timestamp with a time part needs `.` or `:`, which the
+# charset cannot hold.
+# Measured against PyYAML (yaml.SafeLoader and task_yaml._TaskSafeLoader) over
+# every string of length 1-3 drawn from a probe alphabet, plus known YAML words:
+# no misread string is accepted. The over-rejection set (strings PyYAML would
+# read as strings anyway, such as `y`, `n`, `08`, `0b`) is deliberate,
+# conservative, and pinned exactly by tests/test_label_yaml_words.sh.
+_label_reads_as_string() {
+    local l="$1"
+    case "$l" in
+        y|n|yes|no|true|false|on|off|null) return 1 ;;
+    esac
+    [[ "$l" =~ ^[-+]?[0-9][0-9_]*$ ]] && return 1
+    [[ "$l" =~ ^[-+]?0[bx][0-9a-f_]*$ ]] && return 1
+    [[ "$l" =~ ^[0-9]{4}-[0-9]{1,2}-[0-9]{1,2}$ ]] && return 1
+    return 0
+}
+
+ensure_labels_file() {
+    local file dir
+    file=$(labels_file_path)
+    dir=$(dirname "$file")
+    mkdir -p "$dir"
+    touch "$file"
+}
+
+# Print the vocabulary, sorted. Always returns 0 — a bare `[[ -s ]] && sort`
+# returns 1 on an empty file and would abort `set -e` callers.
+get_existing_labels() {
+    local file
+    ensure_labels_file
+    file=$(labels_file_path)
+    if [[ -s "$file" ]]; then
+        LC_ALL=C sort -u "$file"
+    fi
+    return 0
+}
+
+# --- Rich-return globals (see add_labels_csv_to_file) ---
+# NEVER call the label helpers via $( ) — command substitution runs them in a
+# subshell and these globals evaporate with it. Read them after a direct call.
+AIT_LABELS_NORMALIZED=""   # normalized CSV, safe for frontmatter
+AIT_LABELS_ADDED=()        # labels newly appended to the vocabulary this call
+AIT_LABELS_DROPPED=()      # input tokens that sanitized to nothing
+
+# Append a label to the vocabulary if absent. Appends to AIT_LABELS_ADDED when
+# it actually wrote. Always returns 0 (callers invoke it bare under `set -e`).
+add_label_to_file() {
+    local label="$1"
+    local file tmp
+    [[ -z "$label" ]] && return 0
+    # Write-site guard for a line-delimited file: a control character (newline
+    # above all) would inject extra vocabulary entries that no reader can tell
+    # apart from real ones. Undecidable on read, so neutralize on write. Every
+    # in-tree caller passes a sanitize_label output, so this never fires in
+    # practice — it exists so a future caller cannot corrupt the file.
+    # Matched in-shell on purpose: grep is line-oriented and can never see the
+    # newline it is meant to catch (it splits the input on exactly that byte).
+    if [[ "$label" == *[[:cntrl:]]* ]]; then
+        warn "refusing to register a label containing a control character"
+        return 0
+    fi
+    ensure_labels_file
+    file=$(labels_file_path)
+    # -F/-x: labels may legitimately start with "-" or contain regex chars.
+    if grep -qFx -- "$label" "$file" 2>/dev/null; then
+        return 0
+    fi
+    # temp-file + mv so concurrent readers never see a torn file.
+    # LC_ALL=C pins collation: the committed file must not reorder by locale.
+    tmp="${file}.tmp.$$"
+    { cat "$file"; echo "$label"; } | LC_ALL=C sort -u > "$tmp" && mv "$tmp" "$file"
+    AIT_LABELS_ADDED+=("$label")
+    return 0
+}
+
+# Pure: split a CSV on ",", trim, sanitize, drop empties, order-preserving
+# dedupe. stdout = normalized CSV. stderr = "DROPPED:<tok1>,<tok2>" when any
+# input token sanitized to nothing. Writes no files.
+normalize_labels_csv() {
+    local csv="$1"
+    local -a parts=() kept=() dropped=()
+    local raw trimmed clean k found
+    [[ -z "$csv" ]] && { printf ''; return 0; }
+    # `read` consumes ONE line: an embedded newline would silently truncate the
+    # token list (",a\nb,c" yielded just "a"). Fold control characters first so
+    # every token survives the split, then sanitize_label canonicalizes each.
+    csv=$(printf '%s' "$csv" | tr '[:cntrl:]' '_')
+    IFS=',' read -ra parts <<< "$csv"
+    for raw in "${parts[@]}"; do
+        trimmed="${raw#"${raw%%[![:space:]]*}"}"
+        trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
+        [[ -z "$trimmed" ]] && continue
+        clean=$(sanitize_label "$trimmed")
+        if [[ -z "$clean" ]]; then
+            dropped+=("$trimmed")
+            continue
+        fi
+        found=false
+        for k in ${kept[@]+"${kept[@]}"}; do
+            [[ "$k" == "$clean" ]] && { found=true; break; }
+        done
+        [[ "$found" == false ]] && kept+=("$clean")
+    done
+    if (( ${#dropped[@]} > 0 )); then
+        echo "DROPPED:$(IFS=','; printf '%s' "${dropped[*]}")" >&2
+    fi
+    if (( ${#kept[@]} > 0 )); then
+        printf '%s' "$(IFS=','; printf '%s' "${kept[*]}")"
+    fi
+    return 0
+}
+
+# Normalize a CSV and register every resulting label in the vocabulary.
+# Sets AIT_LABELS_NORMALIZED / AIT_LABELS_ADDED / AIT_LABELS_DROPPED.
+# Call directly (never via $( )) — the results are the globals, not stdout.
+# shellcheck disable=SC2034  # the AIT_LABELS_* globals ARE the return value; they are read by callers in other files
+add_labels_csv_to_file() {
+    local csv="$1"
+    local normalized dropped_line
+    AIT_LABELS_NORMALIZED=""
+    AIT_LABELS_ADDED=()
+    AIT_LABELS_DROPPED=()
+    [[ -z "$csv" ]] && return 0
+    # Two-call stdout/stderr split (same idiom as filter_gates_for_issue_type).
+    dropped_line=$(normalize_labels_csv "$csv" 2>&1 >/dev/null)
+    normalized=$(normalize_labels_csv "$csv" 2>/dev/null)
+    if [[ -n "$dropped_line" ]]; then
+        IFS=',' read -ra AIT_LABELS_DROPPED <<< "${dropped_line#DROPPED:}"
+    fi
+    AIT_LABELS_NORMALIZED="$normalized"
+    [[ -z "$normalized" ]] && return 0
+    local -a tokens=()
+    IFS=',' read -ra tokens <<< "$normalized"
+    local t
+    for t in "${tokens[@]}"; do
+        add_label_to_file "$t"
+    done
+    return 0
+}
+
+# Gates a `manual_verification` task can actually REACH: the machine gates
+# recorded in task-workflow Step 9. Manual verification skips Steps 6-8
+# (plan / risk / review), so any gate whose checkpoint lives there is
+# unreachable and must not be declared on such a task (it would block archival
+# forever — see t1156). This is an ALLOWLIST (not a denylist) on purpose: an
+# unknown/new gate is stripped by default, so a future planning gate added to a
+# profile's default_gates can never silently make a manual_verification task
+# unarchivable. See .claude/skills/task-workflow/manual-verification.md
+# (Steps 6-8 skipped) and aitasks/metadata/gates.yaml. `merge_approved` is
+# intentionally excluded (profile-conditional human gate, never auto-injected).
+MANUAL_VERIFICATION_REACHABLE_GATES="build_verified tests_pass lint"
+
+# filter_gates_for_issue_type <issue_type> <csv-gates>
+#   Echoes the kept gates as a CSV on stdout. Echoes "STRIPPED:<csv>" on stderr
+#   iff any unreachable gate was removed. Only `manual_verification` filters;
+#   every other issue_type passes its gates through unchanged.
+filter_gates_for_issue_type() {
+    local issue_type="$1" csv="$2"
+    if [[ "$issue_type" != "manual_verification" || -z "$csv" ]]; then
+        printf '%s' "$csv"
+        return 0
+    fi
+    local kept=() stripped=() g
+    local _gates
+    IFS=',' read -ra _gates <<< "$csv"
+    for g in "${_gates[@]}"; do
+        g="${g// /}"
+        [[ -z "$g" ]] && continue
+        if [[ " $MANUAL_VERIFICATION_REACHABLE_GATES " == *" $g "* ]]; then
+            kept+=("$g")
+        else
+            stripped+=("$g")
+        fi
+    done
+    local IFS=','
+    printf '%s' "${kept[*]}"
+    [[ ${#stripped[@]} -gt 0 ]] && printf 'STRIPPED:%s\n' "${stripped[*]}" >&2
+    return 0
+}
+
+# join_yaml_flow_lists and read_yaml_field are defined in yaml_utils.sh
+# (sourced above) — a shared lib so agentcrew_utils.sh can reuse the same
+# canonical readers without a copy of its own.
+
+# --- Issue-type vocabulary (shell-side reader) ---
+
+# read_valid_task_types [file]
+# Pure reader for the issue-type vocabulary — prints one type per line, sorted.
+# Unlike the callers' get_valid_task_types wrappers it does NOT call
+# ensure_task_types_file: a read-only lister (aitask_ls.sh) must never create
+# files in the user's repo. Callers that legitimately need the file to exist
+# keep their own ensure_task_types_file call around this one.
+#
+# Folding the whole vocabulary onto one seam across the 32+ duplication sites is
+# t720's job (issue_type_list_single_source_of_truth); this is only the
+# shell-side reader, a down-payment on it and not a substitute.
+read_valid_task_types() {
+    local f="${1:-${TASK_TYPES_FILE:-aitasks/metadata/task_types.txt}}"
+    if [[ -s "$f" ]]; then
+        sort -u "$f"
+    else
+        printf '%s\n' "bug" "feature" "refactor"
+    fi
+}
+
+# --- Task level enum (single source of truth) ---
+
+# Canonical task level enum (high/medium/low), shared by priority, effort, and
+# the two risk fields (risk_code_health, risk_goal_achievement). Single bash
+# source of truth — Python mirror: .aitask-scripts/lib/task_levels.py.
+TASK_LEVELS="high medium low"   # canonical, severity-descending
+
+# Return 0 if $1 is a valid task level, non-zero otherwise (empty => invalid).
+is_valid_task_level() {
+    local val="$1" level
+    for level in $TASK_LEVELS; do
+        [[ "$val" == "$level" ]] && return 0
+    done
+    return 1
+}
+
+# Emit the levels one-per-line for interactive pickers (e.g. fzf).
+task_levels_lines()     { printf '%s\n' high medium low; }   # canonical (desc)
+task_levels_lines_asc() { printf '%s\n' low medium high; }   # ascending
+
+# --- Helper: read status of a folded task ---
+read_task_status() {
+    local file_path="$1"
+    read_yaml_field "$file_path" "status"
+}
+
+# --- Cross-repo dependency field readers ---
+
+# Read the xdeps list as a normalized comma-separated string (e.g. "1,t42_3").
+# Empty when the field is absent.
+read_xdeps() {
+    local file_path="$1"
+    local raw
+    raw=$(read_yaml_field "$file_path" "xdeps")
+    [[ -z "$raw" ]] && return 0
+    local parsed
+    parsed=$(parse_yaml_list "$raw")
+    normalize_task_ids "$parsed"
+}
+
+# Read the xdeprepo scalar (cross-repo project name). Empty when absent.
+read_xdeprepo() {
+    local file_path="$1"
+    read_yaml_field "$file_path" "xdeprepo"
+}
+
+# Validate the cross-repo dep pair.
+#
+# As of t832_10:
+#   - Neither set                 → no-op (most tasks).
+#   - Both set                    → BATCH_XDEPREPO must resolve cleanly;
+#                                   every id in BATCH_XDEPS must exist in
+#                                   the cross-repo project.
+#   - BATCH_XDEPREPO alone        → OK (intent-only; the new task declares
+#                                   cross-repo coordination without any
+#                                   concrete deps yet). The xdeprepo
+#                                   registry resolution still runs.
+#   - BATCH_XDEPS alone           → die (xdeps cannot exist without a
+#                                   project context to resolve them in).
+#
+# Reads globals: BATCH_XDEPS, BATCH_XDEPREPO, SCRIPT_DIR. Callers
+# (create.sh, update.sh) populate these before invoking.
+validate_xdeps_pair() {
+    if [[ -z "${BATCH_XDEPS:-}" && -z "${BATCH_XDEPREPO:-}" ]]; then
+        return 0
+    fi
+    if [[ -n "${BATCH_XDEPS:-}" && -z "${BATCH_XDEPREPO:-}" ]]; then
+        die "--xdeps requires --xdeprepo (xdeps without a project context cannot be resolved)."
+    fi
+
+    local resolved
+    resolved=$("$SCRIPT_DIR/aitask_project_resolve.sh" "$BATCH_XDEPREPO" 2>/dev/null || true)
+    case "$resolved" in
+        RESOLVED:*) ;;
+        STALE:*)
+            die "Project '$BATCH_XDEPREPO' is registered but its path is stale: ${resolved#STALE:}"
+            ;;
+        NOT_FOUND:*|"")
+            die "Project '$BATCH_XDEPREPO' is not registered. Run \`cd /path/to/$BATCH_XDEPREPO && ait projects add\`."
+            ;;
+        *)
+            die "Project resolver returned unexpected output for '$BATCH_XDEPREPO': $resolved"
+            ;;
+    esac
+
+    local IFS=','
+    local id
+    for id in $BATCH_XDEPS; do
+        id="${id#t}"
+        [[ -z "$id" ]] && continue
+        local result
+        result=$("$SCRIPT_DIR/aitask_query_files.sh" --project "$BATCH_XDEPREPO" task-status "$id" 2>/dev/null || true)
+        case "$result" in
+            STATUS:NOT_FOUND|"")
+                die "--xdeps id $id not found in cross-repo project '$BATCH_XDEPREPO'."
+                ;;
+            STATUS:*) ;;
+            *)
+                die "Unexpected task-status output for xdeps id $id in '$BATCH_XDEPREPO': $result"
+                ;;
+        esac
+    done
+}
+
+# --- Anchor field helper ---
+
+# Normalize and validate an anchor task id (intra-repo, archived-inclusive).
+#
+# Accepts a raw id with an optional single leading "t" (e.g. t42, 42, t42_1,
+# 42_1), strips it, asserts the id shape (N or N_M), and verifies the task
+# exists (any status, including Done/archived, is valid — anchoring to a
+# completed topic root is allowed). Echoes the BARE id so callers store/resolve
+# the canonical form (so `--anchor t42` and `--anchor 42` are identical, and the
+# stored `anchor:` value equals a root's bare own-id group key).
+#
+# Dies on a malformed id or a non-existent target. Mirrors the local
+# strip_prefix in aitask_query_files.sh, but t-only and shared.
+#
+# Reads global: SCRIPT_DIR.
+normalize_anchor_id() {
+    local raw="$1"
+    local id="${raw#t}"
+    if [[ ! "$id" =~ ^[0-9]+(_[0-9]+)?$ ]]; then
+        die "anchor target '$raw' is not a valid task id (expected N or N_M)."
+    fi
+    local status
+    status=$("$SCRIPT_DIR/aitask_query_files.sh" task-status "$id" 2>/dev/null || true)
+    case "$status" in
+        STATUS:NOT_FOUND|"")
+            die "anchor target '$id' not found."
+            ;;
+        STATUS:*)
+            echo "$id"
+            ;;
+        *)
+            die "anchor target '$id': unexpected status result '$status'."
+            ;;
+    esac
+}
+
+# Validate a board column id against this project's configured columns (t1377_1).
+# Echoes the id unchanged when valid; dies naming the valid ids otherwise.
+#
+# Before this existed, `ait update --boardcol <bad-id>` wrote the value verbatim
+# and produced a task that rendered in NO column at all — not even `unordered` —
+# and that the work-report gatherer could not name either.
+#
+# The synthetic `unordered` is a legal target, so the listing is requested with
+# --include-unordered. The probe reads only board_config.json; deliberately NOT
+# `aitask_work_report_gather.sh --list-columns`, which globs and parses every
+# task file just to decide whether to prepend `unordered` (O(all tasks) per
+# `ait update` call).
+#
+# `$TASK_DIR` is forwarded so a repo using a non-default layout validates against
+# its own columns instead of the stock defaults.
+#
+# Reads globals: SCRIPT_DIR, TASK_DIR.
+normalize_board_column() {
+    local raw="$1"
+    local listing valid_ids
+    if ! listing=$("$SCRIPT_DIR/aitask_board_column.sh" list-columns \
+            --root . --task-dir "${TASK_DIR:-aitasks}" --include-unordered 2>/dev/null); then
+        die "board column '$raw': could not read the configured column list."
+    fi
+    # Column ids never contain '|' (load_columns rejects that), so cutting at the
+    # first separator is exact.
+    valid_ids=$(printf '%s\n' "$listing" | sed -n 's/^COLUMN:\([^|]*\)|.*/\1/p')
+    if [[ -z "$valid_ids" ]]; then
+        die "board column '$raw': no board columns are configured."
+    fi
+    local cid
+    while IFS= read -r cid; do
+        if [[ "$cid" == "$raw" ]]; then
+            echo "$raw"
+            return 0
+        fi
+    done <<< "$valid_ids"
+    die "board column '$raw' is not configured. Valid ids: $(printf '%s' "$valid_ids" | tr '\n' ' ')"
+}
+
+# Normalize child task IDs: ensure entries with underscore have 't' prefix.
+# e.g. "85_2,t85_3,16" -> "t85_2,t85_3,16"
+normalize_task_ids() {
+    local input="$1"
+    [[ -z "$input" ]] && return
+    local result=""
+    IFS=',' read -ra ids <<< "$input"
+    for id in "${ids[@]}"; do
+        if [[ "$id" =~ ^[0-9]+_[0-9]+$ ]]; then
+            id="t${id}"
+        fi
+        [[ -n "$result" ]] && result="${result},"
+        result="${result}${id}"
+    done
+    echo "$result"
+}
+
+# --- Per-user Config ---
+
+# Read the current user's email from the local (gitignored) userconfig.yaml
+# Output: email string, or empty if file missing / field not found
+get_user_email() {
+    local config="${TASK_DIR:-aitasks}/metadata/userconfig.yaml"
+    if [[ -f "$config" ]]; then
+        grep '^email:' "$config" | sed 's/^email: *//'
+    fi
+}
+
+# Read the last-used labels list from userconfig.yaml (per-user).
+# Output: CSV string (e.g. "ui,backend"), empty when field or file is absent.
+# Delegates to the yaml-aware userconfig_persist.py so both flow- and
+# block-style values are read correctly; falls back to a flow-only grep read
+# when no Python interpreter is available (read-only, never corrupts).
+get_last_used_labels() {
+    local config="${TASK_DIR:-aitasks}/metadata/userconfig.yaml"
+    [[ -f "$config" ]] || return 0
+
+    local py out
+    py="$(resolve_python 2>/dev/null || true)"
+    if [[ -n "$py" ]]; then
+        if out="$(TASK_DIR="${TASK_DIR:-aitasks}" "$py" \
+            "${SCRIPT_DIR}/lib/userconfig_persist.py" get-labels 2>/dev/null)"; then
+            printf '%s' "$out"
+            return 0
+        fi
+    fi
+
+    # Fallback (no Python): flow-style single-line read only.
+    local line
+    line=$(grep '^last_used_labels:' "$config" 2>/dev/null) || true
+    [[ -z "$line" ]] && return 0
+    echo "$line" | sed -e 's/^last_used_labels:[[:space:]]*//' \
+                       -e 's/^\[//' \
+                       -e 's/\][[:space:]]*$//' \
+                       -e 's/[[:space:]]//g'
+}
+
+# Write the last-used labels list to userconfig.yaml (per-user).
+# Input: CSV string (e.g. "ui,backend") — empty is valid and writes "[]".
+# Delegates to the yaml-aware userconfig_persist.py, which round-trips the whole
+# file safely so it can never orphan a prior block-style value into invalid
+# YAML. Falls back to a block-safe bash writer when no Python is available.
+set_last_used_labels() {
+    local csv="${1:-}"
+    local config="${TASK_DIR:-aitasks}/metadata/userconfig.yaml"
+    mkdir -p "$(dirname "$config")"
+
+    local py
+    py="$(resolve_python 2>/dev/null || true)"
+    if [[ -n "$py" ]]; then
+        if TASK_DIR="${TASK_DIR:-aitasks}" "$py" \
+            "${SCRIPT_DIR}/lib/userconfig_persist.py" set-labels "$csv" 2>/dev/null; then
+            return 0
+        fi
+    fi
+
+    _set_last_used_labels_fallback "$csv" "$config"
+}
+
+# Block-safe bash writer, used only when no Python interpreter is available.
+# Writes flow style ([a, b]) and, when replacing an existing value, also removes
+# any block-style continuation lines ("- item") that followed the header — so a
+# value previously written in block style cannot orphan list items into invalid
+# YAML. Deletion stops at the first non-list line, so a following block such as
+# "shortcuts:" is never touched.
+_set_last_used_labels_fallback() {
+    local csv="$1" config="$2"
+    local yaml_list
+    if [[ -z "$csv" ]]; then
+        yaml_list="[]"
+    else
+        yaml_list="[$(echo "$csv" | sed 's/,/, /g')]"
+    fi
+
+    if [[ ! -f "$config" ]]; then
+        {
+            echo "# Local user configuration (gitignored, not shared)"
+            echo "last_used_labels: $yaml_list"
+        } > "$config"
+        return 0
+    fi
+
+    if grep -q '^last_used_labels:' "$config" 2>/dev/null; then
+        local tmp
+        tmp="$(mktemp)"
+        awk -v repl="last_used_labels: ${yaml_list}" '
+            drop && /^[[:space:]]*-[[:space:]]/ { next }
+            drop { drop=0 }
+            /^last_used_labels:/ { print repl; drop=1; next }
+            { print }
+        ' "$config" > "$tmp" && mv "$tmp" "$config"
+    else
+        echo "last_used_labels: $yaml_list" >> "$config"
+    fi
+}
+
+# --- Platform Detection ---
+
+# Detect git remote platform from origin URL
+# Output: "github", "gitlab", "bitbucket", or "" (unknown)
+detect_platform() {
+    local remote_url
+    remote_url=$(git remote get-url origin 2>/dev/null || echo "")
+    if [[ "$remote_url" == *"gitlab"* ]]; then
+        echo "gitlab"
+    elif [[ "$remote_url" == *"bitbucket"* ]]; then
+        echo "bitbucket"
+    elif [[ "$remote_url" == *"github"* ]]; then
+        echo "github"
+    else
+        echo ""
+    fi
+}
+
+# Detect platform from an issue/web URL
+# Input: URL string
+# Output: "github", "gitlab", "bitbucket", or "" (unknown)
+detect_platform_from_url() {
+    local url="$1"
+    if [[ "$url" == *"gitlab"* ]]; then
+        echo "gitlab"
+    elif [[ "$url" == *"bitbucket"* ]]; then
+        echo "bitbucket"
+    elif [[ "$url" == *"github"* ]]; then
+        echo "github"
+    else
+        echo ""
+    fi
+}
+
+# --- Task and Plan Resolution ---
+# Archive search/extract primitives provided by archive_utils.sh:
+#   _search_archive(), _extract_from_archive(), _find_archive_for_task()
+# Temp directory cleanup handled by _AIT_ARCHIVE_TMPDIR in archive_utils.sh
+
+# Resolve task number to file path, checking both active and archived directories
+# Input: task_id (e.g., "53" or "53_6")
+# Output: file path
+resolve_task_file() {
+    local task_id="$1"
+    local files=""
+
+    if [[ "$task_id" =~ ^([0-9]+)_([0-9]+)$ ]]; then
+        local parent_num="${BASH_REMATCH[1]}"
+        local child_num="${BASH_REMATCH[2]}"
+
+        # Check active directory first
+        files=$(ls "$TASK_DIR"/t${parent_num}/t${parent_num}_${child_num}_*.md 2>/dev/null || true)
+
+        # Check archived directory
+        if [[ -z "$files" ]]; then
+            files=$(ls "$ARCHIVED_DIR"/t${parent_num}/t${parent_num}_${child_num}_*.md 2>/dev/null || true)
+        fi
+
+        # Tier 3: numbered archives (computed path, then legacy fallback)
+        if [[ -z "$files" ]]; then
+            local archive_path="" tar_match=""
+            archive_path=$(_find_archive_for_task "$parent_num" "$ARCHIVED_DIR")
+            if [[ -n "$archive_path" ]]; then
+                tar_match=$(_search_archive "$archive_path" "(^|/)t${parent_num}/t${parent_num}_${child_num}_.*\.md$")
+            fi
+            if [[ -z "$tar_match" ]]; then
+                local legacy
+                for legacy in "$ARCHIVED_DIR/old.tar.zst" "$ARCHIVED_DIR/old.tar.gz"; do
+                    [[ -f "$legacy" ]] || continue
+                    archive_path="$legacy"
+                    tar_match=$(_search_archive "$archive_path" "(^|/)t${parent_num}/t${parent_num}_${child_num}_.*\.md$")
+                    [[ -n "$tar_match" ]] && break
+                done
+            fi
+            if [[ -n "$tar_match" ]]; then
+                _extract_from_archive "$archive_path" "$tar_match"
+                files="$_AIT_EXTRACT_RESULT"
+            fi
+        fi
+
+        if [[ -z "$files" ]]; then
+            die "No task file found for t${parent_num}_${child_num} (checked active, archived, and numbered archives)"
+        fi
+    else
+        # Parent task
+        files=$(ls "$TASK_DIR"/t${task_id}_*.md 2>/dev/null || true)
+
+        if [[ -z "$files" ]]; then
+            files=$(ls "$ARCHIVED_DIR"/t${task_id}_*.md 2>/dev/null || true)
+        fi
+
+        # Tier 3: numbered archives (computed path, then legacy fallback)
+        if [[ -z "$files" ]]; then
+            local archive_path="" tar_match=""
+            archive_path=$(_find_archive_for_task "$task_id" "$ARCHIVED_DIR")
+            if [[ -n "$archive_path" ]]; then
+                tar_match=$(_search_archive "$archive_path" "(^|/)t${task_id}_.*\.md$")
+            fi
+            if [[ -z "$tar_match" ]]; then
+                local legacy
+                for legacy in "$ARCHIVED_DIR/old.tar.zst" "$ARCHIVED_DIR/old.tar.gz"; do
+                    [[ -f "$legacy" ]] || continue
+                    archive_path="$legacy"
+                    tar_match=$(_search_archive "$archive_path" "(^|/)t${task_id}_.*\.md$")
+                    [[ -n "$tar_match" ]] && break
+                done
+            fi
+            if [[ -n "$tar_match" ]]; then
+                _extract_from_archive "$archive_path" "$tar_match"
+                files="$_AIT_EXTRACT_RESULT"
+            fi
+        fi
+
+        if [[ -z "$files" ]]; then
+            die "No task file found for task number $task_id (checked active, archived, and numbered archives)"
+        fi
+    fi
+
+    local count
+    count=$(echo "$files" | wc -l)
+
+    if [[ "$count" -gt 1 ]]; then
+        die "Multiple task files found for task $task_id"
+    fi
+
+    echo "$files"
+}
+
+# task_file_is_active <task_id> <task_file> -- true iff the file that
+# resolve_task_file returned lives in the ACTIVE task tree: its directory is
+# exactly $TASK_DIR (parent) or $TASK_DIR/t<parent> (child). Anything else is a
+# loose file under $ARCHIVED_DIR or a temp extraction from a .tar.zst bundle.
+# A positive match on the active location, so an unexpected path fails closed.
+# Compared by IDENTITY (-ef: same device + inode), never by spelling:
+# resolve_task_file keeps $TASK_DIR verbatim, so a trailing slash yields
+# `aitasks//t16/...` for a child while dirname collapses a parent's
+# `aitasks//t5_x.md` to `aitasks` -- no one string form fits both (t2004).
+task_file_is_active() {
+    local task_id="$1" task_file="$2" active_dir="$TASK_DIR"
+    [[ "$task_id" =~ ^([0-9]+)_[0-9]+$ ]] && active_dir="$TASK_DIR/t${BASH_REMATCH[1]}"
+    [[ "$(dirname "$task_file")" -ef "$active_dir" ]]
+}
+
+# task_file_is_loose_archived <task_id> <task_file> -- true iff the file that
+# resolve_task_file returned is a LOOSE archived file: its directory is exactly
+# $ARCHIVED_DIR (parent) or $ARCHIVED_DIR/t<parent> (child), compared by
+# identity (-ef) for the same spelling reasons as task_file_is_active. Not a
+# "${ARCHIVED_DIR}/*" prefix test: with TMPDIR beneath an absolute
+# $ARCHIVED_DIR, a bundle extraction is a descendant of it too (t2023).
+task_file_is_loose_archived() {
+    local task_id="$1" task_file="$2" archived_dir="$ARCHIVED_DIR"
+    [[ "$task_id" =~ ^([0-9]+)_[0-9]+$ ]] && archived_dir="$ARCHIVED_DIR/t${BASH_REMATCH[1]}"
+    [[ "$(dirname "$task_file")" -ef "$archived_dir" ]]
+}
+
+# task_archive_bundle <task_id> -- the .tar.zst / .tar.gz bundle under
+# $ARCHIVED_DIR that holds <task_id>'s task file, or nothing. Uses the same
+# member patterns as resolve_task_file's bundle tier; it lists the archive but
+# extracts nothing, so it creates no temp dir (t2023, to name the bundle in a
+# refusal).
+task_archive_bundle() {
+    local task_id="$1" num="$1" pattern hit
+    if [[ "$task_id" =~ ^([0-9]+)_([0-9]+)$ ]]; then
+        num="${BASH_REMATCH[1]}"
+        pattern="(^|/)t${num}/t${num}_${BASH_REMATCH[2]}_.*\.md$"
+    else
+        pattern="(^|/)t${task_id}_.*\.md$"
+    fi
+    hit="$(_search_numbered_then_legacy "$num" "$ARCHIVED_DIR" "$pattern")" || true
+    [[ -n "$hit" ]] && echo "${hit%:*}"
+    return 0
+}
+
+# Resolve plan file from task number, checking both active and archived
+# Plan naming convention:
+#   Parent task t53_name.md -> plan p53_name.md
+#   Child task t53/t53_1_name.md -> plan p53/p53_1_name.md
+# Input: task_id (e.g., "53" or "53_6")
+# Output: file path or empty string if not found
+resolve_plan_file() {
+    local task_id="$1"
+    local files=""
+
+    if [[ "$task_id" =~ ^([0-9]+)_([0-9]+)$ ]]; then
+        local parent_num="${BASH_REMATCH[1]}"
+        local child_num="${BASH_REMATCH[2]}"
+
+        # Check active plan directory
+        files=$(ls "$PLAN_DIR"/p${parent_num}/p${parent_num}_${child_num}_*.md 2>/dev/null || true)
+
+        # Check archived plan directory
+        if [[ -z "$files" ]]; then
+            files=$(ls "$ARCHIVED_PLAN_DIR"/p${parent_num}/p${parent_num}_${child_num}_*.md 2>/dev/null || true)
+        fi
+
+        # Tier 3: numbered archives (computed path, then legacy fallback)
+        if [[ -z "$files" ]]; then
+            local archive_path="" tar_match=""
+            archive_path=$(_find_archive_for_task "$parent_num" "$ARCHIVED_PLAN_DIR")
+            if [[ -n "$archive_path" ]]; then
+                tar_match=$(_search_archive "$archive_path" "(^|/)p${parent_num}/p${parent_num}_${child_num}_.*\.md$")
+            fi
+            if [[ -z "$tar_match" ]]; then
+                local legacy
+                for legacy in "$ARCHIVED_PLAN_DIR/old.tar.zst" "$ARCHIVED_PLAN_DIR/old.tar.gz"; do
+                    [[ -f "$legacy" ]] || continue
+                    archive_path="$legacy"
+                    tar_match=$(_search_archive "$archive_path" "(^|/)p${parent_num}/p${parent_num}_${child_num}_.*\.md$")
+                    [[ -n "$tar_match" ]] && break
+                done
+            fi
+            if [[ -n "$tar_match" ]]; then
+                _extract_from_archive "$archive_path" "$tar_match"
+                files="$_AIT_EXTRACT_RESULT"
+            fi
+        fi
+    else
+        # Parent plan
+        files=$(ls "$PLAN_DIR"/p${task_id}_*.md 2>/dev/null || true)
+
+        if [[ -z "$files" ]]; then
+            files=$(ls "$ARCHIVED_PLAN_DIR"/p${task_id}_*.md 2>/dev/null || true)
+        fi
+
+        # Tier 3: numbered archives (computed path, then legacy fallback)
+        if [[ -z "$files" ]]; then
+            local archive_path="" tar_match=""
+            archive_path=$(_find_archive_for_task "$task_id" "$ARCHIVED_PLAN_DIR")
+            if [[ -n "$archive_path" ]]; then
+                tar_match=$(_search_archive "$archive_path" "(^|/)p${task_id}_.*\.md$")
+            fi
+            if [[ -z "$tar_match" ]]; then
+                local legacy
+                for legacy in "$ARCHIVED_PLAN_DIR/old.tar.zst" "$ARCHIVED_PLAN_DIR/old.tar.gz"; do
+                    [[ -f "$legacy" ]] || continue
+                    archive_path="$legacy"
+                    tar_match=$(_search_archive "$archive_path" "(^|/)p${task_id}_.*\.md$")
+                    [[ -n "$tar_match" ]] && break
+                done
+            fi
+            if [[ -n "$tar_match" ]]; then
+                _extract_from_archive "$archive_path" "$tar_match"
+                files="$_AIT_EXTRACT_RESULT"
+            fi
+        fi
+    fi
+
+    if [[ -z "$files" ]]; then
+        echo ""
+        return
+    fi
+
+    local count
+    count=$(echo "$files" | wc -l)
+    if [[ "$count" -gt 1 ]]; then
+        echo "$files" | head -1
+    else
+        echo "$files"
+    fi
+}
+
+# Extract the issue URL from a task file's YAML frontmatter
+# Input: task file path
+# Output: issue URL or empty string
+extract_issue_url() {
+    local file_path="$1"
+    local in_yaml=false
+
+    while IFS= read -r line; do
+        if [[ "$line" == "---" ]]; then
+            if [[ "$in_yaml" == true ]]; then
+                break
+            else
+                in_yaml=true
+                continue
+            fi
+        fi
+        if [[ "$in_yaml" == true && "$line" =~ ^issue:[[:space:]]*(.*) ]]; then
+            local url="${BASH_REMATCH[1]}"
+            url=$(echo "$url" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            echo "$url"
+            return
+        fi
+    done < "$file_path"
+
+    echo ""
+}
+
+# Extract the pull request URL from a task file's YAML frontmatter
+# Input: task file path
+# Output: pull request URL or empty string
+extract_pr_url() {
+    local file_path="$1"
+    local in_yaml=false
+
+    while IFS= read -r line; do
+        if [[ "$line" == "---" ]]; then
+            if [[ "$in_yaml" == true ]]; then
+                break
+            else
+                in_yaml=true
+                continue
+            fi
+        fi
+        if [[ "$in_yaml" == true && "$line" =~ ^pull_request:[[:space:]]*(.*) ]]; then
+            local url="${BASH_REMATCH[1]}"
+            url=$(echo "$url" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            echo "$url"
+            return
+        fi
+    done < "$file_path"
+
+    echo ""
+}
+
+# --- file_references: (t2209) ---
+#
+# The field is a YAML flow list, so it is READ WITH THE YAML READER and only a
+# string entry is a path. Splitting it on commas turned the valid `["a,b.py"]`
+# into the two paths `a` and `b.py`, which let aitask_verification_stale.sh
+# report a false FRESH. Entries are carried between the shell helpers
+# NEWLINE-separated, never comma-joined, and written by format_yaml_path_list,
+# which quotes whatever YAML would otherwise misread.
+
+# The reader glue. argv[1] = lib dir (APPENDED to sys.path; cwd entries are
+# dropped, as in aitask_premise_stale.sh's glues), argv[2..] = task files.
+# Single-quoted: nothing is interpolated into it. Output (UTF-8 bytes):
+#   FILE:<index>            one block per file, in argument order
+#   REF:<entry>             a string entry (task_yaml.file_reference_entries)
+#   BAD:<ascii repr>        a non-string / empty / NUL entry, or one holding a
+#                           LF / CR / unencodable char (it cannot be one line)
+#   INVALID:frontmatter     instead of REF/BAD: unreadable / undecodable /
+#                           unparseable frontmatter
+#   END:<n REF+BAD lines>
+#   DONE:<n files>
+# Exit 3 when task_yaml (PyYAML) cannot be imported.
+_AIT_FILE_REFS_GLUE='
+import sys
+sys.path = [p for p in sys.path if p not in ("", ".")]
+sys.path.append(sys.argv[1])
+try:
+    import task_yaml
+except Exception:
+    sys.exit(3)
+out = []
+files = sys.argv[2:]
+for index, path in enumerate(files):
+    out.append("FILE:%d" % index)
+    meta = None
+    invalid = False
+    try:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+        parsed = task_yaml.parse_frontmatter(text)
+        if parsed is not None:
+            meta = parsed[0]
+        elif text.startswith("---"):
+            invalid = True
+    except Exception:
+        invalid = True
+    if invalid or (meta is not None and not isinstance(meta, dict)):
+        out.append("INVALID:frontmatter")
+        out.append("END:0")
+        continue
+    n = 0
+    for ok, item in task_yaml.file_reference_entries(meta):
+        if ok and "\n" not in item and "\r" not in item:
+            try:
+                item.encode("utf-8")
+            except UnicodeEncodeError:
+                ok = False
+        else:
+            ok = False
+        out.append(("REF:" + item) if ok else ("BAD:" + ascii(item)))
+        n += 1
+    out.append("END:%d" % n)
+out.append("DONE:%d" % len(files))
+sys.stdout.buffer.write(("\n".join(out) + "\n").encode("utf-8"))
+'
+
+# read_file_references_batch <task_file>...
+# Reads file_references: from every file in ONE python call and prints the
+# validated block protocol above on stdout. All-or-nothing: the output is
+# printed only after the framing checks pass -- exactly one block per file, in
+# order, each END count matching its lines, and a final DONE count -- so a
+# truncated or malformed read can never reach a consumer as a shorter list.
+# Exit: 0 ok | 2 framing failure, python error, or a path holding a newline |
+#       3 no usable python (none resolved, or task_yaml/PyYAML missing).
+read_file_references_batch() {
+    local lib_dir py out rc=0 f
+    [[ $# -gt 0 ]] || { printf 'DONE:0\n'; return 0; }
+    for f in "$@"; do
+        [[ "$f" == *$'\n'* ]] && return 2
+    done
+    lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" || return 2
+    py="$(resolve_python)"
+    [[ -n "$py" ]] || return 3
+    # -B: importing task_yaml must not drop a __pycache__/ into lib/ -- a read
+    # helper leaves no files behind (it would dirty a scaffolded test repo).
+    out="$("$py" -B -c "$_AIT_FILE_REFS_GLUE" "$lib_dir" "$@")" || rc=$?
+    [[ $rc -eq 3 ]] && return 3
+    [[ $rc -eq 0 ]] || return 2
+
+    # Digits are regex-bounded before any arithmetic (a 20-digit count would
+    # wrap). After DONE nothing may follow.
+    local line want=0 in_block=false lines=0 invalid=false n done=false
+    while IFS= read -r line; do
+        [[ "$done" == true ]] && return 2
+        if [[ "$in_block" == false ]]; then
+            if [[ "$line" == "FILE:$want" ]]; then
+                in_block=true; lines=0; invalid=false
+            elif [[ "$line" =~ ^DONE:([0-9]{1,9})$ ]]; then
+                n="${BASH_REMATCH[1]}"
+                [[ $n -eq $# && $want -eq $# ]] || return 2
+                done=true
+            else
+                return 2
+            fi
+            continue
+        fi
+        case "$line" in
+            REF:*|BAD:*)
+                [[ "$invalid" == false ]] || return 2
+                lines=$(( lines + 1 )) ;;
+            INVALID:frontmatter)
+                [[ "$invalid" == false && $lines -eq 0 ]] || return 2
+                invalid=true ;;
+            END:*)
+                n="${line#END:}"
+                [[ "$n" =~ ^[0-9]{1,9}$ && $n -eq $lines ]] || return 2
+                in_block=false
+                want=$(( want + 1 ))
+                ;;
+            *) return 2 ;;
+        esac
+    done <<< "$out"
+    [[ "$done" == true ]] || return 2
+    printf '%s\n' "$out"
+    return 0
+}
+
+# get_file_references <task_file>
+# Prints the file_references: entries, one per line, each exactly as YAML reads
+# it: "path", "path:N", "path:N-M" or compact multi-range "path:N-M^N-M^...".
+# ONLY A STRING IS A PATH (task_yaml.file_reference_entries): an unquoted
+# `null` / `on` / `010` is not one, and neither is an entry holding a line
+# break. Exit status -- check it; never read empty output as "no references":
+#   0  the field is absent or empty, or every entry is a path string
+#   2  unreadable / unparseable frontmatter, any non-path entry, or a read
+#      failure -- NOTHING is printed (never a partial list)
+#   3  no usable python (PyYAML) to read the field with
+get_file_references() {
+    local out rc=0 line
+    out="$(read_file_references_batch "$1")" || rc=$?
+    [[ $rc -eq 0 ]] || return "$rc"
+    case $'\n'"$out" in
+        *$'\n'BAD:*|*$'\n'INVALID:*) return 2 ;;
+    esac
+    while IFS= read -r line; do
+        [[ "$line" == REF:* ]] && printf '%s\n' "${line#REF:}"
+    done <<< "$out"
+    return 0
+}
+
+# --- premise_baseline creation-time seeding (t1663_3) -------------------------
+# Design: aidocs/framework/task_premise_staleness.md ("Seeding"). Consumers:
+# aitask_create.sh (finalize_draft seeding, the --premise-baseline flag) and
+# aitask_archive.sh (carry-over inheritance).
+
+# premise_baseline_canonical <raw>
+# Prints "<lowercase oid> @ <YYYY-MM-DD HH:MM>" and returns 0 when <raw> is a
+# full 40- or 64-hex id followed by " @ YYYY-MM-DD HH:MM" -- the stored grammar
+# the reader (aitask_premise_stale.sh) accepts. Prints nothing and returns 1
+# otherwise. GRAMMAR ONLY, deliberately no repository lookup: an inherited value
+# may name a commit that a history rewrite removed, which the reader reports as
+# history_rewritten, and a carry-over must inherit that state rather than lose
+# it. (aitask_update.sh --premise-baseline is the stricter person-facing writer:
+# it also stamps a bare oid and requires the commit to exist.)
+premise_baseline_canonical() {
+    local raw="$1" oid ts
+    local oid_re='^([0-9a-fA-F]{40}|[0-9a-fA-F]{64})$'
+    local ts_re='^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}$'
+    [[ "$raw" == *" @ "* ]] || return 1
+    oid="${raw%% @ *}"
+    ts="${raw#* @ }"
+    [[ "$oid" =~ $oid_re && "$ts" =~ $ts_re ]] || return 1
+    printf '%s @ %s\n' "$(printf '%s' "$oid" | tr 'ABCDEF' 'abcdef')" "$ts"
+}
+
+# The glue for read_premise_seed_fields. Imports only task_yaml (which
+# setup_fake_aitask_repo copies), never task_premise: that module pulls in the
+# parallel-admission vocabulary, a dependency a creation path must not grow.
+_AIT_PREMISE_SEED_GLUE='
+import sys
+sys.path = [p for p in sys.path if p not in ("", ".")]
+sys.path.append(sys.argv[1])
+try:
+    import task_yaml
+except Exception:
+    sys.exit(3)
+try:
+    with open(sys.argv[2], encoding="utf-8") as fh:
+        text = fh.read()
+except Exception:
+    sys.exit(2)
+try:
+    parsed = task_yaml.parse_frontmatter(text)
+except Exception:
+    parsed = None
+meta = parsed[0] if parsed else None
+if not isinstance(meta, dict):
+    print("INVALID:frontmatter")
+    sys.exit(0)
+out = []
+if "premise_baseline" not in meta:
+    out.append("BASELINE_ABSENT")
+else:
+    base = meta["premise_baseline"]
+    if base is None:
+        base = ""
+    if not isinstance(base, str) or any(c in base for c in "\r\n\0"):
+        out.append("BASELINE_INVALID")
+    else:
+        out.append("BASELINE:" + base)
+out.append("REFS:%d" % len(task_yaml.file_reference_entries(meta)))
+v = meta.get("verifies")
+if v is None or v == "":
+    nv = 0
+elif isinstance(v, (list, tuple)):
+    nv = len(v)
+else:
+    nv = 1
+out.append("VERIFIES:%d" % nv)
+out.append("END:3")
+print("\n".join(out))
+'
+
+# read_premise_seed_fields <task_file>
+# The two file-derived inputs of premise_baseline seeding, read through the
+# framework YAML parser (task_yaml.parse_frontmatter) -- NEVER read_yaml_field,
+# which keeps a quoted scalar's quotes (so a valid '"<oid> @ <ts>"' would fail
+# the grammar) and returns nothing for a block-style list (`verifies:` followed
+# by `  - 1`), which would leave an eligible task unseeded. Prints exactly:
+#   BASELINE_ABSENT | BASELINE:<YAML-decoded string, "" for null> | BASELINE_INVALID
+#   REFS:<file_references entries, usable or not -- the reader evaluates all>
+#   VERIFIES:<verifies entries; a bare scalar counts as one, null/"" as none>
+#   END:3
+# or the single line INVALID:frontmatter. BASELINE_INVALID is a key that is
+# present but not a string, or holds a line break or NUL.
+# Exit status -- check it; never read a failure as "absent":
+#   0  one of the two shapes above
+#   2  unreadable file, or output of any other shape -- NOTHING is printed
+#   3  no usable python (PyYAML)
+read_premise_seed_fields() {
+    local file="$1" lib_dir py out rc=0
+    [[ "$file" == *$'\n'* ]] && return 2
+    lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" || return 2
+    py="$(resolve_python)"
+    [[ -n "$py" ]] || return 3
+    out="$("$py" -B -c "$_AIT_PREMISE_SEED_GLUE" "$lib_dir" "$file" 2>/dev/null)" || rc=$?
+    [[ $rc -eq 3 ]] && return 3
+    [[ $rc -eq 0 ]] || return 2
+    if [[ "$out" == "INVALID:frontmatter" ]]; then
+        printf '%s\n' "$out"
+        return 0
+    fi
+    local -a lines=()
+    local line
+    while IFS= read -r line; do lines+=("$line"); done <<< "$out"
+    [[ ${#lines[@]} -eq 4 ]] || return 2
+    [[ "${lines[0]}" == BASELINE_ABSENT || "${lines[0]}" == BASELINE_INVALID \
+        || "${lines[0]}" == BASELINE:* ]] || return 2
+    [[ "${lines[1]}" =~ ^REFS:[0-9]{1,9}$ ]] || return 2
+    [[ "${lines[2]}" =~ ^VERIFIES:[0-9]{1,9}$ ]] || return 2
+    [[ "${lines[3]}" == "END:3" ]] || return 2
+    printf '%s\n' "$out"
+    return 0
+}
+
+# _yaml_path_is_plain <entry> -> 0 when the entry may be written as a plain
+# flow scalar and every YAML reader still reads back the identical string.
+# Conservative by construction (over-quoting is harmless): ASCII path chars
+# only, so no flow indicator `,[]{}?#`, no space and no quote; the first char is
+# a letter, `_` or `/` (or `.` + letter), because every YAML 1.1 implicit
+# non-string -- int, float, sexagesimal, timestamp -- starts with a digit, `+`,
+# `-` or `.digit`; and none of the bool / null / .inf / .nan words. A trailing
+# `:` is a mapping indicator in flow context. tests/test_file_refs_yaml.sh
+# checks every corpus entry against both PyYAML loaders.
+_yaml_path_is_plain() {
+    local e="$1"
+    [[ "$e" =~ ^[A-Za-z_/][A-Za-z0-9_./^:-]*$ || "$e" =~ ^\.[A-Za-z_][A-Za-z0-9_./^:-]*$ ]] \
+        || return 1
+    [[ "$e" == *: ]] && return 1
+    case "$e" in
+        [Yy]|[Nn]|[Yy][Ee][Ss]|[Nn][Oo]|[Tt][Rr][Uu][Ee]|[Ff][Aa][Ll][Ss][Ee]) return 1 ;;
+        [Oo][Nn]|[Oo][Ff][Ff]|[Nn][Uu][Ll][Ll]|.[Ii][Nn][Ff]|.[Nn][Aa][Nn]) return 1 ;;
+    esac
+    return 0
+}
+
+# _yaml_dq_escape <entry> -> sets _yaml_dq to the double-quoted YAML scalar.
+# MUST run under LC_ALL=C (format_yaml_path_list guarantees it): every rule is a
+# byte-sequence substitution, so the output is identical under every locale.
+# Escapes, measured against PyYAML (both SafeLoader and task_yaml's loader):
+#   `\` and `"`                      the double-quoted syntax itself
+#   C0 0x01-0x1F, DEL 0x7F           non-printable (ReaderError) or folded
+#   C1 U+0080-U+009F as `\xNN`       non-printable; a literal U+0085 (NEL) is a
+#                                    YAML line break and is FOLDED to a space
+#   U+2028 `\L`, U+2029 `\P`         YAML 1.1 line breaks
+#   U+FEFF, U+FFFE, U+FFFF `\uXXXX`  BOM / non-printable
+# The source is valid UTF-8 (validate_file_ref, or the YAML reader), so each
+# multi-byte pattern can only match a whole character.
+_yaml_dq_escape() {
+    local s="$1" i hex b
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    for (( i = 1; i < 32; i++ )); do
+        printf -v hex '%02X' "$i"
+        # shellcheck disable=SC2059  # the format IS the byte escape being built
+        printf -v b "\\x$hex"
+        [[ "$s" == *"$b"* ]] && s="${s//"$b"/\\x$hex}"
+    done
+    b=$'\x7f'; [[ "$s" == *"$b"* ]] && s="${s//"$b"/\\x7F}"
+    if [[ "$s" == *$'\xc2'* ]]; then
+        for (( i = 128; i < 160; i++ )); do
+            printf -v hex '%02X' "$i"
+            # shellcheck disable=SC2059  # the format IS the byte escape being built
+            printf -v b "\\xc2\\x$hex"
+            [[ "$s" == *"$b"* ]] && s="${s//"$b"/\\x$hex}"
+        done
+    fi
+    s="${s//$'\xe2\x80\xa8'/\\L}"
+    s="${s//$'\xe2\x80\xa9'/\\P}"
+    s="${s//$'\xef\xbb\xbf'/\\uFEFF}"
+    s="${s//$'\xef\xbf\xbe'/\\uFFFE}"
+    s="${s//$'\xef\xbf\xbf'/\\uFFFF}"
+    _yaml_dq="\"$s\""
+}
+
+# format_yaml_path_list [<entries>]
+# Formats NEWLINE-separated entries (argument, or stdin when no argument is
+# given) as a YAML flow list for file_references: -- `[a.py, "a,b.py"]`;
+# empty input -> `[]`. Each entry is written plain when _yaml_path_is_plain
+# allows it, else double-quoted by _yaml_dq_escape, so every entry reads back
+# as the identical string. Not format_yaml_list: that one writes id / label /
+# gate lists and stays unquoted. Returns 1 (message on stderr) for an entry
+# holding a CR -- unreachable from validated input, and a written `\r` would be
+# an entry the reader refuses.
+format_yaml_path_list() {
+    local input
+    if [[ $# -gt 0 ]]; then input="$1"; else input="$(cat)"; fi
+    ( export LC_ALL=C; _format_yaml_path_list_impl "$input" )
+}
+
+_format_yaml_path_list_impl() {
+    local input="$1" entry out="" sep="" _yaml_dq=""
+    while IFS= read -r entry; do
+        [[ -z "$entry" ]] && continue
+        if [[ "$entry" == *$'\r'* ]]; then
+            echo "format_yaml_path_list: refusing an entry that holds a carriage return" >&2
+            return 1
+        fi
+        if _yaml_path_is_plain "$entry"; then
+            out+="$sep$entry"
+        else
+            _yaml_dq_escape "$entry"
+            out+="$sep$_yaml_dq"
+        fi
+        sep=", "
+    done <<< "$input"
+    printf '[%s]\n' "$out"
+}
+
+# Validate a single file_reference entry string.
+# Accepted: "path" | "path:N" | "path:N-M" | "path:N-M^N-M^..."
+# Line numbers are 1-indexed. Die with a clear error on malformed input.
+# The byte checks run under LC_ALL=C so they agree under every locale
+# (`[[:cntrl:]]` does not: under LC_ALL=C a UTF-8 U+0085 is two non-control
+# bytes, under a UTF-8 locale it is one control char). Rejected: C0 controls
+# and DEL (a newline would split the entry on the newline carrier), and bytes
+# that are not valid UTF-8 (checked with Python's strict decoder, never a
+# hand-written table; a pure-ASCII ref never needs Python). Valid non-ASCII,
+# U+0085 included, is accepted -- format_yaml_path_list escapes what YAML
+# cannot carry literally.
+validate_file_ref() {
+    local ref="$1" py
+    if [[ -z "$ref" ]]; then
+        die "Empty file reference"
+    fi
+    # The `x` sentinel: $( ) strips trailing newlines, so a ref whose only
+    # control char is a newline would otherwise leave nothing and pass.
+    local ctl
+    ctl="$(printf '%s' "$ref" | LC_ALL=C tr -dc '\001-\037\177'; printf x)"
+    if [[ "$ctl" != "x" ]]; then
+        die "Invalid file reference: it contains a control character (newline, tab, ...)"
+    fi
+    if [[ -n "$(printf '%s' "$ref" | LC_ALL=C tr -d '\001-\177')" ]]; then
+        py="$(resolve_python)"
+        [[ -n "$py" ]] || die "Invalid file reference: it holds non-ASCII bytes and no Python is available to verify they are UTF-8"
+        printf '%s' "$ref" | "$py" -c 'import sys; sys.stdin.buffer.read().decode("utf-8")' 2>/dev/null \
+            || die "Invalid file reference: it is not valid UTF-8"
+    fi
+    if [[ ! "$ref" =~ ^[^:]+(:[0-9]+(-[0-9]+)?(\^[0-9]+(-[0-9]+)?)*)?$ ]]; then
+        die "Invalid file reference: '$ref' (expected PATH[:N[-M][^N[-M]]...])"
+    fi
+}
+
+# union_file_references <primary_file> [<folded_file> ...]
+# Reads file_references from primary first, then each folded file in
+# argument order, in ONE batch read. Dedupes by first-occurrence exact-string
+# match. Prints the unioned list NEWLINE-separated on stdout (empty if nothing
+# to emit). Missing / empty-named files are skipped, as before.
+# Returns non-zero -- printing nothing -- when any existing source cannot be
+# read as a list of path strings (2) or there is no usable python (3):
+# silently dropping a folded task's scope would lose it.
+union_file_references() {
+    local -a files=()
+    local f
+    for f in "$@"; do
+        [[ -n "$f" && -f "$f" ]] && files+=("$f")
+    done
+    [[ ${#files[@]} -gt 0 ]] || return 0
+
+    local out rc=0
+    out="$(read_file_references_batch "${files[@]}")" || rc=$?
+    [[ $rc -eq 0 ]] || return "$rc"
+    case $'\n'"$out" in
+        *$'\n'BAD:*|*$'\n'INVALID:*) return 2 ;;
+    esac
+
+    local -a merged=()
+    declare -A seen=()
+    local line entry
+    while IFS= read -r line; do
+        [[ "$line" == REF:* ]] || continue
+        entry="${line#REF:}"
+        if [[ -z "${seen[$entry]:-}" ]]; then
+            seen[$entry]=1
+            merged+=("$entry")
+        fi
+    done <<< "$out"
+
+    [[ ${#merged[@]} -gt 0 ]] || return 0
+    printf '%s\n' "${merged[@]}"
+}
+
+# Extract related issue URLs from a task file's YAML frontmatter
+# Input: task file path
+# Output: one URL per line (newline-separated), empty if missing/empty
+extract_related_issues() {
+    local file_path="$1"
+    local in_yaml=false
+
+    while IFS= read -r line; do
+        if [[ "$line" == "---" ]]; then
+            if [[ "$in_yaml" == true ]]; then break
+            else in_yaml=true; continue; fi
+        fi
+        if [[ "$in_yaml" == true && "$line" =~ ^related_issues:[[:space:]]*(.*) ]]; then
+            local raw="${BASH_REMATCH[1]}"
+            # Strip brackets, split on comma, trim quotes/spaces
+            raw="${raw#\[}" ; raw="${raw%\]}"
+            if [[ -z "$raw" ]]; then return; fi
+            while IFS=',' read -ra items; do
+                for item in "${items[@]}"; do
+                    item=$(echo "$item" | sed 's/^[[:space:]"]*//;s/[[:space:]"]*$//')
+                    [[ -n "$item" ]] && echo "$item"
+                done
+            done <<< "$raw"
+            return
+        fi
+    done < "$file_path"
+}
+
+# Extract the contributor username from a task file's YAML frontmatter
+# Input: task file path
+# Output: contributor username or empty string
+extract_contributor() {
+    local file_path="$1"
+    local in_yaml=false
+
+    while IFS= read -r line; do
+        if [[ "$line" == "---" ]]; then
+            if [[ "$in_yaml" == true ]]; then
+                break
+            else
+                in_yaml=true
+                continue
+            fi
+        fi
+        if [[ "$in_yaml" == true && "$line" =~ ^contributor:[[:space:]]*(.*) ]]; then
+            local val="${BASH_REMATCH[1]}"
+            val=$(echo "$val" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            echo "$val"
+            return
+        fi
+    done < "$file_path"
+
+    echo ""
+}
+
+# Extract the contributor email from a task file's YAML frontmatter
+# Input: task file path
+# Output: contributor email or empty string
+extract_contributor_email() {
+    local file_path="$1"
+    local in_yaml=false
+
+    while IFS= read -r line; do
+        if [[ "$line" == "---" ]]; then
+            if [[ "$in_yaml" == true ]]; then
+                break
+            else
+                in_yaml=true
+                continue
+            fi
+        fi
+        if [[ "$in_yaml" == true && "$line" =~ ^contributor_email:[[:space:]]*(.*) ]]; then
+            local val="${BASH_REMATCH[1]}"
+            val=$(echo "$val" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            echo "$val"
+            return
+        fi
+    done < "$file_path"
+
+    echo ""
+}
+
+# Extract the implemented_with agent string from a task file's YAML frontmatter
+# Input: task file path
+# Output: implemented_with value or empty string
+extract_implemented_with() {
+    local file_path="$1"
+    local in_yaml=false
+
+    while IFS= read -r line; do
+        if [[ "$line" == "---" ]]; then
+            if [[ "$in_yaml" == true ]]; then
+                break
+            else
+                in_yaml=true
+                continue
+            fi
+        fi
+        if [[ "$in_yaml" == true && "$line" =~ ^implemented_with:[[:space:]]*(.*) ]]; then
+            local val="${BASH_REMATCH[1]}"
+            val=$(echo "$val" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            echo "$val"
+            return
+        fi
+    done < "$file_path"
+
+    echo ""
+}
+
+# Extract "Final Implementation Notes" section from a plan file
+# Input: plan file path
+# Output: the section content
+extract_final_implementation_notes() {
+    local plan_path="$1"
+    local in_section=false
+    local content=""
+
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^##[[:space:]]+Final[[:space:]]+Implementation[[:space:]]+Notes ]]; then
+            in_section=true
+            continue
+        fi
+
+        if [[ "$in_section" == true ]]; then
+            # Stop at next level-2 heading
+            if [[ "$line" =~ ^##[[:space:]] ]]; then
+                break
+            fi
+            if [[ -n "$content" ]]; then
+                content="${content}"$'\n'"${line}"
+            else
+                content="$line"
+            fi
+        fi
+    done < "$plan_path"
+
+    # Trim leading/trailing blank lines (awk for portability — BSD sed can't handle grouped multi-line commands)
+    echo "$content" | sed '/./,$!d' | awk '{lines[NR]=$0} /[^[:space:]]/{last=NR} END{for(i=1;i<=last;i++) print lines[i]}'
+}
+
+# --- Contribute Metadata Parsing ---
+
+# Parse aitask-contribute metadata from issue body HTML comment
+# Sets global: CONTRIBUTE_CONTRIBUTOR, CONTRIBUTE_EMAIL, CONTRIBUTE_FINGERPRINT_VERSION,
+#              CONTRIBUTE_AREAS, CONTRIBUTE_FILE_PATHS, CONTRIBUTE_FILE_DIRS,
+#              CONTRIBUTE_CHANGE_TYPE, CONTRIBUTE_AUTO_LABELS
+parse_contribute_metadata() {
+    local body="$1"
+    CONTRIBUTE_CONTRIBUTOR=""
+    CONTRIBUTE_EMAIL=""
+    CONTRIBUTE_FINGERPRINT_VERSION=""
+    CONTRIBUTE_AREAS=""
+    CONTRIBUTE_FILE_PATHS=""
+    CONTRIBUTE_FILE_DIRS=""
+    CONTRIBUTE_CHANGE_TYPE=""
+    CONTRIBUTE_AUTO_LABELS=""
+
+    local in_block=false
+    while IFS= read -r line; do
+        if [[ "$line" == *"<!-- aitask-contribute-metadata"* ]]; then
+            in_block=true
+            continue
+        fi
+        if [[ "$in_block" == true ]]; then
+            if [[ "$line" == *"-->"* ]]; then
+                break
+            fi
+            case "$line" in
+                *contributor_email:*)
+                    CONTRIBUTE_EMAIL=$(echo "$line" | sed 's/.*contributor_email:[[:space:]]*//' | tr -d '[:space:]')
+                    ;;
+                *contributor:*)
+                    CONTRIBUTE_CONTRIBUTOR=$(echo "$line" | sed 's/.*contributor:[[:space:]]*//' | tr -d '[:space:]')
+                    ;;
+                *fingerprint_version:*)
+                    CONTRIBUTE_FINGERPRINT_VERSION=$(echo "$line" | sed 's/.*fingerprint_version:[[:space:]]*//' | tr -d '[:space:]')
+                    ;;
+                *file_paths:*)
+                    CONTRIBUTE_FILE_PATHS=$(echo "$line" | sed 's/.*file_paths:[[:space:]]*//' | sed 's/[[:space:]]*$//')
+                    ;;
+                *file_dirs:*)
+                    CONTRIBUTE_FILE_DIRS=$(echo "$line" | sed 's/.*file_dirs:[[:space:]]*//' | sed 's/[[:space:]]*$//')
+                    ;;
+                *change_type:*)
+                    CONTRIBUTE_CHANGE_TYPE=$(echo "$line" | sed 's/.*change_type:[[:space:]]*//' | tr -d '[:space:]')
+                    ;;
+                *auto_labels:*)
+                    CONTRIBUTE_AUTO_LABELS=$(echo "$line" | sed 's/.*auto_labels:[[:space:]]*//' | sed 's/[[:space:]]*$//')
+                    ;;
+                *areas:*)
+                    CONTRIBUTE_AREAS=$(echo "$line" | sed 's/.*areas:[[:space:]]*//' | sed 's/[[:space:]]*$//')
+                    ;;
+            esac
+        fi
+    done <<< "$body"
+}

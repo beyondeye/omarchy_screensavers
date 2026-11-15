@@ -1,0 +1,589 @@
+# Step 6: Create Implementation Plan
+
+Detailed planning workflow for the task-workflow skill. Read this file when
+Step 5 (Environment and Branch Setup) is complete and you are ready to plan.
+
+## Table of Contents
+
+- [6.0: Check for Existing Plan](#60-check-for-existing-plan)
+- [6.1: Planning](#61-planning)
+- [Child Task Documentation Requirements](#child-task-documentation-requirements)
+- [Save Plan to External File](#save-plan-to-external-file)
+- [Checkpoint](#checkpoint-after-plan-is-saved)
+
+---
+
+## 6.0: Check for Existing Plan
+
+Check if a plan file already exists at the expected path:
+- For parent tasks: `aiplans/p<taskid>_<name>.md`
+- For child tasks: `aiplans/p<parent>/p<parent>_<child>_<name>.md`
+
+```bash
+./.aitask-scripts/aitask_query_files.sh plan-file <taskid>
+```
+Parse the output: `PLAN_FILE:<path>` means found, `NOT_FOUND` means not found.
+
+**If a plan file exists**, read it.
+
+### Step 6.0-marker: Read the deferred-plan marker
+
+Read `plan_approved_at` from the task file's frontmatter and bind it as
+`plan_approved_marker` (empty when the key is absent). A value means this plan was
+approved and its implementation **deliberately deferred** — by "Approve and stop
+here" — and has not been invalidated since.
+
+It is a **display and prompting** signal only. It does not skip, weaken or reorder
+anything: §6.0a below still runs first, the plan preference still applies, and the
+Checkpoint still runs the Remote Drift Check before implementation. (This is the
+visibility-not-routing constraint recorded in
+`aidocs/gates/ledger-driven-reentry.md`.)
+
+Whenever the marker is non-empty, display one line before applying the preference:
+"Approved plan from \<plan_approved_marker\> awaiting implementation."
+
+**Clearing on replan.** Every "create plan from scratch" branch below — the profile-driven `create_new` value, the `ASK_STALE` option, and the interactive option — discards the approved plan, so the marker must not outlive it. Before entering §6.1 on any of them, run:
+
+```bash
+./.aitask-scripts/aitask_update.sh --batch <task_num> --plan-approved-at "" --silent
+```
+
+This runs **before** `EnterPlanMode`, so it is a legal write (§6.1 onward is read-only). It is a no-op when the task carries no marker.
+
+### Step 6.0a: Force-reverify when a risk mitigation landed
+
+Before applying any plan preference, check whether a "before" risk-mitigation
+task has landed since this plan was last verified. If one has, the codebase
+changed underneath the plan and it must be re-verified — even if a fresh
+verification entry would otherwise let it be skipped. (This is a no-op in the
+common case where the task has no `risk_mitigation_tasks`.)
+
+1. Run:
+   ```bash
+   ./.aitask-scripts/aitask_risk_mitigation_landed.sh <task_file> <plan_file>
+   ```
+2. Parse the output. The first line is `FORCE_VERIFY:<0|1>`; any following
+   `LANDED:<id>|<completed_at>` lines name the mitigations that landed after the
+   last verification.
+   - **`FORCE_VERIFY:0`** → no mitigation landed (or the field is absent).
+     Proceed to the plan-preference logic below unchanged.
+   - **`FORCE_VERIFY:1`** →
+     - Display the landed mitigations to the user, e.g. "Risk-mitigation task(s)
+       landed since the last plan verification: t884_4 (2026-06-01 18:14).
+       Forcing plan re-verification."
+     - Set a **`force_verify` signal** for this Step 6: the **Verify Decision**
+       sub-procedure below MUST append `--force-verify` to its `decide` call.
+     - Keep the landed `<id>` list — on entering verify mode (Step 6.1), resolve
+       each with `./.aitask-scripts/aitask_query_files.sh archived-task <id>` and
+       read the matching `aiplans/archived/p<parent>/` plan to see exactly what
+       changed, then re-check the plan's assumptions and file paths against those
+       changes. This makes the re-verification targeted, not a blind re-read.
+
+### Step 6.0b: Premise replan
+
+If `premise_decision.choice` is `replan` — the user chose "Review & replan with
+this evidence" at `SKILL.md` Step 3 Check 7 — and a plan file exists:
+
+- Display the `DISPLAY:` line from `premise_decision.protocol`, then "Re-verifying
+  the existing plan against the premise evidence."
+- Set the **`force_verify` signal** (the same signal as §6.0a), and **enter
+  verification mode directly** (§6.1 via the verify path). **Do not apply the plan
+  preference below, nor its interactive prompt:** a `use_current` preference or a
+  `SKIP` verify decision would skip planning and silently drop the user's
+  explicit choice to re-plan. The verify-path `plan_verified` append (§6.1) still
+  applies.
+
+With no plan file, §6.1 runs as normal and the evidence is reviewed there. When
+`premise_decision` is `null` or its choice is anything else, this step is a
+no-op.
+
+{# ---------- plan_preference / plan_preference_child ---------- #}{% if profile.plan_preference is defined or profile.plan_preference_child is defined %}
+**Profile-driven plan preference** (profile '{{ profile.name }}').
+
+{# ---------- plan_preference vs plan_preference_child resolution ---------- #}{% if profile.plan_preference_child is defined and profile.plan_preference is defined %}
+For **child tasks** (when `is_child` is true), use `plan_preference_child: {{ profile.plan_preference_child }}`. For **parent tasks**, use `plan_preference: {{ profile.plan_preference }}`. Resolve which one applies based on `is_child`, then act on the effective value as follows:
+{% elif profile.plan_preference_child is defined %}{# plan_preference_child defined, plan_preference absent #}
+For **child tasks** (when `is_child` is true), use `plan_preference_child: {{ profile.plan_preference_child }}`. For **parent tasks**, no profile preference is set — fall through to the interactive AskUserQuestion described in the "no profile preference" block below. Act on the effective value as follows when one applies:
+{% else %}{# plan_preference defined, plan_preference_child absent #}
+The effective plan preference is `{{ profile.plan_preference }}`. Act on it as follows:
+{% endif %}{# ---------- end plan_preference vs plan_preference_child resolution ---------- #}
+
+- If the effective value is `"use_current"`: Skip to the **Checkpoint** at the end of Step 6. Display: "Profile '{{ profile.name }}': using existing plan".
+- If the effective value is `"verify"`: Run the **Verify Decision** sub-procedure below, then branch on its result. Display: "Profile '{{ profile.name }}': checking verification status".
+- If the effective value is `"create_new"`: **Clear the deferred-plan marker first** (see "Clearing on replan" in §6.0-marker above), then proceed with step 6.1 as normal. Display: "Profile '{{ profile.name }}': creating plan from scratch".
+
+When the profile resolves the preference, skip the interactive AskUserQuestion below.
+
+**Verify Decision sub-procedure** (profile-driven verify path only):
+
+1. Use `plan_verification_required = {{ profile.plan_verification_required | default(1) }}` (from profile, default 1 when absent).
+2. Use `plan_verification_stale_after_hours = {{ profile.plan_verification_stale_after_hours | default(24) }}` (from profile, default 24 when absent).
+3. Run:
+   ```bash
+   ./.aitask-scripts/aitask_plan_verified.sh decide <plan_file> {{ profile.plan_verification_required | default(1) }} {{ profile.plan_verification_stale_after_hours | default(24) }}
+   ```
+   If Step 6.0a set the `force_verify` signal, append `--force-verify` to the
+   command above (it forces `DECISION:VERIFY` even when a fresh verification
+   exists).
+4. Parse the 8-line structured output (`KEY:value` per line):
+   - `TOTAL:<N>` / `FRESH:<M>` / `STALE:<K>` / `LAST:<agent @ timestamp>` (or `LAST:NONE`)
+   - `REQUIRED:<R>` / `STALE_AFTER_HOURS:<H>`
+   - `DISPLAY:<human-readable summary>` — print this line verbatim to the user
+   - `DECISION:<SKIP|ASK_STALE|VERIFY>`
+5. Branch on `DECISION:`:
+   - **`SKIP`** → skip verification entirely; jump to the **Checkpoint** at the end of Step 6 (same as `use_current`).
+   - **`ASK_STALE`** → use `AskUserQuestion`:
+     - Question: the `DISPLAY:` line plus " How would you like to proceed?"
+     - Header: "Stale plan"
+     - Options:
+       - "Verify now" (description: "Enter verify mode; a fresh entry will be appended on exit")
+       - "Skip verification" (description: "Use the existing plan as-is, without refreshing")
+       - "Create plan from scratch" (description: "Discard the existing plan and start fresh")
+     - "Verify now" → enter verification mode (step 6.1 via the verify path).
+     - "Skip verification" → jump to the **Checkpoint** (same as `use_current`).
+     - "Create plan from scratch" → **clear the deferred-plan marker first** (see "Clearing on replan" in §6.0-marker above), then proceed with step 6.1 as normal, ignoring the existing plan.
+   - **`VERIFY`** → enter verification mode directly (step 6.1 via the verify path). Display: "Profile '{{ profile.name }}': no fresh verifications — entering verify mode."
+
+{% else %}{# plan_preference / plan_preference_child: both keys absent #}
+**Profile check:** If the active profile has `plan_preference` set (or `plan_preference_child` for child tasks — `plan_preference_child` takes priority when the current task is a child task):
+- If `"use_current"`: Skip to the **Checkpoint** at the end of Step 6. Display: "Profile '\<name\>': using existing plan"
+- If `"verify"`: Run the **Verify Decision** sub-procedure below, then branch on its result. Display: "Profile '\<name\>': checking verification status"
+- If `"create_new"`: **Clear the deferred-plan marker first** (see "Clearing on replan" in §6.0-marker above), then proceed with step 6.1 as normal. Display: "Profile '\<name\>': creating plan from scratch"
+- Skip the AskUserQuestion below
+
+**Verify Decision sub-procedure** (profile-driven verify path only):
+
+1. Read `plan_verification_required` from the active profile (default `1` if key absent).
+2. Read `plan_verification_stale_after_hours` from the active profile (default `24` if key absent).
+3. Run:
+   ```bash
+   ./.aitask-scripts/aitask_plan_verified.sh decide <plan_file> <required> <stale_after_hours>
+   ```
+   If Step 6.0a set the `force_verify` signal, append `--force-verify` to the
+   command above (it forces `DECISION:VERIFY` even when a fresh verification
+   exists).
+4. Parse the 8-line structured output (`KEY:value` per line):
+   - `TOTAL:<N>` / `FRESH:<M>` / `STALE:<K>` / `LAST:<agent @ timestamp>` (or `LAST:NONE`)
+   - `REQUIRED:<R>` / `STALE_AFTER_HOURS:<H>`
+   - `DISPLAY:<human-readable summary>` — print this line verbatim to the user
+   - `DECISION:<SKIP|ASK_STALE|VERIFY>`
+5. Branch on `DECISION:`:
+   - **`SKIP`** → skip verification entirely; jump to the **Checkpoint** at the end of Step 6 (same as `use_current`).
+   - **`ASK_STALE`** → use `AskUserQuestion`:
+     - Question: the `DISPLAY:` line plus " How would you like to proceed?"
+     - Header: "Stale plan"
+     - Options:
+       - "Verify now" (description: "Enter verify mode; a fresh entry will be appended on exit")
+       - "Skip verification" (description: "Use the existing plan as-is, without refreshing")
+       - "Create plan from scratch" (description: "Discard the existing plan and start fresh")
+     - "Verify now" → enter verification mode (step 6.1 via the verify path).
+     - "Skip verification" → jump to the **Checkpoint** (same as `use_current`).
+     - "Create plan from scratch" → **clear the deferred-plan marker first** (see "Clearing on replan" in §6.0-marker above), then proceed with step 6.1 as normal, ignoring the existing plan.
+   - **`VERIFY`** → enter verification mode directly (step 6.1 via the verify path). Display: "Profile '\<name\>': no fresh verifications — entering verify mode."
+
+The interactive (no-profile) path below is unchanged — the `decide` helper is only invoked when `plan_preference` resolves to `"verify"` via a profile.
+
+Otherwise, use `AskUserQuestion` with header "Plan" and these three options, in this order:
+
+- "Use current plan" (description: "Skip planning and proceed with the existing plan as-is")
+- "Verify plan" (description: "Check if code has changed, verify the plan is still sound or if there are better alternatives")
+- "Create plan from scratch" (description: "Discard existing plan and start fresh")
+
+The question text and **which label carries a literal `(Recommended)` suffix** are conditional — the label is the only text a user is guaranteed to read. Exactly one row applies; evaluate them top-down:
+
+| When | Question | Label suffixed `(Recommended)` |
+|---|---|---|
+| `force_verify` set by §6.0a (outranks the marker — it records an *approval*, not freshness) | "Risk-mitigation task(s) landed since this plan was last verified, so it must be re-verified\<if `plan_approved_marker` is non-empty: ` — it was approved on <plan_approved_marker> and deferred`\>. Plan: `<plan_path>`. How would you like to proceed?" | "Verify plan (Recommended)" |
+| no `force_verify`, `plan_approved_marker` non-empty | "An implementation plan approved on `<plan_approved_marker>` is awaiting implementation (`<plan_path>`). How would you like to proceed?" | "Use current plan (Recommended)" |
+| neither | "An existing implementation plan was found at `<plan_path>`. How would you like to proceed?" | none — emit all three labels plain |
+
+Move the recommended option to the front of the list. Never suffix `(Recommended)` on more than one option, and never recommend "Use current plan" when `force_verify` is set.
+
+**If "Use current plan":** Skip to the **Checkpoint** at the end of Step 6.
+**If "Verify plan":** Enter plan mode (step 6.1), but start by reading the existing plan and verifying it against the current codebase. Update the plan if needed.
+**If "Create plan from scratch":** **Clear the deferred-plan marker first** (see "Clearing on replan" in §6.0-marker above), then proceed with step 6.1 as normal, ignoring the existing plan.
+{% endif %}{# ---------- end plan_preference / plan_preference_child ---------- #}
+
+**If no plan file exists**, proceed with step 6.1 as normal.
+
+## 6.1: Planning
+
+Use the `EnterPlanMode` tool to enter Claude Code's plan mode.
+
+**Premise evidence review (replan) — first, on every path:** If `premise_decision.choice` is `replan` (the user chose "Review & replan with this evidence" at `SKILL.md` Step 3 Check 7), this review is the **first** planning action — before the verify path below, before a from-scratch design, and before any terminal step or `ExitPlanMode`:
+
+1. Read the evidence from **`premise_decision.protocol` — never from the shortened list the Step 3 question showed**, which caps its rows for presentation.
+2. Inspect **every** evidence row: for a `CHANGED` path, `git log --oneline <baseline>..<checked> -- ":(literal)<path>"` (the two shas are the protocol's `BASELINE:` and `CHECKED:`); for a `DELETED` path, its culprit commit; for an `UNKNOWN` row, its reason (see `premise-staleness.md` "Evidence classes").
+3. Re-check the task's premise against what changed, and fold the consequences into the plan (the verify path updates the existing plan; a new plan is designed with them).
+4. Record a `## Premise review` section in the plan: **every** evidence row with a one-line verdict each, and the line `Evidence rows reviewed: <n>`, where `<n>` equals the protocol's evidence-row count (`CHANGED:` + `DELETED:` + `UNKNOWN:` lines).
+
+The baseline advances to `premise_decision.checked` once this plan is approved, so a row left unreviewed would be marked reviewed. The **Premise-review guard** after **Save Plan to External File** checks the section exists, and the advance itself refuses without it (`premise-staleness.md`).
+
+**If entering from the "Verify plan" path in 6.0:** Start by reading the existing plan file. Then explore the current codebase to check if the plan's assumptions, file paths, and approach are still valid. Focus on identifying what changed since the plan was written. Update the plan if needed, or confirm it is still sound. When `premise_decision.choice` is `replan`, this verification **includes** the Premise evidence review above: the plan must carry its `## Premise review` section before you go on. Then — **do not `ExitPlanMode` yet** — run the shared **End-of-planning terminal step** at the bottom of this §6.1{% if 'risk_evaluated' in rendered_set %}. It decides at runtime whether this task is risk-gated; when it is, re-run the Risk Evaluation Procedure even if the existing plan already has a `## Risk` section (re-check it against the possibly-changed plan and update it in place). Only after the terminal step completes, `ExitPlanMode`{% endif %}.
+
+**After `ExitPlanMode` on the verify path (post-externalization, pre-commit):**
+
+When the verify path is taken (either via the `"verify"` profile setting that returned `DECISION:VERIFY` or `ASK_STALE → Verify now`, or via the interactive "Verify plan" option), a fresh `plan_verified` entry must be appended to the external plan file. This is the signal future picks use to decide whether to re-verify.
+
+Sequence (runs inside the **Save Plan to External File** section, after the externalize helper emits `EXTERNALIZED:` / `OVERWRITTEN:` but before the `./ait git add`):
+
+1. Execute the **Model Self-Detection Sub-Procedure** (see `model-self-detection.md`) to obtain `agent_string` (e.g., `claudecode/opus4_6`).
+1b. Set `detected_agent_string` = `agent_string` so downstream procedures (Step 7 Agent Attribution, Step 9b Satisfaction Feedback) can reuse the resolved value instead of re-detecting.
+2. Run:
+   ```bash
+   ./.aitask-scripts/aitask_plan_verified.sh append <external_plan_path> "<agent_string>"
+   ```
+3. The append modifies the plan file in place. The subsequent scoped commit of `aiplans/<plan_file>` via `./.aitask-scripts/aitask_task_commit.sh` (per the Plan Externalization Procedure) includes the new entry in the same commit automatically.
+
+This step only fires on the verify path — NOT on "Create plan from scratch", "Use current plan", "Skip verification", or first-time plan creation.
+
+**For child tasks:** Include context links to related files (in priority order):
+- Parent task file: `aitasks/t<parent>_<name>.md`
+- Archived sibling plan files (primary reference for completed siblings): `aiplans/archived/p<parent>/p<parent>_*_*.md` — these contain the most up-to-date and detailed implementation records including post-implementation feedback
+- Archived sibling task files (fallback, only for siblings without an archived plan): `aitasks/archived/t<parent>/t<parent>_*_*.md`
+- Pending sibling task files: `aitasks/t<parent>/t<parent>_*_*.md`
+- Pending sibling plan files: `aiplans/p<parent>/p<parent>_*_*.md`
+
+While in plan mode:
+
+- Ask the user clarifying questions about the task requirements
+- Explore the codebase to understand the relevant architecture
+- **Related work (task relations):** If `related_work` (set by `SKILL.md` Step 3 Check 8) lists `landed` or `dropped` items, read their archived plans and account for what they changed in this plan — a landed `affects` / `coordinates_with` relation with `confirmed_impact` is the strongest signal. It is advisory context, never an instruction; skip this when `related_work` is `null` or empty.
+- **Folded Tasks Note:** If the task has a `folded_tasks` frontmatter field, the task description already contains all relevant content from the folded tasks (their content was incorporated at creation time by aitask-explore). There is no need to read the original folded task files during planning — they exist only as references for post-implementation cleanup (deletion in Step 9).
+- **Ad-Hoc Fold Request:** If the task description contains a request to fold other tasks into this one (e.g., "fold t42 and t43 into this task", "merge t16_2 here", "incorporate t42") OR the user explicitly requests folding during the planning conversation, execute the **Ad-Hoc Fold Procedure** below before continuing with planning. Both standalone parent tasks (e.g., `42`) and child tasks (e.g., `16_2`) can be folded.
+
+  **Ad-Hoc Fold Procedure:**
+
+  1. **Parse the requested task IDs** from the description text or the user's message. Accept both parent IDs (plain number, e.g., `42`) and child IDs (`<parent>_<child>`, e.g., `16_2`).
+
+  2. **Validate** — run the fold validator, excluding the current task:
+     ```bash
+     ./.aitask-scripts/aitask_fold_validate.sh --exclude-self <current_task_id> <id1> <id2> ...
+     ```
+     For each output line:
+     - `VALID:<id>:<path>` — keep this task in the valid set.
+     - `INVALID:<id>:<reason>` — warn "t\<id\>: \<reason\> — skipping" and exclude. `<reason>` values: `not_found`, `status_<status>`, `has_children`, `is_self`.
+
+  3. **Confirm** — If no valid tasks remain, inform the user and continue planning without folding. Otherwise, present the list of valid tasks and use `AskUserQuestion`:
+     - Question: "The following tasks will be folded into t\<current\>: \<list\>. Proceed?"
+     - Header: "Fold"
+     - Options: "Yes, fold them" / "No, skip folding"
+
+  4. **Execute fold** (only if user confirmed):
+     ```bash
+     ./.aitask-scripts/aitask_fold_content.sh <current_task_file> <folded_file1> <folded_file2> ... \
+       | ./.aitask-scripts/aitask_update.sh --batch <current_task_id> --desc-file -
+
+     ./.aitask-scripts/aitask_fold_mark.sh --commit-mode fresh <current_task_id> <folded_id1> <folded_id2> ...
+     ```
+     Parse the `aitask_fold_mark.sh` output for a `COMMITTED:<hash>` line confirming the fold was committed. The marking script automatically handles transitive folds and removes folded child tasks from their parent's `children_to_implement`.
+
+  5. **Resume planning** — Re-read the updated task file to pick up the merged content, then continue planning with the enriched description.
+- **Cross-repo dispatch check (auto-fire with confirmation):** Read and
+  follow the **Cross-Repo Planning Procedure** (see `planning-cross-repo.md`)
+  with `current_task_id` = the current task ID and `trigger_source` = the
+  task body. Trigger detection is metadata-only (it reads `xdeprepo` from the
+  task frontmatter); the body is not scanned. The procedure is **read-only**
+  — it designs a paired decomposition (nominally assigning each child to the
+  current task or to a future cross-repo parent) and records it in the plan,
+  but **creates no tasks** (creation runs in plan mode, which is read-only).
+  If it returns `cross_repo_planned: true`, skip the rest of this Complexity
+  Assessment branch (child-task batch creation, child-plan writing, the
+  manual-verification sibling, and the child-task checkpoint), set
+  `cross_repo_planned = true` in the workflow context, and proceed to **Save
+  Plan to External File** for the local parent. The actual cross-repo parent
+  and child creation runs after the plan is approved, at the start of Step 7
+  (see `cross-repo-child-assignment.md`). If it returns `cross_repo_planned:
+  false`, continue with the Complexity Assessment below.
+- **Complexity Assessment:**
+  - After initial exploration, assess implementation complexity
+  - If the complexity appears HIGH for a parent task, use `AskUserQuestion`:
+    - Question: "This task appears complex. Would you like to break it into child subtasks?"
+    - Options: "Yes, create child tasks" / "No, implement as single task"
+  - **If creating child tasks:**
+    - Ask how many subtasks and get brief descriptions for each
+    - For each child task, execute the **Batch Task Creation Procedure** (see `task-creation-batch.md`) with mode `child`, the parent task number, an appropriate name, and the child task description content
+    - **IMPORTANT:** Each child task description MUST include detailed context (see Child Task Documentation Requirements below)
+    - **IMPORTANT:** Revert the parent task status back to "Ready" since only the child task being worked on should be "Implementing":
+      ```bash
+      ./.aitask-scripts/aitask_update.sh --batch <parent_num> --status Ready --assigned-to "" --plan-approved-at ""
+      ```
+      The `aitask_ls.sh` script will automatically display the parent as "Has children" because it has pending `children_to_implement`. Do NOT manually set the parent status to "Blocked".
+
+      `--plan-approved-at ""` clears any deferred-plan marker: this task's
+      single-task plan has been replaced by the children, so it no longer
+      describes implementable work and must not be advertised as an approved
+      plan awaiting implementation. (A no-op when the task never carried one.)
+      Its cross-repo twin — the demotion in `cross-repo-child-assignment.md`
+      Step 4 — clears it for the same reason; the two sites must not drift.
+    - **IMPORTANT:** Release the parent task lock since only child tasks should be locked during child implementation:
+      ```bash
+      ./.aitask-scripts/aitask_lock.sh --unlock <parent_num> 2>/dev/null || true
+      ```
+      Parent task locking/unlocking should be left to the user via `ait board` or `ait lock`. Only child tasks should be automatically locked when picked for implementation.
+    - **Write implementation plans for ALL child tasks** before proceeding:
+      - For each child task created, write a plan file to `aiplans/p<parent>/p<parent>_<child>_<name>.md`
+      - Use the child plan file naming and metadata header conventions from the **Save Plan to External File** section below
+      - Each plan should leverage the codebase exploration already done during the parent planning phase
+      - Plans do not need to go through `EnterPlanMode`/`ExitPlanMode` — write them directly as files since the overall parent plan was already approved
+      - Commit all child plan files together (child task files were already committed by the Batch Task Creation Procedure):
+        ```bash
+        mkdir -p aiplans/p<parent>
+        ./.aitask-scripts/aitask_task_commit.sh -m "ait: Add t<parent> child implementation plans" \
+            aiplans/p<parent>/p<parent>_1_<name>.md aiplans/p<parent>/p<parent>_2_<name>.md ...
+        ```
+
+      Name **every child plan file you just wrote**, all of them **required** —
+      not the `aiplans/p<parent>/` directory pathspec, which would also stage
+      whatever else happens to be in that directory. Parse the output per the
+      **outcome contract** in `.claude/skills/ait-git/SKILL.md`: a
+      `SKIPPED:unknown:` line naming a plan you wrote means it is missing from
+      the commit, even though the exit status is 0.
+    - **Manual verification sibling (post-child-creation):**
+      After the child plans are committed, offer to add an aggregate manual-verification sibling that covers behavior only a human can validate (TUI flows, live agent launches, multi-screen navigation, etc.). Skip this step entirely if `<N>` (the number of children just created) is `1`.
+
+      Use `AskUserQuestion`:
+      - Question: "Do any of these children produce behavior that needs manual verification (TUI flows, live agent launches, on-disk artifact inspection, multi-screen navigation)?"
+      - Header: "Manual verify"
+      - Options:
+        - "No, not needed" (description: "Skip — no aggregate verification sibling")
+        - "Yes, add aggregate sibling covering all children (Recommended for TUI/UX-heavy work)" (description: "Create one manual-verification sibling that verifies every child task just created")
+        - "Yes, but let me choose which children it verifies" (description: "Create a manual-verification sibling narrowed to a subset of the children")
+
+      If "Yes, but let me choose": use a second `AskUserQuestion` with `multiSelect: true`, one option per child (label = child task filename, description = brief summary). The selected children form the `--verifies` list.
+
+      If either "Yes" option is chosen:
+      - Build a `<tmp_checklist>` file: for each selected child, read its plan file (`aiplans/p<parent>/p<parent>_<child>_<name>.md`) and extract bullet lines from its `## Verification` section (if present). Prefix each bullet with `[t<parent>_<child>] ` so the failure origin is visible at-a-glance. If a child's plan has no `## Verification` section, emit a single stub line: `TODO: define verification for t<parent>_<child>`.
+      - Shell out to the seeder:
+        ```bash
+        ./.aitask-scripts/aitask_create_manual_verification.sh \
+          --parent <parent_num> \
+          --name manual_verification_<parent_slug> \
+          --verifies <selected_child_ids_csv> \
+          --items <tmp_checklist>
+        ```
+        where `<parent_slug>` is derived from the parent task's filename (e.g. `aitasks/t571_structured_brainstorming.md` → `structured_brainstorming`). `<selected_child_ids_csv>` lists the verified children by bare ID (`571_4,571_5`).
+      - Parse the `MANUAL_VERIFICATION_CREATED:<new_id>:<path>` line and display the new task ID to the user. The seeder already commits the new task and its seeded checklist.
+      - The new sibling becomes the last child of the parent; it is automatically added to `children_to_implement` by `aitask_create.sh --parent`.
+
+      After this step, continue to the child task checkpoint below.
+    - **Child task checkpoint (ALWAYS interactive — ignores `post_plan_action` profile setting):**
+      Use `AskUserQuestion`:
+      - Question: "Created <N> child tasks with implementation plans. How would you like to proceed?"
+      - Header: "Children"
+      - Options:
+        - "Start first child" (description: "Continue to pick and implement the first child task")
+        - "Stop here" (description: "All child tasks and plans are written — end this session and pick children later in fresh contexts")
+      - **If "Start first child":** Restart the pick process with `/aitask-pick <parent>_1`
+      - **If "Stop here":** Display: "Child tasks and plans written to `aiplans/p<parent>/`. Pick individual children later with `/aitask-pick <parent>_<N>`." Execute the **Satisfaction Feedback Procedure** (see `satisfaction-feedback.md`) with `skill_name` from the context variables. Then show the **Stopped** banner (see `workflow-end.md`) with `outcome=split`, reason "decomposed into \<N\> child task(s); plans written to `aiplans/p<parent>/`", next "`/aitask-pick <parent>_1`", and end the workflow.
+{%- include "_planning_plan_contract.md" -%}
+- Include a reference to **Step 9 (Post-Implementation)** in the plan for the cleanup, archival, and merge steps
+
+#### End-of-planning terminal step{% if 'risk_evaluated' in rendered_set %} (NON-SKIPPABLE — runs on EVERY plan path){% endif %}
+{%- if 'risk_evaluated' in rendered_set %}
+
+This is the shared terminus of **all** planning paths that reach `ExitPlanMode` — create-new, verify, and `ASK_STALE → Verify now`. It is **not** specific to the create-new narrative above. Whichever path you arrived by, first decide whether this task is **gated for risk evaluation**, then run the risk sub-steps below (when gated) **before** `ExitPlanMode`.
+
+**Risk-gate check (exit-code decision verb — no output parsing).** Branch on:
+
+```bash
+./.aitask-scripts/aitask_gate.sh active <task_id> risk_evaluated
+```
+
+Exit **0** → the task's enforced active set (the `active_gates` tuple materialized at Step 4, falling back to the raw `gates:` field when no tuple exists) contains `risk_evaluated`: run **both** risk sub-steps below. Exit **1** → **skip** them (no `## Risk` section is authored, and Step 7 writes no risk fields). (Decision verbs branch on exit codes only — see `gate-cli.md`.) The planning-time producer here and the verify-time checker (the `risk_evaluated` gate at Step 9) read the same active set, so they **toggle together**. An existing `## Risk` section does not exempt the verify path — when risk-gated, re-run the evaluation and update the section in place.
+
+- **Risk evaluation (end of planning):** Now that the plan is designed (or re-verified), read and follow the **Risk Evaluation Procedure** (see `risk-evaluation.md`). It assesses the two risk dimensions (code-health and goal-achievement) **separately**, assigns a level to each, and appends (or updates) a `## Risk` section in the plan. Thread `risk_level_code_health`, `risk_level_goal_achievement`, and `risk_mitigations_planned` into the workflow context — `SKILL.md` Step 7 writes the two fields post-approval (plan mode is read-only).
+- **Risk-mitigation design (end of planning):** Immediately after the risk evaluation, read and follow **Part 1 (Design-in-planning)** of the **Risk-Mitigation Follow-up Procedure** (see `risk-mitigation-followup.md`). It proposes mitigations for the identified risks as spawned before/after tasks **or as inline pre-/post-phases of this plan** (per-mitigation propose-and-confirm with decision metrics), records the confirmed ones into the plan's `## Risk` section — inline confirmations also become explicit phase steps in the plan body — and threads `risk_mitigations_confirmed`. It creates nothing (plan mode is read-only) — `SKILL.md` Step 7 creates the spawned "before" mitigations and Step 8d the spawned "after" ones, post-approval; inline mitigations land with the task itself.
+{%- endif %}
+- Use `ExitPlanMode` when ready for user approval
+
+## Child Task Documentation Requirements
+
+When creating child tasks, each task file MUST include detailed context that enables independent execution in a fresh Claude Code context. The assumption is that child tasks will NOT be executed in the current context, so ALL information currently available should be stored in the child task definition.
+
+**Required sections for each child task:**
+
+1. **Context Section**
+   - Why this task is needed
+   - How it fits into the parent task's goal
+   - Relevant background from the exploration phase that led to this specific child task
+
+2. **Key Files to Modify**
+   - Full paths to files that need changes
+   - Brief description of what changes are needed in each file
+
+3. **Reference Files for Patterns**
+   - Existing files that demonstrate similar patterns to follow
+   - Specific line numbers or function names when helpful
+
+4. **Implementation Plan**
+   - Step-by-step instructions
+   - Code snippets where helpful
+   - Dependencies between steps
+
+5. **Verification Steps**
+   - How to build/compile
+   - How to test the changes
+   - Expected outcomes
+
+## Save Plan to External File
+
+**If running in Claude Code,** execute the **Plan Externalization Procedure** (see `plan-externalization.md`) immediately after `ExitPlanMode` and before proceeding to the Checkpoint. Claude Code's `EnterPlanMode` writes the plan to an internal file at `~/.claude/plans/<random>.md` and `ExitPlanMode` does **not** copy it to `aiplans/` automatically — the procedure file details the externalize helper, output parsing, and error handling. Other code agents write plans directly to `aiplans/` and skip this step.
+
+**Verify-path append reminder:** If you arrived here via the verify path (profile `"verify"` resolved to `DECISION:VERIFY` / `ASK_STALE → Verify now`, or the interactive "Verify plan" option), after the externalize helper emits `EXTERNALIZED:` / `OVERWRITTEN:` and **before** you run `./ait git add aiplans/<plan_file>`, run the plan-verified append step described in §6.1 ("After `ExitPlanMode` on the verify path"). The append modifies the plan file in place so the subsequent commit picks it up in the same commit.
+
+If the externalize helper reports `NOT_FOUND:no_internal_files` / `no_internal_dir`, fall back to writing the plan manually with the Write tool using the naming convention and metadata header below. These subsections remain the source of truth for the plan file format regardless of how it is created.
+
+**File naming convention:**
+
+For parent tasks:
+- Location: `aiplans/`
+- Filename: Replace `t` prefix with `p`
+- Example: `t16_implement_auth.md` → `aiplans/p16_implement_auth.md`
+
+For child tasks:
+- Location: `aiplans/p<parent>/`
+- Filename: Replace `t` prefix with `p`
+- Example: `t16_2_add_login.md` → `aiplans/p16/p16_2_add_login.md`
+
+**Required metadata header for parent tasks:**
+```markdown
+---
+Task: t16_implement_auth.md
+Worktree: aiwork/t16_implement_auth
+Branch: aitask/t16_implement_auth
+Base branch: main
+Output branch: main
+---
+```
+
+**Required metadata header for child tasks:**
+```markdown
+---
+Task: t16_2_add_login.md
+Parent Task: aitasks/t16_implement_auth.md
+Sibling Tasks: aitasks/t16/t16_1_*.md, aitasks/t16/t16_3_*.md
+Archived Sibling Plans: aiplans/archived/p16/p16_*_*.md
+Worktree: aiwork/t16_2_add_login
+Branch: aitask/t16_2_add_login
+Base branch: main
+Output branch: main
+---
+```
+
+**The header values are placeholders — substitute the real ones.** Both branch
+fields MUST carry what Step 5 resolved, not the literal `main` shown above, and
+they must come from that one resolution rather than from two different sources:
+
+- `Output branch:` is the merge target. `SKILL.md` Step 9 reads this field to
+  decide where to merge, so copying the example verbatim under a profile setting
+  `output_branch: dev` would silently land the work on `main`.
+- `Base branch:` is the branch the task branch is cut from — the Step-5 resolved
+  base (profile `base_branch`, else the branch the user chose). `SKILL.md`'s
+  **Re-entry Routing** resolves the branch context **from this header alone**, so
+  under a profile setting `base_branch: develop` a header reading `main` sends a
+  resumed session's drift check — and, once the fork is deferred, its worktree —
+  to the wrong branch.
+
+In **current-branch mode** neither branch is resolved (nothing is cut, nothing is
+merged): record the checked-out branch — the one the work lands on — in both
+fields (the detected primary only on a detached HEAD), and omit `Worktree:`.
+
+`Branch:` is the branch the work is committed on: `aitask/<task_name>` in worktree
+mode (cut later by Step 7 — not the branch checked out while planning), else the
+checked-out branch, omitted when that is the primary.
+
+`Worktree:` records the **intent** Step 5 resolved, not a directory that exists.
+Externalization runs here in Step 6 while the fork is deferred to Step 7, so the
+directory is not on disk yet — the field comes from `<branch-flags>`'
+`--worktree aiwork/<task_name>` and from nothing else. A worktree-mode plan whose
+header lacks the field means that flag was dropped, not that the task has no
+worktree.
+
+{%- if 'risk_evaluated' in rendered_set %}
+**Risk-section guard (NON-SKIPPABLE when risk-gated — verifies the §6.1 terminal step ran):** This guard applies only when this task is **gated for risk evaluation** (the §6.1 check `./.aitask-scripts/aitask_gate.sh active <task_id> risk_evaluated` exited 0). If it is *not* risk-gated, skip the guard. Also skip if `cross_repo_planned` is true (a cross-repo parent has no single-task `## Risk` section). Otherwise, before proceeding to the Checkpoint, confirm the externalized plan file contains a `## Risk` section:
+
+```bash
+grep -q '^## Risk' aiplans/<plan_file> && echo "RISK_OK" || echo "RISK_MISSING"
+```
+
+- `RISK_OK` → the end-of-planning Risk Evaluation ran; proceed to the Checkpoint.
+- `RISK_MISSING` → the §6.1 End-of-planning terminal step was skipped on this risk-gated path. Do **not** proceed. Re-enter plan mode (`EnterPlanMode`), run the **Risk Evaluation Procedure** and the **Risk-Mitigation design** step now, `ExitPlanMode`, and re-run **Save Plan to External File** so the `## Risk` section is persisted.
+{%- endif %}
+
+**Premise-review guard (NON-SKIPPABLE when replanning — verifies the §6.1 Premise evidence review ran):** Applies only when `premise_decision.choice` is `replan`; skip it otherwise. Before proceeding to the Checkpoint, confirm the externalized plan carries the review and that it covers every evidence row:
+
+```bash
+grep -c '^## Premise review' aiplans/<plan_file>
+sed -n 's/^Evidence rows reviewed: \([0-9][0-9]*\)$/\1/p' aiplans/<plan_file>
+```
+
+The first must print `1` and the second the protocol's evidence-row count. Otherwise the review was skipped or partial: do **not** proceed — re-enter plan mode (`EnterPlanMode`), complete the **Premise evidence review** over the full `premise_decision.protocol`, `ExitPlanMode`, and re-run **Save Plan to External File**.
+
+## Checkpoint (after plan is saved)
+
+**Determine effective post-plan action:**
+
+{# ---------- post_plan_action / post_plan_action_for_child ---------- #}{% if profile.post_plan_action_for_child is defined or profile.post_plan_action is defined %}
+Profile '{{ profile.name }}' configures the post-plan action.
+{# ---------- post_plan_action vs post_plan_action_for_child resolution ---------- #}{% if profile.post_plan_action_for_child is defined and profile.post_plan_action is defined %}
+For **child tasks** (when `is_child` is true), the effective action is `post_plan_action_for_child: {{ profile.post_plan_action_for_child }}`. For **parent tasks**, the effective action is `post_plan_action: {{ profile.post_plan_action }}`. Resolve which one applies based on `is_child`.
+{% elif profile.post_plan_action_for_child is defined %}{# post_plan_action_for_child defined, post_plan_action absent #}
+For **child tasks** (when `is_child` is true), the effective action is `post_plan_action_for_child: {{ profile.post_plan_action_for_child }}`. For **parent tasks**, no profile preference is set — fall through to the interactive AskUserQuestion below.
+{% else %}{# post_plan_action defined, post_plan_action_for_child absent #}
+The effective action is `post_plan_action: {{ profile.post_plan_action }}`.
+{% endif %}{# ---------- end post_plan_action vs post_plan_action_for_child resolution ---------- #}
+
+Then act on the effective value:
+
+- If the effective action is `"start_implementation"`: Display "Profile '{{ profile.name }}': proceeding to implementation". Execute the **Remote Drift Check Procedure** (see `remote-drift-check.md`) with `base_branch`, `output_branch`, `plan_file`, and `active_profile` from context. If the procedure ends the workflow ("Stop and re-verify plan" or "Abort task"), do NOT proceed to Step 7. Then execute the **Parallel-Admission Preflight Procedure** (see `parallel-admission.md`) with `task_id`, `task_num`, `plan_file` and `active_profile`. It never ends the workflow on its own; if the **user** chose to stop or abort there, do NOT proceed to Step 7. Otherwise, skip the interactive AskUserQuestion below and proceed to Step 7.
+- If the effective action is `"ask"`: show the interactive checkpoint below.
+
+{% else %}{# post_plan_action / post_plan_action_for_child: both keys absent #}
+1. If `is_child` is true AND the active profile has `post_plan_action_for_child` set, use `post_plan_action_for_child` as the effective action.
+2. Otherwise, use the profile's `post_plan_action` value (if set).
+
+**Profile check:** If the effective action is `"start_implementation"`:
+- Display: "Profile '\<name\>': proceeding to implementation"
+- Execute the **Remote Drift Check Procedure** (see `remote-drift-check.md`) with `base_branch`, `output_branch`, `plan_file`, and `active_profile` from context. If the procedure ends the workflow ("Stop and re-verify plan" or "Abort task"), do NOT proceed to Step 7. Then execute the **Parallel-Admission Preflight Procedure** (see `parallel-admission.md`) with `task_id`, `task_num`, `plan_file` and `active_profile`. It never ends the workflow on its own; if the **user** chose to stop or abort there, do NOT proceed to Step 7.
+- Otherwise, skip the AskUserQuestion below and proceed to Step 7.
+
+If the effective action is `"ask"`, or is not set (no profile / key omitted): show the interactive checkpoint below.
+{% endif %}{# ---------- end post_plan_action / post_plan_action_for_child ---------- #}
+
+Otherwise, use `AskUserQuestion`:
+- Question: "Plan saved to `<plan_path>`. How would you like to proceed?"
+- Header: "Proceed"
+- Options:
+  - "Start implementation" (description: "Begin implementing the approved plan")
+  - "Revise plan" (description: "Show the full plan, re-enter plan mode, and request specific changes")
+  - "Approve and stop here" (description: "Approve the plan, release the lock, revert task to Ready, and end the workflow — pick it up later in a fresh context")
+  - "Abort task" (description: "Stop and revert task status")
+
+If "Start implementation": Execute the **Remote Drift Check Procedure** (see `remote-drift-check.md`) with `base_branch`, `output_branch`, `plan_file`, and `active_profile` from context. If it ends the workflow ("Stop and re-verify plan" or "Abort task"), stop. Then execute the **Parallel-Admission Preflight Procedure** (see `parallel-admission.md`) with `task_id`, `task_num`, `plan_file` and `active_profile`. It never ends the workflow on its own; if the **user** chose to stop or abort there, do NOT proceed to Step 7. If both return, proceed to Step 7.
+
+If "Revise plan":
+
+1. Re-enter plan mode with `EnterPlanMode`.
+2. **Show the current plan in full.** Read the saved plan file (`aiplans/<plan_file>`) and present its complete content to the user. Do NOT condense it to "main points" or ask which section to change via a fixed multiple-choice list — the user needs the actual plan visible to decide what to revise.
+3. **Find out what to change.** If the user already named a specific modification (in their message or via the `AskUserQuestion` "Other" free-text option), apply it directly. Otherwise, ask the user what they would like to change and accept a free-text answer.
+4. Edit the plan in plan mode to incorporate the requested changes.
+5. `ExitPlanMode`, then re-run **Save Plan to External File** to persist the revised plan, and return to **this Checkpoint** to re-present the approval prompt with the revised plan shown. Repeat the revise loop until the user selects "Start implementation" or "Approve and stop here".
+
+Do NOT return to the beginning of Step 6 — that re-triggers the 6.0 existing-plan preference check and, on profiles with `plan_preference: use_current`, skips plan mode entirely and bounces straight back here without ever showing or revising the plan.
+
+If "Approve and stop here":
+
+If `premise_decision.choice` is `replan`, first execute the **Premise Staleness Procedure** (see `premise-staleness.md`) section **`## Advance after an approved replan`** — this is an approval of the renewed plan, and it must run before the stop
+sequence below releases the lock. Ownership is not assumed here (this runs before Step 7's ownership guard): the advance
+proves the lock is held by this session and refuses otherwise. **If it reaches the procedure's `## Ownership lost` exit**, the
+workflow has ended there: do **not** execute the stop sequence below — it would revert the status and release the lock
+another session now holds. Without it the next pick would
+re-prompt with the very evidence this plan just reviewed.
+
+Execute the **Approved-Plan Stop Sequence** (see `plan-approved-stop.md`) with `task_id`, `task_num`, `plan_file`, `stop_reason=deferred`, `revert_commit_message="ait: Revert t<task_num> to Ready after plan approval"`, and `closing_message="Plan approved and committed. Task t<task_num> reverted to Ready and marked as having a deferred approved plan (visible in \`ait ls -v\`, listable with \`ait ls --plan-approved\`) — pick it up later with /aitask-pick <task_num> in a fresh context."`
+
+That procedure records the approval (audit only — it is **not** a resume signal; the task becomes `Ready`, so §6.0's existing-plan preference is what resumes it, not Step 3 Check 5), commits the plan, releases the lock, reverts the status, **stamps the `plan_approved_at` marker** so the deferred state is visible on every surface, and ends the workflow. Do **NOT** proceed to Step 7. The "Approve and stop here" option is always available (not profile-gated); it replaces the infeasible context-usage auto-detection by letting the user make the call based on their own HUD.
+
+If "Abort": Execute the **Task Abort Procedure** (see `task-abort.md`).
+

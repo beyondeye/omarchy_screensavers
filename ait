@@ -1,0 +1,372 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+AIT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Capture the caller's working directory before the cd below — needed by
+# `ait projects add` (and any future helper that wants the user's intent
+# rather than the script-anchored cwd).
+export AIT_INVOCATION_PWD="$PWD"
+cd "$AIT_DIR"  # CRITICAL: ensures TASK_DIR="aitasks" works in all scripts
+# shellcheck source=.aitask-scripts/lib/aitask_path.sh
+source "$AIT_DIR/.aitask-scripts/lib/aitask_path.sh"
+
+SCRIPTS_DIR="$AIT_DIR/.aitask-scripts"
+
+show_version() {
+    local version_file="$AIT_DIR/.aitask-scripts/VERSION"
+    if [[ -f "$version_file" ]]; then
+        echo "ait version $(cat "$version_file")"
+    else
+        echo "ait version unknown"
+    fi
+}
+
+show_usage() {
+    cat <<'EOF'
+Usage: ait <command> [options]
+
+TUI:
+  applink        Launch the App Linker TUI (mobile pairing)
+  board          Launch the task board TUI
+  trails         Launch the implementation-trails TUI (read-only trail reader)
+  codebrowser    Launch the code browser TUI
+  diffviewer     Launch the diff viewer TUI
+  frozenagent    Launch the frozen-agent viewer TUI
+  ide            Start tmux session and launch ait monitor (one-shot IDE startup)
+  minimonitor    Compact monitor for tmux agent panes
+  monitor        Monitor tmux panes running code agents
+  scratchpad     Launch the scratchpad notes editor
+  settings       Launch the settings TUI
+  stats-tui      Launch the statistics TUI
+  syncer         Launch the remote-desync syncer TUI
+
+Task Management:
+  create         Create a new task file
+  ls             List and prioritize tasks
+  update         Update task metadata
+  sync           Sync task data with remote (push/pull)
+  git            Run git commands against task data (worktree-aware)
+  git-health     Diagnose the .aitask-data worktree state
+  lock           Lock/unlock tasks to prevent concurrent work
+  note           Send a durable note to another task's inbox (--project: another repo)
+  attach         Manage task file attachments (ls/add/get/rm/gc; move pending)
+  artifact       Manage versioned task artifacts (create/update/move/rm/ls/get/versions)
+  relations      Task relations: store (show/why/status/flush/gc) and analysis (analyze/stamp/analysis-state/usage/enable)
+  obsolete       Obsolescence assessments: evidence/ls/show/dismiss/review/sweep/unblock (advisory, never auto-actioned)
+
+Gates:
+  gates run      Run the gate orchestrator for a task
+  gates unlocked Show which gates are runnable now
+  gates status   Show derived per-gate state
+  gates list     List a task's declared gates
+  gates sync-registry
+                 Reconcile this project's gate registry with the framework's
+  gate append    Append a gate-run block (used by verifiers)
+  gate pass      Sign a human gate (writes the code-bound witness)
+  gate fail      Append a manual fail marker for a gate
+  gate log       Print the sidecar log for a gate's latest run
+
+Integration:
+  issue-import   Import tasks from GitHub/GitLab issues
+  pr-import      Import tasks from GitHub/GitLab pull requests
+  issue-update   Update/close linked issues
+  release-notify Comment "Released in vX.Y.Z" on resolved issues
+
+Reporting:
+  stats          Show task completion statistics
+  changelog      Generate changelog from commits and plans
+
+Tools:
+  chatlink       Run the chat bug-intake gateway daemon (--headless)
+  codeagent      Manage code agent and model configuration
+  testmap        Run the test map engine (ait-testmap) after its version handshake
+  engine         Build, test, cross-build and prune the test map engine binaries;
+                 report or migrate the legacy per-user home (engine home)
+  skillrun       Launch a code agent with a profile-aware aitask skill
+  sitrep         Open the repo's sitrep agent window (its persisted todo list)
+  explain-runs     Manage aitask-explain run directories
+  explain-cleanup  Remove stale aitask-explain run directories
+  zip-old        Archive old completed tasks
+
+AgentCrew:
+  crew init      Initialize a new agentcrew
+  crew addwork   Add an agent to an existing crew
+  crew status    Get/set agent and crew status
+  crew command   Send commands to agents
+  crew runner    Start/check the crew runner orchestrator
+  crew report    Report crew summary, agent details, outputs
+  crew cleanup   Remove completed crew worktrees and branches
+  crew dashboard TUI dashboard for monitoring and managing crews
+
+Brainstorm:
+  brainstorm init      Initialize a brainstorm session for a task
+  brainstorm status    Show brainstorm session details
+  brainstorm list      List all brainstorm sessions
+  brainstorm archive   Finalize and archive a brainstorm session
+  brainstorm <num>     Launch brainstorm TUI for a task
+
+Infrastructure:
+  setup          Install dependencies
+  upgrade        Update aitasks to latest or specific version
+
+Options:
+  -h, --help     Show this help message
+  -v, --version  Show version
+
+Run 'ait <command> --help' for more information on a command.
+EOF
+}
+
+# --- Semver comparison: returns 0 if $1 > $2 ---
+version_gt() {
+    local IFS=.
+    # shellcheck disable=SC2206
+    local i v1=($1) v2=($2)
+    for ((i=0; i<${#v1[@]} || i<${#v2[@]}; i++)); do
+        local n1=${v1[i]:-0} n2=${v2[i]:-0}
+        if ((n1 > n2)); then return 0; fi
+        if ((n1 < n2)); then return 1; fi
+    done
+    return 1
+}
+
+# --- Update check (runs at most once per day) ---
+check_for_updates() {
+    local cache_file="$HOME/.aitask/update_check"
+    local version_file="$AIT_DIR/.aitask-scripts/VERSION"
+    local repo="beyondeye/aitasks"
+    # Versions are dot-separated non-negative integers (e.g. 0.19.1).
+    local version_re='^[0-9]+(\.[0-9]+)*$'
+
+    # Bail if no VERSION file
+    [[ -f "$version_file" ]] || return 0
+
+    local local_version
+    local_version="$(cat "$version_file")"
+
+    local now
+    now="$(date +%s)"
+
+    # Read cache
+    local cached_time=0 cached_version=""
+    if [[ -f "$cache_file" ]]; then
+        read -r cached_time cached_version < "$cache_file" 2>/dev/null || true
+    fi
+
+    # Validate cached entries — discard if either field is corrupt. A prior
+    # buggy parse could populate cached_version with a raw JSON token and
+    # cached_time with a non-numeric string, which would then break the
+    # arithmetic and version_gt below.
+    [[ "$cached_time" =~ ^[0-9]+$ ]] || cached_time=0
+    if [[ -n "$cached_version" && ! "$cached_version" =~ $version_re ]]; then
+        rm -f "$cache_file"
+        cached_time=0
+        cached_version=""
+    fi
+
+    # Check if cache is fresh (less than 86400 seconds = 24 hours old)
+    local age=$(( now - cached_time ))
+    if [[ $age -lt 86400 && -n "$cached_version" ]]; then
+        # Cache is fresh — show notice if update available
+        if version_gt "$cached_version" "$local_version"; then
+            echo -e "\033[1;33m[ait]\033[0m Update available: $local_version → $cached_version"
+            echo -e "\033[1;33m[ait]\033[0m Run: ait upgrade latest"
+            echo ""
+        fi
+        return 0
+    fi
+
+    # Cache is stale — fetch in background (no message, avoids interleaved output)
+    (
+        latest_version="$(curl -sS --max-time 5 \
+            "https://api.github.com/repos/$repo/releases/latest" 2>/dev/null \
+            | grep '"tag_name"' | head -1 \
+            | sed -E 's/.*"tag_name": *"v?([^"]*)".*/\1/')" || true
+
+        mkdir -p "$(dirname "$cache_file")"
+        if [[ -n "$latest_version" && "$latest_version" =~ $version_re ]]; then
+            echo "$now $latest_version" > "$cache_file"
+        else
+            # Network failed or parse miss — keep timestamp fresh so we don't
+            # retry every invocation, reuse the last known-good version.
+            echo "$now ${cached_version:-$local_version}" > "$cache_file"
+        fi
+    ) &
+    disown 2>/dev/null || true
+}
+
+# Check for updates (skip for meta-commands, upgrade, and git passthrough).
+# `testmap` is skipped because its stdout is the engine's line protocol (the
+# notice would corrupt it) and a gate run must never perform a network fetch;
+# `engine` because its stdout is line protocol too, and `relations` because
+# every output must START with its RELATIONS_STATE:/STORE: state lines (as must
+# `obsolete`'s).
+case "${1:-help}" in
+    help|--help|-h|--version|-v|upgrade|setup|git|sync|lock|codeagent|crew|brainstorm|settings|monitor|minimonitor|ide|syncer|skillrun|projects|frozenagent|scratchpad|testmap|engine|relations|obsolete) ;;
+    *) check_for_updates ;;
+esac
+
+case "${1:-help}" in
+    create)       shift; exec "$SCRIPTS_DIR/aitask_create.sh" "$@" ;;
+    ls)           shift; exec "$SCRIPTS_DIR/aitask_ls.sh" "$@" ;;
+    update)       shift; exec "$SCRIPTS_DIR/aitask_update.sh" "$@" ;;
+    upgrade)      shift; exec "$SCRIPTS_DIR/aitask_upgrade.sh" "$@" ;;
+    issue-import) shift; exec "$SCRIPTS_DIR/aitask_issue_import.sh" "$@" ;;
+    pr-import)    shift; exec "$SCRIPTS_DIR/aitask_pr_import.sh" "$@" ;;
+    applink)      shift; exec "$SCRIPTS_DIR/aitask_applink.sh" "$@" ;;
+    attach)       shift; exec "$SCRIPTS_DIR/aitask_attach.sh" "$@" ;;
+    note)         shift; exec "$SCRIPTS_DIR/aitask_note.sh" "$@" ;;
+    artifact)     shift; exec "$SCRIPTS_DIR/aitask_artifact.sh" "$@" ;;
+    relations)    shift; exec "$SCRIPTS_DIR/aitask_relations.sh" "$@" ;;
+    obsolete)     shift; exec "$SCRIPTS_DIR/aitask_obsolete.sh" "$@" ;;
+    board)        shift; exec "$SCRIPTS_DIR/aitask_board.sh" "$@" ;;
+    trails)       shift; exec "$SCRIPTS_DIR/aitask_trails.sh" "$@" ;;
+    chatlink)     shift; exec "$SCRIPTS_DIR/aitask_chatlink.sh" "$@" ;;
+    codebrowser)  shift; exec "$SCRIPTS_DIR/aitask_codebrowser.sh" "$@" ;;
+    diffviewer)   shift; exec "$SCRIPTS_DIR/aitask_diffviewer.sh" "$@" ;;
+    frozenagent)  shift; exec "$SCRIPTS_DIR/aitask_frozenagent.sh" "$@" ;;
+    scratchpad)   shift; exec "$SCRIPTS_DIR/aitask_scratchpad.sh" "$@" ;;
+    minimonitor)  shift; exec "$SCRIPTS_DIR/aitask_minimonitor.sh" "$@" ;;
+    monitor)      shift; exec "$SCRIPTS_DIR/aitask_monitor.sh" "$@" ;;
+    ide)          shift; exec "$SCRIPTS_DIR/aitask_ide.sh" "$@" ;;
+    projects)     shift; exec "$SCRIPTS_DIR/aitask_projects.sh" "$@" ;;
+    settings)     shift; exec "$SCRIPTS_DIR/aitask_settings.sh" "$@" ;;
+    syncer)       shift; exec "$SCRIPTS_DIR/aitask_syncer.sh" "$@" ;;
+    stats)
+        shift
+        # `ait stats tui` is a natural alias for the hyphenated `ait stats-tui`
+        # route; forward it there. All other args go to the text CLI.
+        if [ "${1:-}" = "tui" ]; then
+            shift; exec "$SCRIPTS_DIR/aitask_stats_tui.sh" "$@"
+        fi
+        exec "$SCRIPTS_DIR/aitask_stats.sh" "$@" ;;
+    stats-tui)    shift; exec "$SCRIPTS_DIR/aitask_stats_tui.sh" "$@" ;;
+    zip-old)      shift; exec "$SCRIPTS_DIR/aitask_zip_old.sh" "$@" ;;
+    issue-update) shift; exec "$SCRIPTS_DIR/aitask_issue_update.sh" "$@" ;;
+    release-notify) shift; exec "$SCRIPTS_DIR/aitask_release_notify.sh" "$@" ;;
+    skillrun)     shift; exec "$SCRIPTS_DIR/aitask_skillrun.sh" "$@" ;;
+    setup)        shift; exec "$SCRIPTS_DIR/aitask_setup.sh" "$@" ;;
+    changelog)    shift; exec "$SCRIPTS_DIR/aitask_changelog.sh" "$@" ;;
+    explain-runs)    shift; exec "$SCRIPTS_DIR/aitask_explain_runs.sh" "$@" ;;
+    explain-cleanup) shift; exec "$SCRIPTS_DIR/aitask_explain_cleanup.sh" "$@" ;;
+    # migrate-archives: intentionally omitted from `ait help` (t918) — a one-time,
+    # upgrade-only maintenance command for pre-2026-03-29 tar.gz repos. Still
+    # invocable directly; `ait migrate-archives --help` documents its usage.
+    migrate-archives) shift; exec "$SCRIPTS_DIR/aitask_migrate_archives.sh" "$@" ;;
+    lock)         shift; exec "$SCRIPTS_DIR/aitask_lock.sh" "$@" ;;
+    sync)         shift; exec "$SCRIPTS_DIR/aitask_sync.sh" "$@" ;;
+    codeagent)    shift; exec "$SCRIPTS_DIR/aitask_codeagent.sh" "$@" ;;
+    sitrep)       shift; exec "$SCRIPTS_DIR/aitask_sitrep.sh" "$@" ;;
+    testmap)      shift; exec "$SCRIPTS_DIR/aitask_testmap.sh" "$@" ;;
+    engine)       shift; exec "$SCRIPTS_DIR/aitask_engine.sh" "$@" ;;
+    crew)
+        shift
+        subcmd="${1:-}"
+        shift || true
+        case "$subcmd" in
+            init)      exec "$SCRIPTS_DIR/aitask_crew_init.sh" "$@" ;;
+            addwork)   exec "$SCRIPTS_DIR/aitask_crew_addwork.sh" "$@" ;;
+            setmode)   exec "$SCRIPTS_DIR/aitask_crew_setmode.sh" "$@" ;;
+            status)    exec "$SCRIPTS_DIR/aitask_crew_status.sh" "$@" ;;
+            command)   exec "$SCRIPTS_DIR/aitask_crew_command.sh" "$@" ;;
+            runner)    exec "$SCRIPTS_DIR/aitask_crew_runner.sh" "$@" ;;
+            report)    exec "$SCRIPTS_DIR/aitask_crew_report.sh" "$@" ;;
+            cleanup)   exec "$SCRIPTS_DIR/aitask_crew_cleanup.sh" "$@" ;;
+            dashboard) exec "$SCRIPTS_DIR/aitask_crew_dashboard.sh" "$@" ;;
+            logview)   exec "$SCRIPTS_DIR/aitask_crew_logview.sh" "$@" ;;
+            --help|-h|"")
+                echo "Usage: ait crew <subcommand> [options]"
+                echo ""
+                echo "Available subcommands:"
+                echo "  init        Initialize a new agentcrew"
+                echo "  addwork     Add an agent to an existing crew"
+                echo "  setmode     Change launch_mode of a Waiting agent (headless|interactive)"
+                echo "  status      Get/set agent and crew status"
+                echo "  command     Send commands to agents"
+                echo "  runner      Start/check the crew runner orchestrator"
+                echo "  report      Report crew summary, agent details, outputs"
+                echo "  cleanup     Remove completed crew worktrees and branches"
+                echo "  dashboard   TUI dashboard for monitoring and managing crews"
+                echo "  logview     ANSI-aware agent log viewer TUI"
+                echo ""
+                echo "Run 'ait crew <subcommand> --help' for subcommand-specific help."
+                exit 0
+                ;;
+            *)         echo "ait crew: unknown subcommand '$subcmd'" >&2; echo "Available: init, addwork, setmode, status, command, runner, report, cleanup, dashboard, logview" >&2; exit 1 ;;
+        esac
+        ;;
+    brainstorm)
+        shift
+        subcmd="${1:-}"
+        shift || true
+        case "$subcmd" in
+            init)              exec "$SCRIPTS_DIR/aitask_brainstorm_init.sh" "$@" ;;
+            status)            exec "$SCRIPTS_DIR/aitask_brainstorm_status.sh" "$@" ;;
+            archive)           exec "$SCRIPTS_DIR/aitask_brainstorm_archive.sh" "$@" ;;
+            apply-initializer) exec "$SCRIPTS_DIR/aitask_brainstorm_apply_initializer.sh" "$@" ;;
+            apply-explorer)    exec "$SCRIPTS_DIR/aitask_brainstorm_apply_explorer.sh" "$@" ;;
+            apply-synthesizer) exec "$SCRIPTS_DIR/aitask_brainstorm_apply_synthesizer.sh" "$@" ;;
+            delete)            exec "$SCRIPTS_DIR/aitask_brainstorm_delete.sh" "$@" ;;
+            list)              exec "$SCRIPTS_DIR/aitask_brainstorm_status.sh" --list "$@" ;;
+            [0-9]*)            exec "$SCRIPTS_DIR/aitask_brainstorm_tui.sh" "$subcmd" "$@" ;;
+            --help|-h|"")
+                echo "Usage: ait brainstorm <subcommand> [options]"
+                echo ""
+                echo "Available subcommands:"
+                echo "  init               Initialize a brainstorm session for a task"
+                echo "  status             Show brainstorm session details"
+                echo "  list               List all brainstorm sessions"
+                echo "  archive            Finalize and archive a brainstorm session"
+                echo "  apply-initializer  Re-run apply on a session (recovers stuck imports)"
+                echo "  apply-explorer     Re-run apply on an explorer agent (recovers stuck explorations)"
+                echo "  apply-synthesizer  Re-run apply on a synthesizer agent (recovers stuck hybrids)"
+                echo "  delete             Completely delete a brainstorm session"
+                echo "  <num>              Launch brainstorm TUI for a task"
+                echo ""
+                echo "Run 'ait brainstorm <subcommand> --help' for subcommand-specific help."
+                exit 0
+                ;;
+            *)  echo "ait brainstorm: unknown subcommand '$subcmd'" >&2; echo "Available: init, status, list, archive, apply-initializer, apply-explorer, apply-synthesizer, delete" >&2; exit 1 ;;
+        esac
+        ;;
+    gates)
+        shift
+        subcmd="${1:-}"; shift || true
+        case "$subcmd" in
+            run)      exec "$SCRIPTS_DIR/aitask_run_gates.sh" run "$@" ;;
+            unlocked) exec "$SCRIPTS_DIR/aitask_run_gates.sh" unlocked "$@" ;;
+            list)     exec "$SCRIPTS_DIR/aitask_gate.sh" list "$@" ;;
+            status)   exec "$SCRIPTS_DIR/aitask_gate.sh" status "$@" ;;
+            sync-registry) exec "$SCRIPTS_DIR/aitask_gate.sh" sync-registry "$@" ;;
+            --help|-h|"") echo "ait gates: run | unlocked | list | status <task-id> | sync-registry" ;;
+            *)        echo "ait gates: unknown subcommand '$subcmd'" >&2; echo "Available: run, unlocked, list, status, sync-registry" >&2; exit 1 ;;
+        esac
+        ;;
+    gate)
+        shift
+        subcmd="${1:-}"; shift || true
+        case "$subcmd" in
+            append) exec "$SCRIPTS_DIR/aitask_gate.sh" append "$@" ;;
+            pass)   exec "$SCRIPTS_DIR/aitask_gate_pass.sh" "$@" ;;
+            fail)   exec "$SCRIPTS_DIR/aitask_gate_fail.sh" "$@" ;;
+            log)    exec "$SCRIPTS_DIR/aitask_gate_log.sh" "$@" ;;
+            --help|-h|"") echo "ait gate: append <task-id> <gate> <status> [k=v...] | pass <task-id> <gate> | fail <task-id> <gate> [--reason ...] | log <task-id> <gate>" ;;
+            *)      echo "ait gate: unknown subcommand '$subcmd'" >&2; echo "Available: append, pass, fail, log" >&2; exit 1 ;;
+        esac
+        ;;
+    git)          shift; source "$SCRIPTS_DIR/lib/task_utils.sh"
+                  # Routes on the parsed argv, so `-c x push` / `-c x pull`
+                  # reach the same push / pull handling as the bare forms.
+                  task_git_gateway "$@"
+                  ;;
+    git-health)   shift; source "$SCRIPTS_DIR/lib/task_utils.sh"
+                  task_git_health "$@"
+                  ;;
+    help|--help|-h) show_usage ;;
+    --version|-v)   show_version ;;
+    *)
+        echo "ait: unknown command '$1'" >&2
+        echo "Run 'ait help' for usage information." >&2
+        exit 1
+        ;;
+esac

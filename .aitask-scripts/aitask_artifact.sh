@@ -1,0 +1,1558 @@
+#!/usr/bin/env bash
+# aitask_artifact.sh - User-facing dispatcher for versioned task artifacts,
+# routed by `ait artifact <verb>`. Part of the unified artifact model (t1076_2;
+# design: aidocs/unified_artifact_design.md §3/§4).
+#
+# THE MODEL — stable handle / mutable manifest split: an artifact is a stable
+# logical handle (`art:<id>`, recorded ONCE in the owning task's `artifacts:`
+# frontmatter and never rewritten) whose mutable state (current version,
+# version history, backend) lives in a per-artifact manifest
+# (artifacts/manifests/<id>.json via lib/artifact_manifest.py, t1076_1).
+# Updating or repointing an artifact touches ONLY the manifest — never the
+# referencing task file. Attachments (`ait attach`) are the immutable,
+# single-version sibling; the two frontmatter fields stay separate (t1076_2
+# settled decision, design §10).
+#
+# STATE: every verb is functional, `move` included (t1076_3: copy every
+# version blob to the registered target, verify, then repoint the manifest —
+# non-destructive, resumable). Backends: `local` (zero-config, always
+# registered) and `dir` (a mounted directory root registered under
+# artifacts.backends.dir in aitasks/metadata/project_config.yaml). A `dir`
+# store must be initialized once (`init-store dir`, which writes the store
+# marker into the mounted root); every dir operation refuses a root without
+# the marker (t1283). `gitbranch` (t1231_1) keeps blobs on a dedicated orphan
+# branch, pushed to origin; its project-level store identity lives in
+# artifacts/gitbranch_store.json, every gitbranch activation is guarded by
+# _artifact_activate, and `gitbranch-migrate` moves the store between branches.
+# Backend selection goes through lib/artifact_registry.sh (t1076_3); remote
+# adapters (s3/gdrive) arrive with t1089/t1090.
+#
+# LOCKING: every mutating verb runs its whole transaction (blob put, manifest
+# mutation, frontmatter patch, path-scoped commit) under the global
+# attach-transaction lock (with_attach_lock) shared with `ait attach` — the
+# blob store and gc blocking set are shared substrate.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/terminal_compat.sh
+source "$SCRIPT_DIR/lib/terminal_compat.sh"
+# shellcheck source=lib/yaml_utils.sh
+source "$SCRIPT_DIR/lib/yaml_utils.sh"
+# shellcheck source=lib/task_utils.sh
+source "$SCRIPT_DIR/lib/task_utils.sh"
+# shellcheck source=lib/python_resolve.sh
+source "$SCRIPT_DIR/lib/python_resolve.sh"
+# shellcheck source=lib/artifact_utils.sh
+source "$SCRIPT_DIR/lib/artifact_utils.sh"
+# shellcheck source=lib/artifact_backend.sh
+source "$SCRIPT_DIR/lib/artifact_backend.sh"
+# shellcheck source=lib/artifact_cache.sh
+source "$SCRIPT_DIR/lib/artifact_cache.sh"
+# shellcheck source=lib/attachment_lock.sh
+source "$SCRIPT_DIR/lib/attachment_lock.sh"
+# shellcheck source=lib/attachment_meta.sh
+source "$SCRIPT_DIR/lib/attachment_meta.sh"
+# shellcheck source=lib/artifact_manifest.sh
+source "$SCRIPT_DIR/lib/artifact_manifest.sh"
+# shellcheck source=lib/artifact_registry.sh
+source "$SCRIPT_DIR/lib/artifact_registry.sh"
+# shellcheck source=lib/txn_snapshot.sh
+source "$SCRIPT_DIR/lib/txn_snapshot.sh"
+
+KIND_RE='^[a-z][a-z0-9_]{0,31}$'
+HANDLE_RE='^art:[a-z0-9][a-z0-9._-]{0,127}$'
+
+show_help() {
+    cat <<'EOF'
+Usage: ait artifact <verb> [args]
+
+Manage versioned, handle-addressed task artifacts (design: unified artifact
+model §3/§4). A task's frontmatter carries only the stable `art:<id>` handle
+(+ kind/name); the current version, version history, and backend live in the
+artifact manifest and never rewrite the task file.
+
+  create <task> <file> --kind <kind> [--name <label>] [--handle art:<id>] [--backend <n>]
+                                               Create an artifact (v1) on a task.
+  update <handle> <file>                       Store a new version and repoint `current`.
+  move   <handle> --to <backend>               Copy every version to a registered backend,
+                                               then repoint the manifest (source blobs stay).
+  rm     <task> <handle-or-name>               Remove an artifact reference (and, when
+                                               unreferenced, its manifest + orphan blobs).
+  ls     [<task>]                              List a task's artifacts, or every manifest.
+  get    <handle> [--out <path>] [--version <sha256:hash>]
+                                               Fetch the current (or a specific) version.
+  versions <handle>                            List versions oldest-first (* = current).
+  init-store <backend>                         Mark a backend's store as initialized (once,
+                                               per store). A `dir` store must be initialized
+                                               with the share MOUNTED: every operation
+                                               refuses a root without the marker. A
+                                               `gitbranch` store needs no init (the first
+                                               write creates it); init-store creates or
+                                               publishes it eagerly.
+  gitbranch-migrate --from <old> --to <new>    Move the gitbranch store to another branch,
+                                               keeping its identity. <old> is retired
+                                               (readable, refuses writes); re-run to resume.
+  fetch-exclusion apply                        Keep routine fetches (ait sync, git fetch,
+                                               fetch --all) off the gitbranch store: adds
+                                               ^refs/heads/<store> to every named remote,
+                                               for the store and its retired predecessors.
+                                               Idempotent; re-run after adding a remote.
+  fetch-exclusion drop-retired <branch>        Release a retired store branch (after it was
+                                               deleted from the remote) from the record and
+                                               from the exclusion.
+  help                                        Show this help.
+
+These verbs stage whole paths, so they REFUSE to start when a path they would
+commit (the task file, an attachment meta JSON, an artifact manifest) already
+has uncommitted changes — otherwise the commit would absorb your edit. Commit or
+revert that path first. Blobs are content-addressed and never checked.
+
+<task> accepts a parent id (e.g. 16) or a child id (e.g. 16_2), with or without
+the leading `t`. <kind> classifies the render type (html_plan, mockup, report,
+...) — lowercase [a-z0-9_], open set. The default handle is derived as
+art:t<task>-<kind-without-underscores> (child `_` becomes `.`), e.g.
+`ait artifact create 774 plan.html --kind html_plan` -> art:t774-htmlplan.
+`create` refuses an archived <task> (loose or bundled): a new artifact must
+attach to an active task. `ls` and `get` still accept any archived owner, and
+`rm` one whose file is still loose under aitasks/archived/ (not one packed into
+a .tar.zst bundle).
+EOF
+}
+
+# ── Shared helpers ───────────────────────────────────────────────────────────
+
+# _artifact_records <task_file> -- print "<handle>\t<kind>\t<name>" per
+# `artifacts:` frontmatter entry.
+_artifact_records() {
+    local task_file="$1" records ln k v
+    records="$(read_yaml_mappings "$task_file" artifacts)" || true
+    [[ -z "$records" ]] && return 0
+    local rhandle="" rkind="" rname="" have=false
+    while IFS= read -r ln; do
+        if [[ -z "$ln" ]]; then
+            [[ "$have" == true ]] && printf '%s\t%s\t%s\n' "$rhandle" "$rkind" "$rname"
+            rhandle=""; rkind=""; rname=""; have=false; continue
+        fi
+        have=true; k="${ln%%=*}"; v="${ln#*=}"
+        case "$k" in
+            handle) rhandle="$v" ;; kind) rkind="$v" ;; name) rname="$v" ;;
+        esac
+    done <<< "$records"
+    [[ "$have" == true ]] && printf '%s\t%s\t%s\n' "$rhandle" "$rkind" "$rname"
+}
+
+# _artifact_resolve_ref <task_file> <ref> -- print the matching handle, or exit
+# non-zero. An exact handle match wins. A name match is accepted only when it is
+# UNAMBIGUOUS: names are advisory, optional metadata (fold dedupes by handle,
+# not name), so a destructive verb must never pick "first parsed wins" — two
+# same-name artifacts make the name reference die with a pointer to the handle.
+_artifact_resolve_ref() {
+    local task_file="$1" ref="$2" recs h k n
+    recs="$(_artifact_records "$task_file")"
+    while IFS=$'\t' read -r h k n; do
+        [[ -z "$h" ]] && continue
+        [[ "$ref" == "$h" ]] && { printf '%s\n' "$h"; return 0; }
+    done <<< "$recs"
+    local matches=()
+    while IFS=$'\t' read -r h k n; do
+        [[ -z "$h" ]] && continue
+        [[ "$ref" == "$n" ]] && matches+=( "$h" )
+    done <<< "$recs"
+    if (( ${#matches[@]} > 1 )); then
+        die "ait artifact: ambiguous name '$ref' (matches ${matches[*]}) — use the handle"
+    fi
+    if (( ${#matches[@]} == 1 )); then
+        printf '%s\n' "${matches[0]}"
+        return 0
+    fi
+    return 1
+}
+
+# _artifact_size_cap_bytes -- size cap in bytes from project_config.yaml
+# (artifact_max_size_mb, default 25 MB). Own knob, distinct from
+# attachment_max_size_mb — HTML plans may warrant a different cap later.
+_artifact_size_cap_bytes() {
+    local cfg="aitasks/metadata/project_config.yaml" mb=""
+    if [[ -f "$cfg" ]]; then
+        mb="$(read_yaml_field "$cfg" artifact_max_size_mb 2>/dev/null || true)"
+        mb="${mb//\"/}"; mb="${mb//\'/}"; mb="$(printf '%s' "$mb" | tr -d '[:space:]')"
+    fi
+    [[ "$mb" =~ ^[0-9]+$ && "$mb" -gt 0 ]] || mb=25
+    printf '%s' "$(( mb * 1024 * 1024 ))"
+}
+
+# _artifact_commit <message> <relpath>... -- stage explicit data-root-relative
+# paths and commit ONLY those paths (partial commit) as one commit on the data
+# branch. The trailing `-- "$@"` is load-bearing: a bare `git commit` would also
+# commit anything else a concurrent writer left staged in the shared index.
+_artifact_commit() {
+    local msg="$1"; shift
+    task_git add -- "$@" >/dev/null 2>&1 || return 1
+    task_git commit -q -m "$msg" -- "$@" >/dev/null 2>&1 || return 1
+}
+
+# _artifact_manifest_backend <handle> -- print the manifest's backend field.
+_artifact_manifest_backend() {
+    local handle="$1"
+    artifact_manifest get "$handle" \
+        | "$(require_python)" -c 'import json,sys; print(json.load(sys.stdin)["backend"])'
+}
+
+# ── gitbranch store identity (t1231_1) ───────────────────────────────────────
+#
+# The gitbranch backend's store has a PROJECT-LEVEL identity: a store_id in the
+# branch's marker, mirrored on the data branch in artifacts/gitbranch_store.json
+# ({"store_id", "branch"}). Manifests record only `backend: gitbranch`, so the
+# record is what tells a renamed branch config apart from the branch the blobs
+# actually live on. The record is always DERIVED from the branch after a store
+# write (never minted locally), so racing first writers converge on one id.
+
+_artifact_gitbranch_record_relpath() { printf 'artifacts/gitbranch_store.json'; }
+
+_artifact_gitbranch_record_path() {
+    _ait_detect_data_worktree
+    printf '%s/artifacts/gitbranch_store.json' "$_AIT_DATA_WORKTREE"
+}
+
+# _artifact_gitbranch_record_parse <path|-> <record|retired> -- `record` prints
+# "<store_id>\t<branch>", `retired` one retired branch per line (t2099: the
+# predecessors gitbranch-migrate retired, kept so every clone keeps excluding
+# them from routine fetches). Nothing when <path> does not exist. Dies on a
+# malformed record, `retired` included — never reads it as absent.
+_artifact_gitbranch_record_parse() {
+    local p="$1" mode="$2"
+    [[ "$p" == - || -e "$p" ]] || return 0
+    "$(require_python)" -c '
+import json, re, sys
+sys.path.insert(0, sys.argv[3])
+from artifact_registry import check_ref_name
+try:
+    d = json.load(sys.stdin if sys.argv[1] == "-" else open(sys.argv[1], encoding="utf-8"))
+except Exception as exc:
+    sys.exit("not valid JSON: %s" % exc)
+i = d.get("store_id") if isinstance(d, dict) else None
+b = d.get("branch") if isinstance(d, dict) else None
+if not (isinstance(i, str) and re.fullmatch(r"[0-9a-f]{32}", i) and isinstance(b, str) and b):
+    sys.exit("expected {\"store_id\": <32 hex>, \"branch\": <name>}")
+r = d.get("retired", [])
+if not isinstance(r, list) or any(not isinstance(x, str) or check_ref_name(x) for x in r):
+    sys.exit("\"retired\" must be a list of valid branch names")
+if sys.argv[2] == "retired":
+    for x in r:
+        print(x)
+else:
+    print(i + "\t" + b)' "$p" "$mode" "$SCRIPT_DIR/lib" \
+        || die "ait artifact: $(_artifact_gitbranch_record_relpath) is malformed — restore it from data-branch history (./ait git log -- $(_artifact_gitbranch_record_relpath))"
+}
+
+# _artifact_gitbranch_record_read -- print "<store_id>\t<branch>", or nothing
+# when there is no record. Dies on a malformed record (never reads it as absent).
+_artifact_gitbranch_record_read() {
+    _artifact_gitbranch_record_parse "$(_artifact_gitbranch_record_path)" record
+}
+
+# _artifact_gitbranch_record_retired -- print the record's retired branches.
+_artifact_gitbranch_record_retired() {
+    _artifact_gitbranch_record_parse "$(_artifact_gitbranch_record_path)" retired
+}
+
+# _artifact_gitbranch_record_write <store_id> <branch> [retired...] -- write the
+# record atomically. JSON through json.dumps: `retired` is a list.
+_artifact_gitbranch_record_write() {
+    local p json
+    p="$(_artifact_gitbranch_record_path)"
+    json="$("$(require_python)" -c '
+import json, sys
+d = {"store_id": sys.argv[1], "branch": sys.argv[2]}
+if sys.argv[3:]:
+    d["retired"] = sorted(set(sys.argv[3:]))
+print(json.dumps(d))' "$@")" || return 1
+    mkdir -p "$(dirname "$p")" || return 1
+    ait_atomic_write_text "$p" "$json"
+}
+
+# _artifact_assert_gitbranch_store -- the LOCAL half of the store guard (no
+# network): the record must name the configured branch, and must exist once any
+# manifest lives on gitbranch. Exports ARTIFACT_GITBRANCH_STORE_ID for the
+# adapter, which checks it against the branch's marker when it touches the
+# store — so a cache hit never needs origin.
+_artifact_assert_gitbranch_store() {
+    local rec rec_id rec_branch backends
+    rec="$(_artifact_gitbranch_record_read)" \
+        || die "ait artifact: could not read the gitbranch store record (see error above)"
+    if [[ -n "$rec" ]]; then
+        rec_id="${rec%%$'\t'*}"; rec_branch="${rec#*$'\t'}"
+        [[ "$rec_branch" == "$ARTIFACT_GITBRANCH_BRANCH" ]] \
+            || die "artifacts.backends.gitbranch.branch is '${ARTIFACT_GITBRANCH_BRANCH}', but this project's artifact store is ${rec_id} on branch '${rec_branch}'. Blobs on '${rec_branch}' will not resolve from '${ARTIFACT_GITBRANCH_BRANCH}'. Set artifacts.backends.gitbranch.branch to '${rec_branch}', or migrate the store with: ait artifact gitbranch-migrate --from ${rec_branch} --to ${ARTIFACT_GITBRANCH_BRANCH}"
+        export ARTIFACT_GITBRANCH_STORE_ID="$rec_id"
+        return 0
+    fi
+    backends="$(artifact_manifest backends)" \
+        || die "ait artifact: could not read the manifests' backends (see error above)"
+    if printf '%s\n' "$backends" | grep -qx gitbranch; then
+        die "ait artifact: $(_artifact_gitbranch_record_relpath) is missing, but artifacts on the gitbranch backend exist — restore the record from data-branch history (./ait git log -- $(_artifact_gitbranch_record_relpath)); refusing to guess which store they live in"
+    fi
+    export ARTIFACT_GITBRANCH_STORE_ID=""
+}
+
+# _artifact_activate <backend> -- artifact_registry_activate plus, for
+# gitbranch, the store guard. Every activation that can touch a gitbranch store
+# goes through here; rm's explicit `local` activation does not need it.
+_artifact_activate() {
+    artifact_registry_activate "$1"
+    [[ "$1" == "gitbranch" ]] && _artifact_assert_gitbranch_store
+    return 0
+}
+
+# _artifact_gitbranch_record_boundary <label> -- preflight + snapshot the record
+# path (call at the transaction boundary, before the first mutation).
+_artifact_gitbranch_record_boundary() {
+    local rel; rel="$(_artifact_gitbranch_record_relpath)"
+    txn_require_clean "$1" "$rel"
+    txn_snap_add "$rel"
+}
+
+# _artifact_gitbranch_record_sync -- after a gitbranch store write: when the
+# project has no record yet, write one from the branch's (now published) marker
+# and print its relpath for the caller's commit; print nothing otherwise.
+_artifact_gitbranch_record_sync() {
+    local id rec p
+    id="$(artifact_gitbranch_store_id)" \
+        || die "ait artifact: could not read the gitbranch store id (see error above)"
+    [[ "$id" =~ ^[0-9a-f]{32}$ ]] \
+        || die "ait artifact: branch '${ARTIFACT_GITBRANCH_BRANCH}' carries no valid store marker after the write"
+    rec="$(_artifact_gitbranch_record_read)" \
+        || die "ait artifact: could not read the gitbranch store record (see error above)"
+    if [[ -n "$rec" ]]; then
+        [[ "${rec%%$'\t'*}" == "$id" ]] \
+            || die "ait artifact: the store on '${ARTIFACT_GITBRANCH_BRANCH}' is ${id}, but the record says ${rec%%$'\t'*}"
+        return 0
+    fi
+    p="$(_artifact_gitbranch_record_path)"
+    mkdir -p "$(dirname "$p")" || die "ait artifact: cannot create $(dirname "$p")"
+    # JSON-safe by construction: the id is hex, the branch passed the registry's
+    # ref-name validator ([A-Za-z0-9._/-] only).
+    ait_atomic_write_text "$p" "{\"store_id\": \"${id}\", \"branch\": \"${ARTIFACT_GITBRANCH_BRANCH}\"}" \
+        || die "ait artifact: could not write $(_artifact_gitbranch_record_relpath)"
+    _artifact_gitbranch_record_relpath
+}
+
+# _artifact_handle_referenced_elsewhere <handle> <excluded_task_file> -- print
+# the first OTHER task file (active or archived) whose `artifacts:` lists
+# <handle>; empty if none. Folded tasks are deliberately NOT skipped: a Folded
+# task can be revived by board hard-delete (unfold-on-delete), so its handle
+# reference must keep the manifest alive. Consequence: a fold-then-archive
+# sequence can leave an unreferenced manifest behind — conservative
+# (never loses data); orphan reaping is t1135.
+_artifact_handle_referenced_elsewhere() {
+    local handle="$1" excluded="$2"
+    shopt -s nullglob
+    local files=( "$TASK_DIR"/t*.md "$TASK_DIR"/t*/t*.md \
+                  "$ARCHIVED_DIR"/t*.md "$ARCHIVED_DIR"/t*/t*.md )
+    shopt -u nullglob
+    local f h k n
+    for f in "${files[@]}"; do
+        [[ -f "$f" ]] || continue
+        [[ "$f" -ef "$excluded" ]] && continue
+        while IFS=$'\t' read -r h k n; do
+            [[ "$h" == "$handle" ]] && { printf '%s\n' "$f"; return 0; }
+        done < <(_artifact_records "$f")
+    done
+    return 0
+}
+
+# ── Verb: create ─────────────────────────────────────────────────────────────
+
+cmd_create() {
+    local task_id="" file="" kind="" name="" handle="" backend=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --kind)    kind="${2:-}";    shift 2 ;;
+            --name)    name="${2:-}";    shift 2 ;;
+            --handle)  handle="${2:-}";  shift 2 ;;
+            --backend) backend="${2:-}"; shift 2 ;;
+            --)        shift ;;
+            -*)        die "ait artifact create: unknown option $1" ;;
+            *) if [[ -z "$task_id" ]]; then task_id="$1"
+               elif [[ -z "$file" ]]; then file="$1"
+               else die "ait artifact create: too many arguments"; fi; shift ;;
+        esac
+    done
+    [[ -n "$task_id" && -n "$file" ]] \
+        || die "Usage: ait artifact create <task> <file> --kind <kind> [--name <label>] [--handle art:<id>] [--backend <n>]"
+    task_id="${task_id#t}"
+    [[ -f "$file" ]] || die "ait artifact create: not a file: $file"
+    [[ -n "$kind" ]] || die "ait artifact create: --kind is required (html_plan, mockup, report, ...)"
+    [[ "$kind" =~ $KIND_RE ]] \
+        || die "ait artifact create: invalid kind '$kind' (lowercase [a-z0-9_], max 32 chars, must start with a letter)"
+    if [[ -z "$backend" ]]; then
+        # Explicit `|| die`: a failed capture must not silently yield "".
+        backend="$(artifact_registry_default_backend)" \
+            || die "ait artifact create: could not resolve the default backend (see error above)"
+    fi
+    if [[ -z "$handle" ]]; then
+        # Derived handle: art:t<task>-<kindslug>. Child ids keep their structure
+        # readable via `_` -> `.` (both in the handle charset): 16_2 -> t16.2.
+        local tid_slug="${task_id//_/.}" kind_slug="${kind//_/}"
+        handle="art:t${tid_slug}-${kind_slug}"
+    fi
+    [[ "$handle" =~ $HANDLE_RE ]] \
+        || die "ait artifact create: invalid handle '$handle' (expected art:[a-z0-9][a-z0-9._-]{0,127})"
+    local task_file; task_file="$(resolve_task_file "$task_id")"
+    # A new artifact attaches to an ACTIVE task (t2004) -- the substrate half
+    # of the trail gatherer's archived_owner rule (t1989). resolve_task_file
+    # also answers with loose archived files and bundle extractions; writing
+    # into either would commit into an archived record or a temp file. Only
+    # create refuses every archived owner: ls/get still resolve them; rm too,
+    # until the owner is bundled (cmd_remove refuses a bundled owner itself,
+    # naming the bundle).
+    if ! task_file_is_active "$task_id" "$task_file"; then
+        local where="a .tar.zst archive bundle"
+        if task_file_is_loose_archived "$task_id" "$task_file"; then where="$task_file"; fi
+        die "ait artifact create: t${task_id} is archived (${where}) — a new artifact must attach to an active task; ls and get still accept any archived owner, rm only one not yet packed into a bundle"
+    fi
+    with_attach_lock _artifact_create_txn "$task_id" "$task_file" "$file" "$kind" "$name" "$handle" "$backend"
+}
+
+# _artifact_create_txn -- the full create transaction (runs under the lock).
+_artifact_create_txn() {
+    local task_id="$1" task_file="$2" file="$3" kind="$4" name="$5" handle="$6" backend="$7"
+    txn_begin "ait artifact create"
+    # Registry membership + config validation (+ the gitbranch store guard) —
+    # dies actionably pre-mutation.
+    _artifact_activate "$backend"
+
+    # Size cap.
+    local size cap
+    size="$(wc -c < "$file" | tr -d '[:space:]')"
+    cap="$(_artifact_size_cap_bytes)"
+    if (( size > cap )); then
+        die "ait artifact create: file is ${size} bytes, over the ${cap}-byte cap (artifact_max_size_mb in aitasks/metadata/project_config.yaml; default 25 MB)"
+    fi
+
+    local hash; hash="$(artifact_sha256 "$file")"
+
+    # Frontmatter dup guard — one entry per handle per task.
+    local h k n
+    while IFS=$'\t' read -r h k n; do
+        [[ "$h" == "$handle" ]] \
+            && die "ait artifact create: t${task_id} already lists artifact ${handle}"
+    done < <(_artifact_records "$task_file")
+
+    # Manifest collision guard — handles are minted once, globally. Hoisted out
+    # of the `[[ ]]`: a command substitution's status is DISCARDED there, so a
+    # failed read read as "" -> "no collision" -> mint over an existing manifest.
+    # `get` on a missing handle legitimately exits 0 with empty output, so "" and
+    # failure are different answers and only `|| die` separates them (t1675).
+    local existing_manifest
+    existing_manifest="$(artifact_manifest get "$handle")" \
+        || die "ait artifact create: could not read the manifest for ${handle}"
+    [[ -z "$existing_manifest" ]] \
+        || die "ait artifact create: handle ${handle} already exists — pass --handle to choose another"
+
+    # Pre-existence (for deterministic rollback; blob may be shared content).
+    local blob_pre=false
+    artifact_backend_head "$hash" && blob_pre=true
+
+    local manifest_rel; manifest_rel="$(artifact_manifest_relpath "$handle")"
+
+    # Transaction boundary (t1698). Both NON-BLOB paths this stages are checked
+    # for pre-existing dirt (whole-path staging would otherwise absorb it) and
+    # snapshotted, so any abort below restores their pre-transaction bytes and
+    # index entries rather than HEAD.
+    txn_require_clean "ait artifact create" "$task_file"
+    txn_require_clean "ait artifact create" "$manifest_rel"
+    txn_snap_add "$task_file"
+    txn_snap_add "$manifest_rel"
+    [[ "$backend" == "gitbranch" ]] && _artifact_gitbranch_record_boundary "ait artifact create"
+    _ARTIFACT_TXN_HASH="$hash"; _ARTIFACT_TXN_BACKEND="$backend"; _ARTIFACT_TXN_BLOB_PRE="$blob_pre"
+    txn_on_rollback _artifact_rollback_create_blobs
+
+    # Store blob (idempotent atomic put + presence verify) and warm the cache
+    # from the verified local bytes — the write-back wrapper (design §5).
+    artifact_store "$hash" "$file"
+    local record_rel=""
+    if [[ "$backend" == "gitbranch" ]]; then
+        record_rel="$(_artifact_gitbranch_record_sync)" \
+            || die "ait artifact create: could not record the gitbranch store (nothing committed)"
+    fi
+
+    artifact_manifest create "$handle" "$hash" "backend=$backend" \
+        || die "ait artifact create: could not create the manifest for ${handle} (nothing committed)"
+    require_python >/dev/null
+    if [[ -n "$name" ]]; then
+        "$(require_python)" "$SCRIPT_DIR/lib/frontmatter_patch.py" append "$task_file" artifacts \
+            "handle=$handle" "kind=$kind" "name=$name" \
+            || die "ait artifact create: could not add the artifacts entry to $task_file (nothing committed)"
+    else
+        "$(require_python)" "$SCRIPT_DIR/lib/frontmatter_patch.py" append "$task_file" artifacts \
+            "handle=$handle" "kind=$kind" \
+            || die "ait artifact create: could not add the artifacts entry to $task_file (nothing committed)"
+    fi
+
+    # Commit the trio (blob + manifest + task) as one path-scoped commit.
+    # Only local-backend blobs live on the data branch; other backends hold
+    # their blobs outside git, so only manifest + task file are staged.
+    local commit_paths=()
+    [[ "$backend" == "local" ]] && commit_paths+=( "$(artifact_local_blob_relpath "$hash")" )
+    commit_paths+=( "$manifest_rel" "$task_file" )
+    [[ -n "$record_rel" ]] && commit_paths+=( "$record_rel" )
+    if ! _artifact_commit "ait: Create artifact ${handle} on t${task_id}" \
+            "${commit_paths[@]}"; then
+        txn_abort "ait artifact create: commit failed — rolled back to pre-create state"
+    fi
+    txn_end
+    success "Created artifact ${handle} (v1 ${hash}) on t${task_id}"
+    printf 'HANDLE:%s\n' "$handle"
+}
+
+# _artifact_rollback_create_blobs -- the BLOB half of create's rollback,
+# registered with txn_on_rollback. The task file AND the manifest are restored
+# by the snapshot: the manifest is always new here (create dies on a
+# pre-existing one), and the snapshot represents absence explicitly, so restore
+# deletes it — the old hand-rolled `rm -f` is no longer needed.
+#
+# Reads FILE-SCOPE globals, never the dying frame's locals: it runs from the
+# EXIT trap. The txn's backend activation is still in effect, so
+# artifact_backend_delete routes to the backend the blob was put on.
+_ARTIFACT_TXN_HASH=""
+_ARTIFACT_TXN_BACKEND="local"
+_ARTIFACT_TXN_BLOB_PRE=true
+_artifact_rollback_create_blobs() {
+    [[ "$_ARTIFACT_TXN_BLOB_PRE" == false ]] || return 0
+    if [[ "$_ARTIFACT_TXN_BACKEND" == "local" ]]; then
+        task_git reset -q -- "$(artifact_local_blob_relpath "$_ARTIFACT_TXN_HASH")" >/dev/null 2>&1 \
+            || txn_rollback_failed "index: the blob path for ${_ARTIFACT_TXN_HASH} (still staged)"
+    fi
+    # RECORDED, not swallowed (t1698): the rollback's verdict is derived from
+    # what is recorded, so a silent failure here would let the caller announce a
+    # complete rollback while a blob this transaction created survives.
+    artifact_backend_delete "$_ARTIFACT_TXN_HASH" \
+        || txn_rollback_failed "blob ${_ARTIFACT_TXN_HASH} on backend ${_ARTIFACT_TXN_BACKEND} — created by this transaction and could not be deleted"
+}
+
+# ── Verb: update ─────────────────────────────────────────────────────────────
+
+cmd_update() {
+    local handle="${1:-}" file="${2:-}"
+    [[ -n "$handle" && -n "$file" && $# -eq 2 ]] \
+        || die "Usage: ait artifact update <handle> <file>"
+    [[ -f "$file" ]] || die "ait artifact update: not a file: $file"
+    [[ -n "$(artifact_manifest get "$handle")" ]] \
+        || die "ait artifact update: no manifest for ${handle} — create it first (ait artifact create)"
+    with_attach_lock _artifact_update_txn "$handle" "$file"
+}
+
+# _artifact_update_txn -- store a new version + repoint `current`. Touches the
+# blob store and the manifest ONLY — never any task file (the core AC of the
+# stable-handle/mutable-manifest split).
+_artifact_update_txn() {
+    local handle="$1" file="$2"
+    local hash current
+    hash="$(artifact_sha256 "$file")"
+    current="$(artifact_manifest current "$handle")" \
+        || die "ait artifact update: could not read the current version of ${handle}"
+    if [[ "$hash" == "$current" ]]; then
+        success "Artifact ${handle} is already current (${hash}) — nothing to do"
+        return 0
+    fi
+
+    txn_begin "ait artifact update"
+    local backend
+    backend="$(_artifact_manifest_backend "$handle")" \
+        || die "ait artifact update: cannot read backend for ${handle}"
+    # Fails closed pre-mutation if the manifest names an unregistered backend.
+    _artifact_activate "$backend"
+
+    local size cap
+    size="$(wc -c < "$file" | tr -d '[:space:]')"
+    cap="$(_artifact_size_cap_bytes)"
+    if (( size > cap )); then
+        die "ait artifact update: file is ${size} bytes, over the ${cap}-byte cap (artifact_max_size_mb in aitasks/metadata/project_config.yaml; default 25 MB)"
+    fi
+
+    local blob_pre=false
+    artifact_backend_head "$hash" && blob_pre=true
+
+    local manifest_rel; manifest_rel="$(artifact_manifest_relpath "$handle")"
+
+    # Transaction boundary (t1698). The manifest is the ONLY non-blob path this
+    # stages — `update` never touches a task file (the stable-handle /
+    # mutable-manifest split), so a dirty task file must NOT block it. That
+    # narrowing is asserted in tests/test_attach_txn_worktree_isolation.sh
+    # rather than assumed.
+    txn_require_clean "ait artifact update" "$manifest_rel"
+    txn_snap_add "$manifest_rel"
+    [[ "$backend" == "gitbranch" ]] && _artifact_gitbranch_record_boundary "ait artifact update"
+    _ARTIFACT_TXN_HASH="$hash"; _ARTIFACT_TXN_BACKEND="$backend"; _ARTIFACT_TXN_BLOB_PRE="$blob_pre"
+    txn_on_rollback _artifact_rollback_create_blobs
+
+    # Write-back: put + presence verify + warm cache from local bytes (§5).
+    artifact_store "$hash" "$file"
+    local record_rel=""
+    if [[ "$backend" == "gitbranch" ]]; then
+        record_rel="$(_artifact_gitbranch_record_sync)" \
+            || die "ait artifact update: could not record the gitbranch store (nothing committed)"
+    fi
+    # Unchecked, this reported `current is now <hash>` at exit 0 while `current`
+    # had not moved -- a false success claim, not merely a missed error (t1675).
+    artifact_manifest set-current "$handle" "$hash" \
+        || die "ait artifact update: could not repoint ${handle} to ${hash} (nothing committed)"
+
+    local commit_paths=( "$manifest_rel" )
+    [[ "$backend" == "local" ]] && commit_paths+=( "$(artifact_local_blob_relpath "$hash")" )
+    [[ -n "$record_rel" ]] && commit_paths+=( "$record_rel" )
+    if ! _artifact_commit "ait: Update artifact ${handle}" "${commit_paths[@]}"; then
+        txn_abort "ait artifact update: commit failed — rolled back"
+    fi
+    txn_end
+    success "Updated artifact ${handle} — current is now ${hash}"
+}
+
+# ── Verb: move ───────────────────────────────────────────────────────────────
+
+cmd_move() {
+    local handle="" target=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --to) target="${2:-}"; shift 2 ;;
+            --)   shift ;;
+            -*)   die "ait artifact move: unknown option $1" ;;
+            *) if [[ -z "$handle" ]]; then handle="$1"
+               else die "ait artifact move: too many arguments"; fi; shift ;;
+        esac
+    done
+    [[ -n "$handle" && -n "$target" ]] || die "Usage: ait artifact move <handle> --to <backend>"
+    [[ -n "$(artifact_manifest get "$handle")" ]] || die "ait artifact move: no manifest for ${handle}"
+    with_attach_lock _artifact_move_txn "$handle" "$target"
+}
+
+# _artifact_move_txn -- safe backend move: copy EVERY version blob to the
+# registered target, verify presence, then repoint the manifest. Properties:
+# non-destructive (source blobs stay — recoverable / shared-store safe),
+# resumable (a re-run after any failure converges; a same-backend re-run is a
+# clean no-op), and no task-file path is ever staged (stable-handle split).
+# _artifact_rollback_move_blobs -- the BLOB half of move's rollback: delete only
+# the TARGET blobs this move created (pre-existing target blobs stay). Recorded
+# rather than swallowed, so a leaked copy cannot hide behind a clean-rollback
+# claim. Reads file-scope globals — it runs from the EXIT trap.
+_ARTIFACT_TXN_NEW_HASHES=()
+_artifact_rollback_move_blobs() {
+    (( ${#_ARTIFACT_TXN_NEW_HASHES[@]} )) || return 0
+    local nh
+    for nh in "${_ARTIFACT_TXN_NEW_HASHES[@]}"; do
+        artifact_backend_delete "$nh" \
+            || txn_rollback_failed "blob ${nh} on backend ${_ARTIFACT_TXN_BACKEND} — copied there by this move and could not be deleted"
+    done
+}
+
+_artifact_move_txn() {
+    local handle="$1" target="$2" source
+    source="$(_artifact_manifest_backend "$handle")" \
+        || die "ait artifact move: cannot read backend for ${handle}"
+    if [[ "$target" == "$source" ]]; then
+        success "Artifact ${handle} is already on backend '${target}' — nothing to do"
+        return 0
+    fi
+    # AFTER the no-op return, as in _artifact_update_txn: a callback that
+    # `return`s does not reach txn_end, and with_attach_lock's release clears the
+    # EXIT trap, so opening a transaction above this point would leak the
+    # snapshot directory on every no-op move.
+    txn_begin "ait artifact move"
+    # Validate the TARGET first: dies pre-mutation if unregistered/misconfigured.
+    _artifact_activate "$target"
+
+    # Transaction boundary (t1698). Like `update`, `move` stages the manifest
+    # and (for a local target) blobs — never a task file, so a dirty task file
+    # must not block it. Placed after the same-backend no-op return above, which
+    # stages nothing.
+    local manifest_rel; manifest_rel="$(artifact_manifest_relpath "$handle")"
+    txn_require_clean "ait artifact move" "$manifest_rel"
+    txn_snap_add "$manifest_rel"
+    [[ "$target" == "gitbranch" ]] && _artifact_gitbranch_record_boundary "ait artifact move"
+    _ARTIFACT_TXN_NEW_HASHES=()
+    _ARTIFACT_TXN_BACKEND="$target"
+    txn_on_rollback _artifact_rollback_move_blobs
+
+    # Hoisted out of the process substitution: its status is unobservable there,
+    # so a failed read produced an EMPTY list and was misreported below as
+    # "has no versions" -- a wrong cause for a manifest that may have many (t1675).
+    local versions_out
+    versions_out="$(artifact_manifest versions "$handle")" \
+        || die "ait artifact move: could not read versions for ${handle} — nothing moved"
+    local versions=() v
+    while IFS= read -r v; do [[ -n "$v" ]] && versions+=( "$v" ); done <<< "$versions_out"
+    (( ${#versions[@]} > 0 )) || die "ait artifact move: ${handle} has no versions"
+
+    # Phase 1: resolve EVERY version from the source into the local cache
+    # (verified bytes) BEFORE touching the target — one activation each way.
+    local srcs=() p
+    _artifact_activate "$source"
+    for v in "${versions[@]}"; do
+        p="$(artifact_resolve "$v")" \
+            || die "ait artifact move: could not resolve ${v} from backend '${source}' — nothing moved"
+        srcs+=( "$p" )
+    done
+
+    # Phase 2: copy to the target + verify presence per blob (a failed put
+    # does not abort under the lock's suppressed errexit — the head verify is
+    # load-bearing; backend CONTENT correctness is owned by dir-put's
+    # pre-existing-dest verification / local resolve's canonical check).
+    # Track per-version pre-existence so rollback deletes only what WE created.
+    local i commit_paths=()
+    _artifact_activate "$target"
+    for i in "${!versions[@]}"; do
+        artifact_backend_head "${versions[$i]}" || _ARTIFACT_TXN_NEW_HASHES+=( "${versions[$i]}" )
+        artifact_backend_put "${versions[$i]}" "${srcs[$i]}" \
+            || die "ait artifact move: put failed for ${versions[$i]} on '${target}'"
+        artifact_backend_head "${versions[$i]}" \
+            || die "ait artifact move: ${versions[$i]} not present on '${target}' after put"
+        [[ "$target" == "local" ]] \
+            && commit_paths+=( "$(artifact_local_blob_relpath "${versions[$i]}")" )
+    done
+    if [[ "$target" == "gitbranch" ]]; then
+        local record_rel
+        record_rel="$(_artifact_gitbranch_record_sync)" \
+            || die "ait artifact move: could not record the gitbranch store (nothing committed)"
+        [[ -n "$record_rel" ]] && commit_paths+=( "$record_rel" )
+    fi
+
+    # Phase 3: repoint + commit (manifest always; blobs only for a local target).
+    # Unchecked, this reported `Moved ... to backend '<target>'` at exit 0 with
+    # the manifest still naming the SOURCE backend -- the blobs were copied but
+    # the ledger never moved (t1675).
+    artifact_manifest set-backend "$handle" "$target" \
+        || die "ait artifact move: could not repoint ${handle} to backend '${target}'"
+    commit_paths+=( "$manifest_rel" )
+    if ! _artifact_commit "ait: Move artifact ${handle} to backend ${target}" "${commit_paths[@]}"; then
+        # The manifest comes back from the SNAPSHOT (pre-transaction bytes and
+        # index entry, so a caller's dirty manifest is not clobbered); the
+        # target blobs this move created are deleted by the registered hook,
+        # whose target activation is still in effect.
+        txn_abort "ait artifact move: commit failed — manifest and target backend restored to pre-move state, re-run to retry"
+    fi
+    txn_end
+    success "Moved ${handle} to backend '${target}' (${#versions[@]} version(s) copied; source blobs on '${source}' were NOT deleted)"
+}
+
+# ── Verb: rm ─────────────────────────────────────────────────────────────────
+
+cmd_remove() {
+    local task_id="${1:-}" ref="${2:-}"
+    [[ -n "$task_id" && -n "$ref" ]] || die "Usage: ait artifact rm <task> <handle-or-name>"
+    task_id="${task_id#t}"
+    local task_file; task_file="$(resolve_task_file "$task_id")"
+    # A BUNDLED owner resolves to a temp extraction outside the repo: there is
+    # no task file to edit, so refuse here, naming the bundle, before the lock
+    # (t2023). A loose archived owner is still a real file and stays editable.
+    if ! task_file_is_active "$task_id" "$task_file" \
+            && ! task_file_is_loose_archived "$task_id" "$task_file"; then
+        local bundle; bundle="$(task_archive_bundle "$task_id")"
+        die "ait artifact rm: t${task_id} is packed into an archive bundle${bundle:+ (${bundle})} — a bundled record cannot be edited; ls and get still accept it"
+    fi
+    with_attach_lock _artifact_rm_txn "$task_id" "$task_file" "$ref"
+}
+
+# _artifact_rollback_rm_blobs -- the BLOB half of rm's rollback: rm is
+# destructive (it sweeps orphaned version blobs), so the hook puts them back
+# from HEAD. Recorded rather than swallowed: a blob that does not come back is
+# GONE, which before t1698 was announced as a clean rollback.
+_ARTIFACT_TXN_SWEPT_BLOBS=()
+_artifact_rollback_rm_blobs() {
+    (( ${#_ARTIFACT_TXN_SWEPT_BLOBS[@]} )) || return 0
+    task_git reset -q -- "${_ARTIFACT_TXN_SWEPT_BLOBS[@]}" >/dev/null 2>&1 \
+        || txn_rollback_failed "index: ${_ARTIFACT_TXN_SWEPT_BLOBS[*]} (still staged)"
+    local b
+    for b in "${_ARTIFACT_TXN_SWEPT_BLOBS[@]}"; do
+        task_git checkout -- "$b" >/dev/null 2>&1 \
+            || txn_rollback_failed "blob $b — swept by this removal and NOT restored; recover it with 'git checkout HEAD -- $b'"
+    done
+}
+
+_artifact_rm_txn() {
+    local task_id="$1" task_file="$2" ref="$3"
+    txn_begin "ait artifact rm"
+    _ARTIFACT_TXN_SWEPT_BLOBS=()
+    txn_on_rollback _artifact_rollback_rm_blobs
+    local handle
+    handle="$(_artifact_resolve_ref "$task_file" "$ref")" \
+        || die "ait artifact rm: no artifact matching '$ref' on t${task_id}"
+
+    # Capture manifest state BEFORE mutation. A missing manifest is the
+    # stale-reference case (failed/manual cleanup, data-branch inconsistency):
+    # still remove the broken frontmatter entry so the task stays repairable
+    # through the same verb — just skip the manifest/blob work.
+    # `|| die` separates "no manifest" from "could not read it": both yield "",
+    # and unchecked, a failed read took the stale-reference branch below and
+    # dropped a LIVE frontmatter entry while orphaning its manifest (t1675).
+    local manifest_json versions=() versions_out
+    manifest_json="$(artifact_manifest get "$handle")" \
+        || die "ait artifact rm: could not read the manifest for ${handle}"
+    if [[ -n "$manifest_json" ]]; then
+        versions_out="$(artifact_manifest versions "$handle")" \
+            || die "ait artifact rm: could not read versions for ${handle}"
+        while IFS= read -r v; do
+            [[ -n "$v" ]] && versions+=( "$v" )
+        done <<< "$versions_out"
+    fi
+    local backend="local"
+    if [[ -n "$manifest_json" ]]; then
+        backend="$(_artifact_manifest_backend "$handle")" \
+            || die "ait artifact rm: cannot read backend for ${handle}"
+    fi
+
+    # Transaction boundary (t1698). The task file is staged on EVERY branch
+    # below, so it is checked here, before the first mutation. The manifest is
+    # staged only on the last-reference branch, so its own check lives there —
+    # requiring it clean on the stale-reference and referenced-elsewhere
+    # branches would refuse operations that never touch it.
+    txn_require_clean "ait artifact rm" "$task_file"
+    txn_snap_add "$task_file"
+
+    require_python >/dev/null
+    "$(require_python)" "$SCRIPT_DIR/lib/frontmatter_patch.py" remove "$task_file" artifacts \
+        --match-key handle --match-val "$handle" \
+        || die "ait artifact rm: could not remove the artifacts entry from $task_file (nothing committed)"
+
+    if [[ -z "$manifest_json" ]]; then
+        warn "manifest for ${handle} is missing — removing the stale frontmatter reference only"
+        if ! _artifact_commit "ait: Remove stale artifact reference ${handle} from t${task_id}" "$task_file"; then
+            txn_abort "ait artifact rm: commit failed — rolled back"
+        fi
+        txn_end
+        success "Removed stale artifact reference ${handle} from t${task_id}"
+        return 0
+    fi
+
+    # Another task (active, archived, or Folded — revivable) still lists the
+    # handle -> keep the manifest, drop only this task's entry.
+    local other
+    other="$(_artifact_handle_referenced_elsewhere "$handle" "$task_file")" \
+        || die "ait artifact rm: could not scan for other references to ${handle}"
+    if [[ -n "$other" ]]; then
+        if ! _artifact_commit "ait: Remove artifact ${handle} from t${task_id}" "$task_file"; then
+            txn_abort "ait artifact rm: commit failed — rolled back"
+        fi
+        txn_end
+        success "Removed artifact ${handle} from t${task_id}; manifest kept (still referenced by ${other})"
+        return 0
+    fi
+
+    # Last reference -> delete the manifest, then sweep version blobs that
+    # nothing else owns. A blob is KEPT if the attachment ledger has a meta
+    # file for it (an attachment owns it) or any remaining manifest still
+    # references it. Deletions are ordinary data-branch commits — recoverable
+    # from git history.
+    local manifest_rel manifest_path
+    manifest_rel="$(artifact_manifest_relpath "$handle")"
+    manifest_path="$(artifact_manifest_dir)/${handle#art:}.json"
+    # The manifest is staged from HERE on, so this is where its own boundary
+    # check belongs — immediately before the delete that is its first mutation.
+    txn_require_clean "ait artifact rm" "$manifest_rel"
+    txn_snap_add "$manifest_rel"
+    # `|| die` is LOAD-BEARING, not defensive. errexit is suppressed in here, so
+    # an unchecked failure continued into the commit: `git add` on a still-present
+    # manifest stages it UNCHANGED, the task-file edit committed anyway, and the
+    # verb printed "manifest deleted" at exit 0 — leaving an orphan manifest that
+    # no task references and `ait attach gc` can never see past. Measured against
+    # a read-only manifests/ directory before this guard existed. Dying hands the
+    # armed transaction trap the job of restoring both paths.
+    rm -f "$manifest_path" \
+        || die "ait artifact rm: could not delete the manifest for ${handle} (nothing committed)"
+
+    local del_paths=( "$task_file" "$manifest_rel" )
+    local swept=0 remaining="" scanned=0 h blob_rel head_oid disk_oid doomed=()
+    # Local blobs are swept whatever the manifest's CURRENT backend is: `move`
+    # keeps its source blobs, so an artifact created on `local` and moved away
+    # still owns committed blobs here (t1286).
+    artifact_registry_activate local
+    # Pass 1 — select: present on disk, not owned by an attachment, and not
+    # referenced by any remaining manifest (on any backend).
+    for h in ${versions[@]+"${versions[@]}"}; do
+        [[ -f "$(attach_meta_dir)/$(artifact_shard_path "$h").json" ]] && continue
+        artifact_local_head "$h" || continue
+        if (( ! scanned )); then
+            if ! remaining="$(artifact_manifest referenced-hashes)"; then
+                # The fail-closed tree scan died (a malformed manifest somewhere —
+                # its path is in the error above). The task file is already patched
+                # and this manifest already deleted, both uncommitted — restore
+                # BOTH from HEAD so the tree is left untouched and the same rm can
+                # be re-run once the named manifest is repaired. (Computing the
+                # scan before mutation is not an option: it would include this
+                # doomed manifest's own hashes and block the whole sweep.)
+                txn_abort "ait artifact rm: could not compute remaining manifest references (see the malformed-manifest error above) — rolled back; repair that manifest and re-run"
+            fi
+            scanned=1
+        fi
+        printf '%s\n' "$remaining" | grep -qxF "$h" && continue
+        doomed+=( "$h" )
+    done
+    # Pass 2 — preflight EVERY candidate before deleting ANY. The rollback hook
+    # restores a swept blob by reset + checkout, i.e. from its COMMITTED copy, so
+    # a deletion is recoverable only when the on-disk bytes ARE that copy. Index
+    # membership is not enough: an unstaged/staged edit would be lost, and a
+    # staged addition absent from HEAD could not come back at all.
+    # txn_require_clean refuses those (and plain untracked blobs), but it is not
+    # a recovery proof on its own — `git status --porcelain` is silent for an
+    # IGNORED untracked file, which has no committed copy. So each candidate must
+    # also exist in HEAD as exactly its on-disk bytes (same git object id), and
+    # carry a plain index entry: under skip-worktree git refuses both to stage
+    # the deletion and to check the blob back out, and under assume-unchanged
+    # `git add` "succeeds" without staging the deletion at all.
+    # Every refusal dies; the armed trap restores the already-patched task file
+    # and deleted manifest, and no blob has been touched yet.
+    local idx_entry idx_tag fix
+    for h in ${doomed[@]+"${doomed[@]}"}; do
+        blob_rel="$(artifact_local_blob_relpath "$h")"
+        txn_require_clean "ait artifact rm" "$blob_rel"
+        head_oid="$(task_git rev-parse -q --verify "HEAD:${blob_rel}")" \
+            || die "ait artifact rm: ${blob_rel} has no committed copy on the data branch, so deleting it could not be rolled back — commit it or move it aside, then re-run"
+        disk_oid="$(task_git hash-object -- "$blob_rel")" \
+            || die "ait artifact rm: could not hash ${blob_rel} — refusing to delete a blob whose recovery cannot be verified"
+        [[ "$disk_oid" == "$head_oid" ]] \
+            || die "ait artifact rm: ${blob_rel} differs from its committed copy, so deleting it would lose bytes — restore or commit it, then re-run"
+        idx_entry="$(task_git ls-files -v -- "$blob_rel")" \
+            || die "ait artifact rm: could not read the index entry for ${blob_rel} — refusing to delete a blob whose recovery cannot be verified"
+        idx_tag="${idx_entry%% *}"
+        if [[ "$idx_tag" != "H" ]]; then
+            # One command per flag: a combined `--no-skip-worktree
+            # --no-assume-unchanged` leaves skip-worktree SET (measured).
+            # Uppercase/lowercase S = skip-worktree; lowercase = assume-unchanged.
+            fix=""
+            [[ "$idx_tag" == [Ss] ]] && fix="./ait git update-index --no-skip-worktree -- ${blob_rel}"
+            [[ "$idx_tag" == [a-z] ]] && fix="${fix:+${fix}; }./ait git update-index --no-assume-unchanged -- ${blob_rel}"
+            [[ -n "$fix" ]] \
+                || die "ait artifact rm: ${blob_rel} has an unexpected index entry ('${idx_entry}') — refusing to delete a blob whose recovery cannot be verified"
+            die "ait artifact rm: ${blob_rel} is flagged skip-worktree or assume-unchanged in the index, so git could neither stage its deletion nor restore it — clear the flag (${fix}), then re-run"
+        fi
+    done
+    # Pass 3 — delete.
+    for h in ${doomed[@]+"${doomed[@]}"}; do
+        blob_rel="$(artifact_local_blob_relpath "$h")"
+        artifact_backend_delete "$h" \
+            || die "ait artifact rm: could not delete the orphaned blob $h"
+        _ARTIFACT_TXN_SWEPT_BLOBS+=( "$blob_rel" )
+        del_paths+=( "$blob_rel" )
+        swept=$((swept + 1))
+    done
+    if [[ "$backend" != "local" ]]; then
+        warn "backend '${backend}' is not local — its backend blobs were not deleted (cross-backend orphan reaping is t1135)"
+    fi
+
+    if ! _artifact_commit "ait: Remove artifact ${handle} from t${task_id}" "${del_paths[@]}"; then
+        txn_abort "ait artifact rm: commit failed — rolled back"
+    fi
+    txn_end
+    success "Removed artifact ${handle} from t${task_id} (manifest deleted, ${swept} orphan blob(s) swept; recoverable from data-branch history)"
+}
+
+# ── Verb: ls ─────────────────────────────────────────────────────────────────
+
+cmd_list() {
+    local task_id="${1:-}"
+    if [[ -z "$task_id" ]]; then
+        # Global view: every manifest.
+        local handles h cur backend
+        handles="$(artifact_manifest list)"
+        if [[ -z "$handles" ]]; then
+            echo "No artifacts."
+            return 0
+        fi
+        printf '%-40s  %-14s  %s\n' "HANDLE" "CURRENT" "BACKEND"
+        while IFS= read -r h; do
+            [[ -n "$h" ]] || continue
+            cur="$(artifact_manifest current "$h")"
+            backend="$(_artifact_manifest_backend "$h")"
+            local short="${cur#sha256:}"
+            printf '%-40s  %-14s  %s\n' "$h" "${short:0:12}" "$backend"
+        done <<< "$handles"
+        return 0
+    fi
+
+    task_id="${task_id#t}"
+    local task_file records
+    task_file="$(resolve_task_file "$task_id")"
+    records="$(_artifact_records "$task_file")"
+    if [[ -z "$records" ]]; then
+        echo "No artifacts."
+        return 0
+    fi
+    printf '%-40s  %-12s  %-14s  %-5s  %-8s  %s\n' "HANDLE" "KIND" "CURRENT" "VERS" "BACKEND" "NAME"
+    local h k n cur nvers backend
+    while IFS=$'\t' read -r h k n; do
+        [[ -n "$h" ]] || continue
+        if [[ -n "$(artifact_manifest get "$h" 2>/dev/null)" ]]; then
+            cur="$(artifact_manifest current "$h")"
+            nvers="$(artifact_manifest versions "$h" | grep -c . || true)"
+            backend="$(_artifact_manifest_backend "$h")"
+            local short="${cur#sha256:}"
+            printf '%-40s  %-12s  %-14s  %-5s  %-8s  %s\n' \
+                "$h" "${k:-?}" "${short:0:12}" "$nvers" "$backend" "${n:-}"
+        else
+            warn "artifact ${h} has no manifest — the reference is stale (repair with: ait artifact rm ${task_id} ${h})"
+            printf '%-40s  %-12s  %-14s  %-5s  %-8s  %s\n' "$h" "${k:-?}" "?" "?" "?" "${n:-}"
+        fi
+    done <<< "$records"
+}
+
+# ── Verb: get ────────────────────────────────────────────────────────────────
+
+cmd_get() {
+    local handle="" out="" version=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --out)     out="${2:-}";     shift 2 ;;
+            --version) version="${2:-}"; shift 2 ;;
+            --)        shift ;;
+            -*)        die "ait artifact get: unknown option $1" ;;
+            *) if [[ -z "$handle" ]]; then handle="$1"
+               else die "ait artifact get: too many arguments"; fi; shift ;;
+        esac
+    done
+    [[ -n "$handle" ]] || die "Usage: ait artifact get <handle> [--out <path>] [--version <sha256:hash>]"
+    [[ -n "$(artifact_manifest get "$handle")" ]] \
+        || die "ait artifact get: no manifest for ${handle}"
+
+    local hash
+    if [[ -n "$version" ]]; then
+        artifact_manifest versions "$handle" | grep -qxF "$version" \
+            || die "ait artifact get: ${version} is not a version of ${handle} (see: ait artifact versions ${handle})"
+        hash="$version"
+    else
+        hash="$(artifact_manifest current "$handle")"
+    fi
+
+    local backend; backend="$(_artifact_manifest_backend "$handle")"
+    _artifact_activate "$backend"
+    # artifact_resolve verifies the resolved bytes' hash itself (t1076_1) — no
+    # caller-side re-hash needed.
+    local cache; cache="$(artifact_resolve "$hash")"
+    if [[ -n "$out" ]]; then
+        cp "$cache" "$out"
+        success "Wrote $out"
+    else
+        cat "$cache"
+    fi
+}
+
+# ── Verb: versions ───────────────────────────────────────────────────────────
+
+cmd_versions() {
+    local handle="${1:-}"
+    [[ -n "$handle" && $# -eq 1 ]] || die "Usage: ait artifact versions <handle>"
+    [[ -n "$(artifact_manifest get "$handle")" ]] \
+        || die "ait artifact versions: no manifest for ${handle}"
+    local current v
+    current="$(artifact_manifest current "$handle")"
+    while IFS= read -r v; do
+        [[ -n "$v" ]] || continue
+        if [[ "$v" == "$current" ]]; then
+            printf '* %s\n' "$v"
+        else
+            printf '  %s\n' "$v"
+        fi
+    done < <(artifact_manifest versions "$handle")
+}
+
+# ── Verb: init-store ─────────────────────────────────────────────────────────
+
+# cmd_init_store <backend> -- prepare a registered backend's store. For `dir`
+# this writes the store marker into the configured root (which must already
+# exist — it is never created), so later operations can tell the mounted share
+# apart from an empty mountpoint or a wrong path. No attach lock: it touches no
+# git state, and the marker write is idempotent and atomic.
+cmd_init_store() {
+    local backend="${1:-}"
+    [[ -n "$backend" && $# -eq 1 ]] || die "Usage: ait artifact init-store <backend>"
+    _artifact_activate "$backend"
+    local out
+    out="$(artifact_backend_init)" || exit 1
+    case "$out" in
+        INITIALIZED:*)         success "Initialized the '${backend}' artifact store at ${out#INITIALIZED:}" ;;
+        ALREADY_INITIALIZED:*) info "The '${backend}' artifact store at ${out#ALREADY_INITIALIZED:} is already initialized — nothing to do" ;;
+        NOTHING_TO_INIT:*)     info "The '${backend}' backend needs no initialization — nothing to do" ;;
+        *)                     die "ait artifact init-store: unexpected backend output: $out" ;;
+    esac
+    if [[ "$backend" == "gitbranch" ]]; then
+        _artifact_fetch_exclusion_best_effort "ait artifact init-store"
+    fi
+    return 0
+}
+
+# ── Verb: gitbranch-migrate ──────────────────────────────────────────────────
+
+# cmd_gitbranch_migrate --from <old> --to <new> -- move the gitbranch store to
+# another branch, keeping its store_id. The only correct remedy for a renamed
+# artifacts.backends.gitbranch.branch: `move --to gitbranch` is a same-backend
+# no-op, and manifests carry no branch coordinate.
+cmd_gitbranch_migrate() {
+    local from="" to=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --from) from="${2:-}"; shift 2 ;;
+            --to)   to="${2:-}";   shift 2 ;;
+            *)      die "ait artifact gitbranch-migrate: unknown argument $1" ;;
+        esac
+    done
+    [[ -n "$from" && -n "$to" ]] \
+        || die "Usage: ait artifact gitbranch-migrate --from <old-branch> --to <new-branch>"
+    local py b
+    py="$(require_python)"
+    for b in "$from" "$to"; do
+        "$py" "$SCRIPT_DIR/lib/artifact_registry.py" --config "aitasks/metadata/project_config.yaml" \
+            validate-ref "$b" || die "ait artifact gitbranch-migrate: '$b' is not a usable branch (see error above)"
+    done
+    [[ "$from" != "$to" ]] || die "ait artifact gitbranch-migrate: --from and --to name the same branch"
+    # The backend must be registered; its configured branch is only reported.
+    artifact_registry_activate gitbranch
+    with_attach_lock _artifact_gitbranch_migrate_txn "$from" "$to" "$ARTIFACT_GITBRANCH_BRANCH"
+    # After with_attach_lock returned (the fetch-exclusion lock never nests):
+    # exclude <to>, and keep <from> excluded through the record's `retired`.
+    _artifact_fetch_exclusion_best_effort "ait artifact gitbranch-migrate"
+}
+
+# _artifact_gitbranch_migrate_step_failed <rc> <unknown-effect> <what> -- die
+# for a failed remote step. An UNKNOWN push outcome (the adapter's exit 75:
+# origin may have applied it) is registered as a possibly-retained effect
+# first, so the abort report never omits a mutation that may have landed.
+_artifact_gitbranch_migrate_step_failed() {
+    local rc="$1" unknown="$2" what="$3"
+    if (( rc == 75 )); then
+        txn_retain "$unknown"
+        die "ait artifact gitbranch-migrate: ${what} with an UNKNOWN outcome (see above)"
+    fi
+    die "ait artifact gitbranch-migrate: ${what} (see error above)"
+}
+
+# _artifact_gitbranch_missing_hashes <src-list> <dst-list> -- print the hashes
+# of <src-list> absent from <dst-list>; exit non-zero when the comparison
+# itself fails, which must never read as "nothing missing". Lists go through
+# files (a large store would exceed the per-string exec limit as arguments).
+_artifact_gitbranch_missing_hashes() {
+    (
+        tmpd="$(mktemp -d "${TMPDIR:-/tmp}/ait-gitbranch-verify.XXXXXX")" || exit 1
+        # shellcheck disable=SC2064  # expand now: tmpd is this subshell's
+        trap "rm -rf '$tmpd'" EXIT   # archive-sweep: subshell-local
+        printf '%s\n' "$1" | sed '/^$/d' | sort -u > "$tmpd/src" || exit 1
+        printf '%s\n' "$2" | sed '/^$/d' | sort -u > "$tmpd/dst" || exit 1
+        comm -23 "$tmpd/src" "$tmpd/dst" || exit 1
+    )
+}
+
+# _artifact_gitbranch_migrate_txn <from> <to> <configured-branch> -- the
+# migration, under the attach lock. CUTOVER CONTRACT: the attach lock is
+# checkout-local, so other clones are fenced ON THE STORE BRANCH instead —
+# once <from> carries .ait-artifact-retired every write to it dies inside the
+# adapter's CAS, before the writer's manifest is committed. The fence is leased
+# on a fresh tip, so every blob published before it is inside the fenced tip,
+# and the catch-up copies exactly that tip: no window, no pause request. Every
+# step is idempotent, so a failed run is resumed by running it again; remote
+# effects are never undone (they are reported as RETAINED instead).
+_artifact_gitbranch_migrate_txn() {
+    local from="$1" to="$2" configured="$3"
+    txn_begin "ait artifact gitbranch-migrate"
+    local rec_rel; rec_rel="$(_artifact_gitbranch_record_relpath)"
+    txn_require_clean "ait artifact gitbranch-migrate" "$rec_rel"
+    txn_snap_add "$rec_rel"
+    txn_set_resume_hint "ait artifact gitbranch-migrate --from ${from} --to ${to}"
+
+    # 1. Store identity.
+    local rec sid="" rec_branch=""
+    rec="$(_artifact_gitbranch_record_read)" \
+        || die "ait artifact gitbranch-migrate: could not read the gitbranch store record (see error above)"
+    if [[ -n "$rec" ]]; then
+        sid="${rec%%$'\t'*}"; rec_branch="${rec#*$'\t'}"
+        [[ "$rec_branch" == "$from" || "$rec_branch" == "$to" ]] \
+            || die "ait artifact gitbranch-migrate: this project's artifact store ${sid} is on branch '${rec_branch}', not '${from}' — run: ait artifact gitbranch-migrate --from ${rec_branch} --to ${to}"
+    fi
+
+    # 2. Source: our store, or our store already fenced towards <to>.
+    local st state src_tip
+    export ARTIFACT_GITBRANCH_BRANCH="$from" ARTIFACT_GITBRANCH_STORE_ID=""
+    st="$(artifact_gitbranch_probe_state)" \
+        || die "ait artifact gitbranch-migrate: could not read branch '${from}' (see error above)"
+    state="${st%%$'\t'*}"; src_tip="${st#*$'\t'}"
+    case "$state" in
+        STORE:*|UNPUBLISHED:*) [[ -n "$sid" ]] || sid="${state#*:}" ;;
+        RETIRED:*)
+            [[ "${state##*:}" == "$to" ]] \
+                || die "ait artifact gitbranch-migrate: branch '${from}' was already retired to '${state##*:}', not '${to}'"
+            [[ -n "$sid" ]] || { sid="${state#RETIRED:}"; sid="${sid%%:*}"; } ;;
+        OCCUPIED) die "ait artifact gitbranch-migrate: branch '${from}' is not an aitask artifact store (no .ait-artifact-store marker at its tip)" ;;
+        *)        die "ait artifact gitbranch-migrate: there is no artifact store on branch '${from}'" ;;
+    esac
+    local src_id="${state#*:}"; src_id="${src_id%%:*}"
+    [[ "$src_id" == "$sid" ]] \
+        || die "ait artifact gitbranch-migrate: branch '${from}' holds artifact store ${src_id}, but this project's store is ${sid}"
+
+    # 3. Target precondition — before ANY store mutation.
+    export ARTIFACT_GITBRANCH_BRANCH="$to" ARTIFACT_GITBRANCH_STORE_ID=""
+    st="$(artifact_gitbranch_probe_state)" \
+        || die "ait artifact gitbranch-migrate: could not read branch '${to}' (see error above)"
+    state="${st%%$'\t'*}"
+    case "$state" in
+        ABSENT)
+            [[ "$rec_branch" != "$to" ]] \
+                || die "ait artifact gitbranch-migrate: the record says the store already moved to '${to}', but '${to}' has no store — push it back from a clone that still has it" ;;
+        STORE:"$sid"|UNPUBLISHED:"$sid") ;;
+        STORE:*|UNPUBLISHED:*|RETIRED:*)
+            local tid="${state#*:}"; tid="${tid%%:*}"
+            die "ait artifact gitbranch-migrate: branch '${to}' already holds another artifact store (${tid}); this project's store is ${sid} — refusing to merge two stores. Pick an unused branch name." ;;
+        OCCUPIED)
+            die "ait artifact gitbranch-migrate: branch '${to}' already exists and is not an aitask artifact store (no .ait-artifact-store marker at its tip) — refusing to write artifact commits onto an existing branch; pick an unused branch name" ;;
+        *)  die "ait artifact gitbranch-migrate: unexpected state for '${to}': ${state}" ;;
+    esac
+
+    local out new_tip changed fence any=0 mrc
+    # 4. Bulk copy.
+    mrc=0; out="$(artifact_gitbranch_migrate_from "$src_tip" "$sid")" || mrc=$?
+    (( mrc == 0 )) || _artifact_gitbranch_migrate_step_failed "$mrc" \
+        "branch '${to}' MAY have advanced — the push outcome is unknown (origin could not be re-read after the push failed)" \
+        "copying the store to '${to}' failed"
+    read -r new_tip changed <<< "$out"
+    if [[ "$changed" == 1 ]]; then
+        any=1
+        info "gitbranch-migrate: copied the store's blobs to '${to}' (${new_tip:0:12})" >&2
+        txn_retain "branch '${to}' advanced to ${new_tip:0:12} (store ${sid}; INCOMPLETE until the migration record is committed)"
+    fi
+    # 5. Fence the source.
+    export ARTIFACT_GITBRANCH_BRANCH="$from" ARTIFACT_GITBRANCH_STORE_ID="$sid"
+    mrc=0; out="$(artifact_gitbranch_retire "$to")" || mrc=$?
+    (( mrc == 0 )) || _artifact_gitbranch_migrate_step_failed "$mrc" \
+        "branch '${from}' MAY have been RETIRED — the fence push outcome is unknown; if it landed, '${from}' refuses artifact writes and this is final (do not remove .ait-artifact-retired)" \
+        "retiring '${from}' failed"
+    read -r fence changed <<< "$out"
+    if [[ "$changed" == 1 ]]; then
+        any=1
+        info "gitbranch-migrate: retired '${from}' at ${fence:0:12} — writes to it are now refused" >&2
+        txn_retain "branch '${from}' RETIRED at ${fence:0:12} — it now refuses artifact writes; this is final, do not remove .ait-artifact-retired"
+    fi
+    # 6. Catch-up: whatever was published to the source before the fence.
+    export ARTIFACT_GITBRANCH_BRANCH="$to" ARTIFACT_GITBRANCH_STORE_ID=""
+    mrc=0; out="$(artifact_gitbranch_migrate_from "$fence" "$sid")" || mrc=$?
+    (( mrc == 0 )) || _artifact_gitbranch_migrate_step_failed "$mrc" \
+        "branch '${to}' MAY have advanced by the catch-up copy — the push outcome is unknown (origin could not be re-read after the push failed)" \
+        "the catch-up copy to '${to}' failed"
+    read -r new_tip changed <<< "$out"
+    if [[ "$changed" == 1 ]]; then
+        any=1
+        info "gitbranch-migrate: caught up '${to}' with blobs published before the fence (${new_tip:0:12})" >&2
+        txn_retain "branch '${to}' advanced to ${new_tip:0:12} by the catch-up copy (INCOMPLETE until the migration record is committed)"
+    fi
+    # 7. Verify: every fenced blob is on <to>, which is a published store.
+    # +x: these hold full store listings while _artifact_gitbranch_missing_hashes
+    # execs sed/sort/comm. A caller-exported name would otherwise be inherited
+    # and put the listing into every child's environment ("Argument list too
+    # long"; see _artifact_gitbranch_missing_entries in lib/artifact_backends/gitbranch.sh).
+    local +x src_list dst_list missing
+    export ARTIFACT_GITBRANCH_BRANCH="$from" ARTIFACT_GITBRANCH_STORE_ID="$sid"
+    src_list="$(artifact_gitbranch_list)" \
+        || die "ait artifact gitbranch-migrate: could not list '${from}' (see error above)"
+    export ARTIFACT_GITBRANCH_BRANCH="$to" ARTIFACT_GITBRANCH_STORE_ID="$sid"
+    st="$(artifact_gitbranch_probe_state)" \
+        || die "ait artifact gitbranch-migrate: could not re-read '${to}' (see error above)"
+    [[ "${st%%$'\t'*}" == "STORE:${sid}" ]] \
+        || die "ait artifact gitbranch-migrate: '${to}' is not a published store after the copy (${st%%$'\t'*})"
+    dst_list="$(artifact_gitbranch_list)" \
+        || die "ait artifact gitbranch-migrate: could not list '${to}' (see error above)"
+    missing="$(_artifact_gitbranch_missing_hashes "$src_list" "$dst_list")" \
+        || die "ait artifact gitbranch-migrate: could not verify the copy to '${to}' — the record was NOT moved; re-run to resume"
+    [[ -z "$missing" ]] \
+        || die "ait artifact gitbranch-migrate: blobs missing on '${to}' after the copy: ${missing//$'\n'/ }"
+
+    # 8. The record follows the store, and names <from> as retired (t2099):
+    # every clone keeps excluding the retired predecessor from routine fetches.
+    # A record that predates `retired` is backfilled by re-running the migration.
+    local -a kept=()
+    local rb retired_out
+    # A capture, not `mapfile < <(...)`: a process substitution would swallow
+    # the reader's die and read a malformed record as "nothing retired".
+    retired_out="$(_artifact_gitbranch_record_retired)" \
+        || die "ait artifact gitbranch-migrate: could not read the record's retired branches"
+    while IFS= read -r rb; do
+        [[ -n "$rb" && "$rb" != "$to" ]] && kept+=( "$rb" )
+    done <<< "$retired_out"
+    local from_listed=0
+    for rb in "${kept[@]}"; do [[ "$rb" == "$from" ]] && from_listed=1; done
+    if [[ "$sid" != "${rec%%$'\t'*}" || "$rec_branch" != "$to" ]] || (( ! from_listed )); then
+        (( from_listed )) || kept+=( "$from" )
+        _artifact_gitbranch_record_write "$sid" "$to" "${kept[@]}" \
+            || die "ait artifact gitbranch-migrate: could not write ${rec_rel}"
+        if ! _artifact_commit "ait: Migrate gitbranch artifact store ${sid} to ${to}" "$rec_rel"; then
+            txn_abort "ait artifact gitbranch-migrate: committing the migration record failed"
+        fi
+        any=1
+    fi
+    txn_end
+
+    # 9. Report.
+    if (( any )); then
+        success "Migrated artifact store ${sid} from '${from}' to '${to}' ('${from}' is retired: readable, but refuses writes)"
+        printf 'MIGRATED:%s:%s\n' "$sid" "$to"
+    else
+        info "Artifact store ${sid} is already migrated from '${from}' to '${to}' — nothing to do"
+        printf 'ALREADY_MIGRATED:%s:%s\n' "$sid" "$to"
+    fi
+    [[ "$configured" == "$to" ]] \
+        || warn "Set artifacts.backends.gitbranch.branch: ${to} in aitasks/metadata/project_config.yaml — until then every gitbranch artifact operation refuses (the store is on '${to}')"
+    return 0
+}
+
+# ── Verb: fetch-exclusion (t2099) ────────────────────────────────────────────
+#
+# Keeps routine fetches (`ait sync`, `git fetch`, `git fetch --all --prune`)
+# off the gitbranch store: lib/artifact_fetch_exclusion.sh owns the git-config
+# mechanics, this verb gathers the inputs. The desired set is
+#   {configured branch} ∪ {record branch} ∪ {record retired}
+# — all shared data, so every clone computes the same set. The record-branch
+# term keeps the real store excluded while the config was changed without a
+# migration; `retired` keeps a migrated-away predecessor excluded while it is
+# still on the remote (t2104 releases it with `drop-retired`).
+
+_AFX_INPUT_BRANCHES=()
+_AFX_INPUT_DECL=""
+_AFX_INPUT_DED=0
+
+# _artifact_afx_read_inputs <cfg-present> <cfg-content> <rec-present>
+# <rec-content> <local:0|1> -- append the branches one SNAPSHOTTED config +
+# record pair contributes. Contents arrive as strings and reach the parsers on
+# stdin: what is applied is exactly what was fingerprinted. The dedicated-mode
+# declaration is taken from the LOCAL pair only. Returns 1 on a read failure
+# (the readers already said why), never reading a broken input as "absent".
+_artifact_afx_read_inputs() {
+    local cfg_p="$1" cfg="$2" rec_p="$3" recc="$4" is_local="$5" out branch remote ded rec rb
+    if [[ "$cfg_p" == 1 ]]; then
+        out="$(printf '%s' "$cfg" | "$(require_python)" "$SCRIPT_DIR/lib/artifact_registry.py" --config - gitbranch-fetch-config)" \
+            || return 1
+        if [[ -n "$out" ]]; then
+            IFS=$'\t' read -r branch remote ded <<< "$out"
+            _AFX_INPUT_BRANCHES+=( "$branch" )
+            if [[ "$is_local" == 1 ]]; then _AFX_INPUT_DECL="$remote"; _AFX_INPUT_DED="$ded"; fi
+        fi
+    fi
+    if [[ "$rec_p" == 1 ]]; then
+        rec="$(printf '%s' "$recc" | _artifact_gitbranch_record_parse - record)" || return 1
+        [[ -n "$rec" ]] && _AFX_INPUT_BRANCHES+=( "${rec#*$'\t'}" )
+        out="$(printf '%s' "$recc" | _artifact_gitbranch_record_parse - retired)" || return 1
+        while IFS= read -r rb; do [[ -n "$rb" ]] && _AFX_INPUT_BRANCHES+=( "$rb" ); done <<< "$out"
+    fi
+    return 0
+}
+
+# _artifact_afx_snapshot <ref|""> -- capture every source input ONCE: the
+# working-tree files' bytes (_AFX_SNAP_*) and, with <ref>, the blob ids there
+# (immutable objects). Sets _AFX_SNAP_IDS in afx_input_ids' exact format, so the
+# fingerprint stored after the apply describes the bytes the apply consumed.
+_AFX_SNAP_IDS=""
+_artifact_afx_snapshot() {
+    local ref="$1" f c id i=0
+    _AFX_SNAP_IDS=""; _AFX_SNAP_PRESENT=(); _AFX_SNAP_CONTENT=(); _AFX_SNAP_REFID=()
+    for f in "${AFX_INPUT_FILES[@]}"; do
+        if [[ -f "$_AIT_DATA_WORKTREE/$f" ]]; then
+            # The trailing `x` keeps trailing newlines through $( ).
+            c="$(cat -- "$_AIT_DATA_WORKTREE/$f" && printf x)" || return 1
+            c="${c%x}"
+            id="$(printf '%s' "$c" | git hash-object --stdin)" || return 1
+            _AFX_SNAP_PRESENT[i]=1; _AFX_SNAP_CONTENT[i]="$c"
+        else
+            id=none; _AFX_SNAP_PRESENT[i]=0; _AFX_SNAP_CONTENT[i]=""
+        fi
+        _AFX_SNAP_IDS+="local $f $id"$'\n'
+        if [[ -n "$ref" ]]; then
+            id="$(git rev-parse -q --verify "$ref:$f" 2>/dev/null)" || id=none
+            _AFX_SNAP_REFID[i]="$id"
+            _AFX_SNAP_IDS+="ref $f $id"$'\n'
+        fi
+        i=$((i + 1))
+    done
+    _AFX_SNAP_IDS="${_AFX_SNAP_IDS%$'\n'}"
+    return 0
+}
+
+# _artifact_afx_apply_snapshot <ref|""> -- apply exactly the snapshot.
+_artifact_afx_apply_snapshot() {
+    local ref="$1" i c rc
+    local -a rp=() rcontent=()
+    _AFX_INPUT_BRANCHES=(); _AFX_INPUT_DECL=""; _AFX_INPUT_DED=0
+    _artifact_afx_read_inputs "${_AFX_SNAP_PRESENT[0]}" "${_AFX_SNAP_CONTENT[0]}" \
+        "${_AFX_SNAP_PRESENT[1]}" "${_AFX_SNAP_CONTENT[1]}" 1 || return 1
+    if [[ -n "$ref" ]]; then
+        for i in 0 1; do
+            if [[ "${_AFX_SNAP_REFID[i]}" == none ]]; then
+                rp[i]=0; rcontent[i]=""
+            else
+                c="$(git cat-file blob "${_AFX_SNAP_REFID[i]}" && printf x)" || return 1
+                rp[i]=1; rcontent[i]="${c%x}"
+            fi
+        done
+        _artifact_afx_read_inputs "${rp[0]}" "${rcontent[0]}" "${rp[1]}" "${rcontent[1]}" 0 || return 1
+    fi
+    local -a want=()
+    local b
+    while IFS= read -r b; do [[ -n "$b" ]] && want+=( "$b" ); done \
+        < <(printf '%s\n' "${_AFX_INPUT_BRANCHES[@]}" | sort -u)
+    if (( ${#want[@]} == 0 )); then
+        echo "FETCH_EXCLUSION:NOT_CONFIGURED"
+        return 0
+    fi
+    rc=0; afx_apply_core "$_AFX_INPUT_DECL" "$_AFX_INPUT_DED" "${want[@]}" || rc=$?
+    return "$rc"
+}
+
+_AFX_STABLE_ATTEMPTS=3
+
+# _artifact_afx_apply_locked <ref|""> <if-changed:0|1> -- the whole
+# read-modify-write, under the fetch-exclusion lock. That lock serializes
+# appliers, NOT writers of the source files or of <ref>, so stability is
+# checked instead: the inputs are snapshotted, the snapshot is applied, and the
+# live inputs must still equal it afterwards. A change mid-apply re-runs it on a
+# fresh snapshot; inputs that never hold still fail the apply (exit 1, which the
+# sync guard turns into a deferral) and store no fingerprint.
+_artifact_afx_apply_locked() {
+    local ref="$1" if_changed="$2" stored live attempt rc
+    _ait_detect_data_worktree
+    if [[ -n "$ref" ]]; then
+        git rev-parse -q --verify "$ref^{commit}" >/dev/null \
+            || { warn "ait artifact fetch-exclusion: --also-ref '$ref' is not a commit"; return 1; }
+    fi
+    for (( attempt = 1; attempt <= _AFX_STABLE_ATTEMPTS; attempt++ )); do
+        _artifact_afx_snapshot "$ref" || { warn "ait artifact fetch-exclusion: could not read the inputs"; return 1; }
+        if [[ "$if_changed" == 1 && "$attempt" == 1 ]]; then
+            stored="$(git config --get "$AFX_FINGERPRINT_KEY" 2>/dev/null)" || stored=""
+            if [[ "$(afx_fingerprint_from "$_AFX_SNAP_IDS")" == "$stored" ]]; then
+                echo "FETCH_EXCLUSION:UNCHANGED"; return 0
+            fi
+        fi
+        if ! afx_git_supports_negative_refspec; then
+            echo "FETCH_EXCLUSION:UNSUPPORTED_GIT:$(afx_git_version)"
+            warn "git $(afx_git_version) has no negative refspecs (git >= 2.29 needed): routine fetches will still download the gitbranch artifact store"
+        else
+            rc=0; _artifact_afx_apply_snapshot "$ref" || rc=$?
+            (( rc == 0 )) || return 1
+        fi
+        live="$(afx_input_ids "$_AIT_DATA_WORKTREE" "$ref")" || return 1
+        if [[ "$live" == "$_AFX_SNAP_IDS" ]]; then
+            if [[ "$if_changed" == 1 ]]; then
+                # Over the CONSUMED inputs plus the remote state just written.
+                git config "$AFX_FINGERPRINT_KEY" "$(afx_fingerprint_from "$_AFX_SNAP_IDS")" \
+                    || { warn "ait artifact fetch-exclusion: could not store the input fingerprint"; return 1; }
+            fi
+            return 0
+        fi
+        warn "ait artifact fetch-exclusion: the configuration or store record changed while it was being applied — re-applying"
+    done
+    echo "FETCH_EXCLUSION:INPUTS_UNSTABLE"
+    warn "ait artifact fetch-exclusion: the configuration or store record kept changing; the exclusion is not confirmed — retry"
+    return 1
+}
+
+# _artifact_fetch_exclusion_apply [--also-ref <ref>] [--if-changed]
+_artifact_fetch_exclusion_apply() {
+    local ref="" if_changed=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --also-ref)   ref="${2:-}"; [[ -n "$ref" ]] || die "Usage: ait artifact fetch-exclusion apply [--also-ref <ref>] [--if-changed]"; shift 2 ;;
+            --if-changed) if_changed=1; shift ;;
+            *)            die "ait artifact fetch-exclusion apply: unknown argument $1" ;;
+        esac
+    done
+    # shellcheck source=lib/artifact_fetch_exclusion.sh
+    source "$SCRIPT_DIR/lib/artifact_fetch_exclusion.sh"
+    afx_with_lock _artifact_afx_apply_locked "$ref" "$if_changed"
+}
+
+# _artifact_fetch_exclusion_best_effort <context> [args...] -- the in-CLI call
+# sites (init-store, gitbranch-migrate): tokens go to stderr (the verb's own
+# stdout stays its own), and a failure warns without failing the verb.
+_artifact_fetch_exclusion_best_effort() {
+    local ctx="$1"; shift
+    if ! _artifact_fetch_exclusion_apply "$@" >&2; then
+        warn "${ctx}: could not update the routine-fetch exclusion for the gitbranch store — re-run: ait artifact fetch-exclusion apply"
+    fi
+    return 0
+}
+
+# _artifact_drop_retired_txn <branch> -- remove <branch> from the record's
+# retired list and commit, under the attach lock (the record's writer lock).
+_artifact_drop_retired_txn() {
+    local b="$1" rec_rel rec sid rec_branch out rb listed=0
+    local -a kept=()
+    rec_rel="$(_artifact_gitbranch_record_relpath)"
+    txn_begin "ait artifact fetch-exclusion drop-retired"
+    rec="$(_artifact_gitbranch_record_read)" \
+        || die "ait artifact fetch-exclusion drop-retired: could not read the gitbranch store record (see error above)"
+    if [[ -z "$rec" ]]; then
+        txn_end
+        info "No gitbranch store record — nothing is retired"
+        return 0
+    fi
+    sid="${rec%%$'\t'*}"; rec_branch="${rec#*$'\t'}"
+    [[ "$b" != "$rec_branch" ]] \
+        || die "ait artifact fetch-exclusion drop-retired: '$b' is the current store branch, not a retired one"
+    out="$(_artifact_gitbranch_record_retired)" \
+        || die "ait artifact fetch-exclusion drop-retired: could not read the record's retired branches"
+    while IFS= read -r rb; do
+        [[ -n "$rb" ]] || continue
+        if [[ "$rb" == "$b" ]]; then listed=1; else kept+=( "$rb" ); fi
+    done <<< "$out"
+    if (( ! listed )); then
+        txn_end
+        info "'$b' is not listed as a retired store branch — nothing to release"
+        return 0
+    fi
+    txn_require_clean "ait artifact fetch-exclusion drop-retired" "$rec_rel"
+    txn_snap_add "$rec_rel"
+    _artifact_gitbranch_record_write "$sid" "$rec_branch" "${kept[@]}" \
+        || die "ait artifact fetch-exclusion drop-retired: could not write ${rec_rel}"
+    if ! _artifact_commit "ait: Release retired gitbranch store branch ${b}" "$rec_rel"; then
+        txn_abort "ait artifact fetch-exclusion drop-retired: committing the record failed"
+    fi
+    txn_end
+    success "Released retired store branch '${b}' from the gitbranch store record"
+    return 0
+}
+
+# cmd_fetch_exclusion apply [--also-ref <ref>] [--if-changed] | drop-retired <branch>
+cmd_fetch_exclusion() {
+    local sub="${1:-}"
+    case "$sub" in
+        apply) shift; _artifact_fetch_exclusion_apply "$@" ;;
+        drop-retired)
+            shift
+            local b="${1:-}"
+            [[ -n "$b" && $# -eq 1 ]] || die "Usage: ait artifact fetch-exclusion drop-retired <branch>"
+            "$(require_python)" "$SCRIPT_DIR/lib/artifact_registry.py" --config "aitasks/metadata/project_config.yaml" \
+                validate-ref "$b" || die "ait artifact fetch-exclusion drop-retired: '$b' is not a usable branch (see error above)"
+            local cfg_out
+            cfg_out="$("$(require_python)" "$SCRIPT_DIR/lib/artifact_registry.py" --config "aitasks/metadata/project_config.yaml" gitbranch-fetch-config)" \
+                || die "ait artifact fetch-exclusion drop-retired: could not read the gitbranch config (see error above)"
+            [[ "${cfg_out%%$'\t'*}" != "$b" || -z "$cfg_out" ]] \
+                || die "ait artifact fetch-exclusion drop-retired: '$b' is the configured artifacts.backends.gitbranch.branch, not a retired one"
+            with_attach_lock _artifact_drop_retired_txn "$b"
+            # After with_attach_lock returned: the fetch-exclusion lock never nests.
+            _artifact_fetch_exclusion_apply
+            ;;
+        *) die "Usage: ait artifact fetch-exclusion apply [--also-ref <ref>] [--if-changed] | drop-retired <branch>" ;;
+    esac
+}
+
+main() {
+    local verb="${1:-}"
+    case "$verb" in
+        ""|--help|-h|help) show_help ;;
+        create)     shift; cmd_create "$@" ;;
+        update)     shift; cmd_update "$@" ;;
+        move)       shift; cmd_move "$@" ;;
+        rm|remove)  shift; cmd_remove "$@" ;;
+        ls|list)    shift; cmd_list "$@" ;;
+        get)        shift; cmd_get "$@" ;;
+        versions)   shift; cmd_versions "$@" ;;
+        init-store) shift; cmd_init_store "$@" ;;
+        gitbranch-migrate) shift; cmd_gitbranch_migrate "$@" ;;
+        fetch-exclusion) shift; cmd_fetch_exclusion "$@" ;;
+        *)          die "Unknown verb: $verb (try 'ait artifact help')" ;;
+    esac
+}
+
+main "$@"

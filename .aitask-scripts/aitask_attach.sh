@@ -1,0 +1,779 @@
+#!/usr/bin/env bash
+# aitask_attach.sh - User-facing dispatcher for task file attachments, routed by
+# `ait attach <verb>`. Part of the task-attachments feature (t1030).
+#
+# Attachments are content-addressed (SHA-256) files recorded in a task's
+# `attachments:` frontmatter (schema: aidocs/task_attachments_design.md §3) and
+# stored in a pluggable backend (design §4/§5). Full CLI surface: design §6.
+#
+# STATE: `ls`/`add`/`get`/`rm`/`gc` (and `help`) are functional. `move` is a stub
+# (remote backend move — a later remote-backend task). `gc` (t1030_3) reclaims
+# fully-orphaned blobs, honoring the grace knob; archival itself never decrefs
+# (an archived task is still a real referrer — browsable history).
+#
+# STORAGE MODEL (t1030_2): the canonical refcount ledger is PER-BLOB metadata
+# files (attachments/meta/<2>/<62>.json via lib/attachment_meta.py) — NOT a single
+# global index.json. Blobs live at attachments/blobs/<2>/<62> (local backend). The
+# whole add/rm body runs under one global attach-transaction lock (with_attach_lock).
+# See aiplans/p1030/p1030_2_local_backend_cache_index.md.
+#
+# ARTIFACT SUBSTRATE (t1076_1): the blob store/backend/cache seam is the shared
+# artifact substrate (lib/artifact_{utils,backend,cache}.sh) — attachments are
+# one consumer. Artifacts add per-artifact manifests (artifacts/manifests/
+# <id>.json via lib/artifact_manifest.py); any hash referenced by any manifest
+# version blocks gc reclamation (see _attach_gc_blocking_hashes).
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/terminal_compat.sh
+source "$SCRIPT_DIR/lib/terminal_compat.sh"
+# shellcheck source=lib/yaml_utils.sh
+source "$SCRIPT_DIR/lib/yaml_utils.sh"
+# shellcheck source=lib/task_utils.sh
+source "$SCRIPT_DIR/lib/task_utils.sh"
+# shellcheck source=lib/python_resolve.sh
+source "$SCRIPT_DIR/lib/python_resolve.sh"
+# shellcheck source=lib/artifact_utils.sh
+source "$SCRIPT_DIR/lib/artifact_utils.sh"
+# shellcheck source=lib/artifact_backend.sh
+source "$SCRIPT_DIR/lib/artifact_backend.sh"
+# shellcheck source=lib/artifact_cache.sh
+source "$SCRIPT_DIR/lib/artifact_cache.sh"
+# shellcheck source=lib/attachment_lock.sh
+source "$SCRIPT_DIR/lib/attachment_lock.sh"
+# shellcheck source=lib/attachment_meta.sh
+source "$SCRIPT_DIR/lib/attachment_meta.sh"
+# shellcheck source=lib/artifact_manifest.sh
+source "$SCRIPT_DIR/lib/artifact_manifest.sh"
+# shellcheck source=lib/txn_snapshot.sh
+source "$SCRIPT_DIR/lib/txn_snapshot.sh"
+
+NOT_YET="not yet available — backend move arrives with a remote-backend task"
+
+show_help() {
+    cat <<'EOF'
+Usage: ait attach <verb> [args]
+
+Manage content-addressed file attachments on a task (design §6).
+
+  ls   <task>                                  List a task's attachments.
+  add  <task> <file> [--backend <n>] [--name <d>]   Attach a file.
+  get  <task> <name-or-hash> [--out <path>]    Fetch an attachment.
+  rm   <task> <name-or-hash>                   Remove an attachment.
+  move <task> <name-or-hash> --to <backend>    Move an attachment backend. (not yet implemented)
+  gc                                           Sweep fully-orphaned blobs (opt-in; honors grace).
+  help                                         Show this help.
+
+These verbs stage whole paths, so they REFUSE to start when a path they would
+commit (the task file, an attachment meta JSON, an artifact manifest) already
+has uncommitted changes — otherwise the commit would absorb your edit. Commit or
+revert that path first. Blobs are content-addressed and never checked.
+
+Internal (used by the board on hard-delete; not for routine manual use):
+  decref-deleted [--protect-task <id>]... <task-id>...   Release (or rebind to survivors) a deleted task's attachment refs.
+                                               Dies (fail-closed) if a doomed task still lists artifacts
+                                               no protected survivor owns — remove them first (ait artifact rm).
+
+<task> accepts a parent id (e.g. 16) or a child id (e.g. 16_2), with or without
+the leading `t`.
+
+`add` refuses an archived <task> (loose or bundled): a new attachment must go
+on an active task. `ls` and `get` still accept any archived <task>, and `rm`
+one whose file is still loose under aitasks/archived/ (not one packed into a
+.tar.zst bundle).
+EOF
+}
+
+# _attach_print_row
+# Validate and print one accumulated table row. Operates on cmd_list's
+# dynamically-scoped locals (private helper; only called from cmd_list).
+_attach_print_row() {
+    idx=$((idx + 1))
+    if ! artifact_validate_hash "$rhash"; then
+        die "ait attach ls: attachment #$idx (${rname:-<unnamed>}) has an invalid or missing hash: '${rhash}'"
+    fi
+    local short="${rhash#sha256:}"
+    short="${short:0:12}"
+    printf '%-28s  %-14s  %-10s  %s\n' \
+        "${rname:-<unnamed>}" "$short" "${rsize:-?}" "${rbackend:-?}"
+}
+
+# cmd_list <task-id> — the one functional verb in this scaffold.
+cmd_list() {
+    local task_id="${1:-}"
+    [[ -n "$task_id" ]] || die "Usage: ait attach ls <task-id>"
+    task_id="${task_id#t}"
+
+    local task_file records
+    task_file="$(resolve_task_file "$task_id")"
+    records="$(read_yaml_mappings "$task_file" attachments)"
+
+    if [[ -z "$records" ]]; then
+        echo "No attachments."
+        return 0
+    fi
+
+    local idx=0 have_row=false ln k v
+    local rname="" rhash="" rsize="" rbackend=""
+    printf '%-28s  %-14s  %-10s  %s\n' "NAME" "HASH" "SIZE" "BACKEND"
+    while IFS= read -r ln; do
+        if [[ -z "$ln" ]]; then
+            if [[ "$have_row" == true ]]; then
+                _attach_print_row
+            fi
+            rname=""; rhash=""; rsize=""; rbackend=""; have_row=false
+            continue
+        fi
+        have_row=true
+        # Split on the FIRST '=' only (per read_yaml_mappings output contract).
+        k="${ln%%=*}"
+        v="${ln#*=}"
+        case "$k" in
+            name)    rname="$v" ;;
+            hash)    rhash="$v" ;;
+            size)    rsize="$v" ;;
+            backend) rbackend="$v" ;;
+        esac
+    done <<< "$records"
+    if [[ "$have_row" == true ]]; then
+        _attach_print_row
+    fi
+}
+
+# ── Storage helpers (t1030_2) ────────────────────────────────────────────────
+
+# Per-blob ledger helpers (attach_meta_dir / attach_meta / attach_meta_relpath /
+# attach_task_hashes / parse_duration_to_seconds) live in lib/attachment_meta.sh
+# (t1030_3 — shared with aitask_fold_mark.sh). Sourced above.
+
+# _attach_records <task_file> -- print "<hash>\t<name>\t<backend>" per attachment.
+_attach_records() {
+    local task_file="$1" records ln k v
+    records="$(read_yaml_mappings "$task_file" attachments)" || true
+    [[ -z "$records" ]] && return 0
+    local rhash="" rname="" rbackend="" have=false
+    while IFS= read -r ln; do
+        if [[ -z "$ln" ]]; then
+            [[ "$have" == true ]] && printf '%s\t%s\t%s\n' "$rhash" "$rname" "$rbackend"
+            rhash=""; rname=""; rbackend=""; have=false; continue
+        fi
+        have=true; k="${ln%%=*}"; v="${ln#*=}"
+        case "$k" in
+            hash) rhash="$v" ;; name) rname="$v" ;; backend) rbackend="$v" ;;
+        esac
+    done <<< "$records"
+    [[ "$have" == true ]] && printf '%s\t%s\t%s\n' "$rhash" "$rname" "$rbackend"
+}
+
+# _attach_resolve_ref <task_file> <name-or-hash> -- print the matching hash, or
+# exit non-zero. Hash match (full or bare hex) wins over name match.
+_attach_resolve_ref() {
+    local task_file="$1" ref="$2" pairs h n b
+    pairs="$(_attach_records "$task_file")"
+    while IFS=$'\t' read -r h n b; do
+        [[ -z "$h" ]] && continue
+        [[ "$ref" == "$h" || "$ref" == "${h#sha256:}" ]] && { printf '%s\n' "$h"; return 0; }
+    done <<< "$pairs"
+    while IFS=$'\t' read -r h n b; do
+        [[ -z "$h" ]] && continue
+        [[ "$ref" == "$n" ]] && { printf '%s\n' "$h"; return 0; }
+    done <<< "$pairs"
+    return 1
+}
+
+# _attach_record_backend <task_file> <hash> -- print the attachment's backend
+# (defaults to local).
+_attach_record_backend() {
+    local task_file="$1" hash="$2" pairs h n b
+    pairs="$(_attach_records "$task_file")"
+    while IFS=$'\t' read -r h n b; do
+        [[ "$h" == "$hash" ]] && { printf '%s\n' "${b:-local}"; return 0; }
+    done <<< "$pairs"
+    printf 'local\n'
+}
+
+# _attach_size_cap_bytes -- size cap in bytes from project_config.yaml
+# (attachment_max_size_mb, default 25 MB).
+_attach_size_cap_bytes() {
+    local cfg="aitasks/metadata/project_config.yaml" mb=""
+    if [[ -f "$cfg" ]]; then
+        mb="$(read_yaml_field "$cfg" attachment_max_size_mb 2>/dev/null || true)"
+        mb="${mb//\"/}"; mb="${mb//\'/}"; mb="$(printf '%s' "$mb" | tr -d '[:space:]')"
+    fi
+    [[ "$mb" =~ ^[0-9]+$ && "$mb" -gt 0 ]] || mb=25
+    printf '%s' "$(( mb * 1024 * 1024 ))"
+}
+
+# _attach_commit <message> <relpath>... -- stage explicit data-root-relative
+# paths and commit ONLY those paths (partial commit) as one commit on the data
+# branch. The trailing `-- "$@"` is load-bearing: a bare `git commit` would also
+# commit anything else a concurrent writer left staged in the shared index.
+# Non-zero on failure.
+_attach_commit() {
+    local msg="$1"; shift
+    task_git add -- "$@" >/dev/null 2>&1 || return 1
+    task_git commit -q -m "$msg" -- "$@" >/dev/null 2>&1 || return 1
+}
+
+# ── Verb: add ────────────────────────────────────────────────────────────────
+
+cmd_add() {
+    local task_id="" file="" backend="local" name=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --backend) backend="${2:-}"; shift 2 ;;
+            --name)    name="${2:-}";    shift 2 ;;
+            --)        shift ;;
+            -*)        die "ait attach add: unknown option $1" ;;
+            *) if [[ -z "$task_id" ]]; then task_id="$1"
+               elif [[ -z "$file" ]]; then file="$1"
+               else die "ait attach add: too many arguments"; fi; shift ;;
+        esac
+    done
+    [[ -n "$task_id" && -n "$file" ]] || die "Usage: ait attach add <task> <file> [--backend <n>] [--name <d>]"
+    task_id="${task_id#t}"
+    [[ -f "$file" ]] || die "ait attach add: not a file: $file"
+    [[ "$backend" == "local" ]] || die "ait attach add: backend '$backend' not yet supported (local only in t1030_2)"
+    local task_file; task_file="$(resolve_task_file "$task_id")"
+    # A new attachment goes on an ACTIVE task (t2011, mirroring t2004's
+    # artifact create). resolve_task_file also answers with loose archived
+    # files and bundle extractions; writing into either would commit into an
+    # archived record or target a temp file. Only add refuses every archived
+    # owner: ls/get still resolve them; rm too, until the owner is bundled
+    # (cmd_remove refuses a bundled owner itself, naming the bundle).
+    if ! task_file_is_active "$task_id" "$task_file"; then
+        local where="a .tar.zst archive bundle"
+        if task_file_is_loose_archived "$task_id" "$task_file"; then where="$task_file"; fi
+        die "ait attach add: t${task_id} is archived (${where}) — a new attachment must go on an active task; ls and get still accept any archived owner, rm only one not yet packed into a bundle"
+    fi
+    [[ -n "$name" ]] || name="$(basename "$file")"
+    with_attach_lock _attach_add_txn "$task_id" "$task_file" "$file" "$backend" "$name"
+}
+
+# _attach_add_txn -- the full add transaction (runs under the global attach lock).
+_attach_add_txn() {
+    local task_id="$1" task_file="$2" file="$3" backend="$4" name="$5"
+    txn_begin "ait attach add"
+    export ARTIFACT_BACKEND="$backend"
+
+    # Size cap.
+    local size cap
+    size="$(wc -c < "$file" | tr -d '[:space:]')"
+    cap="$(_attach_size_cap_bytes)"
+    if (( size > cap )); then
+        die "ait attach add: file is ${size} bytes, over the ${cap}-byte cap (attachment_max_size_mb in aitasks/metadata/project_config.yaml; default 25 MB). Use a remote backend or 'gh release upload' for larger files."
+    fi
+
+    local mime hash
+    mime="$(file --mime-type -b "$file" 2>/dev/null || echo application/octet-stream)"
+    hash="$(artifact_sha256 "$file")"
+
+    # Duplicate rejection — hash AND name, both per task (keeps (hash,task) 1:1).
+    local pairs h n b
+    pairs="$(_attach_records "$task_file")"
+    while IFS=$'\t' read -r h n b; do
+        [[ -z "$h" ]] && continue
+        [[ "$h" == "$hash" ]] && die "ait attach add: this file ($hash) is already attached to t${task_id} as '${n}'"
+        [[ "$n" == "$name" ]] && die "ait attach add: an attachment named '${name}' already exists on t${task_id} — pass --name to disambiguate"
+    done <<< "$pairs"
+
+    # Blob pre-existence, so the rollback hook deletes only what THIS
+    # transaction created. The meta JSON needs no such flag any more: the
+    # snapshot represents absence explicitly, so a meta file the transaction
+    # created is deleted on restore and a pre-existing one comes back with its
+    # pre-transaction bytes — including a dirty edit, which the old
+    # restore-from-HEAD destroyed.
+    local blob_pre=false
+    artifact_backend_head "$hash" && blob_pre=true
+
+    local blob_rel meta_rel
+    blob_rel="$(artifact_local_blob_relpath "$hash")"
+    meta_rel="$(attach_meta_relpath "$hash")"
+
+    # Transaction boundary (t1698). Refuse if a NON-BLOB path this stages is
+    # already dirty -- `git add` is whole-path, so the commit would absorb the
+    # edit -- then snapshot those paths so ANY abort below restores their
+    # pre-transaction bytes and index entries rather than HEAD. The blob is
+    # content-addressed: nothing to absorb, and its rollback is the hook.
+    txn_require_clean "ait attach add" "$task_file"
+    txn_require_clean "ait attach add" "$meta_rel"
+    txn_snap_add "$task_file"
+    txn_snap_add "$meta_rel"
+    _ATTACH_TXN_HASH="$hash"; _ATTACH_TXN_BLOB_REL="$blob_rel"; _ATTACH_TXN_BLOB_PRE="$blob_pre"
+    txn_on_rollback _attach_rollback_add_blobs
+
+    # Store blob (idempotent atomic copy) + populate cache. Explicit `|| die` on
+    # every status-returning mutator: errexit is suppressed in here (see the
+    # CALLBACK CONTRACT in lib/attachment_lock.sh).
+    artifact_backend_put "$hash" "$file" \
+        || die "ait attach add: could not store the blob for $hash"
+    artifact_resolve "$hash" >/dev/null
+
+    local added_at; added_at="$(date '+%Y-%m-%d %H:%M')"
+    attach_meta incref "$hash" "$task_id" "mime=$mime" "size=$size" "backend=$backend" \
+        || die "ait attach add: ledger incref failed for $hash (nothing committed)"
+    require_python >/dev/null
+    # Unchecked, this was the headline t1675 defect: the append failed, the trio
+    # still committed, and `add` reported success with no frontmatter entry.
+    "$(require_python)" "$SCRIPT_DIR/lib/frontmatter_patch.py" append "$task_file" attachments \
+        "hash=$hash" "name=$name" "mime=$mime" "size=$size" "added_at=$added_at" "backend=$backend" \
+        || die "ait attach add: could not add the attachments entry to $task_file (nothing committed)"
+
+    # Commit the trio (blob + meta + task) as one commit.
+    if ! _attach_commit "ait: Attach ${name} to t${task_id}" "$blob_rel" "$meta_rel" "$task_file"; then
+        txn_abort "ait attach add: commit failed — rolled back to pre-attach state"
+    fi
+    txn_end
+    success "Attached '${name}' (${hash}) to t${task_id}"
+}
+
+# _attach_rollback_add_blobs -- the BLOB half of add's rollback, registered with
+# txn_on_rollback. The task file and the meta JSON are restored by the snapshot
+# (pre-transaction bytes AND index entry); blobs keep unstage-and-delete because
+# they are content-addressed and snapshotting one would copy up to 25 MB.
+#
+# Reads FILE-SCOPE globals, never the dying frame's locals: it is invoked from
+# the EXIT trap, so it must not depend on a caller's `local`s being in scope.
+_ATTACH_TXN_HASH=""
+_ATTACH_TXN_BLOB_REL=""
+_ATTACH_TXN_BLOB_PRE=true
+_attach_rollback_add_blobs() {
+    [[ "$_ATTACH_TXN_BLOB_PRE" == false ]] || return 0
+    task_git reset -q -- "$_ATTACH_TXN_BLOB_REL" >/dev/null 2>&1 \
+        || txn_rollback_failed "index: $_ATTACH_TXN_BLOB_REL (still staged)"
+    # RECORDED, not swallowed (t1698). This used to be `|| true` on the grounds
+    # that a leftover blob is gc-reclaimable and there was nothing left to abort
+    # — but the rollback's verdict is derived from what is recorded, and a
+    # silent failure here let the caller claim a complete rollback. The contract
+    # guard's ALLOWLIST entry still exempts the line; its justification is now
+    # "the failure is reported", not "the failure is harmless".
+    artifact_backend_delete "$_ATTACH_TXN_HASH" \
+        || txn_rollback_failed "blob ${_ATTACH_TXN_HASH} — created by this transaction and could not be deleted; reclaim it with 'ait attach gc'"
+}
+
+# ── Verb: get ────────────────────────────────────────────────────────────────
+
+cmd_get() {
+    local task_id="" ref="" out=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --out) out="${2:-}"; shift 2 ;;
+            --)    shift ;;
+            -*)    die "ait attach get: unknown option $1" ;;
+            *) if [[ -z "$task_id" ]]; then task_id="$1"
+               elif [[ -z "$ref" ]]; then ref="$1"
+               else die "ait attach get: too many arguments"; fi; shift ;;
+        esac
+    done
+    [[ -n "$task_id" && -n "$ref" ]] || die "Usage: ait attach get <task> <name-or-hash> [--out <path>]"
+    task_id="${task_id#t}"
+    local task_file; task_file="$(resolve_task_file "$task_id")"
+    local hash; hash="$(_attach_resolve_ref "$task_file" "$ref")" \
+        || die "ait attach get: no attachment matching '$ref' on t${task_id}"
+    local backend; backend="$(_attach_record_backend "$task_file" "$hash")"
+    export ARTIFACT_BACKEND="${backend:-local}"
+    local cache; cache="$(artifact_resolve "$hash")"
+    # Verify the resolved bytes hash back to the expected hash (design §8).
+    local got; got="$(artifact_sha256 "$cache")"
+    [[ "$got" == "$hash" ]] || die "ait attach get: hash mismatch for '$ref' (expected $hash, got $got)"
+    if [[ -n "$out" ]]; then
+        cp "$cache" "$out"
+        success "Wrote $out"
+    else
+        cat "$cache"
+    fi
+}
+
+# ── Verb: rm ─────────────────────────────────────────────────────────────────
+
+cmd_remove() {
+    local task_id="${1:-}" ref="${2:-}"
+    [[ -n "$task_id" && -n "$ref" ]] || die "Usage: ait attach rm <task> <name-or-hash>"
+    task_id="${task_id#t}"
+    local task_file; task_file="$(resolve_task_file "$task_id")"
+    # A BUNDLED owner resolves to a temp extraction outside the repo: there is
+    # no task file to edit, so refuse here, naming the bundle, before the lock
+    # (t2023). A loose archived owner is still a real file and stays editable.
+    if ! task_file_is_active "$task_id" "$task_file" \
+            && ! task_file_is_loose_archived "$task_id" "$task_file"; then
+        local bundle; bundle="$(task_archive_bundle "$task_id")"
+        die "ait attach rm: t${task_id} is packed into an archive bundle${bundle:+ (${bundle})} — a bundled record cannot be edited; ls and get still accept it"
+    fi
+    with_attach_lock _attach_rm_txn "$task_id" "$task_file" "$ref"
+}
+
+_attach_rm_txn() {
+    local task_id="$1" task_file="$2" ref="$3"
+    txn_begin "ait attach rm"
+    local hash; hash="$(_attach_resolve_ref "$task_file" "$ref")" \
+        || die "ait attach rm: no attachment matching '$ref' on t${task_id}"
+    local meta_rel; meta_rel="$(attach_meta_relpath "$hash")"
+    # Transaction boundary (t1698): both staged paths, checked and snapshotted
+    # before the first mutation. `rm` stages no blob, so it registers no hook.
+    txn_require_clean "ait attach rm" "$task_file"
+    txn_require_clean "ait attach rm" "$meta_rel"
+    txn_snap_add "$task_file"
+    txn_snap_add "$meta_rel"
+    # decref stamps orphaned_at if this empties refs (the gc grace clock); blob
+    # NOT deleted here — reclamation is `ait attach gc` (also t1030_3).
+    attach_meta decref "$hash" "$task_id" "now=$(date +%s)" \
+        || die "ait attach rm: ledger decref failed for $hash (nothing committed)"
+    "$(require_python)" "$SCRIPT_DIR/lib/frontmatter_patch.py" remove "$task_file" attachments \
+        --match-key hash --match-val "$hash" \
+        || die "ait attach rm: could not remove the attachments entry from $task_file (nothing committed)"
+    if ! _attach_commit "ait: Detach attachment from t${task_id}" "$meta_rel" "$task_file"; then
+        txn_abort "ait attach rm: commit failed — rolled back"
+    fi
+    txn_end
+    success "Removed attachment '${ref}' from t${task_id}"
+}
+
+# ── Verb: decref-deleted (internal — board hard-delete, t1093) ────────────────
+# Release attachment refs for one or more tasks being HARD-DELETED. Unlike `rm`
+# it does NOT patch task frontmatter (the whole file is being removed). It
+# self-commits its decref path-limited (so it is decoupled from the board's own
+# delete commit) and rolls back on commit failure, mirroring `_attach_rm_txn`.
+#
+# Usage: ait attach decref-deleted [--protect-task <id>]... <doomed-id> [<doomed-id>...]
+#
+# `--protect-task <id>` names a task that SURVIVES the delete but shares
+# attachments with a doomed task (the unfold-on-delete case: fold merged a
+# folded task's attachments into the primary and rebound their refs to it; the
+# board revives the folded task on delete). Any doomed-task hash that a protected
+# task still lists in its frontmatter — AND that the doomed task currently
+# references in the ledger — is REBOUND to the protected task(s): incref each
+# survivor, then decref the doomed id, so the ref moves to the revived owner
+# instead of being orphaned onto the deleted primary (t1096, the proper
+# rebind-on-unfold that replaced t1093's conservative skip guard). A protected id
+# that cannot be resolved is FATAL (it is the intended new owner — fail-closed).
+#
+# ARTIFACT GUARD (t1076_2): a doomed task that still lists `artifacts:` entries
+# makes the whole call die (fail-closed — the board aborts the delete) unless
+# every such handle is also listed by a protected (revived) task. Full artifact
+# manifest cleanup on hard-delete is t1135.
+cmd_decref_deleted() {
+    local protect_ids=() args=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --protect-task) [[ -n "${2:-}" ]] || die "ait attach decref-deleted: --protect-task needs a value"
+                            protect_ids+=( "${2#t}" ); shift 2 ;;
+            --) shift ;;
+            *)  args+=( "$1" ); shift ;;
+        esac
+    done
+    [[ ${#args[@]} -ge 1 ]] \
+        || die "Usage: ait attach decref-deleted [--protect-task <id>]... <task-id> [<task-id>...]"
+    with_attach_lock _attach_decref_deleted_txn "${#protect_ids[@]}" \
+        ${protect_ids[@]+"${protect_ids[@]}"} "${args[@]}"
+}
+
+# _attach_decref_guard_meta <hash> -- the per-path half of the transaction
+# boundary for the two verbs that DISCOVER their paths while iterating. Both
+# helpers dedup on their OWN set, so calling this twice for a hash two doomed
+# tasks share is a no-op rather than a false refusal.
+_attach_decref_guard_meta() {
+    local rel; rel="$(attach_meta_relpath "$1")"
+    txn_require_clean "ait attach decref-deleted" "$rel"
+    txn_snap_add "$rel"
+}
+
+_attach_decref_deleted_txn() {
+    local n_protect="$1"; shift
+    txn_begin "ait attach decref-deleted"
+    # Map each folded-origin hash -> the revived (surviving) task id(s) that still
+    # list it, so a doomed ref can be REBOUND to the survivor(s) instead of merely
+    # released (t1096). A hash listed by >1 revived folded task -> ALL become
+    # referrers. Unlike the old guard-set, an unresolvable protected id is FATAL:
+    # under rebind semantics it is the intended NEW OWNER, so silently dropping it
+    # would decref/orphan a primary-owned blob as if no survivor existed
+    # (fail-closed, mirroring the doomed-id treatment below).
+    # Also collect the protected tasks' ARTIFACT handles (t1076_2): a doomed
+    # task's artifact is allowed through the guard below only when a revived
+    # survivor still lists its handle (ownership survives the revive).
+    local -A protect_ids_for_hash=()
+    local -A protect_artifact_handles=()
+    local i pid pf h
+    for (( i=0; i<n_protect; i++ )); do
+        pid="${1#t}"
+        pf="$(resolve_task_file "$pid" 2>/dev/null)" \
+            || die "ait attach decref-deleted: cannot resolve protected (revived) task t${pid}"
+        while IFS= read -r h; do
+            [[ -n "$h" ]] || continue
+            case " ${protect_ids_for_hash[$h]:-} " in
+                *" $pid "*) : ;;                                   # de-dup pid per hash
+                *) protect_ids_for_hash["$h"]="${protect_ids_for_hash[$h]:+${protect_ids_for_hash[$h]} }$pid" ;;
+            esac
+        done < <(attach_task_hashes "$pf")
+        while IFS= read -r h; do
+            [[ "$h" == handle=* ]] && protect_artifact_handles["${h#handle=}"]=1
+        done < <(read_yaml_mappings "$pf" artifacts 2>/dev/null | grep '^handle=' || true)
+        shift
+    done
+
+    local now; now="$(date +%s)"
+    local -A seen_relpath=()
+    local stage=() task_id task_file hash rel survivors sid ah cur_refs
+    for task_id in "$@"; do
+        task_id="${task_id#t}"
+        # Doomed ids are derived from files the caller is about to delete, so an
+        # unresolved id means we could not inspect attachments before deletion ->
+        # FATAL (fail-closed: the board aborts the delete rather than leak). t1093
+        task_file="$(resolve_task_file "$task_id" 2>/dev/null)" \
+            || die "ait attach decref-deleted: cannot resolve doomed task t${task_id}"
+        # Artifact guard (t1076_2, fail-closed): a hard-deleted task must not
+        # leave its artifact manifests behind with no owning frontmatter entry
+        # (they would block gc with no visible task association). Allow only a
+        # handle a --protect-task (revived folded survivor) file also lists —
+        # ownership survives the revive. Full manifest cleanup / orphan reaping
+        # on hard-delete is t1135; until then the board aborts the delete and
+        # the user removes artifacts first.
+        while IFS= read -r ah; do
+            [[ "$ah" == handle=* ]] || continue
+            ah="${ah#handle=}"
+            [[ -n "${protect_artifact_handles[$ah]:-}" ]] \
+                || die "ait attach decref-deleted: t${task_id} still has artifact ${ah} — remove it first (ait artifact rm ${task_id} ${ah}); manifest cleanup on hard-delete lands with t1135"
+        done < <(read_yaml_mappings "$task_file" artifacts 2>/dev/null | grep '^handle=' || true)
+        while IFS= read -r hash; do
+            [[ -n "$hash" ]] || continue
+            survivors="${protect_ids_for_hash[$hash]:-}"
+            # REBIND only a ledger ref the doomed task ACTUALLY holds (t1096): a
+            # blind incref on a drifted / already-rebound state would resurrect an
+            # orphan (incref clears orphaned_at) or grant unearned ownership. Confirm
+            # the doomed id is a current referent before moving it to the survivor(s).
+            # Hoisted out of the `if` on purpose: as a pipeline its failure was
+            # indistinguishable from "no match", silently taking the elif branch
+            # and orphaning the ref instead of rebinding it (t1675).
+            cur_refs="$(attach_meta refs "$hash")" \
+                || die "ait attach decref-deleted: could not read refs for $hash (nothing committed)"
+            if [[ -n "$survivors" ]] && printf '%s\n' "$cur_refs" | grep -qxF "$task_id"; then
+                _attach_decref_guard_meta "$hash"
+                # incref survivors FIRST so refs never transiently empties -> decref
+                # cannot stamp a spurious orphaned_at.
+                for sid in $survivors; do
+                    attach_meta incref "$hash" "$sid" \
+                        || die "ait attach decref-deleted: rebind incref failed for $hash -> t${sid}"
+                done
+                attach_meta decref "$hash" "$task_id" "now=$now" \
+                    || die "ait attach decref-deleted: rebind decref failed for $hash (t${task_id})"
+                printf 'REBOUND:%s:%s:%s\n' "$task_id" "$hash" "${survivors// /,}"
+            elif [[ -n "$survivors" ]]; then
+                # Survivor lists it, but the doomed id no longer references it in the
+                # ledger -> nothing to move (already rebound / never owned). No incref,
+                # no staging (bytes unchanged).
+                printf 'REBIND_NOOP:%s:%s\n' "$task_id" "$hash"
+                continue
+            else
+                _attach_decref_guard_meta "$hash"
+                # decref PER (task_id, hash): a blob shared by two doomed tasks must
+                # lose BOTH refs. `now=` drives the orphaned_at stamp (cf _attach_rm_txn).
+                attach_meta decref "$hash" "$task_id" "now=$now" \
+                    || die "ait attach decref-deleted: decref failed for $hash (t${task_id})"
+                printf 'DECREFED:%s:%s\n' "$task_id" "$hash"
+            fi
+            rel="$(attach_meta_relpath "$hash")"
+            if [[ -z "${seen_relpath[$rel]:-}" ]]; then
+                seen_relpath["$rel"]=1
+                stage+=( "$rel" )            # dedup the STAGING list, not the ops
+            fi
+        done < <(attach_task_hashes "$task_file")
+    done
+
+    if (( ${#stage[@]} > 0 )); then
+        task_git add -- "${stage[@]}" >/dev/null 2>&1 \
+            || die "ait attach decref-deleted: failed to stage meta files"
+        # No-op guard: an idempotent re-run (after a partial failure) rewrites
+        # identical bytes -> an empty commit would fail; only commit if changed.
+        if ! task_git diff --cached --quiet -- "${stage[@]}" 2>/dev/null; then
+            if ! _attach_commit "ait: Release/rebind attachments of deleted task(s): $*" "${stage[@]}"; then
+                txn_abort "ait attach decref-deleted: commit failed — rolled back"
+            fi
+        fi
+    fi
+    txn_end
+    printf 'STAGED:%s\n' "${#stage[@]}"
+}
+
+# ── Verb: gc ─────────────────────────────────────────────────────────────────
+
+# _attach_gc_grace -- grace duration string from project_config.yaml
+# (attachments_gc_grace, default 30d). The window after a blob becomes FULLY
+# orphaned (no active OR archived task references it) before gc may reclaim it.
+_attach_gc_grace() {
+    local cfg="aitasks/metadata/project_config.yaml" v=""
+    if [[ -f "$cfg" ]]; then
+        v="$(read_yaml_field "$cfg" attachments_gc_grace 2>/dev/null || true)"
+        v="${v//\"/}"; v="${v//\'/}"; v="$(printf '%s' "$v" | tr -d '[:space:]')"
+    fi
+    [[ -n "$v" ]] || v="30d"
+    printf '%s' "$v"
+}
+
+# _attach_gc_blocking_hashes -- print every hash referenced by a task OR by any
+# artifact-manifest version, i.e. the blobs that must be KEPT: all active tasks
+# AND all archived tasks (archived references are real — browsable history, D4),
+# EXCLUDING Folded tasks (pending-deletion; their refs were rebound to the
+# primary), PLUS every version hash in every artifact manifest (t1076_1, design
+# §9 — version-aware: an old version's blob must survive until that version is
+# itself pruned). This is the belt-and-suspenders cross-check against ledger
+# drift before any delete.
+#
+# A manifest-blocked orphan keeps its zero-ref meta file indefinitely — the
+# block lifts when t1076_2's version pruning removes the manifest reference
+# (intentional, not a leak). If any manifest is malformed, referenced-hashes
+# dies naming the bad file and gc aborts BEFORE sweeping anything (fail-closed:
+# never sweep with an unreadable blocking set).
+_attach_gc_blocking_hashes() {
+    shopt -s nullglob
+    local files=( "$TASK_DIR"/t*.md "$TASK_DIR"/t*/t*.md \
+                  "$ARCHIVED_DIR"/t*.md "$ARCHIVED_DIR"/t*/t*.md )
+    shopt -u nullglob
+    local f st
+    for f in "${files[@]}"; do
+        [[ -f "$f" ]] || continue
+        st="$(read_task_status "$f" 2>/dev/null || true)"
+        [[ "$st" == "Folded" ]] && continue
+        attach_task_hashes "$f"
+    done
+    artifact_manifest referenced-hashes
+}
+
+cmd_gc() {
+    [[ $# -eq 0 ]] || die "Usage: ait attach gc"
+    with_attach_lock _attach_gc_txn
+}
+
+# _attach_gc_txn -- the orphan sweep (runs under the global attach lock).
+# _attach_gc_rollback_blobs -- the BLOB half of gc's rollback. gc is the
+# DESTRUCTIVE verb: it DELETES blobs, so its hook puts them back from HEAD (they
+# are content-addressed and committed, so HEAD is their correct source; the meta
+# JSONs beside them are restored by the snapshot instead, because those can
+# carry a pre-existing dirty edit).
+#
+# A failure here means a blob this transaction deleted is GONE, so it is
+# recorded, not swallowed — before t1698 that was announced as a clean rollback.
+_ATTACH_TXN_GC_BLOBS=()
+_attach_gc_rollback_blobs() {
+    (( ${#_ATTACH_TXN_GC_BLOBS[@]} )) || return 0
+    task_git reset -q -- "${_ATTACH_TXN_GC_BLOBS[@]}" >/dev/null 2>&1 \
+        || txn_rollback_failed "index: ${_ATTACH_TXN_GC_BLOBS[*]} (still staged)"
+    local b
+    for b in "${_ATTACH_TXN_GC_BLOBS[@]}"; do
+        task_git checkout -- "$b" >/dev/null 2>&1 \
+            || txn_rollback_failed "blob $b — deleted by this sweep and NOT restored; recover it with 'git checkout HEAD -- $b'"
+    done
+}
+
+_attach_gc_txn() {
+    txn_begin "ait attach gc"
+    _ATTACH_TXN_GC_BLOBS=()
+    txn_on_rollback _attach_gc_rollback_blobs
+    local grace_sec now
+    grace_sec="$(parse_duration_to_seconds "$(_attach_gc_grace)")"
+    now="$(date +%s)"
+
+    # Blocking set: hashes any non-Folded active/archived task still references,
+    # UNION every artifact-manifest version (t1076_1). The explicit `|| die` is
+    # LOAD-BEARING: this function runs with errexit suppressed (with_attach_lock
+    # invokes it via `"$@" || rc=$?`), so without it a malformed manifest dying
+    # inside referenced-hashes would leave a PARTIAL blocking set and the sweep
+    # would continue — deleting blobs that are still referenced. Fail closed:
+    # never sweep with an unreadable blocking set (the inner error names the
+    # offending manifest file).
+    local blocking
+    blocking="$(_attach_gc_blocking_hashes)" || \
+        die "ait attach gc: could not compute the blocking set (see error above) — sweep aborted, no blobs deleted"
+
+    # Hoisted out of the process substitution: its status is unobservable there,
+    # so a failed read yielded an EMPTY list -> the loop became a no-op -> gc
+    # reported `swept 0` and exited 0 for a sweep that never ran (t1675).
+    local zero_refs
+    zero_refs="$(attach_meta zero-refcount)" \
+        || die "ait attach gc: could not list zero-refcount blobs — sweep aborted, no blobs deleted"
+
+    local swept=0 retained=0
+    local -a del_paths=()
+    local h refs orphaned_at meta_file
+    while IFS= read -r h; do
+        [[ -n "$h" ]] || continue
+        # Re-confirm zero refs under the held lock (zero-refcount is advisory).
+        # `|| die` is load-bearing: an unchecked failure yields "", which reads as
+        # "no refs" and moves a still-referenced blob one gate closer to deletion.
+        refs="$(attach_meta refs "$h")" \
+            || die "ait attach gc: could not read refs for $h — sweep aborted"
+        if [[ -n "$refs" ]]; then retained=$((retained + 1)); continue; fi
+        # Belt-and-suspenders: a live/archived task still lists it -> keep.
+        if printf '%s\n' "$blocking" | grep -qxF "$h"; then
+            retained=$((retained + 1)); continue
+        fi
+        # Grace window: skip orphans more recent than the grace period. A missing
+        # orphaned_at (pre-feature orphan) is treated as eligible (age = inf).
+        # The DESTRUCTIVE one. Unlike the refs read above there is no second gate
+        # after this: an unchecked failure yields "", which is read as "age =
+        # infinite" -> eligible -> the blob is deleted inside its grace window.
+        orphaned_at="$(attach_meta orphaned-at "$h")" \
+            || die "ait attach gc: could not read orphaned-at for $h — sweep aborted, no blobs deleted"
+        if [[ -n "$orphaned_at" ]] && (( now - orphaned_at < grace_sec )); then
+            retained=$((retained + 1)); continue
+        fi
+        # Reclaim: delete blob + meta (v1 is local-only; add rejects other
+        # backends, so every stored blob is local).
+        #
+        # The transaction boundary goes HERE, immediately before this blob's
+        # first mutation — gc discovers its paths while iterating, so it cannot
+        # check at entry. It therefore covers the SWEPT set, not the CANDIDATE
+        # set: a blob retained by the refs / blocking / grace gates above
+        # `continue`d already and is never staged, so a dirty meta JSON on a
+        # retained candidate must not refuse a valid sweep.
+        local blob_rel meta_rel
+        blob_rel="$(artifact_local_blob_relpath "$h")"
+        meta_rel="$(attach_meta_relpath "$h")"
+        txn_require_clean "ait attach gc" "$meta_rel"
+        txn_snap_add "$meta_rel"
+        _ATTACH_TXN_GC_BLOBS+=( "$blob_rel" )
+        export ARTIFACT_BACKEND="local"
+        artifact_backend_delete "$h" \
+            || die "ait attach gc: could not delete the blob for $h — sweep aborted"
+        meta_file="$(attach_meta_dir)/$(artifact_shard_path "$h").json"
+        # Checked for the same reason as the manifest delete in
+        # _artifact_rm_txn: errexit is suppressed, so an unchecked failure would
+        # commit the blob DELETION beside a meta file that is still present —
+        # a zero-ref ledger entry pointing at a blob that no longer exists,
+        # reported as a clean sweep.
+        rm -f "$meta_file" \
+            || die "ait attach gc: could not delete the ledger meta file for $h — sweep aborted"
+        del_paths+=( "$blob_rel" "$meta_rel" )
+        swept=$((swept + 1))
+    done <<< "$zero_refs"
+
+    if (( swept > 0 )); then
+        if ! _attach_commit "ait: GC ${swept} orphaned attachment(s)" "${del_paths[@]}"; then
+            # Restore the just-deleted tracked files so a failed commit leaves no
+            # deleted-on-disk-but-uncommitted split-brain: the meta JSONs from
+            # the snapshot (pre-transaction bytes, so a dirty one is not
+            # clobbered), the blobs from HEAD via the registered hook.
+            txn_abort "ait attach gc: commit failed — restored ${swept} blob(s); no changes made"
+        fi
+    fi
+    txn_end
+    success "gc: swept ${swept} orphaned attachment(s), retained ${retained} referenced/in-grace blob(s)"
+}
+
+cmd_stub() { die "ait attach $1: $NOT_YET"; }
+
+main() {
+    local verb="${1:-}"
+    case "$verb" in
+        ""|--help|-h|help) show_help ;;
+        ls|list)   shift; cmd_list "$@" ;;
+        add)       shift; cmd_add "$@" ;;
+        get)       shift; cmd_get "$@" ;;
+        rm|remove) shift; cmd_remove "$@" ;;
+        move)      cmd_stub move ;;
+        gc)        shift; cmd_gc "$@" ;;
+        decref-deleted) shift; cmd_decref_deleted "$@" ;;
+        *)         die "Unknown verb: $verb (try 'ait attach help')" ;;
+    esac
+}
+
+main "$@"

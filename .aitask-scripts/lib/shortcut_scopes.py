@@ -1,0 +1,244 @@
+"""Global shortcut-scope manifest + registration sweep.
+
+The in-TUI `?` editor only needs the *running* TUI's scopes, so each App
+registers its own bindings lazily when constructed (``ShortcutsMixin.__init__``).
+The Settings → Shortcuts tab is different: it lists **every** TUI's bindings in a
+process where only ``SettingsApp`` is ever instantiated. Without a deliberate
+sweep, ``keybinding_registry._DEFAULTS`` would hold only ``settings`` + ``shared``.
+
+``register_all_known_bindings()`` closes that gap: it imports each TUI module
+listed in ``KNOWN_BINDING_SOURCES`` (by file path, so there are no ``sys.path``
+name collisions) and registers every ``ShortcutsMixin`` class's bindings
+**without instantiating** any App/Screen. Importing a module also triggers any
+class-body / module-level registrations (e.g. ``brainstorm.dag`` and the
+``shared`` TUI-switcher binding).
+
+Maintenance: a *new dialog inside an existing TUI module* is picked up
+automatically (the sweep introspects the module's classes). Only a **brand-new
+TUI module file** must be added to ``KNOWN_BINDING_SOURCES`` below — and
+``tests/test_shortcut_scopes.py`` fails until it is. See the
+"Shortcut-scope registration" rule in ``aidocs/framework/tui_conventions.md``.
+
+This lives in its own module (not ``keybinding_registry``) on purpose: the TUI
+modules import ``keybinding_registry``, so the registry must not import them. The
+sweep is invoked lazily at runtime, by which point every module is importable.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import inspect
+import sys
+from pathlib import Path
+
+import keybinding_registry
+
+# `.aitask-scripts/lib/` (this file lives here) and its parent.
+_LIB_DIR = Path(__file__).resolve().parent
+_SCRIPTS_DIR = _LIB_DIR.parent
+
+# Module files that contribute shortcut scopes. Each entry is
+# ``(module_name, path_relative_to_.aitask-scripts, scopes)`` where ``scopes``
+# lists every scope that module contributes — used by ``register_scope_bindings``
+# to load only the modules relevant to a given TUI. `settings` is omitted —
+# `SettingsApp` self-registers as the running app. Importing a module covers any
+# class-body / module-level registration; the sweep additionally introspects the
+# module's own `ShortcutsMixin` classes (see `register_all_known_bindings`).
+KNOWN_BINDING_SOURCES: list[tuple[str, str, tuple[str, ...]]] = [
+    ("aitask_board", "board/aitask_board.py", ("board",)),
+    ("board_detail_screen", "board/board_detail_screen.py", ("board.detail",)),  # TaskDetailScreen (t1794_7)
+    ("trails_app", "board/trails_app.py", ("board",)),  # shares the board scope (t1794_6, C10)
+    ("brainstorm_app", "brainstorm/brainstorm_app.py", ("brainstorm", "brainstorm.compare_select")),
+    ("brainstorm_dag_display", "brainstorm/brainstorm_dag_display.py", ("brainstorm.dag",)),  # class-body
+    ("codebrowser_app", "codebrowser/codebrowser_app.py", ("codebrowser", "codebrowser.copypath")),
+    ("applink_app", "applink/applink_app.py", ("applink", "applink.pairing", "applink.status")),
+    ("chatlink_app", "chatlink/chatlink_app.py", ("chatlink",)),
+    ("monitor_app", "monitor/monitor_app.py", ("monitor",)),
+    ("minimonitor_app", "monitor/minimonitor_app.py", ("minimonitor",)),
+    ("syncer_app", "syncer/syncer_app.py", ("syncer",)),
+    ("diffviewer_app", "diffviewer/diffviewer_app.py", ("diffviewer",)),
+    ("frozenagent_app", "frozenagent/frozenagent_app.py", ("frozenagent",)),
+    ("scratchpad_app", "scratchpad/scratchpad_app.py", ("scratchpad",)),
+    ("stats_app", "stats/stats_app.py", ("stats",)),
+    ("sitrep_tui_app", "sitrep_tui/sitrep_tui_app.py",
+     ("sitrep_tui", "sitrep_tui.detail", "sitrep_tui.viewer", "sitrep_tui.qa",
+      "sitrep_tui.qa_entry")),  # t2211_1
+    # Shared, cross-TUI dialogs (reused by several Apps) — their scopes live
+    # under "shared.*" so every TUI's `?` editor surfaces them.
+    ("agent_command_screen", "lib/agent_command_screen.py", ("shared.agent_cmd",)),
+    ("stale_entry_modal", "lib/stale_entry_modal.py", ("shared.stale_entry",)),
+    ("tui_switcher", "lib/tui_switcher.py", ("shared", "shared.tui_switcher")),  # module- + class-body register
+]
+
+# Manifest modules are executed under this prefix instead of their canonical
+# name, so a sweep never rebinds `sys.modules[<canonical>]`. See
+# `_load_and_register` for why that matters (t1211).
+_PROBE_PREFIX = "_shortcut_scopes_probe_"
+
+
+def _ensure_import_paths() -> None:
+    """Put the dirs each TUI module imports its siblings from on ``sys.path``.
+
+    Always includes lib + the `.aitask-scripts` root (the latter for
+    namespace-package imports like ``brainstorm.brainstorm_dag``). Every
+    manifest module's own directory is added too, so a module importing a
+    sibling by bare name (e.g. ``codebrowser_app`` → ``history_data`` in
+    ``codebrowser/``) resolves.
+
+    Basenames DO collide across these dirs: ``applink/`` and ``chatlink/`` both
+    ship ``paths.py`` and ``audit.py``. That is safe only because chatlink
+    imports its own modules package-qualified (``chatlink.paths``), so it never
+    binds the bare ``sys.modules["paths"]`` / ``["audit"]``, and ``applink_app``
+    inserts its own directory at ``sys.path[0]`` before its flat
+    ``from paths import ...``. ``tests/test_board_package_contract.py`` pins the
+    collision set (``KNOWN_COLLISIONS``) so it cannot grow unnoticed.
+    """
+    dirs = {_LIB_DIR, _SCRIPTS_DIR}
+    for _module_name, rel_path, _scopes in KNOWN_BINDING_SOURCES:
+        dirs.add((_SCRIPTS_DIR / rel_path).parent)
+    for d in dirs:
+        s = str(d)
+        if s not in sys.path:
+            sys.path.insert(0, s)
+
+
+def _load_and_register(module_name: str, rel_path: str, failed: list[str]) -> None:
+    """Import one manifest module by path and register its bindings.
+
+    Loads the module via ``spec_from_file_location`` (so there are no
+    ``sys.path`` name collisions) and registers the bindings of every
+    ``ShortcutsMixin`` class defined in it — **without instantiating** any
+    App/Screen. Class-body / module-level registrations (e.g. ``brainstorm.dag``,
+    the ``shared`` TUI-switcher binding) fire during the import itself. Fail-soft:
+    a module that cannot be imported is appended to ``failed`` and logged, never
+    raising. ``register_app_bindings`` is idempotent, so repeat calls are safe.
+
+    **The module body is re-executed on every sweep, under a private probe name**
+    (``_shortcut_scopes_probe_<module_name>``). Both halves of that are
+    load-bearing (t1211):
+
+    * *Re-exec, not reuse.* ``keybinding_registry`` can be reset between sweeps
+      (``_reset_for_tests``), and module-level / class-body registrations only
+      re-fire on a fresh exec — reusing an already-imported module silently
+      loses ``shared.tui_switcher`` and ``brainstorm.dag``.
+    * *Probe name, not the canonical one.* Executing under ``module_name`` would
+      rebind ``sys.modules[module_name]`` to a fresh module object, giving its
+      classes a **second identity**: anything holding the pre-sweep class (a live
+      TUI screen, a test module's top-level import) then fails ``isinstance``
+      against the post-sweep one. The ``?`` shortcut editor sweeps inside running
+      TUIs, so this is a live-process concern, not just a test artifact.
+
+    Same sandboxing idiom as ``_load_board_module`` in
+    ``tests/test_board_archived_relation_lookup.py``. The probe entry is left in
+    ``sys.modules`` (popping it risks breaking later lazy ``__module__``
+    resolution); its key is fixed, so repeat sweeps overwrite it rather than
+    accumulating copies.
+    """
+    path = _SCRIPTS_DIR / rel_path
+    probe_name = _PROBE_PREFIX + module_name
+    try:
+        spec = importlib.util.spec_from_file_location(probe_name, path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"no loader for {path}")
+        module = importlib.util.module_from_spec(spec)
+        # Register in sys.modules BEFORE exec_module. Under Python 3.14, a
+        # `@dataclass` whose fields use string annotations (these modules carry
+        # `from __future__ import annotations`) is processed by
+        # dataclasses._is_type, which resolves the owning module via
+        # `sys.modules.get(cls.__module__).__dict__`. Without this entry the
+        # lookup returns None and the import dies with
+        # "AttributeError: 'NoneType' object has no attribute '__dict__'".
+        # Probe names are unique, so there is no collision; popped on failure
+        # so a half-initialized module is never left registered.
+        sys.modules[probe_name] = module
+        spec.loader.exec_module(module)
+    except Exception as exc:  # noqa: BLE001 — degrade gracefully
+        sys.modules.pop(probe_name, None)
+        # Report the CANONICAL name — that is the manifest/caller-facing
+        # identifier (the drift guard names it back to the user).
+        failed.append(module_name)
+        sys.stderr.write(
+            f"shortcut_scopes: could not load {module_name} "
+            f"({path}): {type(exc).__name__}: {exc}\n"
+        )
+        return
+
+    # Register the bindings of every ShortcutsMixin class DEFINED in this
+    # module (filter on __module__ — the probe name, since that is what the
+    # module was executed as — so imported base classes are ignored).
+    # Classes that register at class body (no _shortcuts_scope attr, e.g.
+    # brainstorm.dag) are already handled by the exec_module above and are
+    # skipped here by the truthy-_shortcuts_scope guard.
+    for _name, cls in inspect.getmembers(module, inspect.isclass):
+        if getattr(cls, "__module__", None) != probe_name:
+            continue
+        scope = getattr(cls, "_shortcuts_scope", "")
+        bindings = getattr(cls, "BINDINGS", None)
+        if scope and bindings:
+            keybinding_registry.register_app_bindings(scope, list(bindings))
+
+
+def register_all_known_bindings() -> list[str]:
+    """Import every known TUI module and register its bindings (no instantiation).
+
+    Idempotent (``register_app_bindings`` overwrites the same ``_DEFAULTS``
+    entries) and fail-soft: a module that cannot be imported is logged to stderr
+    and skipped, never breaking the caller (e.g. the Settings tab).
+
+    Returns the list of module names that failed to import (empty on full
+    success) — useful for tests/diagnostics.
+    """
+    _ensure_import_paths()
+    failed: list[str] = []
+    for module_name, rel_path, _scopes in KNOWN_BINDING_SOURCES:
+        _load_and_register(module_name, rel_path, failed)
+    return failed
+
+
+def _scope_relevant(scopes: tuple[str, ...], prefix: str) -> bool:
+    """True if any of ``scopes`` is ``prefix``, a ``prefix.*`` sub-scope, or a
+    global ``shared`` / ``shared.*`` scope.
+
+    Mirrors the filter in ``keybinding_registry.iter_scope_bindings`` so the
+    editor's filtered sweep loads exactly the modules whose scopes the editor
+    will display.
+    """
+    for s in scopes:
+        if (
+            s == prefix
+            or s.startswith(prefix + ".")
+            or s == "shared"
+            or s.startswith("shared.")
+        ):
+            return True
+    return False
+
+
+def register_scope_bindings(scope: str, *,
+                            exclude_modules: tuple[str, ...] = ()) -> list[str]:
+    """Register only the binding sources relevant to ``scope`` (no instantiation).
+
+    The filtered counterpart to :func:`register_all_known_bindings`, for the
+    in-TUI ``?`` shortcut editor: it needs the active TUI's own scope, its modal
+    sub-scopes (``scope.*``), and the global ``shared`` / ``shared.*`` scopes —
+    but NOT every other TUI. Loading only the relevant manifest modules keeps
+    pressing ``?`` in one TUI from importing every other TUI.
+
+    ``exclude_modules`` names manifest modules to leave unloaded even though
+    they contribute to ``scope``. Two modules may share a scope (t1794_6: the
+    stand-alone trails app registers under ``board``), and the lighter one
+    must not have ``?`` execute the heavier one — the whole board — just to
+    list rows it never dispatches. The excluded module's rows are simply not
+    registered from here; an App that DOES dispatch them loads it itself.
+
+    Idempotent and fail-soft (see :func:`_load_and_register`). Returns the list
+    of module names that failed to import.
+    """
+    _ensure_import_paths()
+    failed: list[str] = []
+    for module_name, rel_path, scopes in KNOWN_BINDING_SOURCES:
+        if module_name in exclude_modules:
+            continue
+        if _scope_relevant(scopes, scope):
+            _load_and_register(module_name, rel_path, failed)
+    return failed

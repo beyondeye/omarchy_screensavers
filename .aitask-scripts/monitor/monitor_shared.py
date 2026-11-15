@@ -1,0 +1,6184 @@
+"""monitor_shared - Shared widgets and utilities for monitor TUIs.
+
+Provides reusable components used by both the full monitor (monitor_app.py)
+and the mini monitor. Extracted to avoid code duplication.
+"""
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import os
+import shlex
+import re
+import sys
+import tempfile
+import time
+import uuid
+from pathlib import Path
+
+# Set up import paths before any local imports
+_SCRIPT_DIR = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_SCRIPT_DIR))
+sys.path.insert(0, str(_SCRIPT_DIR / "lib"))
+
+import agent_marks  # noqa: E402
+# The session store (t1705_7): `SessionsView` for reading a frozen
+# record, and the shared drop outcome interpreter. READ side
+# only — every write goes through `_SESSIONS_SH` / `_FROZEN_SH`.
+import agent_sessions  # noqa: E402
+# The ONE authority for follow-up glyphs and colours (t1468_1), shared with the
+# board's card marker — imported, never mirrored (t1468_5).
+from followup_kinds import marker_for  # noqa: E402
+# The ONE authority for the multi-select mark glyph and its colours (t1638),
+# shared with the board and both brainstorm views — imported, never mirrored.
+from mark_glyphs import mark_markup  # noqa: E402
+
+# `PaneSnapshot` + the task-context symbols moved to monitor_core (t822_6);
+# re-exported here so `from monitor.monitor_shared import TaskInfo, …` keeps
+# working for monitor_app / minimonitor_app / tests.
+# The advisory phase seam (t1420) — re-exported so both TUIs reach it the same
+# way they reach the caches, without each re-deriving lib/ on sys.path.
+from monitor.monitor_core import workflow_phase  # noqa: E402,F401
+
+from monitor.monitor_core import (  # noqa: E402,F401
+    BlockAge,
+    FROZEN_OPTION,
+    PaneCategory,
+    PaneSnapshot,
+    _TASK_ID_RE,
+    GateSummaryCache,
+    TaskInfo,
+    TaskInfoCache,
+    combine_staleness,
+    CAPTURE_PIN_ALL,
+    client_view_snapshots,
+    parked_capture_skip,
+    # Moved to monitor_core (t2037_1) so the headless status server shares it.
+    is_task_completed,
+)
+# The subscription-backed `TmuxMonitor` stand-in both TUIs read through
+# (t2037_3). Imported by its package path so `isinstance` checks here, in the
+# apps and in the tests all see ONE class object.
+from monitor.status_client import ClientMode, MonitorClient  # noqa: E402
+
+
+def build_monitor_client(local, *, kind: str, own_pane, session: str,
+                         project_root, pins, enabled=None, log=None) -> MonitorClient:
+    """Wrap an app's own ``TmuxMonitor`` in a :class:`MonitorClient` (t2037_3).
+
+    ``local`` is built exactly as the app always built it: it is the in-process
+    producer in fallback and the action gateway in server mode.
+
+    ``enabled`` — ``None`` follows ``AITASKS_MONITOR_SERVER`` (``0`` opts out);
+    ``False`` keeps this instance permanently in-process, never touching the
+    server (the apps pass it for an explicit ``--interval`` / ``--lines``, which
+    the shared server, applying each project's ``project_config.yaml``, cannot
+    honour). The single construction seam: tests patch this, not the client.
+    """
+    return MonitorClient(
+        local, kind=kind, own_pane=own_pane, session=session or "",
+        project_root=project_root, pins=pins, enabled=enabled, log=log,
+    )
+
+from typing import TYPE_CHECKING, NamedTuple, Sequence
+
+from textual.binding import Binding  # noqa: E402
+from textual.containers import Container, VerticalScroll  # noqa: E402
+from textual.screen import ModalScreen  # noqa: E402
+from textual.widgets import (  # noqa: E402
+    Button, Checkbox, Input, Label, Markdown, Static, TextArea,
+)
+from textual.app import ComposeResult  # noqa: E402
+from textual.content import Content  # noqa: E402
+from rich.text import Text  # noqa: E402
+from rich.markup import escape  # noqa: E402
+# Both names live in `rich.color` — `rich.errors` does NOT export ColorParseError,
+# and this import sits at module scope, so getting it wrong takes down every
+# monitor TUI at startup rather than just the column picker (t1377_2).
+from rich.color import Color, ColorParseError  # noqa: E402
+# Terminal-cell measurement. EVERY width budget in the concern row is denominated
+# in cells and measured with these — never `len()` (a CJK region is 12 chars and
+# 18 cells) and never on a markup string (the `HIGH`+`\u2260` prefix is 42 raw and
+# 9 rendered). See `_Seg` below, which makes that a type rather than a habit.
+from rich.cells import cell_len, set_cell_size  # noqa: E402
+
+try:
+    from monitor.concern_parser import (
+        build_clipboard_payload, concern_marker_line, has_impact_vector,
+        needs_addressing,
+    )
+except ImportError:  # imported flat (tests may put MONITOR_DIR on sys.path)
+    from concern_parser import (  # noqa: E402
+        build_clipboard_payload, concern_marker_line, has_impact_vector,
+        needs_addressing,
+    )
+
+try:
+    from monitor.concern_dimensions import (
+        CONCERN_DIMENSIONS, derive_priority, label_for,
+    )
+except ImportError:  # imported flat, as above
+    from concern_dimensions import (  # noqa: E402
+        CONCERN_DIMENSIONS, derive_priority, label_for,
+    )
+
+try:
+    from monitor.ansi_utils import strip_ansi
+except ImportError:  # imported flat, as above
+    from ansi_utils import strip_ansi  # noqa: E402
+
+from tui_clipboard import copy_to_system_clipboard  # noqa: E402
+
+if TYPE_CHECKING:  # annotations only (PEP 563 via `from __future__`); no runtime cost
+    from monitor.concern_parser import BlockMeta, Concern
+    from dep_resolution import DepVerdict
+
+
+# Dark background for terminal preview — hard-coded because we're rendering
+# actual tmux terminal content (always dark) regardless of the TUI theme.
+_DARK_BG_ANSI = "\033[48;2;26;26;26m"
+_ANSI_RESET_RE = re.compile(r'\033\[0?m')
+_ANSI_DEFAULT_BG_RE = re.compile(r'\033\[49m')
+
+
+# Idle-detection compare-mode pseudo-icons used in agent cards across both
+# the full monitor and the minimonitor. Single column wide so the compact
+# minimonitor layout stays compact.
+COMPARE_MODE_ICONS = {
+    "stripped": "≈",   # ≈ — fuzzy / ANSI-stripped equality (default)
+    "raw": "=",             # = — strict byte-equal
+}
+
+
+def format_compare_mode_glyph(mode: str, is_override: bool) -> str:
+    glyph = COMPARE_MODE_ICONS.get(mode, "?")
+    color = "yellow" if is_override else "dim"
+    return f"[{color}]{glyph}[/]"
+
+
+# Agent-state markup styles. Named here (t1453) because the DONE style was
+# previously duplicated as a literal across five call sites in three files,
+# which is how one wrong colour name spread unnoticed through both monitors.
+# The two `── … ──` rule styles live further down (SESSION_DIVIDER_STYLE,
+# SECTION_HEADER_STYLE); all five must stay mutually distinct.
+STATE_STYLE_PROMPT = "bold magenta"
+
+#: COMPLETED/DONE. Spelled as a **hex literal, not a colour name**: these markup
+#: spans are parsed by Textual, whose palette is CSS colour names — it does NOT
+#: know Rich's xterm names, and an unknown name fails *silently* rather than
+#: raising. `[bold dodger_blue1]` parsed fine and then painted default
+#: foreground with the `bold` dropped, so DONE never once rendered blue, and no
+#: span-level assertion could see it (the span keeps the unresolved string).
+#: Only a composited-screen check catches that — see
+#: tests/test_markup_colour_contract.py. #1e90ff is CSS `dodgerblue`, the shade
+#: the old name intended; plain CSS `blue` is #000080, far too dark on the
+#: #1a1a1a card.
+STATE_COLOUR_DONE = "#1e90ff"
+STATE_STYLE_DONE = f"bold {STATE_COLOUR_DONE}"
+
+STATE_STYLE_IDLE = "yellow"
+STATE_STYLE_ACTIVE = "green"
+
+
+# Advisory workflow-phase marks (t2128): the minimonitor's phase row leads each
+# phase with its own glyph and paints it in its own colour, so the phase reads
+# at a glance instead of disappearing into the dim gate counts beside it.
+#
+# One (glyph, style) per member of `workflow_phase.PHASES`, keyed off that tuple
+# and pinned to it by a drift guard (tests/test_minimonitor_gate_phase_row.py).
+# Every `unknown (…)` variant is the UNKNOWN phase, so it takes that entry.
+#
+# Glyphs are one fill-level family — the circle fills as the task moves through
+# the workflow, and the dotted one is "cannot tell". Admitted under the
+# `mark_glyphs` codepoint policy by measurement: covered by every family in
+# `mark_glyphs.SUPPORTED_FONTS`, claimed by no emoji font, and East Asian Width
+# Neutral, so each is exactly one cell (evidence: tests/data/font_coverage.json,
+# checked by tests/test_mark_glyphs_single_source.py).
+#
+# PLAN and UNKNOWN stay `dim` — the row's colour before t2128; UNKNOWN is
+# "cannot tell", not a phase, and must not compete with one. POSTIMPL reuses the
+# DONE colour without its bold.
+#
+# IMPLEMENT's green is chosen by WCAG contrast, not taste. It must stay legible
+# on the focused card (`MiniPaneCard:focus` paints `$accent`, #ffa62b orange
+# under the default `textual-dark` theme) as well as on dark and light
+# backgrounds, and must differ from POSTIMPL's blue in luminance, not only hue.
+# Measured: 2.37 on the focus orange (POSTIMPL's blue manages 1.66), 4.05 on
+# #121212, 3.50 on #E0E0E0, 1.43 against #1e90ff. Lighter greens vanish on the
+# orange, darker ones on the dark background.
+PHASE_COLOUR_IMPLEMENT = "#22863a"
+
+PHASE_MARKS: dict[str, tuple[str, str]] = {
+    "PLAN": ("◔", "dim"),
+    "IMPLEMENT": ("◕", PHASE_COLOUR_IMPLEMENT),
+    "POSTIMPL": ("◉", STATE_COLOUR_DONE),
+    workflow_phase.UNKNOWN_PHASE: ("◌", "dim"),
+}
+
+
+def phase_mark(sig) -> tuple[str, str]:
+    """``(glyph, style)`` for a ``workflow_phase.PhaseSignal``.
+
+    Total: a phase outside :data:`PHASE_MARKS` reads as UNKNOWN, the same
+    degradation ``workflow_phase.parse_signal`` applies to a non-member.
+    """
+    return PHASE_MARKS.get(getattr(sig, "phase", None),
+                           PHASE_MARKS[workflow_phase.UNKNOWN_PHASE])
+
+
+def _state_color(snap: PaneSnapshot, completed: bool = False) -> str:
+    """The single definition of the state→color mapping (t1133, t1322):
+    PROMPT (awaiting_input) > COMPLETED > IDLE > active, as
+    :data:`STATE_STYLE_PROMPT` / :data:`STATE_STYLE_DONE` /
+    :data:`STATE_STYLE_IDLE` / :data:`STATE_STYLE_ACTIVE`. Shared by the status
+    badge, the agent dot, and the shadow glyph.
+
+    ``completed`` is an explicit opt-in parameter and is never inferred here:
+    it is a property of the pane's *task*, which a ``PaneSnapshot`` does not
+    carry, and a shadow pane has no task of its own — inferring it would make
+    :func:`format_shadow_glyph` colour shadows by their followed agent's task
+    state. A completed agent parked on a final prompt still reads PROMPT, which
+    is actionable now.
+    """
+    if getattr(snap, "awaiting_input", False):
+        return STATE_STYLE_PROMPT
+    if completed:
+        return STATE_STYLE_DONE
+    if snap.is_idle:
+        return STATE_STYLE_IDLE
+    return STATE_STYLE_ACTIVE
+
+
+def format_state_dot(snap: PaneSnapshot, completed: bool = False) -> str:
+    """The agent row's own status dot ``●``, colored by state (t1133 — was
+    previously duplicated inline in monitor_app / minimonitor_app)."""
+    return f"[{_state_color(snap, completed)}]●[/]"
+
+
+# Shadow-status glyph (t1133): a deliberately different shape from the agent's
+# own ● so the pair "agent state + its shadow's state" reads at a glance.
+SHADOW_GLYPH = "◆"  # ◆
+SHADOW_CONCERN_GLYPH = "!"  # appended to ◆ when the shadow has fresh concerns
+
+
+def format_shadow_glyph(
+    shadow_snap: PaneSnapshot | None, *, has_concerns: bool = False
+) -> str:
+    """Colored ``◆`` for a bound shadow's state, or ``""`` when the agent has
+    no live shadow — callers render nothing (no placeholder), keeping
+    non-shadowed rows byte-identical to the pre-t1133 output.
+
+    No ``completed`` parameter: a shadow is an advisory companion with no task
+    of its own, so it can never be COMPLETED and must never be rendered in the
+    completed colour (t1322). Pinned by a test.
+
+    ``has_concerns`` (t1216_3) appends :data:`SHADOW_CONCERN_GLYPH` for an agent
+    whose shadow has emitted a concern block the user has not been offered yet.
+    Keyword-only and defaulting to ``False`` so every existing call site is
+    unchanged, and applied INSIDE the ``None`` guard so a non-shadowed row stays
+    byte-identical whatever the flag says. It shares the state colour rather
+    than adding a span: one marker, one style run.
+    """
+    if shadow_snap is None:
+        return ""
+    body = SHADOW_GLYPH + (SHADOW_CONCERN_GLYPH if has_concerns else "")
+    return f"[{_state_color(shadow_snap)}]{body}[/]"
+
+
+# Prioritized-agent mark (t1326): the user's own durable annotation, shaped
+# distinctly from ● (live state) and ◆ (shadow state) so the row still reads at
+# a glance. The multi-select mark pair (lib/mark_glyphs.py, ✓/□ since t1638 —
+# ☑/☐ before it) was rejected here: it already means "selected for this action"
+# in ConcernPickerModal further down this module. That separation is the point,
+# so this pair is NOT sourced from mark_glyphs.
+#
+# KNOWN COVERAGE GAP, deliberately deferred (t1638): neither U+2605 nor U+2606
+# is covered by any font in mark_glyphs.SUPPORTED_FONTS, so both resolve by
+# fallback. Unlike ☑ they are not emoji-capable, so they still honour the
+# requested foreground and are NOT broken today — which is why t1638 changed the
+# selection mark and left this one alone. t1639 retires that deferral: under its
+# `nerd` glyph tier this pair moves to U+F005/U+F006 (nf-fa-star / nf-fa-star_o),
+# which are the same shapes, are covered by every supported Nerd Font, and cannot
+# be claimed by an emoji font. The bold-white/dim styling and the distinctness
+# recorded above are preserved — a star is still a star.
+MARK_GLYPH = "★"        # prioritized
+MARK_EMPTY_GLYPH = "☆"  # not prioritized
+
+# Parked (t1685). `P` U+0050 was chosen by MEASUREMENT, not taste: it is the only
+# candidate covered by every family in mark_glyphs.SUPPORTED_FONTS that no emoji
+# font claims, so unlike the star pair above it never falls back at all. The
+# alternatives are recorded in tests/data/font_coverage.json so the rejections
+# stay machine-checked rather than becoming folklore: `⏸` U+23F8 is covered by
+# neither supported font AND is emoji-capable — the exact t1638 invisible-glyph
+# defect — and `■` U+25A0, though covered, collides visually with the state dot
+# `●` two columns away.
+#
+# It is a letter, and that is fine here: it sits in a one-cell column whose only
+# other occupants are ★ and ☆, so there is nothing for it to be confused with.
+PARK_GLYPH = "P"
+
+# Frozen (t1705_7). `F` U+0046 is chosen on the same measured basis as `P`
+# above: a plain ASCII capital, covered by every family in
+# mark_glyphs.SUPPORTED_FONTS and claimed by no emoji font, so it can never fall
+# back — the t1638 defect. Its evidence is in tests/data/font_coverage.json
+# alongside `P`'s and is machine-checked by
+# tests/test_mark_glyphs_single_source.py.
+#
+# It is NOT a mark kind, and must not become one: `format_mark_glyph` is total
+# over the three `agent_marks` kinds and raises on anything else. Frozen
+# COEXISTS with a mark rather than replacing it, so it composes as a second
+# cell — see `format_frozen_prefix`.
+FROZEN_GLYPH = "F"
+
+
+def format_mark_glyph(kind: str) -> str:
+    """Always-on mark column for an agent row: ``☆`` / ``★`` / ``P``.
+
+    ``kind`` is one of ``agent_marks.KIND_NONE`` / ``KIND_PRIORITY`` /
+    ``KIND_PARKED`` — the total answer from ``MarksView.kind_for`` or
+    ``AgentMarksMixin._mark_kind``, never a bool. It **raises** on anything else
+    (see the guard below) rather than falling through to the unmarked glyph.
+
+    Unlike :func:`format_shadow_glyph`, this NEVER returns ``""`` — the column is
+    always-on by explicit decision (the t1004 convention, cf. the board's and
+    brainstorm's ✓/□), so an unmarked agent reads as *deliberately unmarked*
+    rather than as a row that forgot to render one. That costs two columns on
+    every row, which is paid for in the minimonitor by a shorter name budget.
+
+    **Bold white, deliberately NOT the repo-wide marked=bold-yellow convention**
+    (``brainstorm/widgets.py``, ``_ConcernRow.render`` below). Those marks live
+    in pickers, where nothing else on the row is coloured by state. This one
+    sits two columns from the agent's ``●``, and :func:`_state_color` paints
+    that dot **yellow for IDLE** — so a yellow ★ beside a yellow ● would read as
+    one state cluster and invite "is that agent idle, or is it flagged?". White
+    belongs to no state in the ladder (magenta / blue / yellow / green),
+    which is exactly what makes it legible as *user intent* rather than status.
+    ``P`` shares that white for the same reason, and shares nothing else: a
+    parked row renders no state dot at all, so the two can never cluster.
+
+    **The raise is a programming-error guard, not a new way to break a tick.**
+    Every production caller passes a ``_mark_kind()`` / ``kind_for()`` result and
+    both are total over the three values, so it is unreachable from advisory
+    data — it exists to make a *missed call site* fail loudly instead of
+    rendering ``☆`` for a stray ``True``. Do NOT wrap call sites in
+    ``try/except`` to "make it safe": that restores exactly the silent
+    wrong-glyph fallthrough this guard removes.
+    """
+    if kind == agent_marks.KIND_PRIORITY:
+        return f"[bold white]{MARK_GLYPH}[/]"
+    if kind == agent_marks.KIND_PARKED:
+        return f"[bold white]{PARK_GLYPH}[/]"
+    if kind == agent_marks.KIND_NONE:
+        return f"[dim]{MARK_EMPTY_GLYPH}[/]"
+    raise ValueError(f"unknown mark kind: {kind!r}")
+
+
+def format_frozen_prefix(kind: str) -> str:
+    """The two-cell prefix of a frozen agent's row: the mark, then ``F``.
+
+    Frozen COEXISTS with the priority/parked mark rather than replacing it
+    (pinned): `frozen` wins for *behaviour* — exclusion from capture, the
+    hidden-agents filter, and which keys act on the row — while the mark stays
+    visible and `space` still cycles it. Composing both is what keeps those two
+    facts separable on screen.
+
+    ``kind`` goes straight to :func:`format_mark_glyph`, so an unknown kind
+    raises there rather than being papered over here.
+    """
+    return f"{format_mark_glyph(kind)}[bold cyan]{FROZEN_GLYPH}[/]"
+
+
+# Repo/session divider (t1449): in multi-session mode each tmux session is one
+# repo/project, so this rule is the repo boundary in the agent list.
+#
+# Bold cyan, deliberately NOT `dim`: `dim` is what the task-title line under
+# every agent card uses, so a dim divider read as one more task title and the
+# repo grouping vanished. Cyan also belongs to no state in the ladder
+# (magenta / blue / yellow / green) and is not the ★ mark's white,
+# which is what makes it legible as *structure* rather than status.
+SESSION_DIVIDER_STYLE = "bold cyan"
+
+
+def format_session_divider(label: str) -> str:
+    """The ``── <session> ──`` repo-boundary rule, styled once for both TUIs.
+
+    Callers own their own leading indent (the full monitor indents by two
+    columns; minimonitor pads via CSS) but never the style — that is the point
+    of this seam.
+
+    ``label`` is a **tmux session name**, i.e. user-controlled text reaching a
+    markup-enabled renderer, so it is made literal (t1580). Unescaped, a
+    session named ``[/]`` raises ``MarkupError`` and takes the whole pane list
+    down with it, and one named ``[dim]`` is silently swallowed — the same
+    hazard already recorded on :meth:`ColumnPickerModal` below, and the reason
+    the minimonitor's own-panel header (``_own_header_text``) treats the same
+    value alike. :func:`markup_literal`, not ``escape`` (t2017): this markup is
+    parsed by Textual, see that helper. The label is followed by `` ──``, never
+    directly by a tag. Contrast :func:`format_section_header`, whose label is
+    built by the framework and needs none.
+    """
+    return f"[{SESSION_DIVIDER_STYLE}]── {markup_literal(label)} ──[/]"
+
+
+def markup_literal(value: str) -> str:
+    """``value`` as Textual markup that renders verbatim (t2006).
+
+    For user-derived text — window names, task titles, a pane's command —
+    interpolated into a markup string that a Textual widget parses. Textual's
+    parser, not Rich's, is the one that matters here, and the two differ:
+
+    * Textual opens a tag at any ``[`` not preceded by a backslash, un-escapes
+      exactly ``\\[`` → ``[`` in text, and keeps every other backslash literal.
+      So prefixing each ``[`` with a backslash, and touching nothing else, is
+      an exact round trip.
+    * ``rich.markup.escape`` (and ``textual.markup.escape``, its copy) also
+      DOUBLE the backslashes before a bracket — right for Rich, which collapses
+      ``\\\\`` back to one, wrong for Textual, which does not: a window named
+      ``agent-\\[bold]y`` would display with two backslashes.
+
+    One case no string escaping can express: a backslash immediately before a
+    real tag (``[dim]…\\`` + ``[/]``) makes Textual read that tag as literal
+    text. A value that may end in ``\\`` must therefore not sit directly before
+    a tag: end the markup with it (Textual closes open styles at end of input),
+    or build the widget content with ``Content.from_markup(template,
+    **variables)``, whose ``$name`` values are substituted after tokenizing
+    and so are always literal. In such a template EVERY user value must be a
+    variable: substitution runs over all template text, so a ``$title`` inside
+    an interpolated name would be expanded.
+
+    The other two boundaries need no markup at all (t2017): a toast that
+    carries no styling takes ``notify(..., markup=False)``, and a ``Static``
+    whose text has no tags takes ``Content(text)``.
+    """
+    return value.replace("[", "\\[")
+
+
+# Pane-list section header (t1449): the `── other (N) ──` rule that heads the
+# uncategorized section. Same glyph shape as the repo divider above, so it needs
+# its own colour or the two read as one kind of boundary — but a DIFFERENT one,
+# because cyan has to keep meaning "repo boundary" and nothing else.
+#
+# A light violet, free in both agent lists: it is not #1e90ff (DONE) and
+# sits far enough from magenta (PROMPT) to stay separable. Bold lives here
+# rather than in CSS so the whole style is one string.
+#
+# Spelled as a **hex literal, not a colour name**: these markup spans are parsed
+# by Textual, whose palette is CSS colour names — it does NOT know Rich's xterm
+# names. `[bold medium_purple1]` parses without error and then silently paints
+# default-foreground, which no span-level assertion can see (the span keeps the
+# unresolved string). Only a composited-screen check catches it; there is one in
+# tests/test_monitor_session_divider.py for exactly this reason.
+SECTION_HEADER_STYLE = "bold #af87ff"
+
+
+def format_section_header(label: str) -> str:
+    """The ``── other (N) ──`` section rule, styled once.
+
+    Deliberately NOT :data:`SESSION_DIVIDER_STYLE`: a section boundary and a
+    repo boundary are different things, and the shared ``── … ──`` shape is
+    exactly why they must not share a colour.
+
+    Also deliberately **not escaped**, unlike :func:`format_session_divider`
+    directly above (t1580). The asymmetry is the rule, not an oversight: every
+    caller builds this label itself (``f"other ({len(others)})"``), so no
+    user-controlled text reaches it. Escape it here too the moment a caller
+    starts passing something a user can name.
+    """
+    return f"[{SECTION_HEADER_STYLE}]── {label} ──[/]"
+
+
+#: The locked writer. Readers go straight to the JSON (see AgentMarksMixin).
+_MARKS_SH = _SCRIPT_DIR / "aitask_agent_marks.sh"
+
+#: Seconds between materializing purges. The render path filters expired and
+#: dead marks every tick for free; this only bounds the file's growth, so it
+#: does not need to be frequent.
+_MARKS_PURGE_INTERVAL = 600.0
+
+#: Startup deferral for the FIRST purge (t1598). The seed used to be 0.0 — "the
+#: first refresh tick after mount materializes a purge" — which put a subprocess
+#: that can block for a full 10s lock timeout inside the very first
+#: `_refresh_data`, the one tick Textual dispatches on the App's own message
+#: pump, ahead of every queued keypress. The result was a minimonitor that
+#: rendered, highlighted a card, and then ignored input for ~10 seconds.
+#:
+#: Deferred, never deleted. 60s is chosen so it cannot land on a startup tick:
+#: 20 refresh ticks past mount at the 3s cadence, well past the 5s auto-close
+#: mount grace, and above :data:`_MARKS_CMD_TIMEOUT` so even a maximally-stalled
+#: first attempt fits inside the window rather than straddling it. It is 10% of
+#: :data:`_MARKS_PURGE_INTERVAL`, so the store's growth bound is materially
+#: unchanged and a short-lived companion still gets a purge in its first minute.
+_MARKS_PURGE_STARTUP_GRACE = 60.0
+
+#: Hard ceiling on a single wrapper invocation. Above the wrapper's own lock
+#: timeouts (2s toggle / 10s purge) so a contended-but-healthy writer reports
+#: LOCK_BUSY itself rather than being killed mid-write.
+_MARKS_CMD_TIMEOUT = 20.0
+
+#: The frozen-agent engines' shell face (t1705_7): freeze / reconcile from a
+#: TUI. `restore` and `drop` are NOT dispatched through here — they replace or
+#: kill the pane a TUI keybinding runs in, so they go through `run-shell -b`.
+_FROZEN_SH = _SCRIPT_DIR / "aitask_frozen.sh"
+
+#: The session store's sole writer (t1705_7) — same "wrapper holds the mutex"
+#: rule as `_MARKS_SH`; the TUIs never import its mutators.
+_SESSIONS_SH = _SCRIPT_DIR / "aitask_agent_sessions.sh"
+
+#: The sitrep store's deterministic refresh (t2175_3). Run per observed project
+#: root that already HAS a sitrep store; it never creates one.
+_SITREP_REFRESH_SH = _SCRIPT_DIR / "aitask_sitrep_refresh.sh"
+
+#: The refresh's whole-run deadline (checks AND write), passed as `--budget`.
+#: The script bounds itself to it -- its worker's process group is killed at the
+#: check deadline -- and needs :data:`_SITREP_REFRESH_TIMEOUT` = budget + 15s
+#: from its caller (interpreter start and exit). Both derive from this one
+#: constant so the caller's kill can never land inside a healthy run's write.
+_SITREP_REFRESH_BUDGET = 60.0
+_SITREP_REFRESH_TIMEOUT = _SITREP_REFRESH_BUDGET + 15.0
+
+#: The harvest helper and its runner live with the harvest-and-close key
+#: (t2175_5, `monitor/sitrep_close.py`); the maintenance `all` pass reuses both.
+from monitor.sitrep_close import (  # noqa: E402
+    HARVEST_ALL_TIMEOUT as _HARVEST_ALL_TIMEOUT,
+    SITREP_HARVEST_SH as _SITREP_HARVEST_SH,
+    run_owned_group,
+)
+
+#: Hard ceiling on ONE `freeze <pane>`, and the per-pane unit that
+#: :data:`_FREEZE_ONE_TIMEOUT` scales for a batch.
+#:
+#: **Deliberately not :data:`_MARKS_CMD_TIMEOUT`.** That budget is 20s and the
+#: runner KILLS the child on expiry, but a single freeze spends up to 30s in
+#: `capture-pane` alone (`agent_freeze._capture`) plus two 20s store calls
+#: (`freeze-begin`, `freeze-commit`) plus a respawn. Reusing the marks budget
+#: would kill a legitimate freeze mid-transaction; worse, `agent_freeze.main()`
+#: buffers the batch and prints its per-pane lines only after `freeze_all()`
+#: returns, so a killed run reports NOTHING -- including the agents it had
+#: already frozen -- and never reaches the rest.
+#:
+#: A killed freeze is recoverable (the record stays `freezing` and reconcile
+#: settles it once the lease goes stale), which is why the callers report a
+#: timeout as PARTIAL rather than failed.
+_FREEZE_ONE_TIMEOUT = 90.0
+
+#: Poll cadence and grace window for a DETACHED drop's outcome (`drop` via
+#: `run-shell -b`). Mirrors the `frozenagent` viewer's own constants — the two
+#: watch the same records through the same interpreter, so a user switching
+#: between them must not see different verdicts.
+_FROZEN_POLL_INTERVAL = 1.0
+_FROZEN_DROP_GRACE = 10.0
+
+#: The shadow concern-rejection store's single writer/reader (t1427_1).
+_REJECTED_SH = _SCRIPT_DIR / "aitask_shadow_rejected.sh"
+
+#: Same rule as :data:`_MARKS_CMD_TIMEOUT`: above the helper's own mutation lock
+#: timeout (10s) so a contended-but-healthy writer gets to report LOCK_BUSY
+#: itself instead of being killed mid-write and blamed for a timeout.
+_REJECTED_CMD_TIMEOUT = 20.0
+
+#: Task creation, for the picker's spin-off triage arm (t1159_3). Invoked
+#: WITHOUT `--commit`, so it only ever writes a draft under `aitasks/new/` —
+#: no network, no id claim, nothing to undo but a file.
+_CREATE_SH = _SCRIPT_DIR / "aitask_create.sh"
+
+#: Draft creation is local-only (no id claim, no push), but it does shell out
+#: per concern; the same "kill only a genuinely stuck child" reasoning as the
+#: two timeouts above applies.
+_CREATE_CMD_TIMEOUT = 20.0
+
+#: `sanitize_name` (aitask_create.sh) caps a task name at 60 characters with
+#: `cut -c1-60` — a RIGHT truncation, which would eat the collision-guarding
+#: nonce and index. The budget below is spent on the region segment alone.
+_DRAFT_NAME_MAX = 60
+
+#: Hex characters of `uuid4` used per batch. Long enough that two confirmations
+#: in the same minute cannot collide, short enough to leave the region readable.
+_SPINOFF_NONCE_CHARS = 8
+
+
+class AgentMarksMixin:
+    """Prioritized-agent marks for a monitor TUI (t1326).
+
+    Mixed into both ``MonitorApp`` and ``MiniMonitorApp``. Requires from the
+    host app: ``_monitor``, ``_snapshots``, ``_get_focused_pane_id()``,
+    ``notify()``, ``call_later()`` and ``_refresh_data()``.
+
+    Reads are lock-free and direct; the single writer is ``_MARKS_SH``, which
+    holds the ``registry_lock.sh`` mutex.
+    """
+
+    #: Class-level floor for the per-tick session→root map, for the same reason
+    #: `MiniMonitorApp._session_bar_enabled` is a class attribute: several test
+    #: modules build the app with `__new__` and hand-set only what they touch,
+    #: so an `__init__`-only default would AttributeError the moment a render
+    #: helper read it. Safe to share — `_set_session_root_map` **rebinds** this
+    #: name every tick and never mutates the dict in place (t1598).
+    _session_root_map: dict = {}
+
+    #: Class-level floors, same `__new__`-built-test rationale as
+    #: `_session_root_map` above.
+    _maintenance_inflight: bool = False
+    #: Client view state (t2034_2) — the producer holds neither. `__init__` sets
+    #: the real values (`$TMUX_PANE`; multi-session ON, as both apps start).
+    #: The floor is OFF to match the single-session fake monitors most
+    #: `__new__`-built tests stubbed before the toggle moved here.
+    _own_pane_id: "str | None" = None
+    _multi_session: bool = False
+    _refresh_inflight: bool = False
+    _sitrep_refresh_inflight: bool = False
+    _sitrep_refresh_due_at: float = 0.0
+    _sitrep_harvest_inflight: bool = False
+    _sitrep_harvest_due_at: float = 0.0
+    #: The off-pump user-refresh worker (t2037_3, `_dispatch_scan_refresh`):
+    #: one in flight, `_scan_again` asks it for one more round, and
+    #: `_scan_rerun` re-dispatches it after a round the refresh guard turned away.
+    _scan_inflight: bool = False
+    _scan_again: bool = False
+    _scan_rerun: bool = False
+
+    #: Whether INACTIVE agents — parked (t1685) or frozen (t1705_7) — are hidden
+    #: from the pane list. Per-app-instance and in-memory by design: it is a view
+    #: toggle, not a preference, and persisting it would let a forgotten `P` hide
+    #: agents across restarts.
+    #:
+    #: The field is named for what it hides; the ACTION it backs is still
+    #: `toggle_parked_visibility` — see `action_toggle_parked_visibility` for why
+    #: that name must not follow this one.
+    _hide_inactive: bool = False
+
+    async def _maybe_offer_concerns(self) -> None:
+        """Host hook run with the purge by `_dispatch_refresh_maintenance`.
+
+        No-op by default. Only minimonitor follows a single agent whose shadow
+        pane can carry an unread concern block, and it overrides this. The full
+        monitor dispatches its own `_offer_concerns` worker from `_refresh_data`
+        instead, so it inherits the no-op — a real default rather than a
+        `getattr` probe, so the contract is visible on the mixin.
+        """
+        return None
+
+    def _dispatch_refresh_maintenance(self) -> None:
+        """Start the trailing maintenance for this tick — never await it.
+
+        `_maybe_purge_marks` can block for a full `_MARKS_CMD_TIMEOUT` (20s) on a
+        contended or wedged marks lock, and Textual's `Timer._tick` **awaits**
+        its callback — so awaiting maintenance inside `_refresh_data` freezes the
+        whole refresh cadence for the duration, and on the very first tick (which
+        Textual dispatches on the App's own message pump) it also freezes input
+        dispatch. Dispatching instead keeps the render path bounded (t1598).
+
+        A single named **sync** seam on purpose: tests stub *this* method and
+        assert the work was requested, rather than letting a real worker outlive
+        an `App.run_test` block — see `aidocs/framework/testing_conventions.md`,
+        "A Textual `@work` worker left in flight fails the *enclosing*
+        `run_test`". `exit_on_error=False` for the same reason.
+        """
+        if self._maintenance_inflight:
+            return
+        self._maintenance_inflight = True
+
+        async def _maintenance() -> None:
+            try:
+                await self._maybe_offer_concerns()
+                await self._maybe_purge_marks()
+                await self._maybe_purge_sessions()
+                # Harvest BEFORE refresh, so items harvested in a pass are
+                # refreshed in the same pass (t2175_5).
+                await self._maybe_harvest_sitrep()
+                await self._maybe_refresh_sitrep()
+            finally:
+                # In a `finally` so a raising or cancelled maintenance pass
+                # cannot wedge every later tick's maintenance — the same rule
+                # `_maybe_purge_marks` states for `_marks_purge_inflight`.
+                self._maintenance_inflight = False
+
+        self.run_worker(
+            _maintenance(),
+            name="refresh_maintenance",
+            group="refresh-maintenance",
+            exclusive=False,
+            exit_on_error=False,
+        )
+
+    def _init_agent_marks(self) -> None:
+        """Call from ``__init__``."""
+        self._marks_view = agent_marks.MarksView()
+        # Deferred, not skipped: the first purge lands one grace period after
+        # construction, then every _MARKS_PURGE_INTERVAL. Seeding 0.0 here put
+        # a blocking subprocess on the mount tick — see the constant (t1598).
+        self._marks_purge_due_at: float = (
+            time.monotonic() + _MARKS_PURGE_STARTUP_GRACE
+        )
+        self._marks_purge_inflight: bool = False
+        # The session store's own liveness purge + frozen reconcile (t1705_7).
+        # Same cadence and grace as the marks purge, its own flag: a wedged
+        # sessions wrapper must not stop marks being purged, or vice versa.
+        self._sessions_purge_due_at: float = (
+            time.monotonic() + _MARKS_PURGE_STARTUP_GRACE
+        )
+        self._sessions_purge_inflight: bool = False
+        # The sitrep refresh (t2175_3): same cadence and grace, its own flag.
+        self._sitrep_refresh_due_at: float = (
+            time.monotonic() + _MARKS_PURGE_STARTUP_GRACE
+        )
+        self._sitrep_refresh_inflight: bool = False
+        # The sitrep `harvest all` pass (t2175_5): same cadence and grace.
+        self._sitrep_harvest_due_at: float = (
+            time.monotonic() + _MARKS_PURGE_STARTUP_GRACE
+        )
+        self._sitrep_harvest_inflight: bool = False
+        # Guards the whole trailing-maintenance worker (concerns + purge), which
+        # `_refresh_data` dispatches rather than awaits (t1598). Distinct from
+        # `_marks_purge_inflight`: that one only covers the purge, and
+        # `_maybe_offer_concerns` has no flag of its own.
+        self._maintenance_inflight: bool = False
+        # Per-tick session→root map, refreshed once per tick by the host app
+        # (see `_set_session_root_map`). Starts empty so a keypress-driven
+        # rebuild that runs outside `_refresh_data` reuses the last tick's map
+        # rather than triggering a fan-out on a keystroke — the same contract
+        # `_completed_pane_ids` uses.
+        self._session_root_map: dict = {}
+        # Inactive-agent view filter (t1685 parked, t1705_7 frozen); see the
+        # class-level floor.
+        self._hide_inactive: bool = False
+
+    def _set_session_root_map(self, mapping: dict) -> None:
+        """Publish this tick's session→project-root map.
+
+        Called once per refresh from each app's `_refresh_data`, which already
+        fetches the mapping for `TaskInfoCache.update_session_mapping` — the
+        full monitor via the **async** variant. Marks reuse that one value
+        instead of re-querying.
+
+        This is not merely a micro-optimisation: `_strict_root_for_snap` runs
+        once per row per tick, and calling the SYNC
+        `get_session_to_project_mapping()` from there put a potential blocking
+        tmux round-trip on the render path (free on a cache hit, but a
+        `list-sessions` plus a `list-panes` per session on a miss).
+        `tests/test_monitor_refresh_no_sync_tmux.py` exists to trip exactly
+        that regression.
+        """
+        self._session_root_map = mapping or {}
+
+    # -- identity ----------------------------------------------------------
+
+    def _strict_root_for_snap(self, snap: PaneSnapshot) -> str | None:
+        """Canonical project root owning this pane's session, or ``None``.
+
+        **Strict on purpose** — unlike ``_root_for_snap``, it never falls back
+        to ``self._project_root``. That fallback is right for "which repo do I
+        read task data from", but catastrophic for mark identity: it would file
+        another repo's agent under *this* repo's root, so a mark set here would
+        surface on an identically-named window elsewhere. Callers treat ``None``
+        as "not markable" and, for the purge, as a visibility gap.
+        """
+        return self._root_for_session(getattr(snap.pane, "session_name", ""))
+
+    def _mark_kind(self, snap: PaneSnapshot) -> str:
+        """Render-time lookup: the pane's mark kind, or ``KIND_NONE``.
+
+        Total by construction, including for a pane whose project root cannot be
+        resolved — the same fail-closed answer :meth:`_is_marked` has always
+        given. That is what lets `format_mark_glyph` take a plain ``str`` and
+        raise on anything outside the vocabulary.
+        """
+        root = self._strict_root_for_snap(snap)
+        if root is None:
+            return agent_marks.KIND_NONE
+        return self._marks_view.kind_for(root, snap.pane.window_name)
+
+    def _is_marked(self, snap: PaneSnapshot) -> bool:
+        """True for a **priority** mark only — parked agents are not starred."""
+        return self._mark_kind(snap) == agent_marks.KIND_PRIORITY
+
+    def _is_parked(self, snap: PaneSnapshot) -> bool:
+        return self._mark_kind(snap) == agent_marks.KIND_PARKED
+
+    def _is_frozen(self, snap: PaneSnapshot) -> bool:
+        """Whether this snapshot is a frozen agent's stand-in (t1705_7).
+
+        Read off the snapshot, not the mark store: frozen is sourced from the
+        `@aitask_frozen` pane option, which is not a mark.
+
+        Deliberately `snap.frozen`, NOT `getattr(snap, "frozen", False)`. A
+        default would silently tolerate a snapshot that genuinely lacks the
+        field — and an incomplete hand-rolled test double raises here, loudly,
+        which is exactly how the six doubles this task completed were found.
+        Same rule t1685 recorded for `parked`.
+        """
+        return snap.frozen
+
+    def _kill_target_state(self, pane_id: str) -> str:
+        """``"live"`` | ``"frozen"`` | ``"unverified"`` — read at KILL time.
+
+        For the pick flows' outgoing-agent kill (t2057, merging t2058/t2059).
+        ``kill_agent_pane_smart``'s frozen path is an UNLEASED kill-then-drop:
+        it can tear down a stand-in whose record a restore coordinator owns,
+        and it deletes the capture — the only copy of the agent's output —
+        without the warning ``k`` shows. So only a target proven live may reach
+        it; a frozen one is retired by ``k`` (the leased ``_drop_frozen``).
+
+        Three reads, cheapest first. The snapshot, because it is what the user
+        saw; then the monitor's discovery cache, because that — not the
+        snapshot, not the live option — is where ``kill_agent_pane_smart``
+        reads the record id it drops, and a restore can clear the live stamp
+        before discovery refreshes the cache (t2065); then the live
+        ``@aitask_frozen`` pane option, because a snapshot can be a tick stale
+        and the agent may have been frozen while a dialog was open. Anything
+        not proven live is ``"unverified"`` and fails closed: the kill is
+        irreversible, skipping it is not. That includes a pane that no longer
+        exists — there is nothing left to kill anyway.
+
+        Residual: a freeze landing between this read and the kill is not
+        caught. Only the leased ``aitask_frozen.sh drop`` closes that window.
+        """
+        snap = self._snapshots.get(pane_id)
+        if snap is not None and self._is_frozen(snap):
+            return "frozen"
+        cached = self._monitor.get_pane(pane_id)
+        if cached is not None and cached.frozen_record:
+            return "frozen"
+        ok, value = self._monitor.get_pane_option_sync(pane_id, FROZEN_OPTION)
+        if not ok:
+            return "unverified"
+        return "frozen" if value else "live"
+
+    def _is_inactive(self, snap: PaneSnapshot) -> bool:
+        """Whether the `P` filter hides this agent — parked OR frozen.
+
+        One filter, one key, one list: both states mean "there is no live agent
+        here to watch", so splitting them across two toggles would make the user
+        press two keys to answer one question. They keep SEPARATE session-bar
+        terms, because which one it is still matters.
+        """
+        return self._is_frozen(snap) or self._is_parked(snap)
+
+    def _global_parked_pairs(self) -> frozenset:
+        """The GLOBAL parked set as ``(session_name, window_name)`` pairs.
+
+        Identical for every client by construction (t2034_2): derived from the
+        per-user marks store and the session→root map ALONE — never from
+        ``_snapshots``. This is read *before* the first capture, when there are
+        no snapshots at all; deriving it from them would make a monitor opened
+        with an already-parked agent capture and classify that agent once on
+        every launch. Inverting the map instead makes the very first tick
+        correct. See :func:`agent_marks.parked_session_windows`.
+        """
+        return agent_marks.parked_session_windows(
+            self._marks_view.parked_windows(), self._session_root_map
+        )
+
+    def _capture_pins(self):
+        """Parked agents THIS client needs captured live anyway (t2034_2).
+
+        ``frozenset()`` here: a monitor shows parked agents as placeholders and
+        needs none of them live. A subclass returns its pinned pairs, or
+        :data:`CAPTURE_PIN_ALL` to fail safe (see ``MiniMonitorApp``).
+        """
+        return frozenset()
+
+    def _parked_agent_pairs(self) -> frozenset:
+        """``(session_name, window_name)`` pairs whose CAPTURE must be skipped.
+
+        Published down to ``TmuxMonitor`` once per tick — the same shape as
+        :meth:`_set_session_root_map`, and for the same reason: the capture path
+        must not do a blocking tmux round-trip to learn about marks.
+
+        The global parked set minus this client's capture pins
+        (:func:`parked_capture_skip`); a shared server applies the same function
+        over every subscriber's pins.
+        """
+        return parked_capture_skip(
+            self._global_parked_pairs(), [self._capture_pins()]
+        )
+
+    def _project_snapshots(self, snaps: dict) -> dict:
+        """THIS client's view of a producer snapshot dict (t2034_2).
+
+        Every write into ``self._snapshots`` goes through here — the bulk
+        refreshes and the single-pane fast preview alike — so the own-pane drop,
+        the ``M`` session filter and the parked placeholder apply on every route.
+        Pure with respect to the producer: its bookkeeping already ran.
+        """
+        try:
+            parked = self._global_parked_pairs()
+        except Exception:  # noqa: BLE001 - advisory data must never break a tick
+            parked = frozenset()
+        return client_view_snapshots(
+            snaps,
+            own_pane=self._own_pane_id,
+            home_session=getattr(self, "_session", None),
+            multi_session=self._multi_session,
+            parked_pairs=parked,
+            pins=self._capture_pins(),
+        )
+
+    def _publish_parked_agents(self) -> None:
+        """Hand this tick's parked set to the monitor, before it captures.
+
+        `getattr`-probed rather than called outright: several test doubles
+        implement only the slice of the ``TmuxMonitor`` API their suite drives,
+        and an unconditional call would break them rather than the feature.
+        """
+        monitor = getattr(self, "_monitor", None)
+        setter = getattr(monitor, "set_parked_agents", None)
+        if setter is not None:
+            try:
+                setter(self._parked_agent_pairs())
+            except Exception:  # noqa: BLE001 - advisory data must never break a tick
+                pass
+        # Under a shared server (t2037_3) the skip set above only reaches the
+        # local instance; the server derives its own from every subscriber's
+        # pins, so this client's pins must be published too, every tick.
+        pins_setter = getattr(monitor, "set_capture_pins", None)
+        if pins_setter is not None:
+            try:
+                pins_setter(self._capture_pins())
+            except Exception:  # noqa: BLE001 - advisory data must never break a tick
+                pass
+
+    # -- user-driven refresh off the App message pump (t2037_3) ------------
+
+    def _wants_offpump_scan(self) -> bool:
+        """Whether a user-driven refresh must go through the scan worker.
+
+        True for a :class:`MonitorClient` in any mode but ``FALLBACK``: there a
+        refresh first asks the server to scan, a wait that must never run on the
+        App message pump — ``call_later`` awaits its callback inline on the same
+        queue that dispatches keys (t1598), and a connected but stalled server
+        would hold input for the request timeout. In ``FALLBACK`` (and with any
+        test double) a refresh stays inline exactly as before.
+        """
+        monitor = getattr(self, "_monitor", None)
+        return isinstance(monitor, MonitorClient) and monitor.mode is not ClientMode.FALLBACK
+
+    def _dispatch_scan_refresh(self) -> None:
+        """Start the user-refresh worker, or ask the running one for one more
+        round. Sync and never awaits: safe from a `call_later` callback."""
+        if self._scan_inflight:
+            self._scan_again = True
+            return
+        self._scan_inflight = True
+        self._scan_again = False
+        self.run_worker(
+            self._scan_refresh_worker(),
+            group="scan-refresh",
+            exclusive=False,
+            exit_on_error=False,
+        )
+
+    async def _scan_refresh_worker(self) -> None:
+        """Run guarded refresh rounds that each request a server scan.
+
+        Each round is ONE ordinary `_refresh_data` call with `_request_scan`:
+        it resolves marks and (minimonitor) this tick's identity, publishes the
+        skip set and pins, flushes the pins to the server, and only THEN asks
+        for the scan and reads it — the publish-before-capture order, so a
+        newly followed parked agent is scanned live and an unconfirmed identity
+        scans under `CAPTURE_PIN_ALL` (t2034_2). Rounds repeat while
+        `_dispatch_scan_refresh` asked for another during the previous one.
+        """
+        try:
+            while True:
+                self._scan_again = False
+                await self._refresh_data(scan=False, _request_scan=True)
+                if not self._scan_again:
+                    break
+        finally:
+            self._scan_inflight = False
+
+    async def _request_server_scan(self, monitor) -> bool:
+        """Inside a `_request_scan` round, after the publish and before the
+        capture: flush this tick's pins, then ask the server to scan. Returns
+        False when the monitor was replaced meanwhile (teardown / re-entry) —
+        the round must then stop without reading the old client."""
+        if not isinstance(monitor, MonitorClient):
+            # Replaced by a non-client before this queued round started: a plain
+            # in-process read, exactly what a fallback refresh does.
+            return True
+        await monitor.flush_pins()
+        if self._monitor is not monitor:
+            return False
+        await monitor.request_refresh()
+        return self._monitor is monitor
+
+    async def _cycle_compare_mode_async(self, pane_id: str, label: str) -> None:
+        """`d` through a :class:`MonitorClient` (t2037_3): run as a worker.
+
+        The server owns the one shared compare-mode override, so the answer to
+        notify is ITS answer (`cycle_compare_mode_async`), not the sync path's
+        prediction. Awaited off the App pump — a hung server must not hold
+        input — and the follow-up refresh goes through the scan worker for the
+        same reason (`call_later` would put it back on the pump)."""
+        monitor = self._monitor
+        try:
+            new_mode, is_default = await monitor.cycle_compare_mode_async(pane_id)
+        except Exception as exc:  # noqa: BLE001 - RequestFailed/ConnectionLost/timeout
+            self.notify(f"{label}: request failed ({exc.__class__.__name__})",
+                        severity="warning")
+            return
+        suffix = " (default)" if is_default else " (override)"
+        self.notify(f"{label}: {new_mode}{suffix}", timeout=3)
+        if self._monitor is not monitor:
+            return
+        if self._wants_offpump_scan():
+            self._dispatch_scan_refresh()
+        else:
+            self.call_later(self._refresh_data)
+
+    def _maybe_rerun_refresh(self) -> None:
+        """From each refresh's ``finally``: re-dispatch the scan worker once if
+        this refresh turned a scan round away (the user's action still needs
+        its scan). One re-dispatch per turn-away, never a loop."""
+        if not self._scan_rerun:
+            return
+        self._scan_rerun = False
+        with contextlib.suppress(Exception):
+            self._dispatch_scan_refresh()
+
+    # -- read path ---------------------------------------------------------
+
+    def _refresh_marks(self) -> None:
+        """Re-read the store if it changed. Call once per refresh tick.
+
+        Costs one ``os.stat`` in the steady state, which is what makes a mark
+        set in another repo appear here within a single tick.
+        """
+        try:
+            self._marks_view.refresh()
+        except Exception:  # noqa: BLE001 - advisory data must never break a tick
+            pass
+
+    # -- write path --------------------------------------------------------
+
+    async def _run_marks_cmd(
+        self, args: list[str], *,
+        script: "Path | None" = None,
+        timeout: float | None = None,
+    ) -> tuple[int, str]:
+        """Run the locked writer off the event loop. The injectable seam.
+
+        Deliberately NOT ``TmuxMonitor._run_offloaded``: that seam's contract is
+        "pure compute over plain data" (invariant A), which spawning a process
+        violates. Tests override this method.
+
+        **Total by contract — never raises, always terminates.** Callers treat
+        the result as data, so every failure is normalised to
+        ``(rc, "ERROR:…")``:
+
+        - A missing or non-executable wrapper raises ``OSError`` from
+          ``create_subprocess_exec``. Unhandled, that would propagate out of
+          ``action_toggle_mark`` on a keypress.
+        - A child that never exits would hang ``communicate()`` forever, and the
+          purge scheduler's ``finally`` — which clears ``_marks_purge_inflight``
+          — would never run, wedging maintenance for the life of the process.
+          That is precisely the guarantee its docstring makes, so the timeout is
+          what makes the claim true rather than aspirational.
+
+        The wrapper's own lock timeouts are 2s (toggle) and 10s (purge), so
+        :data:`_MARKS_CMD_TIMEOUT` sits above both: a slow-but-working writer
+        must be allowed to finish and report ``LOCK_BUSY`` itself.
+        """
+        script = _MARKS_SH if script is None else script
+        timeout = _MARKS_CMD_TIMEOUT if timeout is None else timeout
+        proc = None
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                str(script), *args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            out, _ = await asyncio.wait_for(
+                proc.communicate(), timeout=timeout
+            )
+        except asyncio.TimeoutError:
+            # Kill the child, then reap it so it cannot become a zombie.
+            try:
+                proc.kill()
+                await proc.wait()
+            except Exception:  # noqa: BLE001 - already exited / unkillable
+                pass
+            return 1, (f"ERROR:{script.name} timed out after {timeout}s")
+        except OSError as exc:
+            return 1, f"ERROR:cannot run {script.name}: {exc}"
+        return proc.returncode or 0, out.decode("utf-8", "replace").strip()
+
+    async def _run_frozen_cmd(
+        self, args: list[str], *, timeout: float | None = None,
+    ) -> tuple[int, str]:
+        """`aitask_frozen.sh` through the same runner, on its OWN budget.
+
+        Only `freeze` and `reconcile` come through here. `restore` and `drop`
+        replace or kill the very pane a TUI keybinding runs in, so a child of
+        that pane would be killed mid-transaction — they go through
+        `run-shell -b` instead, which is a detached tmux server job.
+
+        The default budget is one freeze's worth; a batch scales it by the
+        eligible count (see :data:`_FREEZE_ONE_TIMEOUT`).
+        """
+        return await self._run_marks_cmd(
+            args, script=_FROZEN_SH,
+            timeout=_FREEZE_ONE_TIMEOUT if timeout is None else timeout,
+        )
+
+    async def _cycle_mark_for(self, snap: PaneSnapshot) -> None:
+        """Advance ``snap``'s mark one step. The shared write path.
+
+        Target resolution belongs to the caller: the full monitor resolves
+        through live focus (:meth:`action_toggle_mark`); the minimonitor
+        resolves through the agent it follows
+        (``MiniMonitorApp.action_toggle_mark``, t1383). Both reach this one
+        sink, so the guards and the four outcome branches are written once.
+        """
+        # Both TUIs render non-agent panes as focusable cards (monitor's OTHER
+        # section, and minimonitor's since t1382), so "the focused card is an
+        # agent" is no longer an invariant either app can assume. A mark is keyed
+        # by window name and only ever consumed by the agent lists, so marking a
+        # shell / lazygit / renamed window would write an entry nothing reads.
+        # Guarded here, in the shared sink, rather than in each app.
+        if snap.pane.category != PaneCategory.AGENT:
+            self.notify("Marks apply to agent panes only", severity="warning")
+            return
+
+        root = self._strict_root_for_snap(snap)
+        if root is None:
+            self.notify(
+                "Cannot resolve this agent's project — not marking",
+                severity="warning",
+            )
+            return
+
+        window = snap.pane.window_name
+        rc, out = await self._run_marks_cmd(["cycle", root, window])
+        first = out.splitlines()[0] if out else ""
+
+        # Every toast below names the window (tmux-side user input) or, on
+        # failure, quotes the marks store's own error, which embeds stored
+        # window names. None carries styling, so none is parsed (t2017).
+        if first.startswith("MARKED:"):
+            self.notify(f"Prioritized {window}", timeout=3, markup=False)
+        elif first.startswith("PARKED:"):
+            # With the filter on the row is about to vanish, and the only way
+            # back is P then space. Say so here rather than leaving the user to
+            # discover that the agent they just parked cannot be reached.
+            if self._hide_inactive:
+                self.notify(
+                    f"Parked {window} — hidden. Press P to show parked/frozen "
+                    "agents, then Space to unpark.",
+                    timeout=6, markup=False,
+                )
+            else:
+                self.notify(f"Parked {window}", timeout=3, markup=False)
+        elif first.startswith("UNMARKED:"):
+            self.notify(f"Unmarked {window}", timeout=3, markup=False)
+        elif first == "LOCK_BUSY" or rc == 3:
+            self.notify("Marks file busy — try again", severity="warning")
+            return
+        else:
+            self.notify(f"Mark failed: {first or f'exit {rc}'}",
+                        severity="error", markup=False)
+            return
+
+        # The write may land inside the same coarse mtime tick as the last read,
+        # so force the re-read rather than trusting the stat stamp.
+        self._marks_view.invalidate()
+        self._refresh_marks()
+        # Republish immediately: parking must take effect on the NEXT capture,
+        # not the one after it.
+        self._publish_parked_agents()
+        self.call_later(self._refresh_data)
+
+    async def action_toggle_mark(self) -> None:
+        """Cycle the mark on the *focused* agent card: none -> ★ -> P -> none.
+
+        The action id stays ``toggle_mark`` even though the cycle is tristate
+        (t1685): shortcut action ids are persisted in ``userconfig.yaml`` under
+        ``shortcuts:``, so renaming it would silently drop every user's rebind.
+
+        The minimonitor overrides this to target the agent it follows instead
+        (t1383) — it is a companion pane bound to exactly one agent, so focus
+        is the wrong target there. The full monitor follows nothing, so focus
+        is its only target, and it stays the way to mark any *other* agent.
+        """
+        # Live focus, NOT the cached `_focused_pane_id`: the toggle must act on
+        # what is selected *now*, and the cached field survives focus moving off
+        # the card entirely (it is only updated by `on_descendant_focus`, which
+        # never fires for a non-card widget). Acting on it would toggle a mark
+        # the user is no longer pointing at. Returns silently — "nothing
+        # selected" is not an error worth a toast.
+        #
+        # This deliberately diverges from `_current_shadow_pane_id`
+        # (monitor_app.py), which documents preferring the *cached* field
+        # because it must survive focus being in a preview zone. Opposite needs,
+        # opposite choice.
+        #
+        # NOTE: modal safety does NOT rest on this guard. Textual does not
+        # dispatch App-level BINDINGS while a ModalScreen is active, so `space`
+        # never reaches this action from inside a dialog — verified by a
+        # negative control in tests/test_monitor_modal_space_dispatch.py, which
+        # pins that behaviour so a future Textual change or a key-forwarding
+        # modal cannot silently reintroduce the hazard.
+        pane_id = self._get_focused_pane_id()
+        if not pane_id:
+            return
+        snap = self._snapshots.get(pane_id)
+        if snap is None:
+            return
+        await self._cycle_mark_for(snap)
+
+    # -- purge -------------------------------------------------------------
+
+    def action_toggle_parked_visibility(self) -> None:
+        """Show/hide INACTIVE agents — parked (t1685) or frozen (t1705_7) — in
+        the pane list (``P``).
+
+        **The name is deliberately not `action_toggle_inactive_visibility`,
+        even though that is what it now does.** The action string in an App's
+        ``BINDINGS`` is a PERSISTED PUBLIC IDENTIFIER, not an internal name:
+        ``keybinding_registry.register_app_bindings`` resolves a user's key
+        override with ``overrides.get(str(binding.action))`` against the
+        ``shortcuts:`` section of ``userconfig.yaml``, scoped per app. Renaming
+        it would orphan every existing override — a customized key would revert
+        to the default ``P`` silently, with no error anywhere — and a Python
+        alias would not help, because the registry keys off the string in
+        ``BINDINGS`` and Textual dispatches ``action_<that string>``. Only the
+        binding's *description* was widened; descriptions are a value in
+        ``_DEFAULTS``, never a key.
+
+        The host app hands focus off first when the currently focused card is
+        about to be hidden — see `_hand_off_focus_before_hiding`, whose default
+        here is a no-op because only the full monitor has a focusable list.
+        """
+        hiding = not self._hide_inactive
+        if hiding:
+            self._hand_off_focus_before_hiding()
+        self._hide_inactive = hiding
+        self.notify(
+            "Parked/frozen agents hidden" if hiding
+            else "Parked/frozen agents shown",
+            timeout=3,
+        )
+        self.call_later(self._refresh_data)
+
+    # --- frozen agents: freeze / drop (t1705_7) ------------------------------
+    #
+    # Restore and re-pick are NOT here: they belong to the `frozenagent` viewer
+    # alone (`R` / `P`), so the monitors' keys keep the meaning they have on a
+    # live agent (t2054).
+    #
+    # WHICH AGENT AN ACTION TARGETS is per-app and is the ONLY thing that
+    # differs: the minimonitor acts on the agent it follows (its docked panel),
+    # the full monitor on its focused card. Both override
+    # `_current_agent_snapshot`; everything below is shared.
+    #
+    # HOW an action is dispatched is NOT uniform, and the split is load-bearing:
+    #
+    #   * `freeze` respawns the AGENT's pane, never the TUI's, so it runs as a
+    #     subprocess through `_run_frozen_cmd` and its result lines are read.
+    #   * `drop` kills the pane — and possibly the whole window — that the TUI
+    #     itself is in. A subprocess would be a child of that pane and would be
+    #     killed mid-transaction. It goes through `run-shell -b`, a DETACHED
+    #     tmux server job that outlives the kill, exactly as the `frozenagent`
+    #     viewer does.
+    #
+    # A detached job's stdout is unreadable, so the outcome is observed by
+    # polling the store record and interpreting it with
+    # `agent_sessions.drop_verdict` — the same interpreter the viewer uses,
+    # rather than another copy of it.
+
+    def _current_agent_snapshot(self) -> "PaneSnapshot | None":
+        """The agent this app's frozen actions target. Overridden by both apps.
+
+        Returning None here is a real answer ("nothing is targeted"), not a
+        not-implemented marker — an app with no agent in view is a normal state.
+        """
+        return None
+
+    def _run_frozen_detached(self, argv: list[str]) -> bool:
+        """Dispatch a frozen coordinator as a detached tmux server job.
+
+        Never `subprocess`: see the section note above. Returns False when the
+        gateway itself refused, which is the only failure observable from here —
+        the job's own outcome arrives via the store.
+        """
+        if self._monitor is None:
+            return False
+        rc, _out = self._monitor.tmux_run(
+            ["run-shell", "-b", shlex.join([str(_FROZEN_SH), *argv])]
+        )
+        return rc == 0
+
+    def _poll_frozen_outcome(self, record_id: str) -> None:
+        """Watch the store for a dispatched drop's outcome and notify.
+
+        Drop is the only coordinator these apps dispatch detached, and it has
+        its own interpreter because a dropped record disappears rather than
+        reaching `live`.
+        """
+        view = agent_sessions.SessionsView()
+        elapsed = {"t": 0.0}
+        timers: dict[str, object] = {}
+
+        def tick() -> None:
+            elapsed["t"] += _FROZEN_POLL_INTERVAL
+            view.invalidate()
+            rec = view.by_id(record_id)
+            done, note, warn = agent_sessions.drop_verdict(
+                rec, elapsed["t"], drop_grace=_FROZEN_DROP_GRACE)
+            if not done:
+                return
+            timer = timers.pop("t", None)
+            if timer is not None:
+                try:
+                    timer.stop()      # type: ignore[attr-defined]
+                except Exception:     # noqa: BLE001 - already stopped
+                    pass
+            # Plain text: a verdict note is a sink for store-derived text, and
+            # an unparsed toast cannot be broken by one (t2017).
+            self.notify(note, severity="warning" if warn else "information",
+                        markup=False)
+            self.call_later(self._refresh_data)
+
+        timers["t"] = self.set_interval(_FROZEN_POLL_INTERVAL, tick)
+
+    async def _dispatch_freeze(self, argv: list[str], *,
+                               timeout: float, batch: bool) -> None:
+        """Run a freeze and report it, counting the result lines ourselves.
+
+        `freeze --all` emits NO summary line — one line per pane and nothing
+        else (unlike `restore --all`, which does emit `RESTORE_ALL:`) — so the
+        tally has to be built here.
+
+        A timeout is reported as PARTIAL, never as failure: the runner kills the
+        child, but a killed freeze leaves a `freezing` record that reconcile
+        settles once the lease goes stale, and some agents may already be
+        frozen. Calling that "failed" would send the user looking for a problem
+        that repairs itself.
+        """
+        rc, out = await self._run_frozen_cmd(argv, timeout=timeout)
+        lines = [ln for ln in out.splitlines() if ln.strip()]
+        if any(ln.startswith("ERROR:") and "timed out" in ln for ln in lines):
+            # PARTIAL, not failed: the runner killed the child, but a killed
+            # freeze leaves a `freezing` record that reconcile settles, and some
+            # agents may already be frozen. "Failed" would send the user looking
+            # for a problem that repairs itself.
+            self.notify(
+                "Freeze timed out — some agents may be frozen. "
+                "Run `aitask_frozen.sh reconcile`.", severity="warning")
+            self.call_later(self._refresh_data)
+            return
+        if any(ln.startswith("ERROR:") for ln in lines):
+            # The runner could not start the wrapper at all (missing binary,
+            # OSError). Nothing was frozen, so say so plainly rather than
+            # falling through to the "no result" wording below.
+            self.notify(f"Freeze could not run: {lines[0]}", severity="error")
+            return
+        ok = sum(1 for ln in lines if ln.startswith("FROZEN:"))
+        skipped = sum(1 for ln in lines if ln.startswith("FREEZE_SKIPPED:"))
+        failed = [ln for ln in lines if ln.startswith("FREEZE_FAILED:")]
+        if batch:
+            note = f"Froze {ok}/{ok + skipped + len(failed)} agent(s)"
+            if skipped:
+                note += f" ({skipped} already frozen)"
+            self.notify(note, severity="warning" if failed else "information")
+        elif failed:
+            self.notify(f"Freeze failed: {failed[0]}", severity="error")
+        elif skipped:
+            self.notify("That agent is already frozen")
+        elif ok:
+            self.notify(
+                "Frozen — restore (R) or re-pick (P) from its frozen-agent viewer")
+        else:
+            self.notify(f"Freeze produced no result (exit {rc})",
+                        severity="warning")
+        self.call_later(self._refresh_data)
+
+    def action_freeze_current(self) -> None:
+        """``f`` — freeze the current agent, after confirming."""
+        snap = self._current_agent_snapshot()
+        if snap is None:
+            self.notify("No agent selected", severity="warning")
+            return
+        if self._is_frozen(snap):
+            self.notify("That agent is already frozen")
+            return
+        window = snap.pane.window_name
+        pane_id = snap.pane.pane_id
+
+        def confirmed(yes: bool | None) -> None:
+            if not yes:
+                return
+            self.run_worker(
+                self._dispatch_freeze(["freeze", pane_id],
+                                      timeout=_FREEZE_ONE_TIMEOUT, batch=False),
+                name="freeze_one", group="frozen-ops",
+                exclusive=False, exit_on_error=False)
+
+        self.push_screen(
+            FreezeConfirmDialog(
+                "Freeze this agent?",
+                # The window name sits directly before `[/]`, so it is a
+                # `$variable`, never interpolated (t2017): a name ending in a
+                # backslash would otherwise turn the tag into text.
+                Content.from_markup(
+                    "[bold]$window[/]\n\n"
+                    "The agent process ends. Its terminal output is captured "
+                    "and kept, and it can be restored or re-picked later.",
+                    window=window,
+                ),
+            ),
+            confirmed,
+        )
+
+    def action_freeze_all(self) -> None:
+        """``Z`` — freeze every eligible agent, after a scoped confirmation.
+
+        The count comes from `freeze --all --dry-run`, i.e. from the operation's
+        OWN enumeration, so it cannot drift from what confirming does. It is
+        deliberately not derived from `self._snapshots`: `freeze --all` spans
+        every aitasks session on the machine and does not exclude parked agents,
+        while this app may be in single-session mode and its live set excludes
+        parked — so a snapshot-derived number would understate a destructive
+        operation. The dialog says so in words too, because a bare number still
+        reads as "the agents I can see".
+        """
+        self.run_worker(
+            self._offer_freeze_all(), name="freeze_all_offer",
+            group="frozen-ops", exclusive=False, exit_on_error=False)
+
+    async def _offer_freeze_all(self) -> None:
+        rc, out = await self._run_frozen_cmd(
+            ["freeze", "--all", "--dry-run"], timeout=_FREEZE_ONE_TIMEOUT)
+        count = None
+        for line in out.splitlines():
+            if line.startswith("FREEZE_ELIGIBLE:"):
+                try:
+                    count = int(line.split(":", 1)[1])
+                except ValueError:
+                    count = None
+        if rc != 0 or count is None:
+            self.notify("Could not determine what freeze-all would affect — "
+                        "not freezing", severity="error")
+            return
+        if count == 0:
+            self.notify("No agents to freeze")
+            return
+
+        # Compared against `count` by the user, so it must count the same KIND
+        # of thing: agents, not every pane in the snapshot map.
+        shown = sum(1 for s in self._snapshots.values()
+                    if s.pane.category == PaneCategory.AGENT)
+
+        def confirmed(yes: bool | None) -> None:
+            if not yes:
+                return
+            self.run_worker(
+                self._dispatch_freeze(
+                    ["freeze", "--all"],
+                    timeout=_FREEZE_ONE_TIMEOUT * max(1, count), batch=True),
+                name="freeze_all", group="frozen-ops",
+                exclusive=False, exit_on_error=False)
+
+        self.push_screen(
+            FreezeConfirmDialog(
+                f"Freeze all {count} agent(s)?",
+                f"This affects [bold]every aitasks session on this machine[/] — "
+                f"including parked agents and agents in other projects, not "
+                f"just the {shown} agent(s) shown here.\n\n"
+                "Each agent's process ends; its output is captured and kept, "
+                "and it can be restored later.",
+            ),
+            confirmed,
+        )
+
+    def _drop_frozen(self, snap: "PaneSnapshot") -> None:
+        """``k`` on a frozen agent: retire the record, capture and stand-in.
+
+        Uses `aitask_frozen.sh drop`, NOT `kill_agent_pane_smart`. The latter's
+        frozen branch is a best-effort, UNLEASED store write, so it would delete
+        the record out from under a restore that is in flight. `drop` takes the
+        lease first, preflights the pane against the live server, kills, verifies
+        it is gone, and only then deletes — refusing outright
+        (`DROP_REFUSED:<id>|in_flight`) if a coordinator owns the record. It
+        applies the same window-collapse rule, so nothing is lost by using it.
+        """
+        record_id = snap.frozen_record_id
+        if not record_id:
+            self.notify("That frozen pane carries no record id",
+                        severity="warning")
+            return
+        if not self._run_frozen_detached(["drop", record_id]):
+            self.notify("Could not dispatch the drop", severity="error")
+            return
+        self.notify("Dropping…")
+        self._poll_frozen_outcome(record_id)
+
+    def _hand_off_focus_before_hiding(self) -> None:
+        """Hook: move focus off a card that the parked filter is about to hide.
+
+        No-op by default. Minimonitor's list rows are read-only and its followed
+        agent lives in a docked panel, so nothing there can lose focus to the
+        filter; the full monitor overrides this. A real default rather than a
+        `getattr` probe, so the contract is visible on the mixin.
+        """
+        return None
+
+    def _collect_marks_observation(self) -> tuple[dict[str, set[str]], set[str], bool]:
+        """Snapshot what this tick can prove about liveness.
+
+        Returns ``(observed_windows_by_root, sweepable_roots, complete)``.
+
+        Both inputs come from **discovery**, via
+        ``TmuxMonitor.last_enumerated_sessions()`` and
+        ``last_discovered_agents()`` — never from ``_snapshots``.
+
+        That distinction is the whole correctness of the sweep.
+        ``commit_snapshots`` drops any pane whose *content capture* failed
+        (``if result is None: continue``), so ``_snapshots`` is "panes we
+        successfully read", not "panes that exist". Deriving the agent set from
+        it would make a transient capture failure indistinguishable from a
+        departed agent: the agent's siblings would keep its root sweepable while
+        it was itself missing, and the purge would delete a live mark. Discovery
+        output has no such hole — the pane is listed whether or not its content
+        could be read.
+
+        Both facts are published by ``commit_snapshots`` on its winning-generation
+        branch, so they and the snapshots are always the same generation.
+        """
+        monitor = self._monitor
+        sessions = getattr(monitor, "last_enumerated_sessions", None)
+        agents = getattr(monitor, "last_discovered_agents", None)
+        if sessions is None or agents is None:
+            # A monitor that cannot report discovery facts (e.g. a test double)
+            # gives no basis for concluding anything departed. Fail closed.
+            return {}, set(), False
+
+        observed: dict[str, set[str]] = {}
+        sweepable: set[str] = set()
+        complete = True
+
+        for session in sessions():
+            root = self._root_for_session(session)
+            if root is None:
+                # An enumerated session we cannot attribute to a project. Not a
+                # gap in agent visibility — it simply is not sweepable.
+                continue
+            sweepable.add(root)
+            observed.setdefault(root, set())
+
+        for session, window in agents():
+            root = self._root_for_session(session)
+            if root is None:
+                # A discovered agent we cannot attribute. Its window would be
+                # missing from observed[root] while that root may still be
+                # sweepable, so its live mark could be deleted. Suppress the
+                # whole sweep for this tick — a visibility gap must never cause
+                # a deletion.
+                complete = False
+                continue
+            observed.setdefault(root, set()).add(window)
+
+        return observed, sweepable, complete
+
+    def _root_for_session(self, session: str) -> str | None:
+        """Canonical project root for a session name, or ``None``."""
+        if not session:
+            return None
+        root = self._session_root_map.get(session)
+        if root is None:
+            return None
+        return agent_marks.mark_key(root, "")[0]
+
+    def _write_observation_file(
+        self, observed: dict[str, set[str]], sweepable: set[str], complete: bool,
+        panes: "dict[tuple[str, str], list[tuple[str, int, bool]]] | None" = None,
+    ) -> str:
+        """One observation file serving BOTH liveness purges (t1705_7).
+
+        `PANE` rows are a backward-compatible superset: `agent_marks` skips
+        them, `agent_sessions` requires them for its `dead_pane` rule.
+
+        `panes` is keyed by **(root, window)** — already project-resolved by the
+        caller, NOT the raw `(session, window)` that
+        `TmuxMonitor.last_discovered_panes()` returns. Keying on the window name
+        alone would merge two projects that happen to share one, listing each
+        one's panes under the other's root; the store would then read a pane in
+        project A as evidence that project B's record is alive.
+
+        Omitting `panes` yields exactly the old file: a root with `WINDOW` rows
+        but no `PANE` rows is treated by the session store as pane-incomplete,
+        so `dead_window` still applies and `dead_pane` does not. Fail-closed by
+        construction, not by a flag.
+        """
+        fd, path = tempfile.mkstemp(prefix="ait-marks-obs-", suffix=".tsv")
+        rows_for = panes or {}
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            if not complete:
+                fh.write("INCOMPLETE\n")
+            for root in sorted(sweepable):
+                fh.write(f"ROOT\t{root}\n")
+            for root in sorted(observed):
+                for window in sorted(observed[root]):
+                    fh.write(f"WINDOW\t{root}\t{window}\n")
+                    for pane_id, pane_pid, dead in rows_for.get((root, window), ()):
+                        fh.write(
+                            f"PANE\t{root}\t{window}\t{pane_id}\t"
+                            f"{pane_pid}\t{1 if dead else 0}\n"
+                        )
+        return path
+
+    async def _maybe_purge_marks(self) -> None:
+        """Materialize expiry + the liveness sweep, at most every 10 minutes.
+
+        The render path already filters expired marks every tick, so this exists
+        only to bound the store's growth. Scheduling is explicit rather than
+        implicit: an in-flight run is never stacked, and the flag is cleared in a
+        ``finally`` so a crashed or hung wrapper cannot wedge the scheduler.
+        """
+        if self._marks_purge_inflight:
+            return
+        now = time.monotonic()
+        if now < self._marks_purge_due_at:
+            return
+
+        # Snapshot the observation BEFORE the await and pass it explicitly. The
+        # purge must act on the state it was scheduled with, not on whatever
+        # ambient state exists when the subprocess returns.
+        observed, sweepable, complete = self._collect_marks_observation()
+        self._marks_purge_inflight = True
+        path = None
+        try:
+            path = self._write_observation_file(observed, sweepable, complete)
+            await self._run_marks_cmd(["purge", "--observed", path])
+        except Exception:  # noqa: BLE001 - maintenance must never break a tick
+            pass
+        finally:
+            self._marks_purge_inflight = False
+            self._marks_purge_due_at = time.monotonic() + _MARKS_PURGE_INTERVAL
+            if path:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+
+    async def _maybe_purge_sessions(self) -> None:
+        """The session store's twin of :meth:`_maybe_purge_marks` (t1705_7).
+
+        Two jobs, both bounded and both idempotent:
+
+        * ``aitask_agent_sessions.sh purge --observed`` retires `live` records
+          whose window or pane is gone — the observation file carries `PANE`
+          rows for that, which the marks purge ignores;
+        * ``aitask_frozen.sh reconcile`` settles every non-`live` record whose
+          lease has gone stale, from server-observable facts only.
+
+        Reconcile has a second producer (the coordinator runs it after every
+        freeze/restore) precisely so retirement does not depend on a TUI being
+        open; this call is the opportunistic one. Both are best-effort — a
+        maintenance pass must never break a refresh tick — and both are given the
+        freeze budget rather than the marks budget, because reconcile can respawn
+        a stand-in.
+        """
+        if self._sessions_purge_inflight:
+            return
+        now = time.monotonic()
+        if now < self._sessions_purge_due_at:
+            return
+
+        # Snapshot before the await, exactly as the marks purge does.
+        observed, sweepable, complete = self._collect_marks_observation()
+        # No panes is a SAFE answer, not a broken one: a file with `WINDOW` but
+        # no `PANE` rows is treated as pane-incomplete for that root, so
+        # `dead_window` still applies and `dead_pane` does not. Fail-closed by
+        # construction — which is why swallowing the error here is honest rather
+        # than lazy.
+        panes = None
+        if self._monitor is not None:
+            try:
+                # Re-key (session, window) -> (root, window) HERE, where the
+                # session→root map lives. An unattributable session is dropped
+                # rather than guessed: its panes would otherwise be filed under
+                # some other project's root.
+                panes = {}
+                for (session, window), rows in (
+                        self._monitor.last_discovered_panes().items()):
+                    root = self._root_for_session(session)
+                    if root is not None:
+                        panes.setdefault((root, window), []).extend(rows)
+            except Exception:  # noqa: BLE001 - see above: no panes is safe
+                panes = None
+        self._sessions_purge_inflight = True
+        path = None
+        try:
+            path = self._write_observation_file(
+                observed, sweepable, complete, panes=panes)
+            await self._run_marks_cmd(
+                ["purge", "--observed", path],
+                script=_SESSIONS_SH, timeout=_MARKS_CMD_TIMEOUT,
+            )
+            await self._run_frozen_cmd(["reconcile"])
+        except Exception:  # noqa: BLE001 - maintenance must never break a tick
+            pass
+        finally:
+            self._sessions_purge_inflight = False
+            self._sessions_purge_due_at = (
+                time.monotonic() + _MARKS_PURGE_INTERVAL
+            )
+            if path:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+
+    async def _run_sitrep_harvest(
+        self, args: list[str], *, stdin: "bytes | None" = None,
+        timeout: float,
+    ) -> tuple[int, str]:
+        """`aitask_sitrep_harvest.sh` in its OWN process group. The test seam.
+
+        Not :meth:`_run_marks_cmd`: that runner kills only its direct child,
+        while the harvest wrapper's Python children hold the store mutex, and
+        it has no stdin (the live-pane `capture` verb reads the text there).
+        :func:`run_owned_group` kills the whole group on timeout and on
+        cancellation, then re-raises the cancellation (t2175_5).
+        """
+        return await run_owned_group(
+            [str(_SITREP_HARVEST_SH), *args], stdin=stdin, timeout=timeout)
+
+    async def _maybe_harvest_sitrep(self) -> None:
+        """Release frozen records still holding unharvested text (t2175_5).
+
+        One global ``aitask_sitrep_harvest.sh all`` per pass: every record with
+        capture text, each into its own repository's store, receipts written —
+        so the sessions purge stops keeping them (`KEPT:…|unharvested_text`)
+        and their drop is no longer refused. Receipts make the steady state a
+        no-op. Same scheduling contract as :meth:`_maybe_refresh_sitrep`, and
+        it runs BEFORE it in `_maintenance`. Failures (a busy store mutex, a
+        timeout) are swallowed: the next pass retries.
+        """
+        if self._sitrep_harvest_inflight:
+            return
+        if time.monotonic() < self._sitrep_harvest_due_at:
+            return
+        self._sitrep_harvest_inflight = True
+        try:
+            await self._run_sitrep_harvest(
+                ["all"], timeout=_HARVEST_ALL_TIMEOUT)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - maintenance must never break a tick
+            pass
+        finally:
+            self._sitrep_harvest_inflight = False
+            self._sitrep_harvest_due_at = (
+                time.monotonic() + _MARKS_PURGE_INTERVAL
+            )
+
+    async def _maybe_refresh_sitrep(self) -> None:
+        """Refresh each observed root's sitrep store Part 1 (t2175_3).
+
+        One `aitask_sitrep_refresh.sh --root <r>` per distinct project root of
+        this tick's sessions that already has a sitrep store -- a root without
+        one spawns nothing (the refresh never creates a store). Same scheduling
+        contract as :meth:`_maybe_purge_sessions`: an in-flight pass is never
+        stacked, the flag is cleared in a ``finally``, and failures are
+        swallowed -- the refresh writes nothing on failure, and the next pass
+        re-reads. The budget/timeout pair is the script's caller contract (see
+        :data:`_SITREP_REFRESH_BUDGET`).
+        """
+        if self._sitrep_refresh_inflight:
+            return
+        if time.monotonic() < self._sitrep_refresh_due_at:
+            return
+        self._sitrep_refresh_inflight = True
+        try:
+            roots = _sitrep_store_roots(
+                self._root_for_session(s) for s in list(self._session_root_map)
+            )
+            for root in roots:
+                try:
+                    await self._run_marks_cmd(
+                        ["--root", root, "--budget", f"{_SITREP_REFRESH_BUDGET:g}"],
+                        script=_SITREP_REFRESH_SH,
+                        timeout=_SITREP_REFRESH_TIMEOUT,
+                    )
+                except Exception:  # noqa: BLE001 - one root never stops the rest
+                    pass
+        except Exception:  # noqa: BLE001 - maintenance must never break a tick
+            pass
+        finally:
+            self._sitrep_refresh_inflight = False
+            self._sitrep_refresh_due_at = (
+                time.monotonic() + _MARKS_PURGE_INTERVAL
+            )
+
+
+def _sitrep_store_roots(roots) -> list:
+    """The roots (sorted, distinct) that already hold a sitrep store."""
+    return sorted({
+        r for r in roots
+        if r and os.path.isfile(os.path.join(r, ".aitask-sitrep", "store.init"))
+    })
+
+
+def _sanitized_region(region: str) -> str:
+    """A region reduced to what `sanitize_name` would keep (t1159_3).
+
+    `aitask_create.sh:sanitize_name` lowercases, maps spaces to `_`, then
+    `tr -cd 'a-z0-9_'` — which **deletes** every other character rather than
+    replacing it — collapses `_` runs and strips the ends. So a real region
+    like ``authoring-conv.md:103`` becomes ``authoringconvmd103``.
+
+    Mirrored here because the caller must budget the name against its
+    POST-sanitization length: counting raw characters would under-count the
+    truncation and let the suffix fall off the 60-char cap.
+    """
+    lowered = region.lower().replace(" ", "_")
+    kept = re.sub(r"[^a-z0-9_]", "", lowered)      # tr -cd 'a-z0-9_'
+    return re.sub(r"_+", "_", kept).strip("_")     # sed 's/__*/_/g'; strip ends
+
+
+def build_spinoff_name(region: str, nonce: str, index: int) -> str:
+    """``shadow_<region>_<nonce>_<index>``, truncated suffix-preservingly.
+
+    The nonce and index are the collision guard, and `sanitize_name` truncates
+    from the RIGHT — so only the region segment may be shortened, and it is
+    shortened *here* so the name handed to `--name` is already within the cap
+    and survives sanitization unchanged.
+
+    An empty or fully-stripped region degrades to ``concern`` rather than
+    producing a doubled separator.
+    """
+    region_part = _sanitized_region(region) or "concern"
+    fixed = len("shadow_") + 1 + len(nonce) + 1 + len(str(index))
+    budget = max(1, _DRAFT_NAME_MAX - fixed)
+    return f"shadow_{region_part[:budget]}_{nonce}_{index}"
+
+
+def _create_failure_reason(out: str, rc: int) -> str:
+    """The root cause of a failed draft creation, fit for a toast (t1159_3).
+
+    Two things the raw capture gets wrong, both verified against the real
+    script:
+
+    * `aitask_create.sh` colours its `die` message, and this seam merges
+      stderr into stdout — so the text arrives wrapped in ANSI escapes that
+      would render as literal garbage in a Textual notification.
+    * The terminal `die` line is the **last** line, not the first: a label
+      warning (or any other `warn`) is emitted earlier and would otherwise be
+      reported as the failure reason, hiding the actual cause.
+    """
+    cleaned = [line.strip() for line in strip_ansi(out).splitlines() if line.strip()]
+    return cleaned[-1] if cleaned else f"exit {rc}"
+
+
+#: Draft paths listed inline before the message falls back to the nonce
+#: selector alone. Small, because this is a toast, not a report.
+_DRAFT_PATHS_SHOWN = 4
+
+
+def _format_draft_paths(paths: Sequence[str], nonce: str) -> str:
+    """The created drafts, as identifiable text (t1159_3).
+
+    A count plus a directory name would not satisfy the "report draft paths"
+    contract: ``aitasks/new/`` is a shared drop directory and draft filenames
+    are only minute-stamped, so with other sessions writing there the user
+    could not tell which files this confirmation produced.
+
+    The per-batch nonce is therefore always named as a selector, which keeps
+    the whole batch recoverable even when the list is capped. Paths are
+    escaped: they embed a producer-derived region and land on a markup-enabled
+    surface.
+    """
+    shown = [f"  {escape(p)}" for p in paths[:_DRAFT_PATHS_SHOWN]]
+    if len(paths) > _DRAFT_PATHS_SHOWN:
+        shown.append(f"  … and {len(paths) - _DRAFT_PATHS_SHOWN} more")
+    shown.append(f"(this batch: ls aitasks/new/*{escape(nonce)}*)")
+    return "\n".join(shown)
+
+
+def _no_task_id_msg(result) -> str:
+    """Refusal naming exactly which dispositions were dropped (t1159_3).
+
+    Composed rather than fixed, because the pane having no task id defeats
+    rejections and spin-offs for different reasons and the user needs to know
+    which of the things they just marked did not happen. A rejections-only
+    result keeps the pre-t1159_3 wording byte for byte.
+
+    Pure and module-level so it is unit-testable without an App.
+    """
+    parts = []
+    if result.rejected or result.unrejected:
+        parts.append("Rejections not persisted")
+    if result.spun_off:
+        parts.append("spin-off skipped" if parts else "Spin-off skipped")
+    return f"{', '.join(parts)} — no task id for this pane"
+
+
+class ShadowRejectionsMixin:
+    """The concern-rejection store seam for a monitor TUI (t1427_2).
+
+    Mixed into both ``MonitorApp`` and ``MiniMonitorApp``. One shared seam
+    rather than two open-coded subprocess blocks, so the timeout, the
+    never-raises contract and the exit-code vocabulary are defined once.
+
+    A sibling of :class:`AgentMarksMixin` rather than part of it: both wrap a
+    locked bash writer with the same shape, but they own unrelated state and
+    conflating them would put rejection logic behind a marks-shaped name.
+    """
+
+    async def _run_rejected_cmd(
+        self, args: list[str], stdin_text: str = ""
+    ) -> tuple[int, str]:
+        """Run ``aitask_shadow_rejected.sh`` off the event loop. The test seam.
+
+        Modeled on :meth:`AgentMarksMixin._run_marks_cmd` and keeping its
+        contract: **total — never raises, always terminates.** It is reached
+        from a keypress handler and from a modal dismissal callback, so an
+        unhandled ``OSError`` would propagate out of the pick flow, and a child
+        that never exits would wedge the worker for the life of the process.
+        Both are normalised to ``(1, "ERROR:…")`` and callers treat the result
+        as data. Tests override this method — no bash runs in the suites.
+
+        Unlike the marks seam this one writes **stdin**: ``add`` takes its
+        marker lines there rather than as argv, so a body containing shell
+        metacharacters or newlines never has to survive an argument list.
+        """
+        proc = None
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                str(_REJECTED_SH), *args,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            out, _ = await asyncio.wait_for(
+                proc.communicate(stdin_text.encode("utf-8")),
+                timeout=_REJECTED_CMD_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            # Kill the child, then reap it so it cannot become a zombie.
+            try:
+                proc.kill()
+                await proc.wait()
+            except Exception:  # noqa: BLE001 - already exited / unkillable
+                pass
+            return 1, (
+                f"ERROR:rejection store command timed out after "
+                f"{_REJECTED_CMD_TIMEOUT}s"
+            )
+        except OSError as exc:
+            return 1, f"ERROR:cannot run {_REJECTED_SH.name}: {exc}"
+        return proc.returncode or 0, out.decode("utf-8", "replace").strip()
+
+    async def _fetch_rejected_entries(
+        self, task_id: str | None
+    ) -> list[RejectedEntry]:
+        """Pre-fetch the task's rejection store for the picker.
+
+        Returns ``[]`` for every non-success outcome — a store that cannot be
+        read is presented as "nothing rejected yet", which is the safe direction
+        (the shadow keeps raising concerns rather than appearing to suppress
+        them). Callers pass ``store_unavailable`` separately for the case that
+        genuinely needs to be visible: no task id at all.
+        """
+        if not task_id:
+            return []
+        rc, out = await self._run_rejected_cmd(["list", task_id, "--machine"])
+        if rc != 0:
+            return []
+        return parse_rejected_machine_lines(out)
+
+    async def _run_create_cmd(
+        self, args: list[str], stdin_text: str = ""
+    ) -> tuple[int, str]:
+        """Run ``aitask_create.sh`` off the event loop. The test seam (t1159_3).
+
+        Same contract as :meth:`_run_rejected_cmd`, deliberately: **total —
+        never raises, always terminates**, with the child killed *and reaped* on
+        timeout. Callers treat the result as data. Tests override this method,
+        so no bash runs in the Python suites — which is exactly why
+        ``tests/test_shadow_spinoff_create_contract.sh`` exists to exercise the
+        real script's flag contract once.
+
+        The description travels on **stdin** (``--desc-file -``) rather than
+        argv: a concern body is free text that routinely contains brackets,
+        pipes and newlines.
+        """
+        proc = None
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                str(_CREATE_SH), *args,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            out, _ = await asyncio.wait_for(
+                proc.communicate(stdin_text.encode("utf-8")),
+                timeout=_CREATE_CMD_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+                await proc.wait()
+            except Exception:  # noqa: BLE001 - already exited / unkillable
+                pass
+            return 1, (
+                f"ERROR:task creation timed out after {_CREATE_CMD_TIMEOUT}s"
+            )
+        except OSError as exc:
+            return 1, f"ERROR:cannot run {_CREATE_SH.name}: {exc}"
+        return proc.returncode or 0, out.decode("utf-8", "replace").strip()
+
+    async def _spawn_concern_tasks(self, concerns, task_id: str) -> None:
+        """Park each spun-off concern as a DRAFT task. Worker body (t1159_3).
+
+        User-facing behaviour of this arm is documented in
+        ``aidocs/framework/shadow_agent.md`` -> "Spin-off triage arm"; keep the
+        two in step when the flags, naming or store interaction change.
+
+        Drafts, never committed tasks: offline-safe inside a TUI worker,
+        reversible, and cheap to discard. They carry no id until the user runs
+        ``ait create``, so everything reported here is a **path**.
+
+        **ACCEPTED LIMITATION — the duplicate guard is single-process.**
+        Two guards keep the same concern from being parked twice, and both stop
+        at this process boundary: :meth:`_concern_effects_inflight` is an
+        in-memory set, and the store check below is a read (``list`` takes no
+        lock) separated from the ``add`` by a subprocess. So two *separate*
+        monitor processes bound to the same task — a full monitor and a
+        minimonitor, say — can both read "not yet spun off", and each create a
+        draft before either records it.
+
+        This is **not closed**, deliberately. It cannot be closed with the
+        house mutex: ``lib/registry_lock.sh`` records the acquiring shell's own
+        ``$$`` and releases on an EXIT trap, and a holder whose PID is dead is
+        stolen on sight — so it serializes *one bash process's* critical
+        section and cannot span the awaits here. Closing it properly means
+        either an atomic claim verb on ``aitask_shadow_rejected.sh`` (which
+        would have to write the store BEFORE the draft exists) or relaxing
+        mutex invariants the file marks "do NOT relax".
+
+        The trade accepted instead: reaching it needs two monitor processes on
+        one task confirming the *same* concern inside a sub-second window, and
+        the damage is one extra **unfinalized** draft — reported with its full
+        path, owned by no task id, and deleted with `rm`. Nothing is lost, and
+        the store still converges (both markers land, so the next review round
+        suppresses the concern once).
+        """
+        # Already-parked concerns are dropped BEFORE anything is created. The
+        # in-flight guard cannot cover this: the picker lists concerns
+        # unfiltered and t1427's suppression only lands producer-side at the
+        # NEXT shadow round, so re-confirming an unchanged block would otherwise
+        # spin the same concern off again. Re-read rather than reusing the
+        # picker-open fetch — that snapshot is stale by exactly the batch this
+        # is guarding against.
+        already = {
+            entry.marker_line for entry in await self._fetch_rejected_entries(task_id)
+            if entry.producer == "spinoff"
+        }
+        fresh, skipped = [], 0
+        for concern in concerns:
+            if concern_marker_line(concern) in already:
+                skipped += 1
+            else:
+                fresh.append(concern)
+
+        if skipped:
+            self.notify(f"{skipped} concern(s) already spun off — skipped")
+        if not fresh:
+            # Nothing to create, so nothing to suppress either. Returning here
+            # keeps an empty set from reaching the store write below as a no-op
+            # call that would still take the mutex.
+            return
+
+        # ONE nonce for the whole confirmation: it makes this batch's paths
+        # distinct from any other batch's, including a second confirmation in
+        # the same minute (`get_draft_filename` is minute-precision and
+        # `ait_atomic_render` overwrites an existing path silently).
+        nonce = uuid.uuid4().hex[:_SPINOFF_NONCE_CHARS]
+        created: list[tuple[str, "Concern"]] = []
+        failures: list[str] = []
+
+        for index, concern in enumerate(fresh, start=1):
+            name = build_spinoff_name(concern.region, nonce, index)
+            description = (
+                f"Spun off from a shadow review concern on t{task_id}.\n\n"
+                f"{concern_marker_line(concern)}\n"
+            )
+            rc, out = await self._run_create_cmd(
+                [
+                    "--batch", "--silent",
+                    "--name", name,
+                    "--desc-file", "-",
+                    "--priority", concern.priority,
+                    "--labels", "shadow-concern",
+                    "--followup-of", task_id,
+                    "--followup-kind", "review_finding",
+                ],
+                description,
+            )
+            if rc != 0 or not out:
+                failures.append(_create_failure_reason(out, rc))
+            else:
+                # LAST line: `--silent` prints the path last, and this seam
+                # merges stderr, so a label warning can precede it.
+                created.append((strip_ansi(out).splitlines()[-1].strip(), concern))
+
+        if failures:
+            self.notify(
+                f"{len(failures)} concern(s) could not be parked: {failures[0]}",
+                severity="error",
+            )
+        if not created:
+            return
+
+        # One batched store write for the whole successful set, mirroring
+        # `_persist_concern_dispositions`: one mutex acquisition instead of N,
+        # and one partial-failure surface instead of N.
+        rc, out = await self._run_rejected_cmd(
+            ["add", task_id, "--producer", "spinoff"],
+            "".join(concern_marker_line(c) + "\n" for _, c in created),
+        )
+        message, _severity = self.rejection_outcome_message(rc, out)
+        paths = [path for path, _ in created]
+        if message:
+            # The drafts EXIST but are not suppressed. This is the one state a
+            # user must not misread, so it gets its own wording rather than
+            # being folded into the success or the failure path.
+            self.notify(
+                f"{len(created)} draft(s) created but NOT suppressed "
+                f"({message}) — the same concern(s) will be raised again next "
+                f"round; spinning them off again would create duplicate "
+                f"drafts.\n{_format_draft_paths(paths, nonce)}",
+                severity="warning",
+            )
+        else:
+            self.notify(
+                f"{len(created)} concern(s) parked as drafts — finalize with "
+                f"'ait create':\n{_format_draft_paths(paths, nonce)}"
+            )
+
+    def _concern_effects_inflight(self) -> set:
+        """Task ids whose confirmation effects are still running (t1159_3).
+
+        Owned by the MIXIN and created lazily, so neither app has to initialize
+        it. That is deliberate: the pre-existing pick guard (`_concern_pick_busy`)
+        lives in ``MonitorApp`` and minimonitor never grew an equivalent, so a
+        guard added the same way would repeat exactly that gap. It also answers
+        a different question — that one guards *modal stacking* and is released
+        on dismissal, i.e. before this method's worker has even started.
+        """
+        inflight = getattr(self, "_concern_effects_inflight_set", None)
+        if inflight is None:
+            inflight = set()
+            self._concern_effects_inflight_set = inflight
+        return inflight
+
+    def apply_concern_pick_result(self, result, task_id: str | None) -> None:
+        """Act on a :class:`ConcernPickResult` — the shared callback body.
+
+        Identical in both apps, so it lives here rather than being written
+        twice. The caller has already released whatever re-entrancy guard it
+        holds; this is purely the "do what the user asked" half.
+
+        Forwarding is synchronous (a clipboard write); persistence is not — it
+        is a subprocess, and this runs inside a synchronous ``push_screen``
+        dismissal callback, so the work moves onto a worker.
+        """
+        # `is None`, never `if not result`: an all-empty result is a legitimate
+        # "confirmed nothing" and must not be mistaken for a cancellation.
+        if result is None:
+            return
+
+        # Payload-first (t1582): honour whatever the result carries rather than
+        # depending on the picker's invariant that an override always
+        # accompanies a non-empty `forwarded`. Behaviour is byte-identical to
+        # before whenever `payload_override is None`, which is every caller
+        # that never opened the editor.
+        payload = result.payload_override
+        if payload is None and result.forwarded:
+            payload = build_clipboard_payload(result.forwarded)
+        if payload is not None:
+            # copy_to_system_clipboard, never app.copy_to_clipboard: a bare
+            # OSC 52 from a non-visible tmux window never reaches the system
+            # clipboard. tests/test_tui_clipboard_seam.sh enforces this.
+            # Forwarding owns the clipboard alone — the spin-off path reports
+            # its draft paths by notify and never writes here, so a mixed
+            # confirmation cannot clobber the payload the user asked for.
+            copy_to_system_clipboard(self, payload)
+            # Distinct wording, not decoration: it is the only way the user can
+            # tell WHICH text was copied — their edit, or the generated payload.
+            self.notify(
+                "Edited payload copied to clipboard."
+                if result.payload_override is not None
+                else "Concerns copied to clipboard."
+            )
+
+        if not result.rejected and not result.unrejected and not result.spun_off:
+            return
+
+        if not task_id:
+            # A VISIBLE refusal, never a silent drop: the user marked
+            # dispositions and they are not being acted on, which they can only
+            # find out here. The message names exactly what was skipped.
+            self.notify(
+                _no_task_id_msg(result), severity="warning"
+            )
+            return
+
+        # In-flight EFFECT guard (t1159_3), keyed by task id. The rejection
+        # store and `--followup-of` are both task-keyed, so two panes on
+        # different tasks may proceed together while two confirmations on the
+        # same task may not: a spin-off writes a FILE, and the per-batch nonce
+        # is designed to make batches distinct, so it can never dedupe a
+        # duplicate confirmation.
+        if task_id in self._concern_effects_inflight():
+            self.notify(
+                f"Concern effects for t{task_id} are still running — wait for "
+                "them to finish before confirming again",
+                severity="warning",
+            )
+            return
+        self._concern_effects_inflight().add(task_id)
+
+        # ONE worker, never two. The rejection store takes a single per-task
+        # mutex that is NOT producer-scoped, and `_persist_concern_dispositions`
+        # is already sequential for that exact reason. A second concurrent
+        # writer would report LOCK_BUSY against ourselves — and lose worse here,
+        # because the draft is already on disk by the time its store write runs.
+        self.run_worker(
+            self._apply_concern_side_effects(result, task_id),
+            exclusive=False,
+            exit_on_error=False,
+            group="shadow-concern-effects",
+        )
+
+    async def _apply_concern_side_effects(self, result, task_id: str) -> None:
+        """Serialize every store-touching effect of one confirmation."""
+        try:
+            if result.rejected or result.unrejected:
+                await self._persist_concern_dispositions(result, task_id)
+            if result.spun_off:
+                await self._spawn_concern_tasks(result.spun_off, task_id)
+        finally:
+            # MUST be `finally`: the worker runs with `exit_on_error=False`, so
+            # a raise is swallowed, and a leaked guard would wedge every later
+            # confirmation for this task. `MonitorApp._on_inspect_closed` exists
+            # only because one guard-release path was missed once.
+            self._concern_effects_inflight().discard(task_id)
+
+    async def _persist_concern_dispositions(self, result, task_id: str) -> None:
+        """Write the confirmed rejections / un-rejections. Worker body.
+
+        Sequential rather than concurrent: both subcommands take the same
+        per-task mutex, so issuing them together would just make one of them
+        report ``LOCK_BUSY`` against ourselves.
+        """
+        if result.rejected:
+            stdin_text = "".join(
+                concern_marker_line(c) + "\n" for c in result.rejected
+            )
+            rc, out = await self._run_rejected_cmd(
+                ["add", task_id, "--producer", "picker"], stdin_text
+            )
+            message, severity = self.rejection_outcome_message(rc, out)
+            if message:
+                self.notify(message, severity=severity)
+            else:
+                n = len(result.rejected)
+                self.notify(f"{n} concern(s) rejected — suppressed next round")
+
+        if result.unrejected:
+            rc, out = await self._run_rejected_cmd(
+                ["remove", task_id, *result.unrejected]
+            )
+            message, severity = self.rejection_outcome_message(rc, out)
+            if message:
+                self.notify(message, severity=severity)
+            else:
+                self.notify(f"{len(result.unrejected)} concern(s) un-rejected")
+
+    def rejection_outcome_message(self, rc: int, out: str) -> tuple[str, str]:
+        """Map a helper result to ``(message, severity)``.
+
+        The three failure codes are kept **distinct** deliberately (t1427_1):
+        ``3`` is transient contention and retrying is reasonable, ``4`` means
+        the store is structurally unusable and will not fix itself, and ``2``
+        means this code passed something wrong. Collapsing them into one
+        "rejection failed" would turn a permanent misconfiguration into an
+        endless retry, which is exactly the failure t1427_1 recorded.
+        """
+        first = out.splitlines()[0] if out else ""
+        if rc == 3 or first == "LOCK_BUSY":
+            return ("Rejection store busy — try again", "warning")
+        if rc == 4:
+            return (
+                f"Rejection store unusable — not retrying ({first or 'exit 4'})",
+                "error",
+            )
+        if rc == 2:
+            return (f"Rejection store rejected the request: {first}", "error")
+        if rc != 0:
+            return (f"Rejection store failed: {first or f'exit {rc}'}", "error")
+        return ("", "")
+
+
+def unparsed_concerns_msg(count: int) -> str:
+    """Warning for a block whose marker lines yielded no concern (t1274).
+
+    Its own message rather than the bland "no concerns": the shadow *did* emit a
+    block, so silence (or a false all-clear) is the failure being fixed.
+
+    Shared (t1216_3) so minimonitor and the full monitor report an unparseable
+    block identically; it is also what makes that outcome *definitive* enough
+    for the monitor to clear its concern badge.
+    """
+    return (
+        f"Shadow emitted a concern block but {count} line(s) could not be "
+        "parsed — none are forwardable"
+    )
+
+
+def uncertified_round_block_msg(round_number: "int | None") -> str:
+    """Warning for a round-headed block that is not a certified clean round.
+
+    Covers the shapes `is_metadata_only_block` refuses while the block still
+    carries (or attempts) a round header (t1159_1): a complete block whose
+    non-item content the scanner silently dropped (nothing parsed, nothing in
+    `unrecovered_markers`), a still-streaming header-only block, and — with
+    ``round_number=None`` — a block whose ``Round:`` line fails the grammar
+    (`has_invalid_round_header`), where no round can be reported. Reporting
+    any of them as "no concerns" would hide output the shadow did emit — same
+    failure class as :func:`unparsed_concerns_msg`.
+
+    Shared so both TUIs report the shapes identically.
+    """
+    if round_number is None:
+        return (
+            "Concern block has an invalid round header and no parseable "
+            "concerns — showing the raw block"
+        )
+    return (
+        f"Concern block (round {round_number}) has no parseable concerns and "
+        "is not a clean-round record — showing the raw block"
+    )
+
+
+def format_stale_duration(seconds: float) -> str:
+    """Compact human duration for the shadow-staleness banner (t1104).
+
+    Pure. Shared so every surface that reports "analyzed N ago" reads
+    identically (t1216_1).
+    """
+    s = int(max(0.0, seconds))
+    if s < 60:
+        return f"{s}s"
+    m, s = divmod(s, 60)
+    if m < 60:
+        return f"{m}m{s:02d}s"
+    h, m = divmod(m, 60)
+    return f"{h}h{m:02d}m"
+
+
+def _block_older_by(age: "BlockAge") -> str:
+    """How far the block predates the agent's change, or ``""`` (t1493).
+
+    ``last_change_wall - reviewed_epoch`` — **both operands from the tuple**.
+    ``now - reviewed_epoch`` is the block's absolute age, a different quantity
+    that would render a plausible wrong number; the two coincide only if the
+    agent changed at this instant.
+    """
+    if age.last_change_wall is None or age.reviewed_epoch is None:
+        return ""
+    return format_stale_duration(age.last_change_wall - age.reviewed_epoch)
+
+
+#: Narrow (one-row) banner texts — see ``format_shadow_stale_banner``'s
+#: ``narrow`` argument. Sized to fit ONE row of the 40-column companion pane
+#: (38 usable cells after ``padding: 0 1``), which is what lets
+#: ``#mini-shadow-stale`` carry ``max-height: 1`` without clipping (t1566).
+SHADOW_STALE_NARROW = "[bold]⚠ shadow feedback is stale[/]"
+SHADOW_UNKNOWN_NARROW = "[bold]⚠ freshness unknown[/]"
+
+
+def format_shadow_stale_banner(
+    read_stale: bool | None,
+    age: "BlockAge",
+    meta: "BlockMeta | None",
+    analyzed_at: float | None,
+    now: float,
+    *,
+    narrow: bool = False,
+) -> str:
+    """Minimonitor's live staleness banner, chosen by an explicit ladder (t1493).
+
+    ``narrow=True`` returns the **one-row** form (t1566): the same verdict, with
+    the age / round detail dropped so the banner fits a single row of the
+    40-column companion pane. The detail is not lost — ``format_staleness_detail``
+    still carries it into the concern picker, and ``ait monitor`` keeps the full
+    wording. Only the *wording* branches on ``narrow``; the ``combine_staleness``
+    ladder that decides the verdict is shared, so the two forms can never
+    disagree about whether the feedback is stale.
+
+    The narrow form deliberately collapses both stale flavours into one string:
+    at 38 usable cells there is no room to say which, and the distinction stays
+    available on the wider surfaces above.
+
+    Pure, so the wording is testable without a mounted DOM. Both signals can be
+    stale at once, so precedence is stated rather than incidental:
+
+    ==========================  =============  =================================
+    read recency                block age      banner
+    ==========================  =============  =================================
+    ``True``                    ``True``       moved-on + "block older still"
+    ``True``                    anything else  moved-on — **byte-identical to the
+                                               pre-t1493 wording**
+    not ``True``                ``True``       "round N predates the latest change"
+    combined ``None``           —              freshness unknown
+    combined ``False``          —              ``""``
+    ==========================  =============  =================================
+
+    Read recency leads when ``True`` because it is the stronger claim — the
+    shadow has not even *looked* — and users already know that message. The
+    block-age wording exists for the case the shadow demonstrably *did* re-read
+    and emitted nothing, where "agent moved on" would read as a contradiction.
+    """
+    combined = combine_staleness(read_stale, age)
+    if combined is None:
+        return SHADOW_UNKNOWN_NARROW if narrow else (
+            "[bold]⚠ shadow freshness unknown — cannot tell whether the "
+            "feedback is current[/]"
+        )
+    if combined is False:
+        return ""
+    if narrow:
+        return SHADOW_STALE_NARROW
+    older = _block_older_by(age)
+    round_label = f"round {meta.round}" if meta is not None else "the block"
+    if read_stale is True:
+        detail = "" if analyzed_at is None else (
+            f"analyzed {format_stale_duration(now - analyzed_at)} ago"
+        )
+        if age.stale is True and older:
+            detail = (
+                f"{detail}; {round_label} block {older} older still"
+                if detail else f"{round_label} block {older} older"
+            )
+        suffix = f" ({detail})" if detail else ""
+        return f"[bold]⚠ shadow feedback is stale — agent moved on{suffix}[/]"
+    # Block age alone drove it: the shadow DID re-read, so say what is actually
+    # old — the block — rather than claiming the shadow never looked.
+    older_suffix = f" (block {older} older)" if older else ""
+    return (
+        f"[bold]⚠ shadow feedback is stale — {round_label} predates the "
+        f"agent's latest change{older_suffix}[/]"
+    )
+
+
+def format_staleness_detail(age: "BlockAge", meta: "BlockMeta | None") -> str:
+    """Picker-banner suffix naming *why* a block reads stale, or ``""`` (t1493).
+
+    Returned as **plain text**; the caller owns escaping at the markup boundary
+    (``reviewed_at`` is verbatim producer text, and the round travels with it).
+    """
+    if age.stale is not True:
+        return ""
+    older = _block_older_by(age)
+    if not older:
+        return ""
+    round_label = f"round {meta.round}" if meta is not None else "this block"
+    return f" — {round_label} was produced {older} before the agent's latest change"
+
+
+def format_elapsed_compact(seconds: float) -> str:
+    """Elapsed time in at most 4 characters, rounded down (t1996).
+
+    ``0s``…``999s``, then whole minutes up to ``240m``, then whole hours,
+    capped at ``999h``. Keeps the PROMPT/DONE/IDLE badge bounded at
+    :data:`PANE_STATUS_MAX_CELLS`. Not :func:`format_stale_duration`, which is
+    the ``2m05s``-style banner formatter.
+    """
+    s = int(max(0.0, seconds))
+    if s <= 999:
+        return f"{s}s"
+    m = s // 60
+    if m <= 240:
+        return f"{m}m"
+    return f"{min(s // 3600, 999)}h"
+
+
+#: Widest badge :func:`format_pane_status` can return, in terminal cells:
+#: ``"PROMPT "`` (7) + :func:`format_elapsed_compact`'s 4-character cap. The
+#: minimonitor reserves exactly this much for the status column so a name never
+#: re-truncates as the counter grows (t1351); a test pins it EQUAL to the widest
+#: output, so widening the badge fails loudly instead of overflowing rows.
+PANE_STATUS_MAX_CELLS = 11
+
+
+def format_pane_status(snap: PaneSnapshot, completed: bool = False) -> str:
+    """Render a pane's status badge with awaiting_input > completed > is_idle >
+    active priority (t1322). See :func:`_state_color` for why ``completed`` is
+    an explicit parameter rather than something derived from ``snap``. Never
+    wider than :data:`PANE_STATUS_MAX_CELLS`."""
+    if getattr(snap, "awaiting_input", False):
+        return f"[{STATE_STYLE_PROMPT}]PROMPT {format_elapsed_compact(snap.idle_seconds)}[/]"
+    if completed:
+        return f"[{STATE_STYLE_DONE}]DONE {format_elapsed_compact(snap.idle_seconds)}[/]"
+    if snap.is_idle:
+        return f"[{STATE_STYLE_IDLE}]IDLE {format_elapsed_compact(snap.idle_seconds)}[/]"
+    return f"[{STATE_STYLE_ACTIVE}]Active[/]"
+
+
+def _ansi_to_rich_text(ansi_str: str) -> Text:
+    """Convert ANSI text to Rich Text with a forced dark background.
+
+    Pre-processes the raw ANSI to inject a dark background (#1a1a1a) at the
+    start and after every SGR reset, so areas that would otherwise show the
+    terminal's default background render correctly in the TUI preview.
+    """
+    # Set dark bg at start of every line
+    lines = ansi_str.split("\n")
+    patched = []
+    for line in lines:
+        # Inject dark bg at start
+        line = _DARK_BG_ANSI + line
+        # After every reset (\033[0m or \033[m), re-apply dark bg
+        line = _ANSI_RESET_RE.sub(lambda m: m.group(0) + _DARK_BG_ANSI, line)
+        # Replace default-bg-only (\033[49m) with our dark bg
+        line = _ANSI_DEFAULT_BG_RE.sub(_DARK_BG_ANSI, line)
+        patched.append(line)
+    text = Text.from_ansi("\n".join(patched))
+    return text
+
+
+class TaskDetailDialog(ModalScreen):
+    """Read-only dialog showing task content and optional plan."""
+
+    BINDINGS = [
+        Binding("escape", "dismiss_dialog", "Close", show=False),
+        Binding("q", "dismiss_dialog", "Close", show=False),
+        Binding("p", "toggle_plan", "Plan/Task", show=True),
+    ]
+
+    DEFAULT_CSS = """
+    TaskDetailDialog { align: center middle; }
+    #task-detail-dialog {
+        width: 90%;
+        height: 85%;
+        background: $surface;
+        border: thick $accent;
+        padding: 1 2;
+    }
+    #task-detail-header { text-style: bold; margin: 0 0 1 0; }
+    #task-detail-meta { margin: 0 0 1 0; color: $text-muted; }
+    #task-detail-scroll { height: 1fr; }
+    #task-detail-footer { dock: bottom; height: 1; color: $text-muted; }
+    """
+
+    def __init__(self, info: TaskInfo) -> None:
+        super().__init__()
+        self._info = info
+        self._showing_plan = False
+
+    def _detail_widgets(self) -> ComposeResult:
+        """The header / meta / body triple, without the dialog container or the
+        footer. Subclasses (``TaskPickConfirmDialog``, t1310) reuse it so
+        ``action_toggle_plan`` — which queries ``#task-detail-header`` and
+        ``#task-detail-scroll`` — is inherited verbatim.
+        """
+        info = self._info
+        # The title sits directly before `[/]`, so it is a `$variable`; the
+        # meta line is frontmatter with no markup at all, so it is plain
+        # Content and cannot be parsed (t2017).
+        yield Static(
+            Content.from_markup("[bold]t$task_id: $title[/]",
+                                task_id=info.task_id, title=info.title),
+            id="task-detail-header",
+        )
+        yield Static(
+            Content(
+                f"Priority: {info.priority}  Effort: {info.effort}  "
+                f"Type: {info.issue_type}  Status: {info.status}"
+            ),
+            id="task-detail-meta",
+        )
+        yield VerticalScroll(
+            Markdown(info.body or "*No content*"),
+            id="task-detail-scroll",
+        )
+
+    def compose(self) -> ComposeResult:
+        with Container(id="task-detail-dialog"):
+            yield from self._detail_widgets()
+            plan_hint = (
+                "  [dim]p: switch plan/task[/]" if self._info.plan_content else ""
+            )
+            yield Static(
+                f"[dim]q/Esc: close[/]{plan_hint}",
+                id="task-detail-footer",
+            )
+
+    def action_dismiss_dialog(self) -> None:
+        self.dismiss()
+
+    def action_toggle_plan(self) -> None:
+        if not self._info.plan_content:
+            self.app.notify("No plan file found", severity="warning")
+            return
+        self._showing_plan = not self._showing_plan
+        content = self._info.plan_content if self._showing_plan else self._info.body
+        label = "Plan" if self._showing_plan else "Task"
+
+        scroll = self.query_one("#task-detail-scroll", VerticalScroll)
+        for child in list(scroll.children):
+            child.remove()
+        scroll.mount(Markdown(content or "*No content*"))
+
+        header = self.query_one("#task-detail-header", Static)
+        # `$label` carries its own brackets as a variable: the literal
+        # `[Plan]` / `[Task]` it replaces was read as an unknown tag and never
+        # rendered (t2017).
+        header.update(Content.from_markup(
+            "[bold]t$task_id: $title[/] $label",
+            task_id=self._info.task_id, title=self._info.title,
+            label=f"[{label}]",
+        ))
+
+
+class TaskNumberInputModal(ModalScreen):
+    """Prompt for a task number to pick (t1310).
+
+    The first TUI surface in this repo that takes a *typed* task id rather than
+    offering a list — the end-of-run "created t1234 / pick t1235 next" case the
+    minimonitor's ``p`` serves. Dismisses the raw string (validation and
+    normalization belong to the caller, which owns the downstream lookup) or
+    ``None`` on cancel.
+    """
+
+    BINDINGS = [Binding("escape", "dismiss_dialog", "Close", show=False)]
+
+    DEFAULT_CSS = """
+    TaskNumberInputModal { align: center middle; }
+    #task-num-dialog {
+        width: 60%;
+        min-width: 28;
+        height: auto;
+        background: $surface;
+        border: thick $accent;
+        padding: 1 2;
+    }
+    #task-num-header { text-style: bold; color: $accent; margin: 0 0 1 0; }
+    #task-num-input { margin: 0 0 1 0; }
+    #task-num-help { color: $text-muted; margin: 0 0 1 0; }
+    #task-num-buttons { width: 100%; height: auto; layout: horizontal; }
+    #task-num-buttons Button { margin: 0 1; }
+
+    /* Narrow variant (minimonitor companion pane, ~40 cols): widen the dialog
+       and stack the buttons, matching NextSiblingDialog.narrow. */
+    TaskNumberInputModal.narrow #task-num-dialog { width: 90%; min-width: 30; }
+    TaskNumberInputModal.narrow #task-num-buttons { layout: vertical; height: auto; }
+    TaskNumberInputModal.narrow #task-num-buttons Button {
+        width: 1fr;
+        margin: 0 0 1 0;
+    }
+    """
+
+    def __init__(self, narrow: bool = False) -> None:
+        super().__init__()
+        self._narrow = narrow
+
+    def compose(self) -> ComposeResult:
+        if self._narrow:
+            self.add_class("narrow")
+        with Container(id="task-num-dialog"):
+            yield Static("[bold]Pick Task by Number[/]", id="task-num-header")
+            yield Input(placeholder="e.g. 1310 or 1310_2", id="task-num-input")
+            yield Static(
+                "[dim]\\[Enter/OK] continue  \\[Esc] cancel[/]",
+                id="task-num-help",
+            )
+            with Container(id="task-num-buttons"):
+                yield Button("OK", variant="primary", id="btn-num-ok")
+                yield Button("Cancel", variant="default", id="btn-num-cancel")
+
+    def on_mount(self) -> None:
+        self.query_one("#task-num-input", Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self.dismiss(event.value)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "btn-num-ok":
+            self.dismiss(self.query_one("#task-num-input", Input).value)
+        else:
+            self.dismiss(None)
+
+    def action_dismiss_dialog(self) -> None:
+        self.dismiss(None)
+
+
+class TaskPickConfirmDialog(TaskDetailDialog):
+    """Task detail plus a launch confirmation and an opt-in kill (t1310).
+
+    A *subclass* rather than a flag on ``TaskDetailDialog`` so the read-only
+    ``i`` / ``I`` surface stays unchanged by construction: the base keeps its
+    exact bindings, CSS, auto-focus, compose order and ``None`` dismissal, and
+    its two call sites are untouched. Textual type selectors match base classes,
+    so the base's ``#task-detail-dialog`` rules still apply here and only the
+    confirm row and the ``.narrow`` variant live below.
+
+    Dismisses ``("pick", kill_followed_agent)`` on confirm, ``("column", None)``
+    when the user chooses to move the task to a board column, and ``None`` on
+    cancel (t1377_2). The first element used to be a bare ``True``; it is a tag
+    now because a two-way boolean cannot carry a third action.
+
+    The column action is offered only for a **parent** task id: board columns
+    hold parent cards, and the headless seam refuses a child id outright with
+    ``not_a_parent_task``, so an affordance there would be a dead end.
+    """
+
+    DEFAULT_CSS = """
+    /* Leave room for the confirm row on a short pane; the body scroll gives up
+       space first but never disappears entirely. */
+    TaskPickConfirmDialog #task-detail-dialog { height: 90%; }
+    TaskPickConfirmDialog #task-detail-scroll { min-height: 1; }
+    /* Docked, not in normal flow: the minimonitor pane is as short as the tmux
+       window, and a flow-laid confirm row silently overflows *below* the dialog
+       at ~20 rows — the buttons then render off-screen entirely. Docking makes
+       "the controls are inside the dialog" structural: the body scroll is what
+       gives up space, down to a single row.
+
+       This wrapper is the ONE docked widget on this edge (t1563). The confirm
+       row and #task-detail-footer used to carry `dock: bottom` individually,
+       and Textual 8.2.7 does not stack same-edge docked siblings — it hands
+       them overlapping regions and the later-in-DOM widget wins, so the footer
+       painted over the confirm row's last row on every frame (in the wide
+       variant, the buttons' bottom border). NEVER re-add `dock:` to either
+       child; dock this wrapper instead. Same bug class as t1499 (minimonitor
+       top chrome) and t1278 (board #filter_area). */
+    TaskPickConfirmDialog #pick-bottom-dock {
+        dock: bottom;
+        width: 100%;
+        height: auto;
+    }
+    TaskPickConfirmDialog #pick-confirm-row {
+        width: 100%;
+        height: auto;
+        margin: 1 0 0 0;
+    }
+    /* The base class docks this to the dialog; here it flows inside the
+       wrapper above. */
+    TaskPickConfirmDialog #task-detail-footer { dock: none; }
+    #pick-eligibility { color: $warning; text-style: bold; margin: 0 0 1 0; }
+    #pick-running { color: $warning; margin: 0 0 1 0; }
+    #pick-kill-detail { color: $text-muted; text-style: bold; margin: 0 0 1 0; }
+    #pick-buttons { width: 100%; height: auto; layout: horizontal; }
+    #pick-buttons Button { margin: 0 1; }
+
+    /* Narrow variant (minimonitor companion pane, ~40 cols): the buttons plus a
+       checkbox cannot share a row, so stack them — and drop the `tall`
+       borders, which cost two rows per control in a pane that has none to
+       spare. With the t1377_2 column button the stack is three rows tall, which
+       is why `#pick-bottom-dock { dock: bottom }` above is load-bearing: the
+       body scroll gives up the space, not the controls. The dock belongs to
+       that wrapper and to nothing else — do not move it onto
+       `#pick-confirm-row`, which is what this comment named before t1563 and
+       is exactly the same-edge pair that fix removed. */
+    TaskPickConfirmDialog.narrow #task-detail-dialog { width: 90%; min-width: 30; }
+    TaskPickConfirmDialog.narrow #pick-buttons { layout: vertical; height: auto; }
+    TaskPickConfirmDialog.narrow #pick-buttons Button {
+        width: 1fr;
+        height: 1;
+        border: none;
+        margin: 0 0 1 0;
+    }
+    /* Repays the row the footer no longer steals (t1563): the last stacked
+       button's bottom margin is a separator with nothing after it. */
+    TaskPickConfirmDialog.narrow #pick-buttons Button:last-of-type { margin: 0; }
+    TaskPickConfirmDialog.narrow #pick-kill {
+        width: 1fr;
+        height: 1;
+        border: none;
+    }
+    """
+
+    def __init__(
+        self,
+        info: TaskInfo,
+        *,
+        kill_target_label: str | None = None,
+        already_running: str | None = None,
+        blocking: list["DepVerdict"] | None = None,
+        narrow: bool = False,
+    ) -> None:
+        super().__init__(info)
+        self._kill_target_label = kill_target_label
+        self._already_running = already_running
+        self._blocking = list(blocking or [])
+        self._narrow = narrow
+
+    @property
+    def has_eligibility_warning(self) -> bool:
+        """True when the target is not cleanly pickable — drives the OK label."""
+        return self._info.status != "Ready" or bool(self._blocking)
+
+    @property
+    def offers_column_action(self) -> bool:
+        """True when this task can be moved to a board column (t1377_2).
+
+        Only parent tasks are board cards: the board loads children into a
+        separate ``child_task_datas`` map and never renders them in a column, and
+        ``aitask_board_column.sh`` refuses a child id with ``not_a_parent_task``.
+        Offering the button for ``1377_2`` would therefore be a dead affordance,
+        so it is omitted instead. Same parent/child test as
+        ``NextSiblingDialog.compose``.
+        """
+        return "_" not in self._info.task_id
+
+    def _kill_detail_text(self, kill: bool) -> str:
+        """State of the kill checkbox, in words.
+
+        Textual's ``Checkbox`` draws the same ``X`` slider glyph whether or not
+        it is ticked — only the colour differs. That is too weak a signal for a
+        control that closes down a running agent, especially in a ~40-column
+        pane, so the state is restated here in text.
+
+        Plain text — the label names the followed window — so every widget
+        it reaches wraps it in ``Content`` rather than parsing it (t2017).
+        """
+        verb = "KILLS" if kill else "keeps"
+        return f"{verb} {self._kill_target_label}"
+
+    def on_checkbox_changed(self, event: Checkbox.Changed) -> None:
+        if event.checkbox.id != "pick-kill":
+            return
+        self.query_one("#pick-kill-detail", Static).update(
+            Content(self._kill_detail_text(event.value))
+        )
+
+    def _eligibility_lines(self) -> list[str]:
+        lines: list[str] = []
+        if self._info.status != "Ready":
+            status = self._info.status or "(no status)"
+            lines.append(f"⚠ t{self._info.task_id} is {status} — not Ready to pick")
+        if self._blocking:
+            # `.display(prefix="t")` renders an UNRESOLVABLE dep as
+            # `t2 (UNRESOLVED)` — a dep id that matches no task file is a data
+            # error, and must not read as ordinary upstream work. The marker
+            # string itself lives in lib/dep_resolution, so this pane, the board
+            # and `ait ls` cannot spell the same state three ways (t1527).
+            # This Static wraps, so the marker survives the ~40-column narrow
+            # variant instead of being clipped.
+            blockers = " ".join(b.display(prefix="t") for b in self._blocking)
+            lines.append(f"⛔ blocked by {blockers}")
+        return lines
+
+    def compose(self) -> ComposeResult:
+        if self._narrow:
+            self.add_class("narrow")
+        with Container(id="task-detail-dialog"):
+            yield from self._detail_widgets()
+            # One docked wrapper, not two docked siblings — see the
+            # #pick-bottom-dock CSS comment above (t1563).
+            with Container(id="pick-bottom-dock"):
+                with Container(id="pick-confirm-row"):
+                    eligibility = self._eligibility_lines()
+                    if eligibility:
+                        yield Static(
+                            # Plain text with a frontmatter status in it,
+                            # like the two Statics below (t2017).
+                            Content("\n".join(eligibility)),
+                            id="pick-eligibility",
+                        )
+                    if self._already_running:
+                        yield Static(Content(self._already_running),
+                                     id="pick-running")
+                    if self._kill_target_label is not None:
+                        # Short label on purpose: ToggleButton is `text-wrap:
+                        # nowrap; text-overflow: ellipsis`, so a long one is
+                        # silently clipped *inside* the dialog — invisible to a
+                        # region-fit test. The detail goes in its own wrapping
+                        # Static below.
+                        yield Checkbox(
+                            "kill followed agent", value=False, id="pick-kill"
+                        )
+                        yield Static(
+                            Content(self._kill_detail_text(False)),
+                            id="pick-kill-detail",
+                        )
+                    with Container(id="pick-buttons"):
+                        if self.has_eligibility_warning:
+                            yield Button(
+                                "Launch anyway", variant="warning",
+                                id="btn-pick-ok",
+                            )
+                        else:
+                            yield Button("OK", variant="primary", id="btn-pick-ok")
+                        if self.offers_column_action:
+                            # No trailing "…": no Button in this framework uses
+                            # one, and the narrow pane charges a column for it.
+                            yield Button(
+                                "Move to column", variant="default",
+                                id="btn-pick-column",
+                            )
+                        yield Button(
+                            "Cancel", variant="default", id="btn-pick-cancel"
+                        )
+                plan_hint = ""
+                if self._info.plan_content:
+                    # The base's wording is 34 columns with the cancel hint; the
+                    # narrow footer is 30 wide and `height: 1`, so it clipped to
+                    # "p: switch" and the affordance was unreadable (t1563).
+                    plan_hint = (
+                        "  [dim]p: plan/task[/]" if self._narrow
+                        else "  [dim]p: switch plan/task[/]"
+                    )
+                yield Static(
+                    f"[dim]q/Esc: cancel[/]{plan_hint}",
+                    id="task-detail-footer",
+                )
+
+    def on_mount(self) -> None:
+        # Confirm-mode only. The base's default AUTO_FOCUS lands on the
+        # focusable body scroll, which is right for i/I (arrows scroll the
+        # body) and must not change; here the primary action should be armed.
+        self.query_one("#btn-pick-ok", Button).focus()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        # Branch on the id explicitly. The earlier `!= "btn-pick-ok" -> cancel`
+        # shortcut would silently swallow any button added later — including
+        # `btn-pick-column`, which would then read as a cancel.
+        if event.button.id == "btn-pick-ok":
+            kill = False
+            if self._kill_target_label is not None:
+                kill = self.query_one("#pick-kill", Checkbox).value
+            self.dismiss(("pick", kill))
+            return
+        if event.button.id == "btn-pick-column":
+            self.dismiss(("column", None))
+            return
+        self.dismiss(None)
+
+    def action_dismiss_dialog(self) -> None:
+        # Inherited q / Esc must mean cancel, never a truthy result.
+        self.dismiss(None)
+
+
+class FreezeConfirmDialog(ModalScreen):
+    """Confirm a frozen-agent operation (t1705_7). Yes/no over title and body.
+
+    Deliberately NOT `KillConfirmDialog`: that one is built around a snapshot
+    and a task, and shows a capture preview, because killing destroys output.
+    Freezing preserves it — the two must not look alike, or the reassuring
+    operation borrows the alarming one's styling.
+
+    **The affirmative button is parameterized, and it must be.** This screen
+    serves more than one verb: `f` confirms a freeze (reversible — the output is
+    kept), while `k` on a frozen row confirms a DROP, which deletes the record
+    and the only copy of that agent's captured output. A button reading "Freeze"
+    on the drop dialog would name the reassuring operation while performing the
+    destructive one, and the button is what a user reads before clicking. Pass
+    ``destructive=True`` for anything that deletes: it switches the affirmative
+    to the error variant and re-colours the border and header to match, so the
+    dialog's whole appearance carries the same verdict as its text.
+
+    Layout note: the minimonitor hosts this at **40 columns**, so the buttons
+    must fit a ~32-column content area. Textual's `Button` defaults to
+    `min-width: 16`, which puts two side-by-side buttons plus margins past the
+    edge of the dialog *and* the screen — the second one is then unclickable
+    even though it renders. Both the width and the per-button `min-width` below
+    are sized for that host, not for the full monitor.
+    """
+
+    BINDINGS = [Binding("escape", "dismiss_dialog", "Close", show=False)]
+
+    DEFAULT_CSS = """
+    FreezeConfirmDialog { align: center middle; }
+    #freeze-dialog {
+        width: 90%; max-width: 60; min-width: 24; height: auto;
+        background: $surface; border: thick $accent; padding: 1 2;
+    }
+    FreezeConfirmDialog.-destructive #freeze-dialog { border: thick $error; }
+    #freeze-header { text-style: bold; color: $accent; margin: 0 0 1 0; }
+    FreezeConfirmDialog.-destructive #freeze-header { color: $error; }
+    #freeze-details { margin: 0 0 1 0; }
+    #freeze-buttons {
+        width: 100%; height: auto; layout: horizontal; align: center middle;
+    }
+    #freeze-buttons Button { width: auto; min-width: 10; margin: 0 1; }
+    """
+
+    def __init__(self, title: str, body: str | Content, *,
+                 confirm_label: str = "Freeze",
+                 destructive: bool = False) -> None:
+        """``body`` is markup, or a ``Content`` when it names user text (a
+        window name): build that with ``Content.from_markup(template,
+        **variables)`` so the name is never parsed (t2017)."""
+        super().__init__()
+        self._title = title
+        self._body = body
+        self._confirm_label = confirm_label
+        self._destructive = destructive
+        if destructive:
+            self.add_class("-destructive")
+
+    def compose(self) -> ComposeResult:
+        with Container(id="freeze-dialog"):
+            yield Static(f"[bold]{escape(self._title)}[/]", id="freeze-header")
+            yield Static(self._body, id="freeze-details")
+            with Container(id="freeze-buttons"):
+                yield Button(
+                    self._confirm_label,
+                    variant="error" if self._destructive else "primary",
+                    id="btn-confirm",
+                )
+                yield Button("Cancel", variant="default", id="btn-cancel")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        self.dismiss(event.button.id == "btn-confirm")
+
+    def action_dismiss_dialog(self) -> None:
+        self.dismiss(False)
+
+
+class KillConfirmDialog(ModalScreen):
+    """Confirmation dialog before killing a tmux pane."""
+
+    BINDINGS = [
+        Binding("escape", "dismiss_dialog", "Close", show=False),
+    ]
+
+    DEFAULT_CSS = """
+    KillConfirmDialog { align: center middle; }
+    #kill-dialog {
+        width: 80%;
+        min-width: 28;
+        height: auto;
+        max-height: 85%;
+        background: $surface;
+        border: thick $error;
+        padding: 1 2;
+    }
+    #kill-header { text-style: bold; color: $error; margin: 0 0 1 0; }
+    #kill-details { margin: 0 0 1 0; }
+    #kill-preview-label { text-style: bold; color: $text-muted; margin: 1 0 0 0; }
+    #kill-preview { max-height: 17; margin: 0 0 1 0; background: #1a1a1a; color: #d4d4d4; padding: 0 1; }
+    #kill-buttons { width: 100%; height: 3; layout: horizontal; align: center middle; }
+    #kill-buttons Button { width: auto; min-width: 10; margin: 0; }
+    """
+
+    def __init__(
+        self,
+        snap: PaneSnapshot,
+        task_info: TaskInfo | None,
+        show_preview: bool = True,
+    ) -> None:
+        super().__init__()
+        self._snap = snap
+        self._task_info = task_info
+        self._show_preview = show_preview
+
+    def compose(self) -> ComposeResult:
+        snap = self._snap
+        pane = snap.pane
+
+        status = format_pane_status(snap)
+
+        with Container(id="kill-dialog"):
+            yield Static(
+                "[bold red]Kill Agent Confirmation[/]",
+                id="kill-header",
+            )
+
+            # Every user-derived field is a `$variable`, never interpolated
+            # (t2006): Textual substitutes variables after tokenizing, so a
+            # window named `agent-[/]x` neither raises MarkupError nor eats a
+            # tag, and a value ending in a backslash cannot turn the `[/]` after
+            # it into text — which no string escaping can prevent (see
+            # `markup_literal`). Only framework markup stays in the template.
+            variables = {
+                "window": pane.window_name,
+                "cmd": pane.current_command,
+            }
+            detail_parts = [
+                f"Window:   [bold]{pane.window_index}:$window[/] (pane {pane.pane_index})",
+            ]
+            if self._task_info:
+                info = self._task_info
+                variables.update(
+                    task_id=info.task_id, title=info.title,
+                    priority=info.priority, task_status=info.status,
+                )
+                detail_parts.append("Task:     [bold]t$task_id[/]: $title")
+                detail_parts.append(
+                    "          Priority: $priority  Status: $task_status"
+                )
+            detail_parts.append(f"Status:   {status}")
+            detail_parts.append(f"Process:  $cmd (PID {pane.pane_pid})")
+
+            yield Static(
+                Content.from_markup("\n".join(detail_parts), **variables),
+                id="kill-details",
+            )
+
+            if self._show_preview:
+                lines = snap.content.rstrip().splitlines()
+                preview_lines = lines[-15:] if len(lines) > 15 else lines
+                if preview_lines:
+                    preview_content = _ansi_to_rich_text("\n".join(preview_lines))
+                else:
+                    preview_content = "(empty)"
+
+                yield Static("[bold]Window Content Preview:[/]", id="kill-preview-label")
+                yield Static(preview_content, id="kill-preview")
+
+            with Container(id="kill-buttons"):
+                yield Button("Kill", variant="error", id="btn-kill")
+                yield Button("Cancel", variant="default", id="btn-cancel")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "btn-kill":
+            self.dismiss(True)
+        else:
+            self.dismiss(False)
+
+    def action_dismiss_dialog(self) -> None:
+        self.dismiss(False)
+
+
+class NextSiblingDialog(ModalScreen):
+    """Dialog for picking next sibling task."""
+
+    BINDINGS = [Binding("escape", "dismiss_dialog", "Close", show=False)]
+
+    DEFAULT_CSS = """
+    NextSiblingDialog { align: center middle; }
+    #next-sib-dialog { width: 70%; height: auto; background: $surface; border: thick $warning; padding: 1 2; }
+    #next-sib-header { text-style: bold; color: $warning; margin: 0 0 1 0; }
+    #next-sib-details { margin: 0 0 1 0; }
+    #next-sib-buttons { width: 100%; height: auto; layout: horizontal; }
+    #next-sib-buttons Button { margin: 0 1; }
+
+    /* Narrow variant (minimonitor companion pane, ~40 cols): three buttons
+       cannot fit horizontally, so widen the dialog and stack them vertically. */
+    NextSiblingDialog.narrow #next-sib-dialog { width: 90%; min-width: 30; }
+    NextSiblingDialog.narrow #next-sib-buttons { layout: vertical; height: auto; }
+    NextSiblingDialog.narrow #next-sib-buttons Button { width: 1fr; margin: 0 0 1 0; }
+    """
+
+    def __init__(
+        self,
+        current_task_id: str,
+        current_title: str,
+        current_status: str,
+        suggested_id: str,
+        suggested_title: str,
+        parent_id: str,
+        narrow: bool = False,
+        suggested_followup_kind: str = "",
+    ) -> None:
+        super().__init__()
+        self._current_task_id = current_task_id
+        self._current_title = current_title
+        self._current_status = current_status
+        self._suggested_id = suggested_id
+        self._suggested_title = suggested_title
+        self._parent_id = parent_id
+        self._narrow = narrow
+        self._suggested_followup_kind = suggested_followup_kind
+
+    def compose(self) -> ComposeResult:
+        if self._narrow:
+            self.add_class("narrow")
+        is_parent_with_children = "_" not in self._current_task_id
+        will_kill = self._current_status == "Done" or is_parent_with_children
+        with Container(id="next-sib-dialog"):
+            yield Static("[bold yellow]Pick Next Sibling[/]", id="next-sib-header")
+            # Task titles and status are `$variables` (t2017), the
+            # `KillConfirmDialog` pattern: substituted after tokenizing, so
+            # they are literal whatever follows them. Only framework markup
+            # (including `_followup_prefix`) stays in the template.
+            variables = {
+                "cur_id": self._current_task_id,
+                "cur_title": self._current_title,
+                "cur_status": self._current_status,
+                "sug_id": self._suggested_id,
+                "sug_title": self._suggested_title,
+            }
+            lines = [
+                "Current:   [bold]t$cur_id[/]: $cur_title  (Status: $cur_status)",
+                f"Suggested: {_followup_prefix(self._suggested_followup_kind)}"
+                "[bold]t$sug_id[/]: $sug_title",
+            ]
+            if will_kill:
+                if is_parent_with_children:
+                    lines.append("\n[yellow]Parent agent pane will be killed (parent is split into children)[/]")
+                else:
+                    lines.append("\n[yellow]Current agent pane will be killed (task is Done)[/]")
+            yield Static(Content.from_markup("\n".join(lines), **variables),
+                         id="next-sib-details")
+            with Container(id="next-sib-buttons"):
+                yield Button(f"Pick t{self._suggested_id}", variant="warning", id="btn-pick-suggested")
+                yield Button("Choose sibling", variant="primary", id="btn-choose-sibling")
+                yield Button("Cancel", variant="default", id="btn-cancel")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "btn-pick-suggested":
+            self.dismiss(("pick", self._suggested_id))
+        elif event.button.id == "btn-choose-sibling":
+            self.dismiss(("choose", self._parent_id))
+        else:
+            self.dismiss(None)
+
+    def action_dismiss_dialog(self) -> None:
+        self.dismiss(None)
+
+
+def _followup_prefix(followup_kind: str) -> str:
+    """Two-cell rich-markup prefix carrying a task's follow-up provenance.
+
+    Always exactly two cells wide — `"  "` when the task is not an auto-spawned
+    follow-up, `"<glyph> "` when it is — so marked and unmarked rows stay
+    column-aligned and the narrow (minimonitor, ~40 col) variant loses no width
+    to the marker. Glyphs are single-cell by construction (t1468_1).
+
+    `marker_for` owns the three-way rule (absent / recognised / unrecognised);
+    this is only its rendering, and it is shared by every sibling surface so the
+    picker and the `Suggested:` line can never disagree (t1468_5).
+    """
+    marker = marker_for(followup_kind)
+    if not marker:
+        return "  "
+    glyph, colour = marker
+    return f"[{colour}]{glyph}[/] " if colour else f"{glyph} "
+
+
+class _SiblingRow(Static):
+    """A focusable sibling row inside ChooseSiblingModal."""
+
+    can_focus = True
+
+    DEFAULT_CSS = """
+    _SiblingRow {
+        height: 1;
+        padding: 0 1;
+    }
+    _SiblingRow:focus {
+        background: $accent 30%;
+    }
+    """
+
+    def __init__(self, sib_id: str, title: str, blocking_ids: list[str],
+                 followup_kind: str = "", **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._sib_id = sib_id
+        self._title = title
+        self._blocking_ids = blocking_ids
+        self._followup_kind = followup_kind
+
+    @property
+    def sib_id(self) -> str:
+        return self._sib_id
+
+    def render(self) -> str:
+        # The title is followed by two spaces or by the end of the markup,
+        # never directly by a tag, so `markup_literal` is exact (t2017).
+        base = (f"{_followup_prefix(self._followup_kind)}"
+                f"[bold #7aa2f7]t{self._sib_id}[/]  "
+                f"{markup_literal(self._title)}")
+        if self._blocking_ids:
+            blockers = " ".join(f"t{b}" for b in self._blocking_ids)
+            base += f"  [bold red]⛔ blocked by {blockers}[/]"
+        return base
+
+    def on_key(self, event) -> None:
+        if event.key == "enter":
+            self.screen.dismiss(self._sib_id)
+            event.prevent_default()
+            event.stop()
+        elif event.key == "down":
+            self._focus_neighbor(1)
+            event.prevent_default()
+            event.stop()
+        elif event.key == "up":
+            self._focus_neighbor(-1)
+            event.prevent_default()
+            event.stop()
+
+    def _focus_neighbor(self, delta: int) -> None:
+        parent = self.parent
+        if parent is None:
+            return
+        rows = [w for w in parent.children if isinstance(w, _SiblingRow)]
+        try:
+            idx = rows.index(self)
+        except ValueError:
+            return
+        new_idx = max(0, min(len(rows) - 1, idx + delta))
+        if new_idx != idx:
+            rows[new_idx].focus()
+            rows[new_idx].scroll_visible()
+
+
+class ChooseSiblingModal(ModalScreen):
+    """Modal dialog letting the user pick a Ready sibling task by name."""
+
+    BINDINGS = [Binding("escape", "dismiss_dialog", "Close", show=False)]
+
+    DEFAULT_CSS = """
+    ChooseSiblingModal { align: center middle; }
+    #choose-sib-dialog {
+        width: 70%;
+        max-height: 80%;
+        background: $surface;
+        border: thick $accent;
+        padding: 1 2;
+    }
+    #choose-sib-header { text-style: bold; color: $accent; margin: 0 0 1 0; }
+    #choose-sib-context { color: $text-muted; margin: 0 0 1 0; }
+    #choose-sib-list { height: 1fr; min-height: 3; margin: 0 0 1 0; }
+    #choose-sib-help { color: $text-muted; margin: 0 0 1 0; }
+    #choose-sib-buttons { width: 100%; height: auto; layout: horizontal; }
+    #choose-sib-buttons Button { margin: 0 1; }
+
+    /* Narrow variant (minimonitor companion pane, ~40 cols): widen the dialog
+       so the header, sibling rows, and OK/Cancel render fully. The two short
+       buttons still fit horizontally within the widened pane. */
+    ChooseSiblingModal.narrow #choose-sib-dialog { width: 90%; min-width: 30; }
+    """
+
+    def __init__(
+        self,
+        parent_id: str,
+        siblings: list[tuple[str, str, list[str], str]],
+        narrow: bool = False,
+    ) -> None:
+        super().__init__()
+        self._parent_id = parent_id
+        self._siblings = siblings
+        self._narrow = narrow
+
+    def compose(self) -> ComposeResult:
+        if self._narrow:
+            self.add_class("narrow")
+        with Container(id="choose-sib-dialog"):
+            yield Static("[bold]Choose Sibling[/]", id="choose-sib-header")
+            yield Static(
+                f"Parent: [bold]t{self._parent_id}[/]  ·  {len(self._siblings)} Ready sibling(s)",
+                id="choose-sib-context",
+            )
+            with VerticalScroll(id="choose-sib-list"):
+                for sib_id, title, blocking_ids, followup_kind in self._siblings:
+                    yield _SiblingRow(sib_id, title, blocking_ids, followup_kind)
+            yield Static(
+                "[dim]\\[↑/↓] navigate  \\[Enter/OK] select  \\[Esc] cancel[/]",
+                id="choose-sib-help",
+            )
+            with Container(id="choose-sib-buttons"):
+                yield Button("OK", variant="primary", id="btn-ok")
+                yield Button("Cancel", variant="default", id="btn-cancel")
+
+    def on_mount(self) -> None:
+        rows = list(self.query(_SiblingRow))
+        if rows:
+            rows[0].focus()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "btn-ok":
+            focused = self.focused
+            if isinstance(focused, _SiblingRow):
+                self.dismiss(focused.sib_id)
+                return
+            rows = list(self.query(_SiblingRow))
+            if rows:
+                self.dismiss(rows[0].sib_id)
+            else:
+                self.dismiss(None)
+        else:
+            self.dismiss(None)
+
+    def action_dismiss_dialog(self) -> None:
+        self.dismiss(None)
+
+
+def _safe_column_color(raw: str) -> str:
+    """A board-column colour that is safe to use as a rich-markup tag.
+
+    Column colours come from a hand-editable ``board_config.json``, so the value
+    is arbitrary text landing in a markup *tag*. Textual's current renderer
+    tolerates an unknown style name (the text simply renders unstyled), so this
+    is **defence in depth, not crash-prevention** — but ``Style.parse`` does
+    raise ``StyleSyntaxError`` on the same input, so any path that resolves the
+    style eagerly would fail, and relying on the renderer's tolerance would be
+    relying on an implementation detail.
+
+    Note the seam's own ``unordered`` default, ``gray``, is **not** a valid rich
+    colour (rich has ``grey0``…``grey100``, no bare ``gray``/``grey``), so this
+    fires on a stock value and that row draws an unstyled swatch.
+
+    Only :class:`ColorParseError` is caught — the fallback is purely cosmetic so
+    it cannot fail open into wrong behaviour, and a broader except would hide
+    real bugs.
+    """
+    if not raw:
+        return ""
+    try:
+        Color.parse(raw)
+    except ColorParseError:
+        return ""
+    return raw
+
+
+class _ColumnRow(Static):
+    """A focusable board-column row inside ColumnPickerModal (t1377_2)."""
+
+    can_focus = True
+
+    DEFAULT_CSS = """
+    _ColumnRow {
+        height: 1;
+        padding: 0 1;
+    }
+    _ColumnRow:focus {
+        background: $accent 30%;
+    }
+    """
+
+    def __init__(self, col_id: str, title: str, color: str = "",
+                 current: bool = False, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._col_id = col_id
+        self._title = title
+        self._color = _safe_column_color(color)
+        self._current = current
+
+    @property
+    def col_id(self) -> str:
+        return self._col_id
+
+    def pick_result(self):
+        """This row's dismissal payload (t1377_3).
+
+        The **one** place that knows the picker's result shape for a real
+        column; `_NewColumnRow` overrides it for the create action. Both the
+        Enter key and the OK button route through here, so the tagged tuple is
+        defined once rather than at each dismissal site.
+        """
+        return ("existing", self._col_id)
+
+    def render(self) -> str:
+        # `title` and `col_id` are user-authored config reaching a markup
+        # string, so both are escaped. Verified, not theoretical: an unescaped
+        # `[/]` raises MarkupError and takes the modal down, and an unescaped
+        # `[b]` is silently swallowed — `a[b]c` renders as `ac`, corrupting the
+        # title with no signal at all. The colour is a *tag*, not text, so
+        # escaping is not the tool for it — it is validated in the constructor.
+        mark = "●" if self._current else " "
+        swatch = f"[{self._color}]██[/]" if self._color else "██"
+        return (f" {mark} {swatch} {escape(self._title)} "
+                f"[dim]({escape(self._col_id)})[/]")
+
+    def on_key(self, event) -> None:
+        if event.key == "enter":
+            self.screen.dismiss(self.pick_result())
+            event.prevent_default()
+            event.stop()
+        elif event.key == "down":
+            self._focus_neighbor(1)
+            event.prevent_default()
+            event.stop()
+        elif event.key == "up":
+            self._focus_neighbor(-1)
+            event.prevent_default()
+            event.stop()
+
+    def _focus_neighbor(self, delta: int) -> None:
+        parent = self.parent
+        if parent is None:
+            return
+        rows = [w for w in parent.children if isinstance(w, _ColumnRow)]
+        try:
+            idx = rows.index(self)
+        except ValueError:
+            return
+        new_idx = max(0, min(len(rows) - 1, idx + delta))
+        if new_idx != idx:
+            rows[new_idx].focus()
+            rows[new_idx].scroll_visible()
+
+
+class _NewColumnRow(_ColumnRow):
+    """The trailing "create a new column" row of ColumnPickerModal (t1377_3).
+
+    A **subclass** rather than a sentinel `col_id` string: a sentinel would flow
+    into the caller's `titles` lookup and could reach the seam as a real column
+    id, whereas the tagged result makes the create action structurally distinct.
+    Subclassing (rather than a sibling widget) is what keeps `_focus_neighbor`'s
+    ``isinstance(w, _ColumnRow)`` scan and the modal's focus loop working
+    unchanged.
+
+    It carries no id and no colour, so it renders no swatch — there is nothing
+    user-authored in this row to escape.
+    """
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__("", "", "", current=False, **kwargs)
+
+    def pick_result(self):
+        return ("new", None)
+
+    def render(self) -> str:
+        return "   [bold]＋ New column…[/]"
+
+
+class ColumnPickerModal(ModalScreen):
+    """Pick the board column to move a task into (t1377_2).
+
+    ``columns`` is ``(col_id, colour, title)`` in board order — the shape
+    ``aitask_board_column.sh list-columns`` emits, including the synthetic
+    ``unordered`` entry. ``current`` is the task's present column, marked in the
+    list so the user can see where it sits before moving it.
+
+    ``allow_new`` appends a trailing "＋ New column…" row (t1377_3). It defaults
+    to off so the constructor stays usable by a caller that only wants to move.
+
+    Dismisses a **tagged tuple** (t1377_3):
+
+    ==========================  ====================================
+    ``("existing", col_id)``    move to an already-configured column
+    ``("new", None)``           the user chose to create one
+    ``None``                    cancel
+    ==========================  ====================================
+
+    The tag exists because both actions would otherwise be a bare string, and a
+    sentinel id could reach the headless seam as a real column. Note both tuples
+    are **truthy**: a consumer must branch on the tag, not on truthiness.
+    """
+
+    BINDINGS = [Binding("escape", "dismiss_dialog", "Close", show=False)]
+
+    DEFAULT_CSS = """
+    ColumnPickerModal { align: center middle; }
+    #column-pick-dialog {
+        width: 70%;
+        max-height: 80%;
+        background: $surface;
+        border: thick $accent;
+        padding: 1 2;
+    }
+    #column-pick-header { text-style: bold; color: $accent; margin: 0 0 1 0; }
+    #column-pick-context { color: $text-muted; margin: 0 0 1 0; }
+    #column-pick-list { height: 1fr; min-height: 3; margin: 0 0 1 0; }
+    #column-pick-help { color: $text-muted; margin: 0 0 1 0; }
+    #column-pick-buttons { width: 100%; height: auto; layout: horizontal; }
+    #column-pick-buttons Button { margin: 0 1; }
+
+    /* Small-pane variant (minimonitor companion pane, ~40 cols and as SHORT as
+       the tmux window): widen the dialog so rows render fully, then reclaim the
+       vertical budget. This dialog carries more chrome than the sibling picker
+       — header, context, list, help AND buttons — so at ~16 rows the borders
+       cost real space: drop them and let the list collapse to a single
+       scrolling row, the same levers the pick-confirm dialog pulls.
+       `min-width: 0` is load-bearing: Textual's Button defaults to
+       `min-width: 16`, so two of them plus margins overflow a 32-cell content
+       box and Cancel renders outside the dialog. */
+    ColumnPickerModal.narrow #column-pick-dialog { width: 90%; min-width: 30; }
+    ColumnPickerModal.narrow #column-pick-list { min-height: 1; }
+    /* At 40x16 the content box is 8 rows and the chrome wants 9, so the
+       blank-line margins are what has to give — not the list, which is the
+       only part carrying information. */
+    ColumnPickerModal.narrow #column-pick-header { margin: 0; }
+    ColumnPickerModal.narrow #column-pick-help { margin: 0; }
+    ColumnPickerModal.narrow #column-pick-buttons Button {
+        width: 1fr;
+        min-width: 0;
+        height: 1;
+        border: none;
+    }
+    """
+
+    def __init__(
+        self,
+        task_id: str,
+        columns: list[tuple[str, str, str]],
+        current: str | None = None,
+        narrow: bool = False,
+        allow_new: bool = False,
+    ) -> None:
+        super().__init__()
+        self._task_id = task_id
+        self._columns = columns
+        self._current = current
+        self._narrow = narrow
+        self._allow_new = allow_new
+
+    def _current_title(self) -> str:
+        for col_id, _color, title in self._columns:
+            if col_id == self._current:
+                return title
+        return self._current or "unknown"
+
+    def compose(self) -> ComposeResult:
+        if self._narrow:
+            self.add_class("narrow")
+        with Container(id="column-pick-dialog"):
+            yield Static("[bold]Move to Column[/]", id="column-pick-header")
+            # The current column's title is user-authored config too.
+            yield Static(
+                f"Task: [bold]t{escape(self._task_id)}[/]  ·  "
+                f"now in: {escape(self._current_title())}",
+                id="column-pick-context",
+            )
+            with VerticalScroll(id="column-pick-list"):
+                for col_id, color, title in self._columns:
+                    yield _ColumnRow(col_id, title, color,
+                                     current=col_id == self._current)
+                if self._allow_new:
+                    yield _NewColumnRow()
+            yield Static(
+                "[dim]\\[↑/↓] navigate  \\[Enter/OK] select  \\[Esc] cancel[/]",
+                id="column-pick-help",
+            )
+            with Container(id="column-pick-buttons"):
+                yield Button("OK", variant="primary", id="btn-col-ok")
+                yield Button("Cancel", variant="default", id="btn-col-cancel")
+
+    def on_mount(self) -> None:
+        rows = list(self.query(_ColumnRow))
+        if not rows:
+            return
+        for row in rows:
+            if row.col_id == self._current:
+                row.focus()
+                return
+        rows[0].focus()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "btn-col-ok":
+            focused = self.focused
+            if isinstance(focused, _ColumnRow):
+                self.dismiss(focused.pick_result())
+                return
+            rows = list(self.query(_ColumnRow))
+            if rows:
+                self.dismiss(rows[0].pick_result())
+            else:
+                self.dismiss(None)
+        else:
+            self.dismiss(None)
+
+    def action_dismiss_dialog(self) -> None:
+        self.dismiss(None)
+
+
+class NewColumnTitleModal(ModalScreen):
+    """Prompt for the title of a board column to create (t1377_3).
+
+    Shape copied from :class:`TaskNumberInputModal` — one input, OK/Cancel, a
+    ``.narrow`` variant for the ~40-column companion pane. Dismisses the raw
+    title string, or ``None`` on cancel; the id and colour are derived by the
+    headless seam, so this asks for the one thing only a human can supply.
+
+    **A blank title is rejected in place** — warn and stay mounted, mirroring
+    the board's ``ColumnEditScreen.save``. Dismissing an empty string would push
+    the refusal down to the seam and close the dialog the user has to reopen.
+    """
+
+    BINDINGS = [Binding("escape", "dismiss_dialog", "Close", show=False)]
+
+    DEFAULT_CSS = """
+    NewColumnTitleModal { align: center middle; }
+    #new-col-dialog {
+        width: 60%;
+        min-width: 28;
+        height: auto;
+        background: $surface;
+        border: thick $accent;
+        padding: 1 2;
+    }
+    #new-col-header { text-style: bold; color: $accent; margin: 0 0 1 0; }
+    #new-col-input { margin: 0 0 1 0; }
+    #new-col-help { color: $text-muted; margin: 0 0 1 0; }
+    #new-col-buttons { width: 100%; height: auto; layout: horizontal; }
+    #new-col-buttons Button { margin: 0 1; }
+
+    /* Small-pane variant for the ~40-column companion pane. `min-width: 0` is
+       load-bearing: Textual's Button defaults to `min-width: 16`, so two of them
+       plus margins overflow a 32-cell content box and Cancel renders outside the
+       dialog. Buttons stack, as in TaskNumberInputModal.
+       Keep the small-pane keyword out of THIS comment: the CSS-stripping helper
+       in tests/test_minimonitor_pick_by_number.py drops any line containing it
+       and then eats lines through the next `}`, so a mention here would orphan
+       this comment's opener and take a real rule with it. */
+    NewColumnTitleModal.narrow #new-col-dialog { width: 90%; min-width: 30; }
+    NewColumnTitleModal.narrow #new-col-buttons { layout: vertical; height: auto; }
+    NewColumnTitleModal.narrow #new-col-buttons Button {
+        width: 1fr;
+        min-width: 0;
+        height: 1;
+        border: none;
+        margin: 0 0 1 0;
+    }
+    """
+
+    def __init__(self, narrow: bool = False) -> None:
+        super().__init__()
+        self._narrow = narrow
+
+    def compose(self) -> ComposeResult:
+        if self._narrow:
+            self.add_class("narrow")
+        with Container(id="new-col-dialog"):
+            yield Static("[bold]New Board Column[/]", id="new-col-header")
+            yield Input(placeholder="e.g. Spikes", id="new-col-input")
+            yield Static(
+                "[dim]\\[Enter/OK] create  \\[Esc] cancel[/]",
+                id="new-col-help",
+            )
+            with Container(id="new-col-buttons"):
+                yield Button("Create", variant="primary", id="btn-new-col-ok")
+                yield Button("Cancel", variant="default", id="btn-new-col-cancel")
+
+    def on_mount(self) -> None:
+        self.query_one("#new-col-input", Input).focus()
+
+    def _submit(self) -> None:
+        """The single guard both Enter and the Create button route through."""
+        title = self.query_one("#new-col-input", Input).value.strip()
+        if not title:
+            self.app.notify("Title is required", severity="warning")
+            return  # stay mounted — never dismiss on a blank title
+        self.dismiss(title)
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self._submit()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "btn-new-col-ok":
+            self._submit()
+        else:
+            self.dismiss(None)
+
+    def action_dismiss_dialog(self) -> None:
+        self.dismiss(None)
+
+
+# Priority → rich-markup badge for a concern row. Colors mirror the broader
+# high=red / medium=yellow / low=dim convention used across the monitor TUIs.
+_CONCERN_BADGE = {
+    "high": "[bold red]HIGH[/]",
+    "medium": "[bold yellow]MED[/]",
+    "low": "[dim]LOW[/]",
+}
+
+#: Magnitude -> rich style for a trade-profile arrow (t1651). The single site to
+#: retune the ramp; :func:`_magnitude_markup` is only the lookup.
+#:
+#: **Deliberately the same vocabulary as** :data:`_CONCERN_BADGE`, which sits
+#: three cells to its left on the one-line layout. That is not a collision:
+#: `derive_priority` DEFINES the badge as the max improve magnitude, so a red
+#: HIGH badge beside a red improve arrow is the same fact rendered twice.
+#:
+#: **The ramp encodes INTENSITY, never direction.** The glyph (up / down) already
+#: carries direction, so a high improve and a high worsen are the SAME colour on
+#: purpose — re-encoding direction here would leave high/medium/low
+#: indistinguishable, which is the defect this replaces.
+#:
+#: **`low` gets a real colour, unlike the badge's `dim`.** The report that opened
+#: t1651 is that bold-vs-plain-vs-dim on a single glyph is close to unreadable,
+#: and `dim` resolves to no colour at all (`Style.parse("dim").color is None`) —
+#: it is a weight, not a colour. The badge can keep `dim` because it renders a
+#: WORD, where weight is legible; a single arrow is not. So the ramp is
+#: hot -> warm -> cold. For the values it ACTUALLY renders — #ff0000, #ffff00,
+#: #808080 — see the Textual-palette note below the mapping; the bare-Rich
+#: numbers for these names are NOT what reaches the screen.
+#:
+#: **`""` (unspecified) is deliberately OFF that ramp.** `normalize_magnitude`
+#: refuses to degrade it to `low`, and `trade_profile_rungs`' last rung drops the
+#: `?` character that otherwise carries it — so at that rung the colour is its
+#: ONLY carrier and must not collapse into a real magnitude. #6272A4 is this
+#: codebase's existing "inactive / unset" blue (`mark_glyphs`).
+#:
+#: **No value may contain `?`**: that same rung does a positional
+#: `markup.replace("?", "", 1)`, which would strike ramp markup instead of the
+#: unspecified marker. Pinned by `ConcernMagnitudeRampTests`.
+#: **The two named values resolve through TEXTUAL's palette, not Rich's.** This
+#: markup is rendered inside a Textual ``Static``, so `red` is #FF0000 and
+#: `yellow` is #FFFF00 — NOT the #800000 / #808000 that `rich.style.Style.parse`
+#: reports for the same names in isolation. Measuring the bare Rich style is the
+#: wrong context and gives the wrong answer; `ConcernMagnitudeRampTests` pins the
+#: values as they actually composite.
+_MAGNITUDE_RAMP = {
+    "high": "bold red",       # -> #ff0000 + bold  (Textual's `red`)
+    "medium": "bold yellow",  # -> #ffff00 + bold  (Textual's `yellow`)
+    "low": "#808080",         # -> grey; NOT `dim`, which carries no colour
+    "": "#6272A4",            # -> unspecified, off the heat ramp
+}
+
+
+class RejectedEntry(NamedTuple):
+    """One row of the per-task rejection store, as pre-fetched by the caller.
+
+    Mirrors a single ``REJECTED:r<id>|<ts>|<producer>|<marker line>`` line from
+    ``aitask_shadow_rejected.sh list --machine``. The marker line comes **last**
+    on the wire precisely because it contains ``|``, so the parse is a 3-way
+    split — see :func:`parse_rejected_machine_lines`.
+    """
+
+    id: str            # store entry id, `r`-prefixed exactly as the helper emits
+    ts: str            # ISO-8601 rejection timestamp
+    producer: str      # which shadow producer raised it, or "unknown"
+    marker_line: str   # the canonical `- [priority | region] body` line
+
+
+class ConcernPickResult(NamedTuple):
+    """What :class:`ConcernPickerModal` dismisses with on confirm (t1427_2).
+
+    Four independent output channels, because each disposition needed its own
+    and overloading the original ``list[Concern]`` return would have made
+    "forward these", "reject these" and "spin these off" indistinguishable.
+
+    ``spun_off`` (t1159_3) carries **no default** on purpose: it is a new
+    output channel, and a default would let a construction site that predates
+    it silently report "nothing to spin off" instead of failing loudly. Every
+    site is amended together — see the class docstring test literals in
+    ``tests/test_concern_picker_modal.py``,
+    ``tests/test_minimonitor_concern_action.py`` and
+    ``tests/test_monitor_concern_action.py``.
+
+    ``payload_override`` (t1582) **does** take a default, and the difference
+    from ``spun_off`` is the point rather than an inconsistency. That one is a
+    disposition channel, where "absent" and "empty" are the same claim and a
+    default would let a stale site make it silently. This one is an *optional*
+    override of text that is otherwise derived: ``None`` is the correct and
+    meaningful reading for every caller that never opened the editor, which is
+    exactly what keeps ``Enter`` the unchanged zero-friction fast path.
+
+    **All-empty is a valid result** — the user confirmed without marking
+    anything. Cancellation is signalled by ``None`` instead, so a consumer must
+    test ``result is None`` and never ``if not result``.
+    """
+
+    forwarded: list["Concern"]
+    rejected: list["Concern"]
+    unrejected: tuple[str, ...]   # store entry ids to un-reject, e.g. ("r1", "r3")
+    spun_off: list["Concern"]     # park each as its own draft task (t1159_3)
+    #: The user's edited clipboard text, or None when they never edited (t1582).
+    #: Never ``""``: an emptied editor is refused at save time.
+    payload_override: str | None = None
+
+
+def parse_rejected_machine_lines(out: str) -> list[RejectedEntry]:
+    """Parse ``list --machine`` output into entries.
+
+    ``NO_REJECTIONS`` (a missing store *or* one drained of entries) and any
+    unrecognised line yield nothing. Branch on that sentinel, never on the exit
+    status: the helper exits 0 for **every** resolution outcome.
+
+    ``split("|", 3)`` — bounded at 3 — is what keeps a body containing ``|``
+    intact, since the marker line is the last field.
+    """
+    entries: list[RejectedEntry] = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line.startswith("REJECTED:"):
+            continue
+        parts = line[len("REJECTED:"):].split("|", 3)
+        if len(parts) != 4:
+            continue
+        entries.append(RejectedEntry(*parts))
+    return entries
+
+
+#: Disposition → row mark (t1427_2, `spinoff` added t1159_3). Every glyph is
+#: **single-width**, which is what keeps :data:`_NARROW_PREFIX_COLS` valid: the
+#: narrow layout budgets the prefix in columns, so a double-width mark would
+#: silently eat a column of region text at exactly the widths that already have
+#: none to spare. `»` (U+00BB) is East-Asian-Width *Ambiguous*, i.e. width 1
+#: outside CJK locales — the same class as the three glyphs above it.
+_CONCERN_MARKS = {
+    "none": mark_markup(False),
+    "forward": mark_markup(True),
+    "rejected": "[red]✗[/]",
+    "spinoff": "[bold cyan]»[/]",
+}
+
+#: Plain-text mirror of :data:`_CONCERN_MARKS`, for measurement only. Derived
+#: from the markup rather than written twice, so the two cannot drift: a second
+#: hand-maintained table is exactly how a glyph change would silently move every
+#: width budget. Every entry is single-width (asserted by
+#: `test_every_mark_is_single_width`).
+_MARK_PLAIN = {
+    state: Text.from_markup(markup).plain for state, markup in _CONCERN_MARKS.items()
+}
+
+
+#: Columns line 1 of a narrow row spends before the region: mark, spaces, the
+#: widest badge (`HIGH`), and the separating space.
+#:
+#: **This is a documented worst case, not the value the row budgets with (t1636_4).**
+#: The impact-vector badge appends a `\u2260` when the derived priority disagrees with
+#: the marker, which makes the widest prefix **9**, not 8. `_ConcernRow` therefore
+#: MEASURES its assembled prefix (`_prefix_seg`) and budgets with that; this
+#: constant survives only as the bound `_PrefixTemplateTests` pins every state
+#: against. Budgeting with it directly would admit a one-line row that renders a
+#: cell wider than it measured, and Rich folds the overflowing segment whole.
+_NARROW_PREFIX_COLS = 8
+
+#: The mismatch marker: the derived priority disagrees with the emitted marker
+#: priority. Appended **directly to the badge**, no separating space — it
+#: The one-line form's region cap — the legacy `_region_label(40)` budget, kept
+#: so a row that stays on one line renders exactly as it always has.
+_ONE_LINE_REGION_CELLS = 40
+
+#: Cells the one-line form reserves for the body before it gives up and goes
+#: multi-line. **Measured, not chosen:** 12 is what keeps an 80-column monitor
+#: (a 48-cell row) on one line for a legacy concern — the width `P1` pins as
+#: unchanged — while sending the ~60-column case (a 34-cell row, where the body
+#: was being folded away entirely) to the multi-line form.
+_MIN_BODY_CELLS = 12
+
+#: Floor for a truncated region. Below this the region is noise rather than a
+#: label, so the row goes multi-line instead.
+_MIN_REGION_CELLS = 12
+
+#: annotates the badge rather than standing beside it, and that spacing is the
+#: layout contract every prefix budget derives from. `\u2260` (U+2260) is
+#: East-Asian-Width Ambiguous, i.e. width 1 outside CJK — the same class as the
+#: `\u00bb` spin-off mark, so it does not disturb single-width assumptions.
+_PRIORITY_MISMATCH_MARK = "[dim]\u2260[/]"
+
+
+class _Seg(NamedTuple):
+    """A rendered segment: what it *looks like* and what it *measures* (t1636_4).
+
+    Every width budget in this row is denominated in terminal cells, but every
+    string the row assembles is Rich **markup**: `_CONCERN_MARKS["none"]` is
+    `'[#6272A4]\u25a1[/]'` and `_CONCERN_BADGE["high"]` is `'[bold red]HIGH[/]'`.
+    Measuring those raw gives 42 cells for a prefix that renders as 9, which
+    would classify almost every row as too wide and collapse the layout
+    threshold entirely. `escape()` compounds it, adding backslashes that exist in
+    the markup and never on screen.
+
+    So the two halves travel together and are never re-derived from each other:
+    **render joins `.markup`, measure sums `.plain`.** This is a type rather
+    than a convention on purpose — a convention is something a later edit can
+    forget, and the failure is silent.
+    """
+
+    plain: str
+    markup: str
+
+    @property
+    def cells(self) -> int:
+        return cell_len(self.plain)
+
+
+def _seg(plain: str, markup: str | None = None) -> "_Seg":
+    """A `_Seg` whose markup defaults to its (unstyled) plain text."""
+    return _Seg(plain, plain if markup is None else markup)
+
+
+def _escape_markup(text: str) -> str:
+    """Escape free text so **no** bracket can be read as markup (t1636_4).
+
+    ``rich.markup.escape`` is *tag-aware*: it escapes ``[dim]`` but leaves a bare
+    ``[`` alone, because on its own a bare bracket is harmless. It stops being
+    harmless the moment more markup follows on a later line — which is exactly
+    what the trade-profile line added. Rich then scans forward from the stray
+    ``[`` for a closing ``]``, swallows the profile's first tag, and the next
+    ``[/]`` has nothing to close::
+
+        MarkupError: auto closing tag ('[/]') has nothing to close
+
+    A concern body is free text from a shadow agent, so ``x[`` is reachable, and
+    the whole modal dies rather than one row rendering oddly. Same hazard class
+    as the block-meta and stale-detail escapes elsewhere in this file.
+
+    Applied to the region as well as the body. The region survives today only by
+    accident — its stray bracket happens not to match Rich's tag regex where it
+    sits — and "safe because of where it currently appears in the string" is not
+    a property worth relying on when the fix is this cheap.
+
+    Fidelity is identical to ``escape()`` on every input: the one shape neither
+    round-trips is a trailing backslash, which is Rich's own behaviour.
+    """
+    escaped = escape(text)
+    out, i = [], 0
+    while i < len(escaped):
+        char = escaped[i]
+        if char == "\\" and i + 1 < len(escaped) and escaped[i + 1] == "[":
+            out.append("\\[")          # already escaped by escape()
+            i += 2
+            continue
+        if char == "[":
+            out.append("\\[")          # bare bracket escape() left behind
+            i += 1
+            continue
+        out.append(char)
+        i += 1
+    return "".join(out)
+
+
+#: Effort scalar tokens. Four cells each, including the unspecified `E:?` — a
+#: uniform width is what lets the packing bound be stated once rather than per
+#: effort value.
+_EFFORT_TOKENS = {"high": "E:hi", "medium": "E:md", "low": "E:lo", "": "E:?"}
+
+#: Improve / worsen arrows. Both East-Asian-Width Ambiguous (width 1 outside
+#: CJK), the same class as the existing concern marks.
+_IMPROVE_ARROW = "\u25b2"
+_WORSEN_ARROW = "\u25bc"
+
+#: `Worsens: nothing.` — the cost was **priced and is zero**. Rendered as a
+#: visible token because "priced as nothing" and "never priced" are different
+#: facts, and the second is exactly what the mandatory-Worsens rule exists to
+#: expose. An absent side renders no token at all.
+_PRICED_NOTHING = "\u2013"
+
+#: Cells the narrow layout indents its continuation lines by.
+_NARROW_INDENT = "   "
+
+
+def _magnitude_markup(arrow: str, magnitude: str) -> str:
+    """Colour the arrow by magnitude, from :data:`_MAGNITUDE_RAMP` (t1651).
+
+    The magnitude is carried by *style*, not by extra cells, which is what keeps
+    the packing bound independent of it — see `check_label_widths.__doc__` for
+    the derivation that rests on it. The one exception is an **unspecified**
+    magnitude, which also gets a real `?` character (see `_entry_seg`): "not
+    stated" is a fact about the concern, and
+    `concern_dimensions.normalize_magnitude` refuses to degrade it to `low`.
+    That `?` is dropped by the ladder's last rung, which is exactly why
+    unspecified carries its own colour rather than sharing one.
+
+    Replaces a weight-only encoding (bold / plain / dim) that was unreadable on a
+    single glyph, and in which **medium and unspecified were both a bare arrow** —
+    byte-identical once the `?` was dropped.
+
+    An unrecognised magnitude falls back to the unspecified style rather than
+    raising: this is a `render()` path, and `normalize_magnitude` already maps
+    everything it does not recognise to `""`.
+    """
+    return f"[{_MAGNITUDE_RAMP.get(magnitude, _MAGNITUDE_RAMP[''])}]{arrow}[/]"
+
+
+def _clip_cells(text: str, budget: int) -> str:
+    """``text`` truncated to ``budget`` **cells**, ellipsized when it did not fit.
+
+    Cells, never ``len()``: a region like ``插件配置模块.py:12`` is 12 characters
+    and 18 cells, and a character-denominated clip overflows the line (t1274).
+    """
+    if budget <= 0:
+        return ""
+    if cell_len(text) <= budget:
+        return text
+    if budget < 2:
+        return set_cell_size(text, budget)
+    return set_cell_size(text, budget - 1) + "…"
+
+
+def _ellipsize_lines(lines: "list[str]", rows: int) -> "list[str]":
+    """At most ``rows`` lines, with a visible marker when any were dropped."""
+    if len(lines) <= rows:
+        return lines
+    kept = lines[:rows]
+    if kept:
+        kept[-1] = kept[-1] + " [dim]…[/]"
+    return kept
+
+
+def _detail_parts(entries, arrow: str) -> "list[tuple[str, int, str, str]]":
+    """One ``(prefix_markup, prefix_cells, full_text, compact_text)`` per entry.
+
+    Deliberately returns BOTH forms as raw text rather than a finished line, and
+    picks neither: the rung is a per-line, per-budget decision made by
+    :func:`_detail_form`, because the last line of a truncated panel has less
+    room than the others (it shares with a ``+N`` marker). Choosing once from
+    the panel width — the first implementation — hid a whole entry that would
+    have fitted: at width 30 with five entries in two rows it rendered one
+    ``▲maintainability (unspecified)`` and ``+4``, when
+    ``▲maintainability +3`` fits in 19 of the 30 cells.
+
+    Raw, because re-clipping an assembled markup string would cut a tag; and
+    because the cell budget is measured on what reaches the screen, not on the
+    escaped form. Escape last — the same rule the rest of this surface follows.
+
+    **The two forms, widest first:**
+
+    - ``correctness (high)`` — the name and the magnitude as a word;
+    - ``correctness`` — the name alone. The magnitude is not lost: the arrow's
+      colour carries it, which is the other half of t1651.
+
+    A name is **never** abbreviated. When even the compact form does not fit,
+    the caller drops the whole entry and says so with the marker, exactly as
+    ``trade_profile_rungs`` drops whole tokens rather than truncating one.
+
+    **No inline rubric.** The one-line definition of each dimension was rendered
+    here at first and removed after visual review: repeated on every entry it
+    dominated the panel and pushed the names — the thing being looked up — into
+    the noise. The vocabulary is documented in ``concern-format.md``.
+    """
+    if entries is None:
+        return [(_magnitude_markup(arrow, ""), 1, "not priced", "not priced")]
+    if not entries:  # `Worsens: nothing.` — priced, and the price is zero
+        return [(_magnitude_markup(arrow, ""), 1, "nothing", "nothing")]
+    out = []
+    for entry in entries:
+        dimension, magnitude = entry[0], entry[1]
+        compact = str(dimension)
+        out.append((
+            _magnitude_markup(arrow, magnitude), 1,
+            f"{compact} ({magnitude or 'unspecified'})", compact,
+        ))
+    return out
+
+
+def _detail_form(part, budget: int) -> "str | None":
+    """The widest form of ``part`` that fits ``budget`` cells, or ``None``.
+
+    ``None`` means "not even the name fits" — the caller must drop the entry
+    rather than abbreviate it. Returning a clipped name here is what the two
+    rungs exist to prevent.
+    """
+    _prefix_markup, prefix_cells, full_text, compact_text = part
+    room = budget - prefix_cells
+    if cell_len(full_text) <= room:
+        return full_text
+    if cell_len(compact_text) <= room:
+        return compact_text
+    return None
+
+
+def _detail_uses_full_form(width: int) -> bool:
+    """Whether the panel renders the magnitude word at ``width``.
+
+    **One rung for the whole panel, not per line.** Letting each line take the
+    widest form that fits was tried and is worse than it looks: it renders
+    ``▲correctness (high)`` beside ``▲verification``, and a reader has no way to
+    tell the second from a genuinely unpriced dimension — ``(unspecified)`` is a
+    real value on this surface, so a missing parenthetical must not be able to
+    mean two different things. The one exception is the line that shares its row
+    with a ``+N`` marker; there the degradation is local and the marker itself
+    explains why that line is shorter.
+    """
+    return max(1, width - 1) >= _DETAIL_FULL_CONTENT_CELLS - 1
+
+
+def _detail_render(part, budget: int, form: "str | None" = None) -> str:
+    """Render one part into markup, at ``form`` or the widest form that fits.
+
+    The dimension name can be an **unknown** one — the parser keeps what the
+    producer wrote — so the text is escaped, and only after the cell-measured
+    fit. The clip on the last branch is defensive: the visibility gate refuses
+    the panel below :data:`_DETAIL_MIN_CONTENT_CELLS`, so a name that cannot fit
+    at the panel's own width does not reach here.
+    """
+    text = form if form is not None else _detail_form(part, budget)
+    if text is None:
+        text = _clip_cells(part[3], max(1, budget - part[1]))
+    return part[0] + _escape_markup(text)
+
+
+def _entry_seg(entry, arrow: str) -> "_Seg":
+    """One impact entry as `\u25b2label` (+ a single `?` when unspecified).
+
+    **The label is escaped on the markup half only** (t1651). `label_for`
+    returns "" for a dimension outside the closed vocabulary, and the fallback
+    is then the producer's own string — free text on a markup-enabled surface.
+    Measured before the fix: a name of five or more `[` characters truncates to
+    `[[[[[`, whose dangling tag swallows the arrow's `[/]` and raises
+    `MarkupError: auto closing tag ('[/]') has nothing to close`, taking the
+    whole picker down. Pre-existing since t1636_4 and the same failure class
+    t1636_4 itself fixed for the body and region.
+
+    The **plain** half stays raw, exactly as `_region_seg` does it: `_Seg.cells`
+    measures `.plain`, and an escaped string counts backslashes that never reach
+    the screen. Escape late, measure raw.
+    """
+    dimension, magnitude = entry[0], entry[1]
+    label = label_for(dimension) or str(dimension)[:MAX_PROFILE_LABEL_CELLS]
+    suffix = "?" if not magnitude else ""
+    return _Seg(
+        f"{arrow}{label}{suffix}",
+        f"{_magnitude_markup(arrow, magnitude)}{_escape_markup(label)}{suffix}",
+    )
+
+
+#: Mirrors `concern_dimensions.MAX_LABEL_CELLS`; used only to clamp an unknown
+#: dimension name, which the closed vocabulary should already have refused.
+MAX_PROFILE_LABEL_CELLS = 5
+
+
+def _side_segs(entries, arrow: str) -> "list[_Seg]":
+    """Rendered entries for one side of the vector, in producer order."""
+    if entries is None:
+        return []
+    if not entries:  # `Worsens: nothing.` — priced, and the price is zero
+        return [_Seg(f"{arrow}{_PRICED_NOTHING}", f"[dim]{arrow}{_PRICED_NOTHING}[/]")]
+    return [_entry_seg(entry, arrow) for entry in entries]
+
+
+def _join_segs(parts: "list[_Seg]", indent: str) -> "_Seg":
+    plain = indent + " ".join(part.plain for part in parts)
+    markup = indent + " ".join(part.markup for part in parts)
+    return _Seg(plain, markup)
+
+
+def trade_profile_rungs(concern: "Concern") -> "list[_Seg]":
+    """Candidate profile lines, **strongest first** — the degradation ladder.
+
+    A concern is a proposed delta in a shared quality space (t1636); this line is
+    that delta, compressed to fit a companion pane. What may be sacrificed, and
+    in what order, is the whole design:
+
+    1. the 2nd improve entry (folded into `+N`);
+    2. the `+N` overflow markers;
+    3. the 2nd worsen entry;
+    4. the 3-space indent — alignment is cosmetic, the arrows lead the line;
+    5. the `?` unspecified-magnitude markers — magnitudes are *documented as
+       advisory* (`concern_dimensions.MAGNITUDES`), the named dimension is the
+       load-bearing part.
+
+    **The core is never a rung.** First improve entry, first worsen entry and the
+    effort scalar are what the ladder protects: they are the trade, and a row
+    that shows an improvement without its price is the pure demand this whole
+    mechanism exists to stop.
+
+    Worst case per measured row width, all three cores intact:
+
+        row 28 (screen 40)   `   \u25b2robus? \u25bcsimpl? E:lo`   23 of 28
+        row 24 (screen 30)   `   \u25b2maint? \u25bcsimpl? E:hi`   23 of 24
+        row 18 (screen 24)   `\u25b2maint \u25bcsimpl E:hi`        18 of 18  (rungs 4+5)
+
+    The last is an **exact** fit, which is why `ConcernRowVectorPackingTests`
+    pins the row geometry and `ConcernTradeProfilePackingTests` sweeps every
+    combination rather than one lucky pair.
+    """
+    improves = _side_segs(concern.improves, _IMPROVE_ARROW)
+    worsens = _side_segs(concern.worsens, _WORSEN_ARROW)
+    effort = _seg(_EFFORT_TOKENS.get(concern.effort, _EFFORT_TOKENS[""]))
+    if not improves and not worsens and not concern.effort:
+        return []
+
+    def build(max_per_side: int, show_overflow: bool, indent: str,
+              drop_unspecified: bool) -> "_Seg":
+        parts: "list[_Seg]" = []
+        for side in (improves, worsens):
+            head = side[:max_per_side]
+            if drop_unspecified:
+                head = [
+                    _Seg(seg.plain.rstrip("?"), seg.markup.replace("?", "", 1))
+                    if seg.plain.endswith("?") else seg
+                    for seg in head
+                ]
+            parts.extend(head)
+            extra = len(side) - len(head)
+            if extra > 0 and show_overflow:
+                parts.append(_seg(f"+{extra}", f"[dim]+{extra}[/]"))
+        parts.append(effort)
+        return _join_segs(parts, indent)
+
+    return [
+        build(2, True, _NARROW_INDENT, False),   # full
+        build(1, True, _NARROW_INDENT, False),   # 1. drop the 2nd improve/worsen
+        build(1, False, _NARROW_INDENT, False),  # 2. drop the +N markers
+        build(1, False, "", False),              # 4. drop the indent
+        build(1, False, "", True),               # 5. drop the `?` markers
+    ]
+
+
+def trade_profile(concern: "Concern", budget: int, *, allow_indent: bool = True) -> "_Seg":
+    """The widest profile rung that fits `budget` **cells**; empty when no vector.
+
+    Measured on `.plain` — see `_Seg`. Returns the last (most degraded) rung
+    rather than raising when even that overflows: the caller is a `render()`, and
+    a row that shows a clipped profile is better than a TUI that crashes. The
+    packing tests are what guarantee the fallback is unreachable at every
+    supported width.
+    """
+    rungs = trade_profile_rungs(concern)
+    if not rungs:
+        return _Seg("", "")
+    if not allow_indent:
+        rungs = [
+            _Seg(rung.plain.lstrip(" "), rung.markup.lstrip(" ")) for rung in rungs
+        ]
+    for rung in rungs:
+        if rung.cells <= budget:
+            return rung
+    return rungs[-1]
+
+
+class _ConcernRow(Static):
+    """A focusable, quad-state concern row inside ConcernPickerModal.
+
+    Holds one ``Concern``, its ``original_index`` in the modal's input list, and a
+    **mutually exclusive** disposition in
+    ``{"none", "forward", "rejected", "spinoff"}`` (t1427_2; ``spinoff`` added
+    t1159_3). The mark glyph follows the t1004 convention, sourced from
+    ``lib/mark_glyphs.py`` (✓/□, never a dot — t1638); rejection adds a red
+    ``✗`` and spin-off a cyan ``»``.
+    Navigation mirrors ``_SiblingRow``; ``space`` toggles *forward*, ``r``
+    toggles *rejected* and ``t`` toggles *spinoff* — setting any one clears the
+    others, so a concern can never carry two dispositions at once (``enter``
+    confirm is handled at the modal level).
+
+    The four marks are all **single-width**, so :data:`_NARROW_PREFIX_COLS`
+    still describes the narrow layout's prefix budget.
+
+    **Two layouts (t1274), chosen by MEASUREMENT (t1636_4).** The one-line
+    variant is ``□ BADGE region [profile] body``. The multi-line variant — the
+    minimonitor companion pane, where the laid-out row gets ~28 columns — is two
+    lines (region, then body), or **three** when the concern carries an impact
+    vector and the trade profile gets its own line. One line does not fit there:
+    Rich's fold drops an overflowing segment whole rather than truncating it, so
+    a region past ~19 characters erased the region *and* the body and the row
+    rendered as a bare priority badge. A 21-char region like
+    ``authoring-conv.md:103`` is both real and fully compliant with the
+    producer's ≤30-char rule, which is why this was hit routinely.
+
+    ``narrow`` forces the multi-line form, but does not own the choice: the row
+    also falls back to it whenever its **measured** width cannot seat the prefix,
+    a usable region, the profile core and :data:`_MIN_BODY_CELLS` of body. That
+    is what fixed the same failure on the full monitor's ``narrow=False`` path,
+    where the body was folded away below ~60 columns.
+
+    **Every width here is in terminal cells, measured on rendered text.** See
+    :class:`_Seg` — the prefix, the region and the profile are markup strings
+    whose raw length is unrelated to what they occupy, and the region is free
+    text that may contain wide characters.
+    """
+
+    can_focus = True
+
+    DEFAULT_CSS = """
+    _ConcernRow {
+        height: 1;
+        padding: 0 1;
+    }
+    _ConcernRow.two-line {
+        height: 2;
+    }
+    /* A vector-bearing row in the multi-line layout: mark+badge+region, body,
+       then the trade profile (t1636_4). Legacy concerns carry no vector and so
+       stay two-line — every pre-existing block renders exactly as before. */
+    _ConcernRow.three-line {
+        height: 3;
+    }
+    /* Informational: the shadow is NOT asking for action — recede, don't hide. */
+    _ConcernRow.informational {
+        color: $text-muted;
+    }
+    /* Rejected (t1427_2): dim, which together with the red ✗ mark reads as
+       struck through without depending on terminal strikethrough support.
+       Same colour as .informational on purpose — a rejected informational row
+       is simply dim, and the mark is what distinguishes the two states. */
+    _ConcernRow.rejected {
+        color: $text-muted;
+    }
+    _ConcernRow:focus {
+        background: $accent 30%;
+    }
+    /* Focused + hovered stays a shade of the focus accent — never gray hover. */
+    _ConcernRow:focus:hover {
+        background: $accent 40%;
+    }
+    """
+
+    def __init__(
+        self,
+        concern: "Concern",
+        *,
+        narrow: bool = False,
+        original_index: int = 0,
+        **kwargs,
+    ) -> None:
+        super().__init__(**kwargs)
+        self._concern = concern
+        self._narrow = narrow
+        self._original_index = original_index
+        self._state = "none"
+        self._sync_layout_classes()
+        if not needs_addressing(concern):
+            self.add_class("informational")
+
+    def _sync_layout_classes(self) -> None:
+        """Apply the height class matching this row's CURRENT layout choice.
+
+        Three states, and exactly one class may be on at a time: `three-line` for
+        a multi-line vector-bearing row, `two-line` for a multi-line row without
+        a vector, and neither for a one-line row (the default `height: 1`).
+
+        Called from `__init__` — where `size` is still 0, so the caller's
+        `narrow` hint decides — and again from `on_resize` once the real width is
+        known. A legacy no-vector row is unaffected either way: it lands on
+        `two-line` under `narrow`, exactly as before.
+        """
+        width = self.size.width or 0
+        prefix_cells = self._prefix_seg().cells
+        profile = trade_profile(self._concern, max(0, width), allow_indent=False)
+        multiline = self._use_multiline(prefix_cells, profile)
+        vector = has_impact_vector(self._concern)
+        self.set_class(multiline and vector, "three-line")
+        self.set_class(multiline and not vector, "two-line")
+
+    @property
+    def concern(self) -> "Concern":
+        return self._concern
+
+    @property
+    def original_index(self) -> int:
+        """Position in the modal's input list — the stable selection identity.
+
+        Partitioning reorders the DOM, and ``Concern`` is a ``NamedTuple``: two
+        equal concerns are indistinguishable by value, so the original order can
+        only be restored positionally.
+        """
+        return self._original_index
+
+    @property
+    def state(self) -> str:
+        """One of ``"none"`` / ``"forward"`` / ``"rejected"`` / ``"spinoff"``."""
+        return self._state
+
+    @property
+    def selected(self) -> bool:
+        """True only in the ``forward`` state — the "will be forwarded" read."""
+        return self._state == "forward"
+
+    @property
+    def rejected(self) -> bool:
+        return self._state == "rejected"
+
+    @property
+    def spun_off(self) -> bool:
+        """True only in the ``spinoff`` state — "park this as its own task"."""
+        return self._state == "spinoff"
+
+    def set_state(self, value: str) -> None:
+        """Set the disposition; repaint and re-class only on a real change.
+
+        The ``rejected`` CSS class tracks the state here rather than at each
+        call site, so the glyph and the dimming can never disagree. ``spinoff``
+        deliberately gets NO dimming class: unlike a rejection it is not a
+        "struck through" outcome — the concern is being kept, just elsewhere —
+        so the cyan ``»`` is the whole signal.
+        """
+        if self._state == value:
+            return
+        self._state = value
+        self.set_class(value == "rejected", "rejected")
+        self.refresh()
+
+    def toggle_forward(self) -> None:
+        """``space``: forward ⇄ none. Clears any other disposition."""
+        self.set_state("none" if self._state == "forward" else "forward")
+
+    def toggle_reject(self) -> None:
+        """``r``: rejected ⇄ none. Clears any other disposition."""
+        self.set_state("none" if self._state == "rejected" else "rejected")
+
+    def toggle_spinoff(self) -> None:
+        """``t``: spinoff ⇄ none. Clears any other disposition."""
+        self.set_state("none" if self._state == "spinoff" else "spinoff")
+
+    def _region_seg(self, budget: int) -> "_Seg":
+        """The region, ellipsized to ``budget`` **cells**, or a visible placeholder.
+
+        Measured with `cell_len` / `set_cell_size`, never `len()` (t1636_4). The
+        marker grammar accepts any character but `]`, so a region is free text:
+        `插件配置模块.py:12` is 12 characters and **18 cells**, and a
+        character-denominated check passed it through unellipsized, overflowed
+        line 1 and folded the body away — the t1274 failure, on parser-valid
+        input. `escape()` is applied only to the markup half, after truncation:
+        its backslashes exist in the markup and never on screen.
+        """
+        region = self._concern.region
+        if not region:
+            return _Seg("(no region)", "[dim italic](no region)[/]")
+        if budget >= 4 and cell_len(region) > budget:
+            # set_cell_size truncates to a cell count, splitting no wide glyph.
+            region = set_cell_size(region, budget - 1) + "…"
+        return _Seg(region, f"[dim]{_escape_markup(region)}[/]")
+
+    def _region_label(self, budget: int) -> str:
+        """Markup half of :meth:`_region_seg` (kept for callers that only render)."""
+        return self._region_seg(budget).markup
+
+    def _badge_seg(self) -> "_Seg":
+        """Priority badge, plus the `≠` when the derived priority is disputed.
+
+        For a vector-bearing concern the badge shows
+        `concern_dimensions.derive_priority(improves)` — the derived value is
+        authoritative (`concern-format.md`). A disagreeing marker priority is
+        **flagged, never silently reconciled**: the two facts stay visible, which
+        is the whole reason the picker is where a human decides. Legacy concerns
+        keep their marker priority exactly as before.
+
+        Template — `≠` attached directly to the badge, no separating space. This
+        is the layout contract every prefix budget derives from; see
+        `_PRIORITY_MISMATCH_MARK` and `_PrefixTemplateTests`.
+        """
+        concern = self._concern
+        if not has_impact_vector(concern):
+            priority = concern.priority
+            mismatch = False
+        else:
+            priority = derive_priority(concern.improves)
+            mismatch = priority != concern.priority
+        markup = _CONCERN_BADGE.get(priority, "[dim]LOW[/]")
+        plain = {"high": "HIGH", "medium": "MED"}.get(priority, "LOW")
+        if mismatch:
+            return _Seg(f"{plain}≠", f"{markup}{_PRIORITY_MISMATCH_MARK}")
+        return _Seg(plain, markup)
+
+    def _prefix_seg(self) -> "_Seg":
+        """Everything on line 1 before the region: mark, badge, `≠`, separator.
+
+        **Measured, never assumed.** `_NARROW_PREFIX_COLS` describes the widest
+        *legacy* prefix (8); with the mismatch marker `HIGH≠ ` makes it 9, and
+        budgeting the constant would admit a one-line row that renders one cell
+        wider than it measured — Rich then folds the reserved profile or body
+        away whole. One measurement feeds the layout decision AND both region
+        budgets, so the three can never disagree.
+        """
+        mark = _CONCERN_MARKS[self._state]
+        badge = self._badge_seg()
+        return _Seg(
+            f"{_MARK_PLAIN[self._state]}  {badge.plain} ",
+            f"{mark}  {badge.markup} ",
+        )
+
+    def _use_multiline(self, prefix_cells: int, profile: "_Seg") -> bool:
+        """Whether this row needs the multi-line layout at its measured width.
+
+        `narrow` (the caller's hint) still forces it, but it is no longer the
+        only thing that can: the full monitor passes `narrow=False` and
+        `ConcernPickerWidthTierTests` proves it reaches 24 columns, where the
+        one-line form folded region *and* body away. Measured, the one-line row
+        lost the body from ~60 columns down — the t1274 failure, still live on
+        that path (t1636_4). The hint is a floor, measurement is the truth; this
+        is the same rule the modal already applies to its own chrome.
+        """
+        if self._narrow:
+            return True
+        width = self.size.width or 0
+        if not width:
+            return False  # unmeasured: keep the caller's hint (one line)
+        region = min(_ONE_LINE_REGION_CELLS, self._region_seg(10**6).cells)
+        needed = prefix_cells + region + 2 + _MIN_BODY_CELLS
+        if profile.cells:
+            needed += profile.cells + 1
+        return width > 0 and needed > width
+
+    def render(self) -> str:
+        prefix = self._prefix_seg()
+        # display_body(), never .body — the Disposition:/Verified: trailer is
+        # metadata for the receiving agent, not for this row. (The clipboard path
+        # is the mirror rule: always .body, so the trailer is forwarded intact.)
+        # Frozen with a DISPLAY role in
+        # tests/test_concern_body_display_contract.py (t1294).
+        # Kept as PLAIN text until the very last step: the clip below is
+        # denominated in cells, and escaping first would both miscount (a
+        # backslash occupies no cell) and risk splitting a `\[` pair in half.
+        body_plain = self._concern.display_body()
+        width = self.size.width or (28 if self._narrow else 0)
+        profile = trade_profile(self._concern, max(0, width), allow_indent=True)
+        if self._use_multiline(prefix.cells, trade_profile(
+                self._concern, max(0, width), allow_indent=False)):
+            budget = max(6, width - prefix.cells)
+            line1 = f"{prefix.markup}{self._region_seg(budget).markup}"
+            if not profile.markup:
+                # Legacy two-line row: body verbatim, exactly as before. Its
+                # overflow is clipped by `height: 2`, which is pre-existing.
+                return f"{line1}\n{_NARROW_INDENT}{_escape_markup(body_plain)}"
+            # Three-line row: the body must occupy exactly ONE row, or its wrap
+            # consumes the profile's line and the trade vector never renders at
+            # all. Caught in a real 40x24 tmux pane, where a 36-cell body wrapped
+            # and pushed `▲corr ▼simpl E:md` out of the `height: 3` box — every
+            # composited test had used a body short enough to fit.
+            body_budget = max(4, width - cell_len(_NARROW_INDENT))
+            if cell_len(body_plain) > body_budget:
+                body_plain = set_cell_size(body_plain, body_budget - 1) + "…"
+            body = _escape_markup(body_plain)
+            return f"{line1}\n{_NARROW_INDENT}{body}\n{profile.markup}"
+        one_line_profile = trade_profile(
+            self._concern, max(0, width), allow_indent=False
+        )
+        region = self._region_seg(_ONE_LINE_REGION_CELLS).markup
+        middle = f"  {one_line_profile.markup}" if one_line_profile.markup else ""
+        return f"{prefix.markup}{region}{middle}  {_escape_markup(body_plain)}"
+
+    def on_resize(self) -> None:
+        """Re-derive the height class — the layout choice is measured now.
+
+        Fixing the class at construction was safe while `narrow` decided the
+        layout alone. It no longer does, so a row that is re-measured into (or
+        out of) the multi-line form must move its class with it, or the widget
+        renders three lines into a one-line box.
+        """
+        self._sync_layout_classes()
+
+    def on_key(self, event) -> None:
+        if event.key == "space":
+            self.toggle_forward()
+            event.prevent_default()
+            event.stop()
+        elif event.key == "r":
+            self.toggle_reject()
+            event.prevent_default()
+            event.stop()
+        elif event.key == "t":
+            # Consumed here exactly like `r`: the full monitor binds `t` at App
+            # level (scroll_preview_tail), just as it binds `r` (refresh), and
+            # stopping the event on the focused row is what has kept `r` from
+            # reaching that binding since t1427_2.
+            self.toggle_spinoff()
+            event.prevent_default()
+            event.stop()
+        elif event.key == "down":
+            self._focus_neighbor(1)
+            event.prevent_default()
+            event.stop()
+        elif event.key == "up":
+            self._focus_neighbor(-1)
+            event.prevent_default()
+            event.stop()
+
+    def _focus_neighbor(self, delta: int) -> None:
+        parent = self.parent
+        if parent is None:
+            return
+        rows = [w for w in parent.children if isinstance(w, _ConcernRow)]
+        try:
+            idx = rows.index(self)
+        except ValueError:
+            return
+        new_idx = max(0, min(len(rows) - 1, idx + delta))
+        if new_idx != idx:
+            rows[new_idx].focus()
+            rows[new_idx].scroll_visible()
+
+
+#: Section headers for the disposition partition, in presentation order.
+_CONCERN_SECTIONS = ("Needs addressing", "Informational")
+
+
+#: The ``.narrow`` dialog's declared ``min-width``, and therefore the width at or
+#: below which its chrome can no longer fit (t1293). **Derived, not chosen:** a
+#: dialog whose minimum is N cells exactly fills an N-cell screen and overflows
+#: anything narrower — at 24 the composited rows lose their right border and are
+#: cut mid-word (``HIGH authoring-co``, ``[Spac``). The bound is inclusive
+#: because the second defect bites at N too: ``max-height: 80%`` plus a help line
+#: that wraps to five rows pushes the OK/Cancel labels off-screen. Pinned to the
+#: stylesheet by ``test_tier_threshold_is_derived_from_the_declared_min_width``,
+#: so retuning the CSS moves the tier with it.
+#:
+#: **Not a terminal tier.** This is a *component minimum width* in the sense of
+#: ``aidocs/framework/tui_conventions.md`` — a property of this dialog, which is
+#: why it lives here rather than in ``lib/tui_layout.py``. Do not route it
+#: through ``terminal_tier`` / ``is_narrow_terminal``: those bound the NARROW
+#: tier at 80 columns, so they answer True for every width this modal
+#: distinguishes (24, 30, 40) and cannot express the decision at all. Rule 3 of
+#: that document forbids reusing a tier constant as a component floor.
+_PICKER_NARROW_MIN_WIDTH = 30
+
+#: Narrowest width the picker is *tested* at, and the floor the docs quote.
+#: Matches ``concern_parser._SENTINEL_SAFE_COLS`` — below it the block's own
+#: fences wrap in the shadow pane and there is nothing parseable to show anyway.
+_PICKER_MIN_COLS = 24
+
+#: The share of the screen ``#concern-dialog`` may occupy, as declared by its
+#: own ``max-height`` (t1648). **Derived, not chosen** — pinned to the stylesheet
+#: by ``test_max_height_pct_is_derived_from_the_declared_stylesheet``, exactly as
+#: :data:`_PICKER_NARROW_MIN_WIDTH` is pinned to the declared ``min-width``.
+#:
+#: This is the *only* stylesheet value the height tier needs. Everything else it
+#: compares against is measured from the laid-out children, so a longer context
+#: line, a wrapped banner or a future widget is counted with no new term. An
+#: earlier attempt used a fixed "chrome rows" constant instead; it was wrong,
+#: because ``_context_line()`` wraps to **three** rows at 40 columns and grows
+#: further with ``format_block_meta`` / ``stale_detail``. Do not reintroduce one.
+_PICKER_MAX_HEIGHT_PCT = 80
+
+_CONCERN_HELP_FULL = (
+    "[dim]\\[↑/↓] navigate  \\[Space] forward  \\[r] reject  \\[t] spin off  "
+    "\\[e] edit payload  \\[R] rejected list  \\[u] unparsed  "
+    "\\[Enter/OK] confirm  \\[Esc] cancel[/]"
+)
+
+#: Same keys, ~50 columns instead of ~100 — at the xnarrow tier the full line
+#: wraps to five rows and evicts the buttons. Dropping the removed `a`/`A` bulk
+#: keys (t1427_2) is what buys the room for `r` / `R` at 24 columns.
+#: `t spin` (t1159_3) spends part of that room, so
+#: :class:`ConcernHelpLineBudgetTests` asserts every token below still reaches
+#: the composited screen at :data:`_PICKER_MIN_COLS` — shorten a token here
+#: rather than widening the dialog if a future key stops fitting.
+#:
+#: `e edit` (t1582) is the ninth key. Its wording was chosen by MEASUREMENT,
+#: not by guess: the variant below was added first and
+#: :class:`ConcernHelpLineBudgetTests` plus the 24x20
+#: ``test_short_pane_keeps_the_row_and_the_help`` were run before any other
+#: token was touched. They passed, so no existing token was shortened.
+_CONCERN_HELP_COMPACT = (
+    "[dim]↑↓ move · spc fwd · r rej · t spin · e edit · R list · u raw · "
+    "↵ ok · esc[/]"
+)
+
+
+#: Decision guidance for a block carrying impact vectors (t1636_4). The picker
+#: has had `forward` / `reject` / `spinoff` since t1427_2; what the user lacked
+#: was the basis for choosing between them, which the vector now supplies.
+_CONCERN_GUIDANCE = (
+    "[dim]fwd: obligation or pure win · spin: net-positive or costly · "
+    "rej: worsens ≥ improves[/]"
+)
+
+#: Geometry floors for showing :data:`_CONCERN_GUIDANCE`.
+#:
+#: **The help line's key names outrank the guidance.** Once the OK/Cancel buttons
+#: are dropped, the help line is the only place `r` / `t` / `R` / `u` / Esc are
+#: named; the guidance is advisory and the per-row vector is the real data. So
+#: guidance is shown only where it cannot cost the keys.
+#:
+#: Both numbers are MEASURED, not chosen. At 40 columns `_CONCERN_HELP_FULL`
+#: wraps to **6** rows — the compact swap is keyed at ≤30, so the widest
+#: companion width gets the longest help line — and a wrapped guidance line costs
+#: ~3 more on top of it. By 80 columns the help is 3 rows and the room is real.
+#:
+#: **What this gate protects changed at t1648.** It used to be the last thing
+#: standing between the guidance and the key names: at 40 columns the dialog was
+#: capped at 80% of the screen, so the extra rows evicted the help line outright.
+#: The vertical-fit tier (:data:`_PICKER_MAX_HEIGHT_PCT`) now lifts that cap
+#: whenever it cannot seat the content, so the keys are no longer evictable at
+#: this width and the guidance is no longer competing with them. What it still
+#: buys is the concern rows' usable height: `#concern-list` is pinned to its
+#: `min-height` at 40 columns, and ~3 rows of advisory prose there costs a
+#: concern marker the per-row vector already encodes better.
+#:
+#: The precedence rule is unchanged and still one-directional — the key names
+#: outrank the guidance — it simply no longer has to be enforced by this gate
+#: alone. `ConcernPickerNarrowLayoutTests`, `ConcernGuidanceContractTests` and
+#: `ConcernVerticalFitTierTests` are the enforcement; if a future edit lengthens
+#: the help, they fail rather than the keys silently vanishing.
+_GUIDANCE_MIN_WIDTH = 80
+_GUIDANCE_MIN_HEIGHT = 24
+
+#: Row budget for the focused-concern detail panel (t1651): the floor below
+#: which it is not worth showing, and the ceiling it never exceeds.
+#:
+#: The panel renders **one line per impact-vector entry and nothing else**, so
+#: two rows is a real floor rather than a token one — it seats the one improve
+#: and one worsen entry that every priced concern has, which is also exactly
+#: what the row itself degrades to. The ceiling covers a concern that priced
+#: several dimensions per side; beyond it the surplus entries are dropped with
+#: a `+N` marker.
+#:
+#: **MEASURED against the post-t1648 dialog**, using the same `needed` sum
+#: :func:`_apply_measured_height_tier` computes, with the panel excluded. A
+#: **width**-only floor (the shape `_GUIDANCE_MIN_WIDTH` uses) cannot express
+#: this: a tall narrow pane has more vertical room than a short wide one, so a
+#: `>= 80` rule would hide the panel exactly where the row drops the most.
+_DETAIL_MIN_ROWS = 2   # one improve entry + one worsen entry
+_DETAIL_MAX_ROWS = 8   # a concern that priced several dimensions per side
+
+#: Content-width floor, **derived from the closed dimension vocabulary** rather
+#: than chosen: the panel's entire justification is that it shows the FULL
+#: dimension name and the magnitude as a word, where the row can only afford a
+#: 5-cell label and a coloured glyph. Below this width it cannot, and a panel
+#: rendering `verification (medi…` is worse than no panel — it occupies rows
+#: the concern list needs while breaking the promise it exists to keep.
+#:
+#: ``1`` for the arrow + the longest dimension name + the longest magnitude
+#: word in parentheses. Recomputed from :data:`CONCERN_DIMENSIONS`, so adding a
+#: longer dimension moves the floor instead of silently clipping.
+_DETAIL_FULL_CONTENT_CELLS = (
+    1
+    + max(len(name) for name in CONCERN_DIMENSIONS)
+    + len(" (unspecified)")
+)
+
+#: Floor for the COMPACT variant, and the panel's absolute minimum: the arrow
+#: plus the longest dimension name, with the magnitude carried by the arrow's
+#: colour instead of a word. Below this the full name itself cannot fit, and a
+#: clipped name is exactly what the row already gives you.
+#:
+#: The two together are a degradation ladder, deliberately the same shape as
+#: ``trade_profile_rungs``': spend width on the most informative thing that
+#: fits, and drop whole items rather than truncating one mid-word. Rung 1 is
+#: name + magnitude word; rung 2 is the name alone. (An inline rubric was a
+#: third rung at first and was removed after visual review — see
+#: `_detail_parts`.)
+_DETAIL_MIN_CONTENT_CELLS = 1 + max(len(name) for name in CONCERN_DIMENSIONS)
+
+#: Shown when the focused concern carries no impact vector. A mixed block can
+#: hold both kinds (`has_impact_vector` is per concern), so the panel must say
+#: "this one is unpriced" rather than leave the previous row's vector on screen.
+_DETAIL_NO_VECTOR = "no impact vector"
+
+
+def _apply_measured_width_tier(
+    screen, threshold: int, help_id: str, full: str, compact: str
+) -> bool:
+    """Set the ``xnarrow`` class and swap the help line from MEASURED width.
+
+    Textual has no media queries, so every dialog that distinguishes 24 / 30 /
+    40 columns re-runs this from ``on_mount`` and ``on_resize``. Extracted at
+    t1582 so :class:`ConcernPickerModal` and :class:`ConcernPayloadEditModal`
+    share one definition of *how* the tier is applied — the rule is subtle
+    enough (measured width, not the caller's hint; the help swap and the class
+    must move together) that two copies would be two places to get it wrong.
+
+    ``threshold`` is the **calling dialog's own** declared minimum, passed in
+    rather than read here: it is a component floor, never a shared terminal
+    tier. ``tui_layout.terminal_tier`` bounds NARROW at 80 and so answers True
+    for every width these dialogs distinguish — see
+    :data:`_PICKER_NARROW_MIN_WIDTH` for the full reasoning.
+
+    **Returns whether the help text was swapped** (t1648). A caller that goes on
+    to *measure* the help must wait a refresh when this is ``True``: the new text
+    is NOT laid out by the time this returns, and the stale height is wrong in
+    both directions — measured across the 30-column breakpoint, 31→30 reports 6
+    rows for a line that renders in 3, and 30→31 reports 3 for one that renders
+    in 7. The second is the dangerous one: it under-counts, so a fit check would
+    conclude there is room and leave the keys evicted.
+    """
+    xnarrow = screen.size.width <= threshold
+    screen.set_class(xnarrow, "xnarrow")
+    help_widgets = list(screen.query(f"#{help_id}"))
+    if not help_widgets:
+        return False
+    wanted = compact if xnarrow else full
+    # `render().plain` is the laid-out text; comparing against it (rather than
+    # tracking a flag) keeps this correct no matter who else called `update`.
+    changed = help_widgets[0].render().plain != Text.from_markup(wanted).plain
+    help_widgets[0].update(wanted)
+    return changed
+
+
+def _apply_measured_height_tier(
+    screen, dialog_id: str, list_id: str, pct: int
+) -> None:
+    """Set the ``xshort`` class when ``pct`` of the screen cannot seat the dialog.
+
+    The companion counterpart to :func:`_apply_measured_width_tier`, and
+    deliberately a SEPARATE decision (t1648). The two answer different questions
+    that one threshold used to conflate: *is the chrome too wide for this screen*
+    (a ``min-width`` fact, which owns the horizontal chrome and the help wording)
+    versus *does the content fit vertically* (this one, which owns the cap).
+
+    Keying the help swap on width alone is what left the widest companion pane
+    the worst-served: at 40 columns the full help wraps to six rows, and
+    ``max-height: 80%`` on a 20-row pane withholds exactly the rows needed to
+    show it. Compacting the help does NOT fix that — measured, the keys are still
+    evicted — because the evictor is the cap, not the wording.
+
+    **This measures; it does not model.** ``needed`` is summed from the children
+    Textual actually laid out, so a wrapped context line, a long ``stale_detail``,
+    a banner or a future widget is counted with no new term. The one exception is
+    ``#concern-list``: it is ``height: 1fr``, so its measured height is the
+    *result* of the cap and using it would be circular. Its declared
+    ``min-height`` — the floor that is actually reserved — is used instead.
+
+    A child's measured height is right even while the child is off screen (the
+    help reports 6 rows at 40x20 when nothing of it is visible), so this reads
+    the same in the broken state as in the fixed one.
+
+    **Cannot oscillate.** ``xshort`` changes only ``max-height``, which changes
+    only the ``1fr`` list. Every other child is width-driven and the list
+    contributes a static declared floor, so ``needed`` is invariant under the
+    class this sets.
+    """
+    dialogs = list(screen.query(f"#{dialog_id}"))
+    lists = list(screen.query(f"#{list_id}"))
+    if not dialogs or not lists:
+        return
+    dialog, concern_list = dialogs[0], lists[0]
+    # Pre-layout: every child reports 0, which would sum to "fits" and latch the
+    # wrong answer on first paint. Leave the class untouched and wait.
+    if dialog.size.height <= 0:
+        return
+
+    needed = dialog.gutter.height  # border + padding, both edges
+    for child in dialog.children:
+        if not child.display:
+            continue
+        margin = child.styles.margin
+        if child is concern_list:
+            rows = int(concern_list.styles.min_height.value or 0)
+        else:
+            rows = child.size.height
+        needed += rows + margin.top + margin.bottom
+
+    available = screen.size.height * pct // 100
+    screen.set_class(needed > available, "xshort")
+
+
+def format_block_meta(meta: "BlockMeta | None") -> str:
+    """Display suffix for a concern block's round header, ``""`` when absent.
+
+    Pure and **total over garbage**: ``reviewed_at`` is verbatim producer text
+    that the parser never validates, so this must render *something* for any
+    input rather than raise. The time is shortened to its clock part when the
+    ISO shape is recognizable (``…T14:03:27Z`` → ``14:03:27Z``) and truncated
+    otherwise. Returns **plain text** — the caller owns escaping at whatever
+    markup boundary consumes it.
+    """
+    if meta is None:
+        return ""
+    when = meta.reviewed_at
+    if "T" in when:
+        when = when.rsplit("T", 1)[1]
+    when = when[:12]
+    return f"  ·  round {meta.round}" + (f", {when}" if when else "")
+
+
+class ConcernBlockInspectModal(ModalScreen):
+    """Raw view of a concern block that did not fully parse (t1293).
+
+    t1274 made the loss *visible* (``⚠ N line(s) … could not be parsed``); this
+    shows **what** was lost, so the user can tell an over-bound split marker from
+    a producer typo and file a real bug against the shadow procedure.
+
+    Two entry points: ``u`` from :class:`ConcernPickerModal`, and — when the
+    block parsed to *nothing*, so there is no picker to show a banner beside —
+    pushed directly by the caller's ``c`` handler.
+
+    Everything is rendered with ``markup=False``. A concern marker is literally
+    ``- [high | region]``; interpreted as Rich markup the bracket is eaten, i.e.
+    the inspect view would corrupt the very text it exists to show.
+    """
+
+    BINDINGS = [
+        Binding("escape", "dismiss_dialog", "Close", show=False),
+        Binding("q", "dismiss_dialog", "Close", show=False),
+    ]
+
+    DEFAULT_CSS = """
+    ConcernBlockInspectModal { align: center middle; }
+    #concern-inspect-dialog {
+        width: 90%;
+        height: 85%;
+        background: $surface;
+        border: thick $warning;
+        padding: 0 1;
+    }
+    #concern-inspect-header { text-style: bold; color: $warning; }
+    #concern-inspect-lines { color: $text; height: auto; max-height: 40%; }
+    #concern-inspect-raw-label { color: $text-muted; }
+    #concern-inspect-scroll { height: 1fr; }
+    #concern-inspect-footer { dock: bottom; height: 1; color: $text-muted; }
+    """
+
+    def __init__(self, unrecovered: Sequence[str], raw_block: str = "") -> None:
+        super().__init__()
+        self._unrecovered = list(unrecovered)
+        self._raw_block = raw_block
+
+    def compose(self) -> ComposeResult:
+        with Container(id="concern-inspect-dialog"):
+            yield Static(
+                f"Unparsed concern lines ({len(self._unrecovered)})",
+                id="concern-inspect-header",
+            )
+            with VerticalScroll(id="concern-inspect-lines"):
+                for line in self._unrecovered:
+                    yield Static(line, markup=False)
+            yield Static("─ raw block ─", id="concern-inspect-raw-label")
+            with VerticalScroll(id="concern-inspect-scroll"):
+                yield Static(
+                    self._raw_block.strip() or "(block region unavailable)",
+                    markup=False,
+                )
+            yield Static("q/Esc: close", id="concern-inspect-footer")
+
+    def action_dismiss_dialog(self) -> None:
+        self.dismiss()
+
+
+#: :class:`ConcernPayloadEditModal`'s own component floor — the width at or
+#: below which it drops to the extra-narrow chrome. Deliberately a SEPARATE
+#: constant from :data:`_PICKER_NARROW_MIN_WIDTH` even though the numbers match
+#: today: each is a property of its own dialog, and tying them would make
+#: retuning one silently retune the other (``tui_conventions.md`` rule 3, which
+#: forbids reusing a tier constant as a component floor).
+_PAYLOAD_EDIT_NARROW_MIN_WIDTH = 30
+
+_PAYLOAD_EDIT_HELP_FULL = (
+    "[dim]\\[ctrl+s] save  \\[Esc] cancel  \\[←→↑↓] move  "
+    "\\[shift+arrows] select  \\[ctrl+z] undo[/]"
+)
+
+#: The two keys that actually commit or abandon the edit, and nothing else.
+#: At the xnarrow tier the Save/Cancel buttons are hidden, so this line is the
+#: ONLY place they are named — ``ConcernPayloadEditWidthTierTests`` asserts both
+#: tokens reach the composited screen at :data:`_PICKER_MIN_COLS`.
+_PAYLOAD_EDIT_HELP_COMPACT = "[dim]^s save · esc cancel[/]"
+
+
+class ConcernPayloadEditModal(ModalScreen):
+    """Edit the outgoing clipboard payload before it is copied (t1582).
+
+    Pushed by :class:`ConcernPickerModal` on ``e``, **over** the still-open
+    picker — the same modal-over-modal shape as
+    :meth:`ConcernPickerModal.action_inspect_unrecovered` — so cancelling
+    returns to an intact selection. It carries its own ``DEFAULT_CSS`` because
+    two Apps reach it through that picker (``tui_conventions.md``, "Modals
+    pushed by multiple Apps").
+
+    **Takes a ``str``, never ``Concern`` objects.** Two reasons, and the second
+    is a hard constraint:
+
+    - WYSIWYG — the box holds byte-for-byte what will land on the clipboard.
+    - ``tests/test_concern_body_display_contract.py`` is an AST guard over the
+      whole ``monitor/`` package: a DISPLAY surface must never read
+      ``Concern.body``, while the FORWARD path must. An editor showing forward
+      text is both at once; receiving an already-rendered string is what lets it
+      be neither, registering no ``Concern``-body read at all.
+
+    **Dismiss contract:** the edited text on save (``ctrl+s`` / Save), ``None``
+    on cancel (``Esc`` / Cancel). ``None`` is the ONLY cancel signal — an
+    all-whitespace buffer is refused rather than dismissed, so a caller must
+    branch on ``is None`` and never on truthiness.
+
+    Nothing here writes the clipboard or touches the filesystem; the picker
+    carries the result out on ``ConcernPickResult.payload_override`` and the
+    caller's mixin still owns the copy.
+    """
+
+    BINDINGS = [
+        # No `priority=True` needed: `ctrl+s` and `escape` are both absent from
+        # `TextArea.BINDINGS` (verified against the pinned textual 8.2.7) and
+        # neither is printable, so the focused editor lets them bubble here.
+        # `show=False` because this modal composes no Footer — the in-dialog
+        # help line is the discoverability surface, exactly as the picker's is.
+        Binding("ctrl+s", "save", "Save", show=False),
+        Binding("escape", "cancel", "Cancel", show=False),
+    ]
+
+    DEFAULT_CSS = """
+    ConcernPayloadEditModal { align: center middle; }
+    #payload-edit-dialog {
+        width: 70%;
+        max-height: 80%;
+        background: $surface;
+        border: thick $accent;
+        padding: 1 2;
+    }
+    #payload-edit-header { text-style: bold; color: $accent; margin: 0 0 1 0; }
+    #payload-edit-text { height: 1fr; min-height: 3; margin: 0 0 1 0; }
+    #payload-edit-help { color: $text-muted; margin: 0 0 1 0; }
+    #payload-edit-buttons { width: 100%; height: auto; layout: horizontal; }
+    #payload-edit-buttons Button { margin: 0 1; }
+
+    /* Narrow variant (minimonitor companion pane, ~40 cols), mirroring the
+       picker this is pushed from so the two dialogs agree at every width. */
+    /* `min-width` here is the CANONICAL value _PAYLOAD_EDIT_NARROW_MIN_WIDTH
+       mirrors; a drift guard in tests/test_concern_picker_modal.py keeps the
+       two equal, so retuning this number moves the tier boundary with it. */
+    ConcernPayloadEditModal.narrow #payload-edit-dialog {
+        width: 90%;
+        min-width: 30;
+    }
+
+    /* Extra-narrow tier, applied from the modal's MEASURED width at or below
+       _PAYLOAD_EDIT_NARROW_MIN_WIDTH. The `min-width` above is exactly what
+       would overflow a 24-column screen, so it is cleared here, not reduced.
+       `border: thick` is deliberately KEPT: an intact border on every dialog
+       row is what the layout tests assert against to prove nothing is clipped. */
+    ConcernPayloadEditModal.xnarrow #payload-edit-dialog {
+        width: 100%;
+        min-width: 0;
+        max-height: 100%;
+        padding: 0 1;
+    }
+    /* No Save/Cancel at this tier, for the picker's reason: side by side the
+       second label truncates, stacked they evict the help line — and they are
+       fully redundant with ctrl+s / Esc, which the compact help does name.
+       Nothing is ever half-drawn. */
+    ConcernPayloadEditModal.xnarrow #payload-edit-buttons { display: none; }
+    """
+
+    def __init__(self, payload: str, narrow: bool = False) -> None:
+        super().__init__()
+        self._payload = payload
+        self._narrow = narrow
+
+    def compose(self) -> ComposeResult:
+        # The class must be added explicitly — the constructor kwarg alone does
+        # nothing, and `_apply_measured_width_tier` only ever owns `xnarrow`.
+        # The two knobs are independent by design: `narrow` is the caller's
+        # host-role hint (minimonitor's ~40-column companion pane), `xnarrow` is
+        # derived from measured width. Without this line every `.narrow` rule
+        # above is dormant and that pane gets the 70% base dialog.
+        if self._narrow:
+            self.add_class("narrow")
+        with Container(id="payload-edit-dialog"):
+            yield Static("[bold]Edit payload[/]", id="payload-edit-header")
+            # No markup-enabled widget ever renders the payload: a TextArea is
+            # not markup-rendered, and the header/help are static literals. A
+            # concern body may contain `[dim]` or a bare `[/]`, which a
+            # markup-enabled Static would eat or raise MarkupError on.
+            yield TextArea(
+                self._payload,
+                id="payload-edit-text",
+                # Long marker lines must stay readable in a ~20-column box.
+                soft_wrap=True,
+                # Line numbers would cost ~4 of the 20 usable columns there.
+                show_line_numbers=False,
+                # language=None: the payload is prose, not code.
+            )
+            # Swapped for the compact variant by _apply_width_tier() once the
+            # modal knows its measured width.
+            yield Static(_PAYLOAD_EDIT_HELP_FULL, id="payload-edit-help")
+            with Container(id="payload-edit-buttons"):
+                yield Button("Save", variant="primary", id="btn-payload-save")
+                yield Button("Cancel", variant="default", id="btn-payload-cancel")
+
+    def on_mount(self) -> None:
+        self._apply_width_tier()
+
+    def on_resize(self) -> None:
+        self._apply_width_tier()
+
+    def _apply_width_tier(self) -> None:
+        """Dialog chrome from this modal's MEASURED width — see the picker's.
+
+        Shares :func:`_apply_measured_width_tier` with
+        :class:`ConcernPickerModal` while keeping its own threshold, so the two
+        dialogs cannot drift on the mechanism.
+        """
+        _apply_measured_width_tier(
+            self,
+            _PAYLOAD_EDIT_NARROW_MIN_WIDTH,
+            "payload-edit-help",
+            _PAYLOAD_EDIT_HELP_FULL,
+            _PAYLOAD_EDIT_HELP_COMPACT,
+        )
+
+    def action_save(self) -> None:
+        """Commit the edit — unless the buffer is empty, which is refused.
+
+        An emptied box must never fall back to the generated payload (the user
+        would be told "copied" and get text they had deleted), and dismissing
+        with ``""`` would be indistinguishable from "forward nothing" at the
+        one place the distinction matters. So it stays open and says why; Esc
+        is still the way out.
+        """
+        text = self.query_one("#payload-edit-text", TextArea).text
+        if not text.strip():
+            self.app.notify(
+                "Editor is empty — nothing to copy. Esc to cancel, or type a "
+                "payload.",
+                severity="warning",
+            )
+            return
+        # The raw `.text`, never the stripped one: what the user sees is what
+        # gets copied.
+        self.dismiss(text)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        # Routed to the ACTIONS, not to duplicated bodies: the empty-buffer
+        # refusal must behave identically whether the user pressed ctrl+s or
+        # clicked Save, and a second copy of that rule would be a place for the
+        # two paths to drift. Note `action_save` may decline to dismiss — the
+        # click path inherits that for free, which is why it delegates.
+        if event.button.id == "btn-payload-save":
+            self.action_save()
+        else:
+            self.action_cancel()
+
+
+class _RejectedRow(Static):
+    """A focusable, toggleable row of :class:`RejectedStoreModal` (t1427_2).
+
+    ``space`` marks the entry for **un-rejection**; the mark follows the same
+    t1004 convention as ``_ConcernRow``, sourced from ``lib/mark_glyphs.py``
+    (t1638) — its unmarked state was bare/unstyled before t1638 and is now dim
+    like every other surface. Navigation
+    mirrors ``_ConcernRow._focus_neighbor``.
+
+    Rendered with ``markup=False`` semantics: the marker line is escaped before
+    it reaches the markup renderer, because a marker literally reads
+    ``- [high | region]`` and Rich would eat the bracket — corrupting the very
+    text this view exists to show (the same rule
+    :class:`ConcernBlockInspectModal` states).
+    """
+
+    can_focus = True
+
+    DEFAULT_CSS = """
+    _RejectedRow {
+        height: auto;
+        padding: 0 1;
+    }
+    _RejectedRow:focus {
+        background: $accent 30%;
+    }
+    _RejectedRow:focus:hover {
+        background: $accent 40%;
+    }
+    /* Marked for un-rejection: it is coming back, so stop dimming it. */
+    _RejectedRow.unrejecting {
+        color: $text;
+    }
+    """
+
+    def __init__(self, entry: RejectedEntry, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._entry = entry
+        self._marked = False
+
+    @property
+    def entry(self) -> RejectedEntry:
+        return self._entry
+
+    @property
+    def marked(self) -> bool:
+        return self._marked
+
+    def toggle(self) -> None:
+        self._marked = not self._marked
+        self.set_class(self._marked, "unrejecting")
+        self.refresh()
+
+    def render(self) -> str:
+        mark = mark_markup(self._marked)
+        meta = escape(f"{self._entry.id} · {self._entry.producer}")
+        return f"{mark}  [dim]{meta}[/]\n   {escape(self._entry.marker_line)}"
+
+    def on_key(self, event) -> None:
+        if event.key == "space":
+            self.toggle()
+            event.prevent_default()
+            event.stop()
+        elif event.key in ("down", "up"):
+            self._focus_neighbor(1 if event.key == "down" else -1)
+            event.prevent_default()
+            event.stop()
+
+    def _focus_neighbor(self, delta: int) -> None:
+        parent = self.parent
+        if parent is None:
+            return
+        rows = [w for w in parent.children if isinstance(w, _RejectedRow)]
+        try:
+            idx = rows.index(self)
+        except ValueError:
+            return
+        new_idx = max(0, min(len(rows) - 1, idx + delta))
+        if new_idx != idx:
+            rows[new_idx].focus()
+            rows[new_idx].scroll_visible()
+
+
+class RejectedStoreModal(ModalScreen):
+    """The task's persisted rejections, with a per-row un-reject toggle (t1427_2).
+
+    Rejection is otherwise irreversible, and a single mis-press would blind the
+    shadow to that concern for the rest of the task — so this view is the
+    required undo path (t1427 requirement 5). It is **TUI-only** by decision;
+    there is no user-facing CLI for un-rejecting.
+
+    Pure UI, exactly like the picker that pushes it: it neither reads nor writes
+    the store. Entries arrive pre-fetched, and the ids it dismisses with travel
+    back through the picker's result for the caller to act on.
+
+    Dismisses a ``tuple[str, ...]`` of entry ids to un-reject — empty on
+    ``escape``, which is therefore indistinguishable from "confirmed nothing".
+    That is deliberate: both mean "change nothing", so no caller needs to tell
+    them apart.
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Close", show=False),
+        Binding("q", "cancel", "Close", show=False),
+        Binding("enter", "confirm", "Un-reject marked"),
+    ]
+
+    DEFAULT_CSS = """
+    RejectedStoreModal { align: center middle; }
+    #rejected-dialog {
+        width: 90%;
+        height: 85%;
+        background: $surface;
+        border: thick $accent;
+        padding: 0 1;
+    }
+    #rejected-header { text-style: bold; color: $accent; }
+    #rejected-list { height: 1fr; }
+    #rejected-footer { dock: bottom; height: 1; color: $text-muted; }
+    """
+
+    def __init__(self, entries: Sequence[RejectedEntry]) -> None:
+        super().__init__()
+        self._entries = list(entries)
+
+    def compose(self) -> ComposeResult:
+        with Container(id="rejected-dialog"):
+            yield Static(
+                f"Rejected concerns ({len(self._entries)})", id="rejected-header"
+            )
+            with VerticalScroll(id="rejected-list"):
+                for entry in self._entries:
+                    yield _RejectedRow(entry)
+            yield Static(
+                "[dim]\\[Space] un-reject  \\[Enter] apply  \\[q/Esc] cancel[/]",
+                id="rejected-footer",
+            )
+
+    def on_mount(self) -> None:
+        rows = list(self.query(_RejectedRow))
+        if rows:
+            rows[0].focus()
+
+    def _marked_ids(self) -> tuple[str, ...]:
+        return tuple(
+            row.entry.id for row in self.query(_RejectedRow) if row.marked
+        )
+
+    def action_confirm(self) -> None:
+        self.dismiss(self._marked_ids())
+
+    def action_cancel(self) -> None:
+        self.dismiss(())
+
+
+class ConcernPickerModal(ModalScreen):
+    """Modal letting the user forward or reject shadow concerns.
+
+    Lives here rather than in minimonitor because **both** apps push it:
+    minimonitor with ``narrow=True`` and the full monitor with ``narrow=False``
+    (t1216_3, since landed). It carries its own ``DEFAULT_CSS`` per the TUI
+    conventions for multi-App modals.
+
+    **Disposition partition (t1274).** Concerns the shadow marked
+    ``informational`` — real, but explicitly *not* a request for action — are
+    grouped under their own header and dimmed. A block whose concerns all fall in
+    one partition shows no headers at all, so plan-review blocks (whose producers
+    have no disposition concept) look exactly as they did before.
+
+    **Per-row actions only (t1427_2; ``t`` added t1159_3).** ``space``
+    forwards, ``r`` rejects, ``t`` spins off as its own draft task, and the
+    three are mutually exclusive on each row. The former ``a`` (select all
+    actionable) and ``A`` (copy ALL) bulk keys were **removed outright**, not
+    re-scoped: a bulk key that swept a row into "forward" would silently
+    overwrite a rejection the user had just made, and rejection is persistent
+    state rather than a one-shot selection. That reasoning binds ``t`` at least
+    as hard — a spin-off writes a file — so no bulk key may be reintroduced.
+
+    **Two independent size knobs (t1293) — neither is derived from the other.**
+    ``narrow`` is the *caller's* hint; the ``xnarrow`` class is derived from the
+    modal's own **measured** width (:data:`_PICKER_NARROW_MIN_WIDTH`) and owns the
+    dialog chrome, so a full-width monitor running in a 24-column terminal gets
+    it too.
+
+    **The hint is a floor, not the whole rule (t1636_4).** ``narrow`` still
+    *forces* the multi-line row, but it no longer decides alone: ``_ConcernRow``
+    measures its own width and switches to the multi-line form whenever the
+    one-line form cannot seat region, profile and body. That closed a live gap on
+    the ``narrow=False`` path — the full monitor reaches 24 columns (pinned by
+    :class:`ConcernPickerWidthTierTests`), and below ~60 columns the one-line row
+    was folding the body away entirely, the same t1274 failure the narrow layout
+    was built to fix.
+
+    **Dismiss contract (t1427_2; supersedes the t1037_4 list contract):**
+    dismisses with a :class:`ConcernPickResult` on confirm (OK / Enter) and with
+    ``None`` on Esc / Cancel. ``None`` is the ONLY cancel signal — a result whose
+    ``forwarded`` / ``rejected`` / ``unrejected`` / ``spun_off`` channels are all
+    empty (with ``payload_override`` at its ``None`` default) is a legitimate
+    "confirmed nothing", so consumers MUST branch on ``is None`` and never on
+    truthiness.
+
+    **Pure-UI, with one narrowed exception (t1582).** It does NOT touch the
+    clipboard, the filesystem or any subprocess — the caller's action handler
+    still runs ``tui_clipboard.copy_to_system_clipboard`` and the
+    ``aitask_shadow_rejected.sh`` seam, and ``rejected_entries`` is pre-fetched
+    by the caller and passed in. It *does* now call
+    ``concern_parser.build_clipboard_payload`` — a pure string function — to
+    seed the payload editor and to detect a stale edit. That keeps it
+    unit-testable without a clipboard backend or a filesystem, which was the
+    point of the original rule; what it must never do is *perform* the copy.
+    """
+
+    BINDINGS = [
+        Binding("escape", "dismiss_dialog", "Close", show=False),
+        Binding("enter", "confirm", "OK"),
+        Binding("R", "show_rejected", "Rejected list"),
+        # `u` for "unparsed". Deliberately not `i` — both apps bind that to Task
+        # Info. `_ConcernRow.on_key` stops only space/r/t/up/down, so this
+        # bubbles.
+        Binding("u", "inspect_unrecovered", "Unparsed", show=False),
+        # `e` for "edit" (t1582). Free here for the same reason: the row stops
+        # neither, and both apps' App-level `e` (launch shadow) is a plain
+        # non-priority binding, which does not dispatch under a ModalScreen.
+        Binding("e", "edit_payload", "Edit payload", show=False),
+    ]
+
+    DEFAULT_CSS = """
+    ConcernPickerModal { align: center middle; }
+    #concern-dialog {
+        width: 70%;
+        max-height: 80%;
+        background: $surface;
+        border: thick $accent;
+        padding: 1 2;
+    }
+    #concern-header { text-style: bold; color: $accent; margin: 0 0 1 0; }
+    #concern-stale { color: $error; text-style: bold; margin: 0 0 1 0; }
+    /* The third state (t1493): freshness could not be established. Warning,
+       not error — "cannot tell" is weaker than "known stale", and rendering
+       nothing here would read as "current", which is the defect. */
+    #concern-stale-unknown { color: $warning; text-style: bold; margin: 0 0 1 0; }
+    #concern-unrecovered { color: $warning; text-style: bold; margin: 0 0 1 0; }
+    #concern-context { color: $text-muted; margin: 0 0 1 0; }
+    #concern-guidance { color: $text-muted; margin: 0 0 1 0; }
+    .concern-section { text-style: bold; color: $accent; height: 1; }
+    #concern-list { height: 1fr; min-height: 3; margin: 0 0 1 0; }
+    /* Focused-concern detail (t1651). The height here is a FIXED FALLBACK in
+       cells, never `auto` and never `max-height`: `_apply_detail_visibility` is
+       the sole writer and overwrites it from measured geometry. `auto` would
+       make the height track the focused concern's content, which would let a
+       focus event move the vertical budget `_apply_measured_height_tier` sums —
+       and would make the truncation point vary per row instead of being a known
+       row count. Content is clipped to the budget with a visible ellipsis. */
+    #concern-detail { height: 4; color: $text-muted; margin: 0 0 1 0; }
+    #concern-help { color: $text-muted; margin: 0 0 1 0; }
+    #concern-buttons { width: 100%; height: auto; layout: horizontal; }
+    #concern-buttons Button { margin: 0 1; }
+
+    /* Narrow variant (minimonitor companion pane, ~40 cols): widen the dialog
+       so the header, concern rows, and OK/Cancel render fully. */
+    /* `min-width` here is the CANONICAL value _PICKER_NARROW_MIN_WIDTH mirrors;
+       a drift guard in tests/test_concern_picker_modal.py keeps the two equal,
+       so retuning this number moves the tier boundary with it. */
+    ConcernPickerModal.narrow #concern-dialog { width: 90%; min-width: 30; }
+
+    /* Extra-narrow tier (t1293), applied from the modal's MEASURED width at or
+       below _PICKER_NARROW_MIN_WIDTH. The `min-width` above is exactly what
+       makes the dialog overflow a 24-column screen — clipping the right border
+       away and cutting every row mid-word — so it is cleared here, not reduced.
+       `border: thick` is deliberately KEPT: an intact border on every dialog row
+       is what the layout tests assert against to prove nothing is clipped. */
+    ConcernPickerModal.xnarrow #concern-dialog {
+        width: 100%;
+        min-width: 0;
+        max-height: 100%;
+        padding: 0 1;
+    }
+    /* No OK/Cancel at this tier. Measured: side by side under ~34 columns the
+       second label renders as "Can"; stacked they cost 6 rows and at 24x20 they
+       evict the help line — the only place `r` / `R` / `u` are named. They are
+       fully redundant with Enter/Esc, which the compact help does name, so the
+       buttons are the right thing to drop. Nothing is ever half-drawn. */
+    ConcernPickerModal.xnarrow #concern-buttons { display: none; }
+    ConcernPickerModal.xnarrow #concern-buttons Button { width: 100%; margin: 0; }
+
+    /* Vertical-fit tier (t1648), applied when `max-height` above cannot seat the
+       dialog's own content — see _apply_measured_height_tier. Independent of
+       `xnarrow`: that one is keyed on width and owns the horizontal chrome, this
+       one is keyed on height and owns the cap. Conflating them is what left the
+       40-column companion pane — too WIDE for the xnarrow chrome, too SHORT for
+       80% of its rows — showing no key hints at all.
+       `max-height` is the ONLY property here. Dropping the buttons or compacting
+       the help buys no extra concern row at 40x20 (measured), so the cap is the
+       whole fix and everything else would be churn. */
+    ConcernPickerModal.xshort #concern-dialog { max-height: 100%; }
+    """
+
+    def __init__(
+        self, concerns: list["Concern"], narrow: bool = False,
+        stale: bool | None = False, unrecovered: Sequence[str] = (),
+        raw_block: str = "",
+        *,
+        rejected_entries: Sequence[RejectedEntry] = (),
+        store_unavailable: bool = False,
+        block_meta: "BlockMeta | None" = None,
+        stale_detail: str = "",
+    ) -> None:
+        super().__init__()
+        self._concerns = list(concerns)
+        self._narrow = narrow
+        # Tri-state since t1493: True = known stale, False = known current,
+        # **None = could not tell**. `None` gets its own banner rather than
+        # collapsing to "no banner", which reads as "current" — the exact
+        # false-confidence this task removes. Callers pass the COMBINED verdict
+        # (read recency joined with block age via `combine_staleness`).
+        self._stale = stale
+        # Plain text naming why the block reads stale; escaped at render.
+        self._stale_detail = stale_detail
+        # The LINES, not a count (t1293): a count derived from the list with
+        # `len()` cannot disagree with what the inspect view shows, whereas a
+        # separate int parameter alongside a list parameter could.
+        self._unrecovered = list(unrecovered)
+        self._raw_block = raw_block
+        # Pre-fetched by the caller at open time and never refreshed: the
+        # session's view of the store is deliberately frozen (t1427 descoped
+        # cross-session staleness handling). Safe to act on despite that,
+        # because t1427_1 made entry ids stable and never reused.
+        self._rejected_entries = list(rejected_entries)
+        # No task id for this pane ⇒ the store cannot be located at all. Kept
+        # distinct from "store is empty" so `R` can say which is true.
+        self._store_unavailable = store_unavailable
+        # Round metadata from the block header (t1159_1) — display-only.
+        self._block_meta = block_meta
+        self._unreject_ids: list[str] = []
+        # Two fields, two jobs — never one field doing both (t1582). The
+        # override is the user's text, verbatim; the seed is the CANONICAL
+        # payload for the selection that edit was made against. Collapsing them
+        # would make staleness undetectable the moment the user changed a word.
+        self._payload_override: str | None = None
+        self._payload_seed: str = ""
+
+    def _partitions(self) -> list[tuple[str, list[tuple[int, "Concern"]]]]:
+        """``[(section_title, [(original_index, concern), …]), …]``, non-empty only.
+
+        Input order is preserved inside each partition, and the original index
+        travels with every concern so selection can be restored positionally.
+        """
+        actionable: list[tuple[int, "Concern"]] = []
+        informational: list[tuple[int, "Concern"]] = []
+        for index, concern in enumerate(self._concerns):
+            target = actionable if needs_addressing(concern) else informational
+            target.append((index, concern))
+        pairs = zip(_CONCERN_SECTIONS, (actionable, informational))
+        return [(title, group) for title, group in pairs if group]
+
+    def _context_line(self) -> str:
+        # `reviewed_at` is verbatim untrusted producer text on a markup-enabled
+        # Static — an unescaped `[/]` raises MarkupError and takes the modal
+        # down (same hazard class as the board-column title at _swatch_markup).
+        meta_suffix = escape(format_block_meta(self._block_meta))
+        partitions = self._partitions()
+        if len(partitions) < 2:
+            return (
+                f"{len(self._concerns)} concern(s)  ·  forward, reject, or spin off"
+                + meta_suffix
+            )
+        counts = {title: len(group) for title, group in partitions}
+        return (
+            f"{counts['Needs addressing']} to address  ·  "
+            f"{counts['Informational']} informational  ·  "
+            "forward, reject, or spin off"
+            + meta_suffix
+        )
+
+    def compose(self) -> ComposeResult:
+        if self._narrow:
+            self.add_class("narrow")
+        partitions = self._partitions()
+        with Container(id="concern-dialog"):
+            yield Static("[bold]Concerns[/]", id="concern-header")
+            # Staleness warning (t1104, tri-state since t1493). `_stale_detail`
+            # carries producer-derived text (round number, durations) onto a
+            # markup-enabled Static, so it is escaped exactly as the context
+            # line escapes `format_block_meta`.
+            if self._stale is True:
+                yield Static(
+                    "⚠ These concerns may be stale — the agent has moved on"
+                    + escape(self._stale_detail),
+                    id="concern-stale",
+                )
+            elif self._stale is None:
+                # "Could not tell" is its own state. Rendering nothing here
+                # would present unverified concerns as current (t1493).
+                yield Static(
+                    "⚠ Freshness unknown — cannot tell whether these concerns "
+                    "are current" + escape(self._stale_detail),
+                    id="concern-stale-unknown",
+                )
+            # Lossy-parse warning (t1274): the block held marker-looking lines
+            # that yielded no concern, so this list is short of what the shadow
+            # emitted. Visible degradation beats a silently truncated list.
+            if self._unrecovered:
+                yield Static(
+                    # `\\[u]` — an unescaped `[u]` is Rich's underline tag and
+                    # renders as nothing at all.
+                    f"⚠ {len(self._unrecovered)} line(s) in this block "
+                    "could not be parsed — \\[u] inspect",
+                    id="concern-unrecovered",
+                )
+            yield Static(self._context_line(), id="concern-context")
+            # Only for a block that actually carries vectors: a legacy
+            # plan-review block has nothing to decide with, so it renders
+            # exactly as it did before (t1636_4). Visibility is then gated on
+            # measured geometry by `_apply_size_tier`.
+            if any(has_impact_vector(concern) for concern in self._concerns):
+                yield Static(_CONCERN_GUIDANCE, id="concern-guidance")
+            with VerticalScroll(id="concern-list"):
+                # Headers only when both partitions exist — a single-partition
+                # block (every plan-review block) looks exactly as it did before.
+                show_headers = len(partitions) > 1
+                for title, group in partitions:
+                    if show_headers:
+                        yield Static(f"─ {title} ─", classes="concern-section")
+                    for index, concern in group:
+                        yield _ConcernRow(
+                            concern, narrow=self._narrow, original_index=index
+                        )
+            # Focused-concern detail (t1651). Composed for a vector-bearing
+            # block only — the same gate the guidance line uses — so a legacy
+            # block renders exactly as it did before. Seeded in `on_mount` and
+            # kept current by `on_descendant_focus`; visibility and height are
+            # set from measured geometry by `_apply_detail_visibility`.
+            if any(has_impact_vector(concern) for concern in self._concerns):
+                yield Static("", id="concern-detail", markup=True)
+            # Swapped for the compact variant by _apply_size_tier() once the
+            # modal knows its measured width.
+            yield Static(_CONCERN_HELP_FULL, id="concern-help")
+            with Container(id="concern-buttons"):
+                yield Button("OK", variant="primary", id="btn-ok")
+                yield Button("Cancel", variant="default", id="btn-cancel")
+
+    def on_mount(self) -> None:
+        self._apply_size_tier()
+        rows = list(self.query(_ConcernRow))
+        if rows:
+            rows[0].focus()
+            # SEED THE PANEL EXPLICITLY (t1651). `Widget.focus()` is deferred —
+            # the same caveat already documented at `monitor_app.py` and
+            # `minimonitor_app.py` — so `on_descendant_focus` has NOT fired for
+            # this first focus by the time `on_mount` returns. Relying on the
+            # event here leaves the panel blank until the user presses up/down.
+            self._sync_detail(rows[0].concern)
+
+    def on_resize(self) -> None:
+        self._apply_size_tier()
+
+    def on_descendant_focus(self, event) -> None:
+        """Follow focus with the detail panel (t1651).
+
+        `on_descendant_focus` is the established pattern for this in the repo
+        (`monitor_app.py`, `minimonitor_app.py`, `stats/stats_app.py`,
+        `lib/section_viewer.py`) — preferred over inventing a per-row message,
+        which would put focus knowledge in `_ConcernRow` where none exists today.
+
+        Deliberately does **not** touch visibility or height: those are
+        geometry-derived and owned by `_apply_detail_visibility`. If a focus
+        change could resize the panel it would move the vertical budget
+        `_apply_measured_height_tier` sums, and a focus event would be able to
+        flip the `xshort` cap.
+        """
+        widget = getattr(event, "widget", None)
+        if isinstance(widget, _ConcernRow):
+            self._sync_detail(widget.concern)
+
+    def _apply_size_tier(self) -> None:
+        """Pick the dialog chrome from the modal's MEASURED size.
+
+        Renamed from ``_apply_width_tier`` at t1636_4: it reads **height** as
+        well as width now, because the decision-guidance line competes for
+        vertical room with the help line and the concern list.
+
+        Keyed on ``self.size.width`` — never on ``self._narrow``, which is the
+        caller's row-layout hint and says nothing about the real terminal. Textual
+        has no media queries, so this is the substitute; ``on_resize`` keeps it
+        live. ``_ConcernRow.render`` already derives its region budget from live
+        width, so the rows follow with no change here.
+
+        The threshold is this dialog's own declared minimum, not a shared
+        terminal tier — see :data:`_PICKER_NARROW_MIN_WIDTH` for why
+        ``tui_layout.is_narrow_terminal`` cannot express this decision.
+
+        The mechanism itself lives in :func:`_apply_measured_width_tier`, shared
+        with :class:`ConcernPayloadEditModal` (t1582) so the two dialogs cannot
+        drift on *how* a tier is applied while keeping their own thresholds.
+
+        **The order below is load-bearing (t1648).**
+
+        *Guidance before the height tier.* ``#concern-guidance`` is composed
+        ``display=True`` and only hidden by :meth:`_apply_guidance_visibility`
+        below 80x24 — measured, it is still ``True`` when this method is first
+        reached. The height tier counts every *displayed* child, so computing it
+        first would charge ~3 rows for a line that never renders and lift the cap
+        at healthy vector-bearing geometries. The gate reads only ``self.size``,
+        never ``xshort``, so running it first is deterministic and non-circular.
+
+        *Detail gate with the guidance, before the height tier* (t1651). It is
+        another ``self.size``-only gate, and it may take the guidance's rows —
+        the precedence is `list > help line > detail panel > guidance`. Running
+        it after the fit tier would charge rows for a panel that never renders.
+
+        *Height tier after every geometry change has settled.* When the width
+        tier changes the help text, or the detail gate moves the panel's display
+        or height, the new geometry is not laid out yet and the reported height
+        is stale in both directions, so the fit check is deferred one refresh.
+        This cannot loop: on the deferred pass both are already correct, both
+        report ``False``, and the check runs inline.
+        """
+        help_changed = _apply_measured_width_tier(
+            self,
+            _PICKER_NARROW_MIN_WIDTH,
+            "concern-help",
+            _CONCERN_HELP_FULL,
+            _CONCERN_HELP_COMPACT,
+        )
+
+        self._apply_guidance_visibility()
+        detail_changed = self._apply_detail_visibility()
+
+        if help_changed or detail_changed:
+            self.call_after_refresh(self._apply_fit_tier)
+        else:
+            self._apply_fit_tier()
+
+    def _apply_fit_tier(self) -> None:
+        """Lift the vertical cap when it cannot seat this dialog's content.
+
+        Split out from :meth:`_apply_size_tier` so it can be deferred a refresh
+        after a help swap — see that method for why the ordering matters. The
+        mechanism lives in :func:`_apply_measured_height_tier`, which keeps its
+        own threshold the way the width tier does.
+        """
+        _apply_measured_height_tier(
+            self, "concern-dialog", "concern-list", _PICKER_MAX_HEIGHT_PCT
+        )
+
+    def _apply_guidance_visibility(self) -> None:
+        """Show the guidance only where it cannot cost the help line's keys.
+
+        The precedence is explicit and one-directional: **the key names outrank
+        the guidance.** They are the only place `r` / `t` / `R` / `u` / Esc are
+        named once the buttons are dropped, whereas the guidance restates a
+        rubric the per-row vector already encodes.
+
+        Gated on measured geometry rather than the ``xnarrow`` width class,
+        because that class is the wrong predicate here: 40 columns is *not*
+        xnarrow yet is the tier where the full help wraps to six rows and the
+        list is already pinned to its ``min-height``. See
+        :data:`_GUIDANCE_MIN_WIDTH`.
+        """
+        widgets = list(self.query("#concern-guidance"))
+        if not widgets:
+            return  # a legacy block: no guidance was composed at all
+        widgets[0].display = (
+            self.size.width >= _GUIDANCE_MIN_WIDTH
+            and self.size.height >= _GUIDANCE_MIN_HEIGHT
+        )
+
+    def _rows_needed_excluding(self, *skip) -> int:
+        """Rows the dialog's laid-out children need, ignoring ``skip``.
+
+        The same sum :func:`_apply_measured_height_tier` computes — including
+        the reason `#concern-list` contributes its declared ``min-height``
+        rather than its measured height, which is the *result* of the cap and
+        so would be circular.
+        """
+        dialogs = list(self.query("#concern-dialog"))
+        lists = list(self.query("#concern-list"))
+        if not dialogs or not lists:
+            return 0
+        dialog, concern_list = dialogs[0], lists[0]
+        needed = dialog.gutter.height
+        for child in dialog.children:
+            if not child.display or child in skip:
+                continue
+            margin = child.styles.margin
+            rows = (
+                int(concern_list.styles.min_height.value or 0)
+                if child is concern_list
+                else child.size.height
+            )
+            needed += rows + margin.top + margin.bottom
+        return needed
+
+    def _apply_detail_visibility(self) -> bool:
+        """Show and size the detail panel from MEASURED geometry (t1651).
+
+        **The denominator is the DECLARED budget — ``screen height *
+        _PICKER_MAX_HEIGHT_PCT``— never the dialog's resolved ``max-height``.**
+        The distinction is the whole design:
+
+        - the resolved style is what `xshort` rewrites, so reading it would feed
+          this panel's size back into the class that sets the cap and break
+          t1648's stated "cannot oscillate" property;
+        - the declared budget is computed from a **constant** and the screen
+          size, both invariant under `xshort`. This method never reads the class.
+
+        So the panel is sized to fit *within* the ordinary 80% cap, and
+        therefore **cannot by itself flip `xshort`**. That is deliberate and not
+        merely conservative: `xshort` means "the cap cannot seat this dialog's
+        content", and letting advisory chrome inflate the content until that
+        became true would grow the dialog to full screen height wherever the
+        panel appears and hollow the tier out — `ConcernVerticalFitTierTests`
+        pins 24x30 as narrow-but-NOT-short, and it stays that way.
+
+        The consequence is honest and measured: the panel is refused at some
+        geometries that have raw screen rows to spare (40x30) because the cap
+        withholds them. Those are t1652's bands.
+
+        **The width floor protects the dimension NAME, and only the name.**
+        Between the two floors the panel degrades rather than disappearing —
+        :func:`_detail_parts` drops the magnitude word and keeps
+        ``▲correctness``, because the arrow's colour still carries the magnitude.
+        The gate here enforces the lower floor,
+        :data:`_DETAIL_MIN_CONTENT_CELLS`: below it the full name itself cannot
+        fit, and a panel rendering ``verification…`` would occupy rows the
+        concern list needs while breaking the one thing it is for. Only there
+        does it yield entirely — the row's own coloured glyph is the better
+        answer at that width.
+
+        **Runs BEFORE `_apply_fit_tier`** for the reason that method's docstring
+        gives: the fit tier charges rows for every *displayed* child, so a panel
+        left displayed when it should not be would lift the cap at a healthy
+        geometry. Pinned by `ConcernSizeTierOrderTests` and
+        `ConcernDetailGateOrderTests`.
+
+        **Precedence.** `concern list > help line > detail panel > guidance`.
+        The panel outranks `_CONCERN_GUIDANCE` — the guidance restates a rubric
+        the vector already encodes, whereas the panel shows data the row
+        actually dropped — so it may take the guidance's rows. It never outranks
+        the help line's key names or the list.
+
+        **Returns whether it moved the panel's display or height**, for the same
+        reason :func:`_apply_measured_width_tier` reports its help swap: the new
+        geometry is NOT laid out by the time this returns, so a caller that goes
+        on to *measure* the children must wait a refresh. Measured at 24x30, the
+        fit tier reading the stale height summed 2 rows too many, concluded the
+        cap could not seat the dialog, and set `xshort` on a geometry t1648 pins
+        as narrow-but-NOT-short.
+        """
+        widgets = list(self.query("#concern-detail"))
+        if not widgets:
+            return False  # a legacy block: no panel was composed at all
+        panel = widgets[0]
+        before = (panel.display, str(panel.styles.height))
+        width, height = self.size.width, self.size.height
+        if width <= 0 or height <= 0:
+            return False  # pre-layout: children report 0; wait rather than latch
+
+        guidance = list(self.query("#concern-guidance"))
+
+        budget = height * _PICKER_MAX_HEIGHT_PCT // 100
+
+        def spare() -> int:
+            return budget - self._rows_needed_excluding(panel)
+
+        room = spare()
+        # The panel outranks the guidance: if hiding the advisory line is what
+        # buys the room, do it. Bounded — one retry, never a loop.
+        if room < _DETAIL_MIN_ROWS + 1 and guidance and guidance[0].display:
+            guidance[0].display = False
+            room = spare()
+            if room < _DETAIL_MIN_ROWS + 1:
+                guidance[0].display = True  # it bought nothing; give it back
+                room = spare()
+
+        # The width the panel would actually get to draw in — the dialog's own
+        # content box, which is laid out whether or not the panel is displayed
+        # (the panel's `size.width` is 0 while it is hidden, so it cannot be
+        # the input to the decision that unhides it).
+        dialogs = list(self.query("#concern-dialog"))
+        content_width = (
+            dialogs[0].size.width - dialogs[0].gutter.width if dialogs else 0
+        )
+        show = (
+            content_width >= _DETAIL_MIN_CONTENT_CELLS
+            and room >= _DETAIL_MIN_ROWS + 1
+        )
+        panel.display = show
+        target = 0
+        if show:
+            # Size to what the panel will actually DRAW, not to every spare row:
+            # the content is one line per impact entry, a small known count. The
+            # `- 1` is the panel's own bottom margin, which `spare` counted
+            # against it. Explicit cell height, never `auto` — see the CSS.
+            focused = self._focused_concern()
+            wanted = (
+                len(self._detail_lines(focused))
+                if focused is not None else _DETAIL_MIN_ROWS
+            )
+            target = max(1, min(wanted, _DETAIL_MAX_ROWS, room - 1))
+            panel.styles.height = target
+            self._sync_detail(focused)
+        changed = before != (panel.display, str(panel.styles.height))
+        # **Also defer while the LAID-OUT height still disagrees with the
+        # target.** The style is set here; the size the fit tier actually reads
+        # catches up a refresh later, and `changed` alone does not cover the
+        # pass where this method rewrote nothing but layout had not yet applied
+        # the previous pass's value. Measured at 24x30: the gate converged
+        # 8 -> 6 -> 6 while every fit-tier call still saw 6 as 8, summed 26
+        # against a budget of 24, and set `xshort` on a geometry t1648 pins as
+        # not-short. Cannot spin: this only defers the fit tier (never re-runs
+        # this gate), and layout converges on its own.
+        pending = show and panel.size.height != target
+        return changed or pending
+
+    def _focused_concern(self):
+        """The focused row's concern, or the first row's when nothing is focused."""
+        rows = list(self.query(_ConcernRow))
+        if not rows:
+            return None
+        for row in rows:
+            if row.has_focus:
+                return row.concern
+        return rows[0].concern
+
+    def _sync_detail(self, concern) -> None:
+        """Rewrite the panel for ``concern``; a no-op when there is no panel."""
+        widgets = list(self.query("#concern-detail"))
+        if not widgets or concern is None:
+            return
+        panel = widgets[0]
+        rows = int(panel.styles.height.value or _DETAIL_MIN_ROWS)
+        width = max(1, panel.size.width or self.size.width or _DETAIL_MIN_WIDTH)
+        panel.update(self._detail_text(concern, width, rows))
+
+    def _detail_text(self, concern: "Concern", width: int, rows: int) -> str:
+        """Rich markup for the focused concern's impact vector, in ``rows`` lines.
+
+        **Dimensions only.** One line per improve / worsen entry — coloured
+        arrow, full dimension name, magnitude as a word — and nothing else. No
+        body preview, no region, no effort or disposition line, and no inline
+        rubric: the row directly above already carries the region and the
+        disposition, and repeating them here read as duplication rather than
+        detail.
+
+        What the panel is for is the part the row genuinely cannot show: the row
+        degrades to ONE improve entry, ONE worsen entry and 5-cell labels
+        (``▲corr ▼simpl E:lo``), so every additional entry and every full name is
+        exactly what is missing.
+
+        **A ``+N`` marker reserves its own cells.** Entries that do not fit are
+        announced, never dropped silently — but the announcement is appended to
+        a line that may already be exactly ``width`` cells wide, so the final
+        surviving entry is RE-RENDERED against ``width - marker`` rather than
+        having the marker bolted on. Measured before the fix: five entries at
+        width 30 in one row produced ``▲maintainability (unspecified) +4`` at 33
+        cells, which Rich folds to a second row — silently breaking the declared
+        height this panel's whole geometry contract rests on.
+
+        Width is spent by the two-rung ladder in :func:`_detail_parts`, which
+        drops the magnitude word rather than ever truncating a name.
+        """
+        parts = self._detail_lines(concern)
+        # One rung for the whole panel — see `_detail_uses_full_form` for why a
+        # per-line choice is misleading rather than merely inconsistent.
+        full = _detail_uses_full_form(width)
+
+        def render(part, budget=width):
+            return _detail_render(part, budget, part[2] if full else part[3])
+
+        if len(parts) <= rows:
+            return "\n".join(render(part) for part in parts)
+
+        # Inline the marker when the last surviving entry fits beside it IN
+        # EITHER RUNG. `_detail_form` re-picks the form against the reduced
+        # budget, so an entry whose full form does not fit can still be kept in
+        # its compact one rather than dropped: at width 30 that is the
+        # difference between `▲maintainability (unspecified)` + `+4` and
+        # `▲maintainability (unspecified)` / `▲maintainability +3`, which shows
+        # one more of exactly the names this panel exists to recover.
+        if rows >= 1:
+            marker = f" +{len(parts) - rows}"
+            reduced = width - cell_len(marker)
+            if _detail_form(parts[rows - 1], reduced) is not None:
+                lines = [render(part) for part in parts[: rows - 1]]
+                # This ONE line may fall back a rung — `_detail_form` re-picks
+                # against the reduced budget, so an entry whose full form does
+                # not fit beside the marker is kept compact rather than dropped.
+                lines.append(
+                    _detail_render(parts[rows - 1], reduced)
+                    + f"[dim]{marker}[/]"
+                )
+                return "\n".join(lines)
+
+        # Not even the name fits beside the marker: drop that entry too and give
+        # the marker its own row. Fewer names, but every name shown is whole —
+        # and the count stays honest about what was dropped.
+        keep = max(0, rows - 1)
+        lines = [render(part) for part in parts[:keep]]
+        lines.append(f"[dim]+{len(parts) - keep}[/]")
+        return "\n".join(lines)
+
+    def _detail_lines(self, concern) -> "list[tuple[str, int, str, str]]":
+        """Every entry the panel would draw, unrendered and width-independent.
+
+        Split out so :meth:`_apply_detail_visibility` can size the panel to what
+        it will actually draw instead of greedily taking every spare row, and so
+        :meth:`_detail_text` can pick each line's rung against that line's own
+        budget. Carries no width: the entry COUNT does not depend on it, and the
+        form does not depend on the panel width either — only on the room the
+        individual line gets.
+        """
+        if not has_impact_vector(concern):
+            return [("[dim]", 0, _DETAIL_NO_VECTOR, _DETAIL_NO_VECTOR)]
+        parts: "list[tuple[str, int, str, str]]" = []
+        for entries, arrow in (
+            (concern.improves, _IMPROVE_ARROW),
+            (concern.worsens, _WORSEN_ARROW),
+        ):
+            parts.extend(_detail_parts(entries, arrow))
+        return parts
+
+    def action_inspect_unrecovered(self) -> None:
+        """Show the marker lines this block lost, over the still-open picker.
+
+        Pushed on the App (the first modal-over-modal in the monitor package;
+        the repo precedent is ``brainstorm/modals.py``'s ``NodeDetailModal``).
+        The picker is NOT dismissed, so closing the inspect view returns to an
+        intact selection.
+        """
+        if not self._unrecovered:
+            self.app.notify("Nothing unparsed in this block")
+            return
+        self.app.push_screen(
+            ConcernBlockInspectModal(self._unrecovered, self._raw_block)
+        )
+
+    def _rows(self) -> list[_ConcernRow]:
+        return list(self.query(_ConcernRow))
+
+    def _concerns_in_state(self, state: str) -> list["Concern"]:
+        """Concerns whose row is in ``state``, in **original input order**.
+
+        Sorted by ``original_index``, never by DOM position and never matched by
+        value: partitioning reorders the DOM, and two equal ``Concern`` tuples
+        are indistinguishable, so ticking one of a duplicate pair would otherwise
+        forward — or reject — the wrong one, or both.
+        """
+        rows = [row for row in self._rows() if row.state == state]
+        return [row.concern for row in sorted(rows, key=lambda r: r.original_index)]
+
+    def action_edit_payload(self) -> None:
+        """Edit the outgoing payload, over the still-open picker (t1582).
+
+        Same modal-over-modal shape as :meth:`action_inspect_unrecovered` — the
+        picker is NOT dismissed, so cancelling returns to an intact selection.
+
+        **Reopening resumes the user's own text**, not a regenerated payload:
+        the editor is a place to iterate, and reseeding from the canonical build
+        would silently throw the previous edit away the moment the user pressed
+        ``e`` a second time to revise it.
+
+        Seeded with a BUILT STRING, never with ``Concern`` objects — see
+        :class:`ConcernPayloadEditModal` for why that is a hard constraint and
+        not just a convenience.
+        """
+        forwarded = self._concerns_in_state("forward")
+        if not forwarded:
+            # Refused, not opened on an empty box: same shape as `u` and `R`,
+            # which each say which empty case they hit rather than showing
+            # nothing.
+            self.app.notify(
+                "Nothing marked for forwarding — press Space on a row first"
+            )
+            return
+        # Resolve BEFORE re-snapshotting: the comparison has to run against the
+        # seed the existing override was made against, not the one about to
+        # replace it.
+        override = self._resolve_payload_override(on_confirm=False)
+        self._payload_seed = build_clipboard_payload(forwarded)
+        self.app.push_screen(
+            ConcernPayloadEditModal(
+                self._payload_seed if override is None else override,
+                narrow=self._narrow,
+            ),
+            callback=self._on_payload_edited,
+        )
+
+    def _on_payload_edited(self, text) -> None:
+        """Store a saved edit; a cancel leaves any PRIOR override untouched.
+
+        `is None` is the cancel test, mirroring the editor's own contract — an
+        empty buffer never reaches here, because saving one is refused.
+        """
+        if text is None:
+            return
+        self._payload_override = text
+
+    def _resolve_payload_override(self, *, on_confirm: bool) -> str | None:
+        """The saved edit if it still matches the selection; else discard it.
+
+        The single application of the stale rule, consulted by BOTH
+        :meth:`action_edit_payload` (before reseeding) and :meth:`_result`
+        (before dismissing) — applying it in one place and forgetting the other
+        is how the two would come to disagree about which text is live.
+
+        A STATE comparison, not an event hook: rows own their disposition keys
+        and stop them (:meth:`_ConcernRow.on_key`), so no route through
+        ``set_state`` is observable from here. It is also the better rule — a
+        row toggled off and back on regenerates an identical payload, so the
+        edit correctly survives, which a "touched" flag would not manage.
+
+        Discards by CLEARING the field, so the warning fires exactly once even
+        though two callers consult it. Never silently: the user has to be able
+        to tell which text was copied.
+        """
+        if self._payload_override is None:
+            return None
+        current = build_clipboard_payload(self._concerns_in_state("forward"))
+        if current == self._payload_seed:
+            return self._payload_override
+        self._payload_override = None
+        self.app.notify(
+            "Selection changed after editing — copied the regenerated payload, "
+            "your edit was discarded."
+            if on_confirm
+            else "Selection changed since your last edit — reopening on the "
+                 "current payload.",
+            severity="warning",
+        )
+        return None
+
+    def _result(self) -> ConcernPickResult:
+        return ConcernPickResult(
+            forwarded=self._concerns_in_state("forward"),
+            rejected=self._concerns_in_state("rejected"),
+            unrejected=tuple(self._unreject_ids),
+            spun_off=self._concerns_in_state("spinoff"),
+            payload_override=self._resolve_payload_override(on_confirm=True),
+        )
+
+    def action_show_rejected(self) -> None:
+        """Open the persisted rejection list, over the still-open picker.
+
+        Same modal-over-modal shape as :meth:`action_inspect_unrecovered` — the
+        picker is NOT dismissed, so returning lands on an intact selection.
+
+        The two empty cases are reported **differently on purpose**: "no task id"
+        means the store could not even be located and any rejection made here
+        will be refused, which the user needs to know *before* confirming; "no
+        rejected concerns" means the store was read and is genuinely empty.
+        """
+        if self._store_unavailable:
+            self.app.notify(
+                "No task id for this pane — rejection store unavailable",
+                severity="warning",
+            )
+            return
+        if not self._rejected_entries:
+            self.app.notify("No previously rejected concerns for this task")
+            return
+        self.app.push_screen(
+            RejectedStoreModal(self._rejected_entries),
+            callback=self._on_rejected_view_closed,
+        )
+
+    def _on_rejected_view_closed(self, ids) -> None:
+        """Accumulate the ids the rejected-store view marked for un-rejection.
+
+        Accumulates rather than replaces: the view can be opened more than once
+        before confirming, and a second visit must not discard the first visit's
+        choices. De-duped, order preserved.
+        """
+        for entry_id in ids or ():
+            if entry_id not in self._unreject_ids:
+                self._unreject_ids.append(entry_id)
+
+    def action_confirm(self) -> None:
+        self.dismiss(self._result())
+
+    def action_dismiss_dialog(self) -> None:
+        self.dismiss(None)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "btn-ok":
+            self.dismiss(self._result())
+        else:
+            self.dismiss(None)

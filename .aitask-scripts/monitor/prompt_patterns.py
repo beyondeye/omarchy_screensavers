@@ -1,0 +1,386 @@
+"""Known 'agent is awaiting user input' prompt patterns for ait monitor.
+
+Grouped per code agent, and since t1467 matching is **scoped to the pane's own
+agent** — see `scope_patterns`. A pane whose command does not resolve to a known
+agent still gets the full flat list (`all_patterns()`), so no detection that
+worked before is lost; that fail-open is the common case, not an edge, because
+`pane_current_command` is unreliable (a Codex pane reports `node`). See
+`aidocs/framework/monitor_idle_and_prompt_detection.md`.
+
+This file is the only place to edit when a new prompt wording shows up.
+There is intentionally no project_config.yaml surface — these patterns are
+treated like TUI_NAMES / DEFAULT_AGENT_PREFIXES (framework constants).
+
+Workflow-*phase* meaning is NOT assigned here: `lib/workflow_phase.py` maps
+these `name`s to a phase (`NATIVE_KIND_PHASE`) and uses the per-agent
+`QUESTION_WIDGET_KINDS` entries as its currency markers. The Codex/OpenCode
+surfaces were inventoried live in t1467; note that neither agent has an
+`ExitPlanMode` analogue, so neither has a phase-bearing native dialog and their
+`NATIVE_KIND_PHASE` rows are empty **by measurement**, not by omission.
+"""
+from __future__ import annotations
+
+import os
+import re
+import sys
+from dataclasses import dataclass
+
+# The canonical pane→agent mapper lives in `lib/`, which is one layer DOWN from
+# `monitor/` (monitor_core puts lib on sys.path and imports from it, never the
+# reverse). Reached here by a __file__-derived insert with a flat-import
+# fallback, the idiom review_loop.py already uses, so this module keeps working
+# however it is imported.
+_LIB_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib")
+if _LIB_DIR not in sys.path:
+    sys.path.insert(0, _LIB_DIR)
+from agent_keys import (  # noqa: E402
+    AGENT_KEYS,
+    agent_key_from_command,
+    agent_key_from_pane,
+)
+
+
+@dataclass(frozen=True)
+class PromptPattern:
+    name: str             # short id, surfaced as snap.awaiting_input_kind
+    regex: re.Pattern[str]
+    # Match against the tail with its trailing BLANK rows dropped first, instead
+    # of the shared bottom-6 window (t1522). For inline pre-TUI screens that
+    # render TOP-aligned: their bottom element sits above a run of blank rows
+    # filling the rest of the pane, so the shared window is all blank there.
+    # Opt-in per pattern, never global: trimming the shared window was measured
+    # to change which kind Claude's permission dialog reports (its captures
+    # carry trailing blank rows too) — see monitor_core._prompt_detection_text.
+    skip_trailing_blank_rows: bool = False
+
+
+# The two option lines of Claude Code's workspace-trust confirm dialog, each
+# holding nothing but its (optionally pointer-prefixed) label. Named fragments
+# rather than one inline literal so the adjacency requirement below stays
+# readable in both orders. See `claude_trust_folder` for why each piece is
+# shaped this way.
+_TRUST_YES = r"^[ \t]*(?:❯[ \t]*)?Yes, I trust th(?:is folder|ese settings)[ \t]*$"
+_TRUST_NO = (r"^[ \t]*(?:❯[ \t]*)?"
+             r"No, (?:exit(?: Claude Code)?|continue without these permissions)[ \t]*$")
+
+
+# Claude's tool-permission dialog question, alone on its line.
+#
+# SHARED VERBATIM with `review_loop._CLAUDE_PERMISSION_RE`, which imports this
+# object: one line of one dialog, serving two different roles — the review
+# loop's block BOUNDARY and this file's KIND selection. They were two literals
+# until t1557, and they drifted: the boundary was tightened to a whole line by
+# t1540 while the kind selector stayed a substring, which is the defect below.
+# `ClaudePermissionBoundaryTests.test_boundary_and_prompt_pattern_share_one_object`
+# is the drift guard; unpick the sharing there first if the two roles ever have
+# to diverge.
+#
+# `(?m)` is load-bearing: `classify_content` searches the multi-line detection
+# window and `review_loop._ordered_state` searches the whole captured tail, so
+# without it `^`/`$` would anchor to the ends of the blob rather than to a line.
+CLAUDE_PROCEED_LINE_RE = re.compile(r"(?m)^[ \t]*Do you want to proceed\?[ \t]*$")
+
+
+# Per code agent. Empty lists are placeholders for agents whose prompt
+# wording has not been observed/needed yet.
+PROMPT_PATTERNS_BY_AGENT: dict[str, list[PromptPattern]] = {
+    "claude": [
+        # Numbered-option question widget (the AskUserQuestion tool). Measured
+        # against Claude Code 2.1.226 (t1420): this was matched by NOTHING, so an
+        # agent parked on a question — the single most common "waiting on you"
+        # state, and every task-workflow checkpoint — read as idle.
+        # Listed FIRST because matching is first-wins: this is the specific
+        # widget, `claude_help_bar` below is the tool-permission one.
+        PromptPattern("claude_askuserquestion",
+                      re.compile(r"Enter to select\s+·\s+↑/↓ to navigate")),
+        # ExitPlanMode's plan-approval dialog. Also previously unmatched; its
+        # wording is "Would you like to proceed?", which is why `claude_proceed`
+        # below never covered it.
+        # MUST stay bottom-anchored: matching happens against the last
+        # _PROMPT_DETECTION_TAIL_LINES (6) lines only, and this dialog's question
+        # text renders ~7 lines up — outside the window. The alternation below is
+        # measured at distance 0 and 5 respectively, so either rendering lands
+        # inside it.
+        PromptPattern("claude_plan_approval",
+                      re.compile(r"ctrl\+g to edit in|Yes, auto-accept edits")),
+        # First-run workspace-trust dialog ("Accessing workspace:" / "Quick
+        # safety check: Is this a project you created or one you trust?" /
+        # confirm + cancel options). Matched by NOTHING before t1474, so an
+        # agent blocked on it — typically before it has produced any output at
+        # all — read as IDLE and the user was never told it was waiting.
+        #
+        # Anchored on the two OPTION LINES, not on the footer t1420 measured
+        # ("Enter to confirm · Esc to cancel"): the options are the bottom-most
+        # lines of the dialog, so they land inside the tail window whichever way
+        # the question wraps, and that footer is shared with unrelated confirm
+        # dialogs (terms acceptance) this name would misdescribe.
+        #
+        # Four constraints, each load-bearing:
+        #  * `❯` is the ONLY accepted marker. It comes from a figures-style
+        #    table (pointer:"❯", " " when unfocused) and the CLI ships no
+        #    fallbackSymbols / isUnicodeSupported table, so there is no ASCII
+        #    degradation path. ASCII `>` is deliberately rejected — it is the
+        #    Markdown blockquote prefix, and quoted prose would fire on it.
+        #    A numeric prefix is rejected for the same reason: this is a
+        #    pointer-select, not a numbered menu.
+        #  * Each option line must hold NOTHING but its label (`[ \t]*$`).
+        #  * The two labels must be ADJACENT. Requiring merely that both appear
+        #    "nearby" is not structural — arbitrary prose fits between them, so
+        #    any document discussing the dialog would match.
+        #  * Both orders are accepted: which label carries `❯` depends on the
+        #    dialog's initial focus.
+        # `exit(?: Claude Code)?` is required, not cosmetic: the sibling
+        # settings-trust dialog's cancel label is "No, exit Claude Code", and
+        # with `$` closing the line a bare `exit` would leave that arm dead.
+        #
+        # KNOWN LIMIT: no text matcher can separate this dialog from a verbatim,
+        # geometry-faithful reproduction of it — a pane displaying the test
+        # fixture, or a doc that pastes the option block, IS the dialog as far as
+        # captured text goes. Accepted (advisory signal, transient wrong badge)
+        # and pinned by _check_trust_pattern_known_false_positive. The practical
+        # rule that follows: describe these labels inline in prose, never as a
+        # copied two-line option block.
+        PromptPattern("claude_trust_folder",
+                      re.compile(rf"(?m){_TRUST_YES}\n{_TRUST_NO}"
+                                 rf"|{_TRUST_NO}\n{_TRUST_YES}")),
+        # The permission dialog's DEFAULT question text: Claude Code renders it
+        # verbatim for command/Bash permission and for the Read/Edit file
+        # permission fallback (verified against 2.1.226). It is NOT the
+        # plan-mode prompt — ExitPlanMode asks "Would you like to proceed?" and
+        # is `claude_plan_approval`'s job.
+        # In practice this rarely fires, and that is structural rather than a
+        # wording problem: the question renders ABOVE the option list, so it
+        # usually falls outside _PROMPT_DETECTION_TAIL_LINES and the
+        # bottom-anchored `claude_help_bar` is what matches those dialogs.
+        # Kept as a cheap backstop for short renderings (t1474).
+        #
+        # WHOLE-LINE, since t1557, and that is load-bearing rather than tidiness
+        # — the same technique, and the same reason, as `claude_trust_folder`'s
+        # "each option line holds nothing but its label" above. The dialog's
+        # option rows are EDITABLE (`Tab` amends option 1), so a user who types
+        # this exact phrase into one puts a second copy of it inside the 6-line
+        # detection window while the real header stays outside it. Under the
+        # previous substring form the reported kind flipped `claude_help_bar` ->
+        # `claude_proceed` mid-dialog, and `classify_followed_change` returns
+        # WORK on the `prev_kind != curr_kind` short-circuit — a spurious
+        # auto-recheck round fired while the user was still typing, ahead of any
+        # boundary lookup. t1540 had already closed the identical hole in
+        # `review_loop`'s boundary; the two layers now share one literal.
+        #
+        # Measured against every Claude fixture in tests/review_loop_fixtures.py:
+        # the tightening keeps every legitimate in-window match (the ≤9-row
+        # regime, where Claude truncates the option list and lifts the real
+        # header to index -5 as a whole line) and drops only the typed copy.
+        #
+        # KNOWN LIMITS, both accepted and both the same disposition as
+        # `claude_trust_folder`'s — documented, not guarded:
+        #  * Whole-line anchoring rejects prose that puts anything ELSE on the
+        #    line (inline, bulleted, blockquoted, quote-marked), but it does NOT
+        #    tell a line holding only the question apart from the real header —
+        #    a doc or fixture reproducing it on its own line still fires. That
+        #    is irreducible: at ≤9 rows the real header IS exactly such a line,
+        #    so rejecting it would delete the detection this pattern exists for.
+        #    Pinned by `_check_claude_proceed_requires_a_whole_line`.
+        #  * Amend text long enough to WRAP could still put the phrase alone on
+        #    a continuation line. It needs the wrap point to fall exactly before
+        #    `Do`, no capture reproduces it, and rejecting it would require this
+        #    pattern to know the option rows' structure.
+        PromptPattern("claude_proceed", CLAUDE_PROCEED_LINE_RE),
+        # Bottom-of-pane help bar shown whenever Claude Code blocks on input
+        # (numbered selection, free-text amend prompt, etc.).
+        #
+        # The `Tab to amend` affordance is NOT stable across the permission
+        # dialog's own states. Measured live 5/5 reps at every geometry from 30
+        # down to 11 rows against 2.1.233 (t1540): with option 1 or 3 selected
+        # the bar reads `Esc to cancel · Tab to amend · ctrl+e to explain`, but
+        # on option 2 ("Yes, and always allow access to …") amend does not apply
+        # and the affordance is absent. Anchoring on `Tab to amend` alone
+        # therefore matched two of the three selection states and reported NO
+        # kind on the third — so a pure cursor move onto option 2 flipped
+        # `awaiting_input` True->False and `classify_followed_change` returned
+        # WORK for it (kind change / not-awaiting both short-circuit ahead of any
+        # boundary lookup). That is the spurious-FIRE direction of the review
+        # loop, and no NATIVE_DIALOG_BOUNDARIES row can reach it.
+        #
+        # The alternation accepts either affordance, which covers every state of
+        # that dialog. It is a strict widening — every line the previous regex
+        # matched still matches — and it is bounded rather than open-ended:
+        # `ctrl+e to explain` is the command-explanation affordance, which only
+        # the tool-permission dialog offers. Do not relax it to `Esc to cancel`
+        # alone: that footer is shared with unrelated confirm dialogs, which is
+        # exactly why t1474 rejected it.
+        PromptPattern("claude_help_bar",
+                      re.compile(
+                          r"Esc to cancel\s+·\s+"
+                          r"(?:Tab to amend|ctrl\+e to explain)")),
+    ],
+    "codex": [
+        # Codex's request-user-input widget — the direct analogue of Claude's
+        # AskUserQuestion, and the surface a task-workflow checkpoint renders
+        # through under Codex. Measured live against 0.146.0 in a 163x50 pane
+        # (t1467): the footer sits at distance 1 from the pane bottom, well
+        # inside _PROMPT_DETECTION_TAIL_LINES (6).
+        #
+        # Anchored on the key-binding legend rather than on the question text:
+        # the question is arbitrary agent prose (and renders ~8 lines up, outside
+        # the window), whereas the legend is fixed by the widget. Legends are
+        # also the part of a TUI least likely to appear in quoted prose.
+        # Listed FIRST because matching is first-wins: this is the specific
+        # widget, `codex_permission` below is the tool-approval one.
+        PromptPattern("codex_question",
+                      re.compile(r"tab to add notes\s*\|\s*enter to submit answer")),
+        # The exec-approval dialog's footer, measured at distance 1. Deliberately
+        # NOT a NATIVE_KIND_PHASE key — a tool confirmation carries no workflow
+        # phase (see lib/workflow_phase.py).
+        PromptPattern("codex_permission",
+                      re.compile(r"Press enter to confirm or esc to cancel")),
+        # Matches both "Yes, proceed (y)" and "Yes proceed (y)" across versions.
+        # Verified still live on 0.146.0 (t1467): it renders at distance 5, so it
+        # remains a real backstop for the same dialog when the footer scrolls.
+        PromptPattern("codex_yes_proceed", re.compile(r"Yes,? proceed \(y\)")),
+        # The startup update-available dialog (t1522): a header naming the old
+        # and new versions, a release-notes line, three numbered options (the
+        # selected one carries the `›` composer glyph) and a bottom hint asking
+        # to press enter to continue. It renders on EVERY launch while a newer
+        # version exists, and is the first screen a freshly spawned agent shows.
+        #
+        # The hint has two measured wordings, and the slot accepts either:
+        # `Press enter to continue` (0.146-0.154) and `enter continue · esc
+        # skip` (0.160.0, captured live as an inline shadow in t1900 —
+        # tests/review_loop_fixtures.py's CODEX_0160_INLINE_UPDATE_PROMPT_RAW).
+        # The option rows, their labels and the one blank row above the hint
+        # are the same in both, so every other anchor below holds for both.
+        #
+        # The only pattern with `skip_trailing_blank_rows`, and it cannot work
+        # without it. Measured live against 0.154.0 (npm-managed): the dialog is
+        # an inline pre-TUI screen (alternate_on=0) rendered TOP-aligned — the
+        # hint sits at row -15 / -21 / -41 at 80x24 / 120x30 / 120x50 with only
+        # blank rows below it, so the shared 6-line window is entirely blank on
+        # every real pane. With the blank run dropped the window holds exactly
+        # the dialog's tail: blank, three option rows, blank, hint.
+        # (tests/review_loop_fixtures.py's CODEX_UPDATE_PROMPT_RAW was trimmed of
+        # those rows, which is why it looks bottom-anchored.)
+        #
+        # Dropping an arbitrary blank run is safe on the way OUT as well as in:
+        # measured live (t1522, 0.25 s sampling), the kind clears on the first
+        # sample after the dialog is dismissed and never returns — including
+        # when the dismissed dialog's text stays in scrollback above the next
+        # inline screen (sign-in or directory-trust), because the trimmed window
+        # then ends on THAT screen's rows, whose hint sits under other options.
+        #
+        # Anchored on the LAST option row plus the hint — adjacent, with exactly
+        # the measured one blank row between them, each holding nothing but its
+        # label:
+        #  * the hint alone (either wording) is generic prose, and Codex's
+        #    sign-in onboarding screen ends with the very same hint over
+        #    different options — this name must not claim that screen;
+        #  * option 3 rather than option 1, because option 1's label embeds the
+        #    install command, which varies with the install method;
+        #  * `›` is the only selection marker recognised WHEN PRESENT, and the
+        #    regex makes it optional on purpose: the option-3 row carries it
+        #    only while option 3 is selected, so requiring it would stop the
+        #    pattern matching in the other two selection states (all three are
+        #    pinned by _check_codex_update_prompt_detected). ASCII `>` is not a
+        #    marker — it is the Markdown blockquote prefix.
+        # Two anchors in fixed geometry are structure, not a quotable phrase:
+        # prose mentioning the hint or the option label cannot match.
+        #
+        # KNOWN LIMIT: a verbatim, geometry-faithful reproduction of the option
+        # row and hint is indistinguishable from the dialog (rule 3 of
+        # monitor_idle_and_prompt_detection.md) — pinned by
+        # _check_codex_update_prompt_known_false_positive.
+        #
+        # Consumers: the followed-pane window gains detection through the
+        # opt-in. The review loop already classified this pane SHADOW_DIALOG
+        # structurally (t1509) and now also matches it in its whole-tail
+        # negative half — same verdict. No NATIVE_DIALOG_BOUNDARIES row: see
+        # review_loop.DELIBERATELY_UNANCHORED_KINDS.
+        PromptPattern("codex_update_prompt",
+                      re.compile(r"(?m)^[ \t]*(?:›[ \t]*)?3\. Skip until next version[ \t]*\n"
+                                 r"[ \t]*\n"
+                                 r"[ \t]*(?:Press enter to continue"
+                                 r"|enter continue · esc skip)[ \t]*$"),
+                      skip_trailing_blank_rows=True),
+    ],
+    "opencode": [
+        # OpenCode's interactive question widget. Measured live against 1.18.18
+        # (t1467): footer at distance 2, inside the 6-line window.
+        #
+        # The separator runs are `\s+`, not fixed double spaces: OpenCode wraps a
+        # right-hand status column into the same physical lines, which can reflow
+        # the spacing. For the same reason nothing here anchors on `$` —
+        # trailing content on the line is normal for this TUI.
+        PromptPattern("opencode_question",
+                      re.compile(r"↑↓\s+select\s+enter\s+submit\s+esc\s+dismiss")),
+        # The permission dialog's option row (distance 2). Before t1467 OpenCode
+        # had NO patterns at all, so an agent blocked on this dialog read as
+        # IDLE and the user was never told it was waiting — the same class of
+        # blindness t1474 fixed for Claude's trust dialog.
+        #
+        # Anchored on all three labels in order, which is geometry rather than a
+        # quotable phrase: prose mentioning "Reject" or "Allow once" alone cannot
+        # match, and the fixed order is what the widget renders.
+        PromptPattern("opencode_permission",
+                      re.compile(r"Allow once\s+Allow always\s+Reject")),
+        # The `ctrl+p` command palette. Measured live against 1.18.18 (t1520):
+        # unlike the two dialogs above, the palette is an OVERLAY -- it leaves
+        # the composer box rendered intact below it. So it is invisible to any
+        # structural "is the composer empty" check, and a shadow pane with it
+        # open read as READY until this pattern existed, where an injected
+        # Enter would have run whichever command was selected.
+        #
+        # **Do not read more coverage into this than exists.** The palette
+        # renders ABOVE the composer, so in a real capture its header sits ~21
+        # lines from the bottom -- outside `_PROMPT_DETECTION_TAIL_LINES` (6).
+        # It therefore does NOT change followed-pane `awaiting_input`: `ait
+        # monitor` still reads a palette-open agent as idle. What consumes it is
+        # the review loop, whose negative half scans the WHOLE captured tail
+        # (see review_loop._ordered_state). The palette has no marker at all
+        # inside the bottom 6 lines, so no pattern could serve both.
+        #
+        # Anchored on the header row's label plus its right-aligned dismiss
+        # hint, which is geometry rather than a quotable phrase, and which
+        # survives filtering (the header stays while you type in Search).
+        # Scanned over 1130 live captures from the t1520 measurement session it
+        # matched the three palette captures and nothing else.
+        PromptPattern("opencode_palette", re.compile(r"Commands\s+esc\b")),
+    ],
+    "all": [],   # generic prompts that match across agents — add as needed
+}
+
+
+def scope_patterns(patterns: list[PromptPattern],
+                   agent: str) -> list[PromptPattern]:
+    """``patterns`` minus every pattern that provably belongs to a DIFFERENT agent.
+
+    Subtractive rather than selective, and each of those three consequences is
+    load-bearing:
+
+    * an unrecognised ``agent`` (``""`` — a wrapper process, a companion TUI)
+      removes nothing, so the pre-t1467 flat-list behaviour is the fail-open
+      default and no working detection is lost;
+    * a caller-supplied pattern whose name is in no registry group survives,
+      because "not owned by another agent" is a weaker and safer test than
+      "listed under this agent";
+    * ``patterns=[]`` stays empty, so the explicit disable path is untouched.
+
+    Order is preserved, so first-match-wins semantics are unchanged.
+    """
+    key = (agent or "").strip().lower()
+    if key not in AGENT_KEYS:
+        return patterns
+    foreign = {p.name
+               for group, group_patterns in PROMPT_PATTERNS_BY_AGENT.items()
+               if group != key and group != "all"
+               for p in group_patterns}
+    if not foreign:
+        return patterns
+    return [p for p in patterns if p.name not in foreign]
+
+
+def all_patterns() -> list[PromptPattern]:
+    """Flatten the per-agent dict into a single list for today's matching."""
+    out: list[PromptPattern] = []
+    for patterns in PROMPT_PATTERNS_BY_AGENT.values():
+        out.extend(patterns)
+    return out

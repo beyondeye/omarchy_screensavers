@@ -1,0 +1,459 @@
+"""Explain data manager for the codebrowser TUI.
+
+Generates, caches, and parses explain data for files browsed in the codebrowser.
+Uses aitask_explain_extract_raw_data.sh + aitask_explain_process_raw_data.py
+pipeline, directing output to .aitask-explain/codebrowser/ with directory-based naming.
+"""
+
+from __future__ import annotations
+
+import glob
+import os
+import re
+import shutil
+import subprocess
+from collections import OrderedDict
+from datetime import datetime
+from pathlib import Path
+
+import yaml
+
+from annotation_data import AnnotationRange, ExplainRunInfo, FileExplainData, TaskDetailContent
+
+CODEBROWSER_DIR = ".aitask-explain/codebrowser"
+EXTRACT_SCRIPT = "./.aitask-scripts/aitask_explain_extract_raw_data.sh"
+
+
+class ExplainManager:
+    TASK_CONTENT_CACHE_MAX = 100
+    TASKS_INDEX_CACHE_MAX = 20
+
+    def __init__(self, project_root: Path):
+        self._root = project_root
+        self._cb_dir = project_root / CODEBROWSER_DIR
+        os.makedirs(self._cb_dir, exist_ok=True)
+        self._task_content_cache: OrderedDict[str, TaskDetailContent] = OrderedDict()
+        self._tasks_index_cache: OrderedDict[str, list[dict]] = OrderedDict()
+        self._active_generation: str | None = None  # dir_key currently generating
+        self._pending_precache: set[str] = set()  # dir_keys queued for pre-caching
+        self._git_ts_cache: dict[str, float] = {}  # dir_key -> last commit timestamp
+        self.cleanup_stale_runs()
+
+    def _dir_to_key(self, directory: Path) -> str:
+        """Convert a directory path (relative to project root) to a cache key."""
+        rel = str(directory)
+        if rel in (".", ""):
+            return "_root_"
+        return rel.replace("/", "__")
+
+    def _find_run_dir(self, dir_key: str) -> Path | None:
+        """Find the most recent run directory for a given directory key."""
+        pattern = str(self._cb_dir / f"{dir_key}__[0-9]*")
+        matches = sorted(glob.glob(pattern))
+        if not matches:
+            return None
+        # Most recent is last when sorted alphabetically (timestamp suffix)
+        return Path(matches[-1])
+
+    def get_cached_data(self, file_path: Path) -> FileExplainData | None:
+        """Get cached explain data for a file, or None if not cached."""
+        rel_path = file_path.relative_to(self._root)
+        directory = rel_path.parent
+        dir_key = self._dir_to_key(directory)
+
+        run_dir = self._find_run_dir(dir_key)
+        if run_dir is None:
+            return None
+
+        ref_yaml = run_dir / "reference.yaml"
+        if not ref_yaml.exists():
+            return None
+
+        all_data = self.parse_reference_yaml(ref_yaml)
+        return all_data.get(str(rel_path))
+
+    def generate_explain_data(
+        self, directory: Path, max_commits: int = 30
+    ) -> dict[str, FileExplainData]:
+        """Generate explain data for direct children of a directory.
+
+        Returns dict of file_path -> FileExplainData for all files in the directory.
+        Uses --no-recurse flag so the shell script handles depth filtering.
+        """
+        rel_dir = directory.relative_to(self._root) if directory != self._root else Path(".")
+        dir_key = self._dir_to_key(rel_dir)
+        rel_dir_str = str(rel_dir)
+
+        self._active_generation = dir_key
+        try:
+            env = os.environ.copy()
+            env["AITASK_EXPLAIN_DIR"] = CODEBROWSER_DIR
+            cmd = [
+                EXTRACT_SCRIPT, "--no-recurse", "--gather",
+                "--source-key", dir_key,
+                "--max-commits", str(max_commits),
+                rel_dir_str,
+            ]
+            subprocess.run(
+                cmd, env=env, check=True, capture_output=True,
+                cwd=str(self._root),
+            )
+        finally:
+            self._active_generation = None
+            # Invalidate git timestamp cache for this directory (fresh data)
+            self._git_ts_cache.pop(dir_key, None)
+
+        run_dir = self._find_run_dir(dir_key)
+        if run_dir is None:
+            return {}
+
+        ref_yaml = run_dir / "reference.yaml"
+        if not ref_yaml.exists():
+            return {}
+
+        return self.parse_reference_yaml(ref_yaml)
+
+    def cleanup_stale_runs(self) -> int:
+        """Remove stale run directories, keeping only the newest per dir_key."""
+        if not self._cb_dir.exists():
+            return 0
+
+        groups: dict[str, list[Path]] = {}
+        for entry in self._cb_dir.iterdir():
+            if not entry.is_dir():
+                continue
+            name = entry.name
+            # Parse <key>__<YYYYMMDD_HHMMSS>
+            if "__" in name:
+                last_sep = name.rfind("__")
+                ts_part = name[last_sep + 2:]
+                if len(ts_part) == 15 and ts_part[8] == "_" and ts_part.replace("_", "").isdigit():
+                    key = name[:last_sep]
+                    groups.setdefault(key, []).append(entry)
+                    continue
+            # Bare timestamp
+            if len(name) == 15 and name[8] == "_" and name.replace("_", "").isdigit():
+                groups.setdefault("_bare_timestamp_", []).append(entry)
+
+        removed = 0
+        for key, dirs in groups.items():
+            if len(dirs) <= 1:
+                continue
+            dirs.sort(key=lambda p: p.name)
+            for stale_dir in dirs[:-1]:
+                shutil.rmtree(stale_dir)
+                removed += 1
+        return removed
+
+    def parse_reference_yaml(self, yaml_path: Path) -> dict[str, FileExplainData]:
+        """Parse a reference.yaml file into per-file FileExplainData."""
+        with open(yaml_path) as f:
+            data = yaml.safe_load(f)
+
+        if not data or "files" not in data:
+            return {}
+
+        # Extract generated_at from the run directory name (timestamp suffix)
+        run_dir_name = yaml_path.parent.name
+        # Timestamp is the last 15 chars: YYYYMMDD_HHMMSS
+        ts_str = run_dir_name[-15:] if len(run_dir_name) >= 15 else ""
+        generated_at = ""
+        if len(ts_str) == 15 and ts_str[8] == "_":
+            try:
+                dt = datetime.strptime(ts_str, "%Y%m%d_%H%M%S")
+                generated_at = dt.strftime("%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                pass
+
+        result = {}
+        for file_entry in data["files"]:
+            file_path = file_entry["path"]
+            is_binary = file_entry.get("binary", False)
+
+            annotations = []
+            commit_map = {}
+
+            if not is_binary:
+                for lr in file_entry.get("line_ranges", []):
+                    annotations.append(AnnotationRange(
+                        start_line=lr["start"],
+                        end_line=lr["end"],
+                        task_ids=[str(t) for t in lr.get("tasks", [])],
+                        commit_hashes=[],
+                        commit_messages=[],
+                    ))
+
+                # Build commit hash/message lists from commit timeline
+                for commit in file_entry.get("commits", []):
+                    commit_map[commit["num"]] = commit
+
+                # Enrich annotations with commit details
+                for ann in annotations:
+                    for lr in file_entry.get("line_ranges", []):
+                        if lr["start"] == ann.start_line and lr["end"] == ann.end_line:
+                            for cnum in lr.get("commits", []):
+                                if cnum in commit_map:
+                                    c = commit_map[cnum]
+                                    if c["hash"] not in ann.commit_hashes:
+                                        ann.commit_hashes.append(c["hash"])
+                                        ann.commit_messages.append(c.get("message", ""))
+                            break
+
+            commit_timeline = file_entry.get("commits", [])
+            result[file_path] = FileExplainData(
+                file_path=file_path,
+                annotations=annotations,
+                commit_timeline=commit_timeline,
+                generated_at=generated_at,
+                is_binary=is_binary,
+            )
+
+        return result
+
+    def refresh_data(self, directory: Path) -> dict[str, FileExplainData]:
+        """Delete cached data for a directory and regenerate."""
+        rel_dir = directory.relative_to(self._root) if directory != self._root else Path(".")
+        dir_key = self._dir_to_key(rel_dir)
+
+        run_dir = self._find_run_dir(dir_key)
+        if run_dir is not None:
+            shutil.rmtree(run_dir)
+
+        return self.generate_explain_data(directory)
+
+    def get_run_info(self, file_path: Path) -> ExplainRunInfo | None:
+        """Get metadata about the explain run covering a file."""
+        rel_path = file_path.relative_to(self._root)
+        directory = rel_path.parent
+        dir_key = self._dir_to_key(directory)
+
+        run_dir = self._find_run_dir(dir_key)
+        if run_dir is None:
+            return None
+
+        # Parse timestamp from directory name
+        ts_str = run_dir.name[-15:] if len(run_dir.name) >= 15 else ""
+        timestamp = ""
+        if len(ts_str) == 15 and ts_str[8] == "_":
+            try:
+                dt = datetime.strptime(ts_str, "%Y%m%d_%H%M%S")
+                timestamp = dt.strftime("%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                pass
+
+        # Count files from files.txt
+        file_count = 0
+        files_txt = run_dir / "files.txt"
+        if files_txt.exists():
+            file_count = sum(1 for line in files_txt.read_text().splitlines() if line.strip())
+
+        stale = self._check_stale(dir_key, run_dir)
+
+        return ExplainRunInfo(
+            run_dir=str(run_dir),
+            directory_key=dir_key,
+            timestamp=timestamp,
+            file_count=file_count,
+            is_stale=stale,
+        )
+
+    def _parse_run_timestamp(self, run_dir: Path) -> float:
+        """Parse the unix timestamp from a run directory name suffix."""
+        ts_str = run_dir.name[-15:] if len(run_dir.name) >= 15 else ""
+        if len(ts_str) == 15 and ts_str[8] == "_":
+            try:
+                dt = datetime.strptime(ts_str, "%Y%m%d_%H%M%S")
+                return dt.timestamp()
+            except ValueError:
+                pass
+        return 0.0
+
+    def _get_git_last_commit_ts(self, dir_key: str) -> float:
+        """Get the unix timestamp of the last commit touching a directory.
+
+        Results are cached per dir_key to avoid repeated subprocess calls.
+        """
+        if dir_key in self._git_ts_cache:
+            return self._git_ts_cache[dir_key]
+
+        # Convert dir_key back to path
+        if dir_key == "_root_":
+            dir_path = "."
+        else:
+            dir_path = dir_key.replace("__", "/")
+
+        try:
+            result = subprocess.run(
+                ["git", "log", "-1", "--format=%ct", "--", dir_path],
+                capture_output=True, text=True, cwd=str(self._root),
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                ts = float(result.stdout.strip())
+                self._git_ts_cache[dir_key] = ts
+                return ts
+        except (ValueError, OSError):
+            pass
+
+        self._git_ts_cache[dir_key] = 0.0
+        return 0.0
+
+    def _check_stale(self, dir_key: str, run_dir: Path) -> bool:
+        """Check if cached data is stale (newer commits exist since generation)."""
+        run_ts = self._parse_run_timestamp(run_dir)
+        if run_ts == 0.0:
+            return False
+        git_ts = self._get_git_last_commit_ts(dir_key)
+        if git_ts == 0.0:
+            return False
+        return git_ts > run_ts
+
+    def has_cached_data(self, directory: Path) -> bool:
+        """Check if cached explain data exists for a directory (without parsing)."""
+        rel_dir = directory.relative_to(self._root) if directory != self._root else Path(".")
+        dir_key = self._dir_to_key(rel_dir)
+        return self._find_run_dir(dir_key) is not None
+
+    def is_generating(self, directory: Path | None = None) -> bool:
+        """Check if a generation is currently active, optionally for a specific directory."""
+        if directory is None:
+            return self._active_generation is not None
+        rel_dir = directory.relative_to(self._root) if directory != self._root else Path(".")
+        return self._active_generation == self._dir_to_key(rel_dir)
+
+    def request_precache(self, directory: Path) -> bool:
+        """Queue a directory for pre-caching. Returns True if queued, False if skipped."""
+        rel_dir = directory.relative_to(self._root) if directory != self._root else Path(".")
+        dir_key = self._dir_to_key(rel_dir)
+
+        # Skip if already cached
+        if self._find_run_dir(dir_key) is not None:
+            return False
+        # Skip if currently generating this directory
+        if self._active_generation == dir_key:
+            return False
+        # Skip if already queued
+        if dir_key in self._pending_precache:
+            return False
+
+        self._pending_precache.add(dir_key)
+        return True
+
+    def pop_precache(self) -> Path | None:
+        """Pop the next directory from the pre-cache queue, or None if empty."""
+        if not self._pending_precache:
+            return None
+        dir_key = self._pending_precache.pop()
+        # Convert dir_key back to Path
+        if dir_key == "_root_":
+            return self._root
+        return self._root / dir_key.replace("__", "/")
+
+    def clear_precache(self) -> None:
+        """Clear the pre-cache queue."""
+        self._pending_precache.clear()
+
+    def invalidate_git_cache(self) -> None:
+        """Clear the git timestamp cache (call after known file modifications)."""
+        self._git_ts_cache.clear()
+
+    @staticmethod
+    def _lru_get(cache: OrderedDict, key: str):
+        """Get from LRU cache, promoting to most-recently-used. Returns None on miss."""
+        if key in cache:
+            cache.move_to_end(key)
+            return cache[key]
+        return None
+
+    @staticmethod
+    def _lru_put(cache: OrderedDict, key: str, value, max_size: int) -> None:
+        """Insert into LRU cache, evicting oldest entry if over max_size."""
+        cache[key] = value
+        cache.move_to_end(key)
+        while len(cache) > max_size:
+            cache.popitem(last=False)
+
+    @staticmethod
+    def _strip_frontmatter(content: str) -> str:
+        """Remove YAML frontmatter (--- ... ---) from markdown content."""
+        if not content.startswith("---"):
+            return content
+        match = re.match(r"^---\s*\n.*?\n---\s*\n?", content, re.DOTALL)
+        if match:
+            return content[match.end():]
+        return content
+
+    def _get_tasks_index(self, run_dir: Path) -> list[dict]:
+        """Get the tasks index from reference.yaml, with LRU caching."""
+        cache_key = run_dir.name
+        cached = self._lru_get(self._tasks_index_cache, cache_key)
+        if cached is not None:
+            return cached
+
+        ref_yaml = run_dir / "reference.yaml"
+        if not ref_yaml.exists():
+            return []
+
+        with open(ref_yaml) as f:
+            data = yaml.safe_load(f)
+
+        tasks_list = data.get("tasks", []) if data else []
+        self._lru_put(self._tasks_index_cache, cache_key, tasks_list,
+                       self.TASKS_INDEX_CACHE_MAX)
+        return tasks_list
+
+    def get_task_detail(self, file_path: Path, task_id: str) -> TaskDetailContent | None:
+        """Get plan/task markdown content for a task_id from the explain run covering file_path."""
+        rel_path = file_path.relative_to(self._root)
+        directory = rel_path.parent
+        dir_key = self._dir_to_key(directory)
+
+        run_dir = self._find_run_dir(dir_key)
+        if run_dir is None:
+            return None
+
+        # Check LRU cache
+        cache_key = f"{run_dir.name}:{task_id}"
+        cached = self._lru_get(self._task_content_cache, cache_key)
+        if cached is not None:
+            return cached
+
+        # Find task in the tasks index
+        tasks_index = self._get_tasks_index(run_dir)
+        entry = None
+        for t in tasks_index:
+            if str(t.get("id", "")) == str(task_id):
+                entry = t
+                break
+
+        if entry is None:
+            return None
+
+        detail = TaskDetailContent(task_id=task_id)
+
+        # Read plan file
+        plan_rel = entry.get("plan_file", "")
+        if plan_rel:
+            plan_path = run_dir / plan_rel
+            if plan_path.exists():
+                try:
+                    raw = plan_path.read_text()
+                    detail.plan_content = self._strip_frontmatter(raw)
+                    detail.has_plan = True
+                except OSError:
+                    pass
+
+        # Read task file
+        task_rel = entry.get("task_file", "")
+        if task_rel:
+            task_path = run_dir / task_rel
+            if task_path.exists():
+                try:
+                    raw = task_path.read_text()
+                    detail.task_content = self._strip_frontmatter(raw)
+                    detail.has_task = True
+                except OSError:
+                    pass
+
+        self._lru_put(self._task_content_cache, cache_key, detail,
+                       self.TASK_CONTENT_CACHE_MAX)
+        return detail

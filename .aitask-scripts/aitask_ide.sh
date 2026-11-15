@@ -1,0 +1,232 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/terminal_compat.sh
+source "$SCRIPT_DIR/lib/terminal_compat.sh"
+# shellcheck source=lib/tmux_exec.sh
+source "$SCRIPT_DIR/lib/tmux_exec.sh"
+# shellcheck source=lib/tmux_bootstrap.sh
+source "$SCRIPT_DIR/lib/tmux_bootstrap.sh"
+# shellcheck source=lib/ide_frozen_offer.sh
+source "$SCRIPT_DIR/lib/ide_frozen_offer.sh"
+
+SESSION_OVERRIDE=""
+FROZEN_CHECK=1
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --session)
+            SESSION_OVERRIDE="${2:-}"
+            [[ -z "$SESSION_OVERRIDE" ]] && die "--session requires a name"
+            _tmux_bootstrap_session_name_ok "$SESSION_OVERRIDE" \
+                || die "Session name contains invalid chars (. or :): $SESSION_OVERRIDE"
+            shift 2
+            ;;
+        --no-frozen-check)
+            FROZEN_CHECK=0
+            shift
+            ;;
+        -h|--help)
+            cat <<'EOF'
+Usage: ait ide [--session NAME] [--no-frozen-check]
+
+Starts (or attaches to) the configured tmux session and launches ait monitor.
+
+This collapses the manual "tmux + ait monitor" startup into a single command
+and always passes an explicit session name so ait monitor never has to fall
+back to the SessionRenameDialog.
+
+Options:
+  --session NAME     Use NAME instead of the configured default_session.
+                     NAME may not contain '.' or ':' (tmux target separators).
+  --no-frozen-check  Do not offer to bring back frozen agents (see below).
+  -h, --help         Show this help.
+
+Frozen agents: when frozen agents have lost their viewer — typically after a
+shutdown killed the tmux server — ait ide lists them before attaching, for
+every project, grouped by project with this one first. For each project it may
+act on it asks once: recreate their viewers (the default; the agents stay
+frozen), restore them, re-pick their tasks, or skip. This project's agents land
+in the session being opened; another project's land in that project's own tmux
+session, which is created if it does not exist. Only registered projects
+('ait projects list') whose directory still exists are acted on; any other
+project is listed with the reason and left alone. Every frozen viewer that has
+lost its minimonitor gets it back. Without a terminal it prints a one-line hint
+instead. --no-frozen-check skips all of this.
+
+Ownership: ait ide stamps the session as belonging to this project. If a
+session with the configured name already belongs to another project (or its
+ownership cannot be verified), ait ide refuses and changes nothing — start this
+project in its own session with --session NAME.
+
+Note: The tmux session is shared, not per-terminal. If you run 'ait ide' in a
+second terminal, you don't get a separate IDE — you get another view of the
+same session, showing the same windows, panes, and TUIs. Changes in one
+terminal (opening a window, resizing, switching TUIs) are visible in all the
+others. To work on two projects side-by-side in parallel, start each one in
+its own session with --session NAME (or configure a different default_session
+under tmux in each project's aitasks/metadata/project_config.yaml).
+EOF
+            exit 0
+            ;;
+        *)
+            die "Unknown option: $1 (try 'ait ide --help')"
+            ;;
+    esac
+done
+
+# --session wins verbatim (printf, so an option-like name such as `-n` survives);
+# otherwise tmux.default_session, warning on stderr when it is unreadable.
+SESSION=$(_tmux_bootstrap_session_for "$(pwd)" "$SESSION_OVERRIDE")
+# Exact-match tmux target — prevents prefix-match collisions when another
+# project's session name shares a prefix (e.g. 'aitasks' vs 'aitasks_mob').
+SESSION_T="$(ait_tmux_session_target "$SESSION")"
+
+command -v tmux >/dev/null || die "tmux is not installed. Install it first, then re-run 'ait ide'."
+
+# Socket flag for the `exec tmux ...` sites below. A shell function cannot be
+# exec'd (and exec must keep the `\;` separator intact), so the ait_tmux
+# wrapper is unusable there — capture the emitter's args once instead.
+# The client-args emitter: `-u` (UTF-8 client, t2236 — without it a client with
+# no locale draws every non-ASCII glyph of the TUIs as `_`), then `-L ait` by
+# default (the dedicated ait socket, t953); the socket flag is absent only when
+# the legacy no-flag escape hatch is active (AITASKS_TMUX_SOCKET set but empty).
+_IDE_SOCK_ARGS=()
+while IFS= read -r _line; do _IDE_SOCK_ARGS+=("$_line"); done < <(ait_tmux_client_args)
+_IDE_SOCK_NAME="$(ait_tmux_socket_name)"
+
+# die with the reason a session claim was refused (t1922). <rc> is the
+# 45/46/47 contract of _tmux_bootstrap_set_project_registry; <stderr> is what
+# it printed, carrying the BOOTSTRAP_FAILED sentinel. Anything else is replayed
+# and reported as a plain failure.
+die_claim_refused() {
+    local rc="$1" errs="$2" owner="" line prefix
+    case "$rc" in
+        45)
+            # Literal prefix match: a session name is data (it may hold `/`),
+            # never part of a regex.
+            prefix="BOOTSTRAP_FAILED:session_owned:${SESSION}:"
+            while IFS= read -r line; do
+                if [[ "$line" == "$prefix"* ]]; then
+                    owner="${line#"$prefix"}"
+                    break
+                fi
+            done <<<"$errs"
+            die "tmux session '$SESSION' belongs to project ${owner:-another project}; not touching it. Start this project in its own session: ait ide --session NAME"
+            ;;
+        46)
+            die "Could not verify which project owns tmux session '$SESSION' — not touching it. Retry, or use: ait ide --session NAME"
+            ;;
+        47)
+            die "Could not register tmux session '$SESSION' to this project."
+            ;;
+    esac
+    [[ -z "$errs" ]] || printf '%s\n' "$errs" >&2
+    die "Failed to set up tmux session '$SESSION' (exit $rc)."
+}
+
+# Thin wrappers that delegate to the shared bootstrap helpers (t826_2).
+# Claims the session before ANY change to it (t1922): every caller runs it
+# ahead of window creation, the frozen offer and the attach, and a refusal
+# ends the script here.
+set_project_registry() {
+    local rc=0 errs
+    errs=$(_tmux_bootstrap_set_project_registry "$(pwd)" "$SESSION" 2>&1 >/dev/null) || rc=$?
+    [[ "$rc" -eq 0 ]] || die_claim_refused "$rc" "$errs"
+}
+
+ensure_syncer_window() {
+    _tmux_bootstrap_ensure_syncer_window "$(pwd)" "$SESSION"
+}
+
+# Offer to bring back the frozen agents whose viewer is gone (t1847) — of every
+# project, each into its own session (t2039) — and top up frozen viewers'
+# companions. Runs once the session exists and its registry entry is set — so the
+# frozen agent commands can attribute it to this project — and before the
+# `exec tmux`, while the terminal is still ours. Never fails startup.
+offer_frozen_agents() {
+    [[ "$FROZEN_CHECK" == 1 ]] || return 0
+    ide_offer_frozen_agents "$(pwd)" "$SESSION" "$SCRIPT_DIR/aitask_frozen.sh" || true
+}
+
+if [[ -n "${TMUX:-}" ]]; then
+    # Socket-identity check (t953): the gateway targets the dedicated socket,
+    # so a gateway-routed self-probe from inside a FOREIGN server (the user's
+    # personal tmux, or a pre-t953 legacy session) would query a server where
+    # this client has no pane — failing under `set -e`. Compare the attached
+    # server's socket name ($TMUX's first field is the socket path) against
+    # the gateway's resolved name; bail out with guidance on mismatch. Skip
+    # when the legacy no-flag escape hatch is active (empty name → ait_tmux
+    # follows $TMUX, today's behavior).
+    _attached_sock="$(basename "${TMUX%%,*}")"
+    if [[ -n "$_IDE_SOCK_NAME" && "$_attached_sock" != "$_IDE_SOCK_NAME" ]]; then
+        warn "You are inside a tmux server on socket '$_attached_sock', but ait sessions"
+        warn "live on the dedicated socket '-L $_IDE_SOCK_NAME'."
+        warn "Detach (Ctrl-b d) and re-run 'ait ide' to use the aitasks server, or run"
+        warn "  AITASKS_TMUX_SOCKET=$_attached_sock ait ide"
+        warn "to keep using the current server."
+        exit 1
+    fi
+    current_session=$(ait_tmux display-message -p '#S')
+    if [[ "$current_session" != "$SESSION" ]]; then
+        warn "Already inside tmux session '$current_session', but configured session is '$SESSION'."
+        warn "Refusing to nest tmux. Either detach (Ctrl-b d) and re-run 'ait ide', or"
+        warn "pass '--session $current_session' to use the current session."
+        exit 1
+    fi
+    set_project_registry
+    if ! ait_tmux list-windows -F '#{window_name}' | grep -qx 'monitor'; then
+        ait_tmux new-window -n monitor 'ait monitor'
+    fi
+    ensure_syncer_window
+    offer_frozen_agents
+    exec tmux ${_IDE_SOCK_ARGS[@]+"${_IDE_SOCK_ARGS[@]}"} select-window -t "${SESSION_T}:monitor"
+fi
+
+if ait_tmux has-session -t "$SESSION_T" 2>/dev/null; then
+    set_project_registry
+    if ! ait_tmux list-windows -t "$SESSION_T" -F '#{window_name}' | grep -qx 'monitor'; then
+        ait_tmux new-window -t "${SESSION_T}:" -n monitor 'ait monitor'
+    fi
+    ensure_syncer_window
+    offer_frozen_agents
+    exec tmux ${_IDE_SOCK_ARGS[@]+"${_IDE_SOCK_ARGS[@]}"} attach -t "$SESSION_T" \; select-window -t "${SESSION_T}:monitor"
+fi
+
+# Legacy-session migration offer (t953): no session on the dedicated socket,
+# but one with the same name may still live on the user's default server from
+# before the socket move (tmux cannot move sessions between servers). Detect
+# it so a user mid-flight is not stranded. Skipped when the gateway already
+# targets the default server (opt-out / legacy escape hatch).
+if [[ -n "$_IDE_SOCK_NAME" && "$_IDE_SOCK_NAME" != "default" ]] \
+    && ait_tmux_legacy has-session -t "$SESSION_T" 2>/dev/null; then
+    if [[ -t 0 && -t 1 ]]; then
+        warn "Session '$SESSION' exists on the legacy default tmux server (pre-dedicated-socket)."
+        printf 'Attach to it instead? [y/N] ' >&2
+        read -r _legacy_answer || _legacy_answer=""
+        if [[ "$_legacy_answer" =~ ^[Yy]$ ]]; then
+            _IDE_LEGACY_ARGS=(${AIT_TMUX_CLIENT_FLAGS[@]+"${AIT_TMUX_CLIENT_FLAGS[@]}"})
+            while IFS= read -r _line; do _IDE_LEGACY_ARGS+=("$_line"); done < <(ait_tmux_legacy_socket_args)
+            exec tmux "${_IDE_LEGACY_ARGS[@]}" attach -t "$SESSION_T"
+        fi
+        warn "Creating a fresh session on the dedicated socket. To reach the legacy one later:"
+        warn "  AITASKS_TMUX_SOCKET=default ait ide"
+    else
+        warn "Session '$SESSION' also exists on the legacy default tmux server;"
+        warn "run 'AITASKS_TMUX_SOCKET=default ait ide' to reach it."
+    fi
+fi
+
+# Fresh-session path. spawn_session_detached handles new-session + env
+# registry + syncer in one call (shared with the TUI switcher's
+# inactive-project bootstrap path, t826_2). Then attach.
+# stderr is captured (and replayed on success) so a claim refusal's sentinel
+# can name the owner; spawn_session_detached sets no state this script reads.
+_ide_spawn_rc=0
+_ide_spawn_errs="$(spawn_session_detached "$(pwd)" 2>&1 >/dev/null)" || _ide_spawn_rc=$?
+if [[ "$_ide_spawn_rc" -ne 0 ]]; then
+    die_claim_refused "$_ide_spawn_rc" "$_ide_spawn_errs"
+fi
+[[ -z "$_ide_spawn_errs" ]] || printf '%s\n' "$_ide_spawn_errs" >&2
+offer_frozen_agents
+exec tmux ${_IDE_SOCK_ARGS[@]+"${_IDE_SOCK_ARGS[@]}"} attach -t "$SESSION_T"

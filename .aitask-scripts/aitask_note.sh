@@ -1,0 +1,1598 @@
+#!/usr/bin/env bash
+# aitask_note.sh - Append an attributed note to a task's "## Inbox" (t1657_2).
+#
+# The durable lane of the task-note mailbox: a task can be told something even
+# when nobody is working on it. Shaped on aitask_gate_record.sh (append via the
+# shared ledger seam, then a path-scoped commit and a best-effort push), with one
+# deliberate difference: gate-record is best-effort and always exits 0, while
+# `ait note` is AUTHORITATIVE and reports failure.
+#
+# Built ON lib/ledger_block.sh (t1657_1) — the per-task append mutex, marker
+# assembly and section ensure-and-append are the seam's, not ours. What stays
+# here is what is genuinely note-specific: the '> | ' body sentinel, note
+# identity, provenance capture and the sender proof.
+#
+# Usage:
+#   aitask_note.sh <target-task-id> --from <id> [--text ... | --file ...]
+#                  [--with-live]
+#   aitask_note.sh <target-task-id> --migrate --claimed-from <ref> \
+#                  --claimed-at <date> --base <oid> [--base-branch <b>] \
+#                  (--text ... | --file ...)
+#
+# OUTPUT CONTRACT — one line per LANE. Without --with-live there is exactly ONE
+# line on stdout, always. The DURABLE lane:
+#   NOTE_APPENDED:<note-id>|<path>                       appended + committed
+#   NOTE_APPENDED_UNCOMMITTED:<note-id>|<path>|<reason>  appended, commit failed
+#   NOTE_TARGET_MISSING:<id>
+#   NOTE_SELF:<id>
+#   NOTE_ERROR:<reason>                                  failed BEFORE the append
+#
+# The first two are id-bearing and terminal (the note exists — do not retry);
+# the last three mean no note and no id exist. The two sets are disjoint, so
+# "was a note created?" is answerable from stdout alone. Every advisory — the
+# recovery hint, git noise — goes to stderr via warn(), mirroring
+# aitask_gate.sh's MATERIALIZED / MATERIALIZED_UNCOMMITTED split.
+#
+# With --with-live a SECOND line follows, but ONLY after NOTE_APPENDED: — every
+# other durable outcome short-circuits the live lane and still prints one line.
+# The LIVE lane (t1657_5), passed through from aitask_live_endpoint.sh verbatim:
+#   LIVE_PANE:<%pane>|<session>:<@win>.<%pane>|<pid>|agent=<family>
+#   LIVE_NONE:<reason>                 no live endpoint — a successful answer
+#   LIVE_ERROR:<reason>                the resolver could not run
+#
+# THE DURABLE RESULT IS AUTHORITATIVE, and the exit status follows it alone: a
+# LIVE_NONE or LIVE_ERROR after NOTE_APPENDED: is a SUCCESS with live delivery
+# unavailable (exit 0), never a partial failure and never a reason to resend.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/terminal_compat.sh
+source "$SCRIPT_DIR/lib/terminal_compat.sh"
+# shellcheck source=lib/task_utils.sh
+source "$SCRIPT_DIR/lib/task_utils.sh"
+# shellcheck source=lib/stale_lock.sh
+source "$SCRIPT_DIR/lib/stale_lock.sh"
+# shellcheck source=lib/ledger_block.sh
+source "$SCRIPT_DIR/lib/ledger_block.sh"
+# shellcheck source=lib/pid_anchor.sh
+source "$SCRIPT_DIR/lib/pid_anchor.sh"
+# shellcheck source=lib/lock_record.sh
+source "$SCRIPT_DIR/lib/lock_record.sh"
+# shellcheck source=lib/git_utils.sh
+source "$SCRIPT_DIR/lib/git_utils.sh"
+# shellcheck source=lib/python_resolve.sh
+source "$SCRIPT_DIR/lib/python_resolve.sh"
+
+TASK_DIR="${TASK_DIR:-aitasks}"
+
+# Scratch file for --file / stdin bodies, so NUL can be detected on the raw
+# bytes before they reach a shell variable (which cannot hold one).
+TMPBODY="$(mktemp "${TMPDIR:-/tmp}/aitask_note.XXXXXX")"
+# The locked append runs in a subshell (see note_append_locked), so its id and
+# its output have to cross the process boundary through files.
+NOTE_ID_FILE="$(mktemp "${TMPDIR:-/tmp}/aitask_note_id.XXXXXX")"
+NOTE_ERR_FILE="$(mktemp "${TMPDIR:-/tmp}/aitask_note_err.XXXXXX")"
+NOTE_STDERR_FILE="$(mktemp "${TMPDIR:-/tmp}/aitask_note_stderr.XXXXXX")"
+# The `read` verb's locked section prints its own final line (it owns the
+# commit, so only it knows which outcome applies); this carries it out of the
+# subshell.
+READ_OUT_FILE="$(mktemp "${TMPDIR:-/tmp}/aitask_note_read.XXXXXX")"
+# Two scopes, deliberately. The SUBSHELL must not remove the handoff files —
+# its EXIT trap fires when it finishes, which is precisely when the parent still
+# needs the id it just wrote. Only the parent tears those down.
+note_cleanup_body() { rm -f "$TMPBODY"; }
+note_cleanup() {
+    rm -f "$TMPBODY" "$NOTE_ID_FILE" "$NOTE_ERR_FILE" "$NOTE_STDERR_FILE" \
+          "$READ_OUT_FILE"
+}
+trap note_cleanup EXIT
+ait_archive_rearm_exit_trap
+
+# --- Section constants ------------------------------------------------------
+#
+# Mirrors gate_ledger.SECTION_HEADER / SECTION_COMMENT. The Inbox is inserted
+# BEFORE '## Gate Runs': both gate-append paths (_gate_append_locked and
+# gate_ledger.append_block) append at EOF, so an Inbox placed after would
+# silently capture every future gate block.
+NOTE_SECTION_HEADER="## Inbox"
+NOTE_SECTION_COMMENT="<!-- Appended by the note framework. Do not edit by hand; use \`./ait note\`. -->"
+NOTE_NAMESPACE="note"
+NOTE_ANCHOR_HEADER="## Gate Runs"
+NOTE_ICON="✉"
+
+# Body size bound. Documented in --help; a note is context, not a payload.
+NOTE_MAX_BODY_BYTES=8192
+
+# Id-collision retry bound. The in-lock uniqueness check re-mints on collision;
+# this bounds it so a degenerate generator terminates instead of spinning.
+NOTE_ID_RETRIES=8
+
+# --- Live lane (--with-live, t1657_5) ---------------------------------------
+#
+# The generic half of the LIVE lane. This script owns the DURABLE write and
+# nothing else; the resolver decides whether a live endpoint exists, and the
+# per-agent adapter — a model-facing procedure, since ListAgents/SendMessage
+# have no CLI — does the delivery. Fusing the first two here is what makes
+# "the note is committed BEFORE any live attempt exists" structural rather
+# than a sentence in a skill an agent may or may not follow in order.
+#
+# AIT_LIVE_ENDPOINT_SH is the documented test seam, mirroring the resolver's
+# own AIT_LIVE_DELIVERY_DIR: point it at a stub to force a specific result
+# code, an exit status, or an unparseable answer.
+LIVE_ENDPOINT_SH="${AIT_LIVE_ENDPOINT_SH:-$SCRIPT_DIR/aitask_live_endpoint.sh}"
+
+# --- Canonical task-id representation (t1657_2 §0) --------------------------
+#
+# Two forms circulate and they are NOT interchangeable. Measured: `aitask_lock.sh
+# --check t1669` prints NOTHING while `--check 1669` works, and resolve_task_file
+# errors on a 't' prefix. Feeding a stored 't'-prefixed id to either helper
+# therefore yields a silent empty answer that reads as "no lock record" — which
+# would make from_verified=yes essentially unwritable.
+#
+#   CLI input : liberal   — 349, t349, 1657_2, t1657_2
+#   lookup    : BARE      — 349, 1657_2        (every helper call)
+#   stored    : t-PREFIXED — t349, t1657_2     (marker name and from=)
+#
+# Normalize once at the boundary; render once at the write site.
+
+# note_id_normalize <input> -> bare id on stdout, or non-zero if malformed.
+note_id_normalize() {
+    local raw="${1:-}" bare="${1#t}"
+    [[ -n "$raw" ]] || return 1
+    [[ "$bare" =~ ^[0-9]+(_[0-9]+)?$ ]] || return 1
+    printf '%s' "$bare"
+}
+
+# note_id_render <bare-id> -> stored 't'-prefixed form.
+note_id_render() { printf 't%s' "$1"; }
+
+# A cross-repo reference, per aidocs/framework/cross_repo_references.md.
+# Accepted ONLY on the --migrate path: '#' is not in ledger_block's
+# _NAME_CHARS, so such a value can never be a marker NAME — only a k=v value.
+note_xrepo_local_part() {
+    local ref="${1:-}"
+    [[ "$ref" =~ ^[a-z0-9_-]+#t?([0-9]+(_[0-9]+)?)$ ]] || return 1
+    printf '%s' "${BASH_REMATCH[1]}"
+}
+
+# --- Provenance value shapes (t1657_2 F18) ----------------------------------
+#
+# These MIRROR the merger's INBOX_SPEC.validate rules. They have to: whatever
+# the writer commits, the merger later re-validates on every other PC, so a
+# value accepted here and rejected there turns a local migration into a
+# cross-PC conflict source — the block is already in git by then.
+#
+# A full object id, never an abbreviation: 40 hex (sha1) or 64 (sha256).
+note_is_full_oid() {
+    [[ "${1:-}" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]]
+}
+
+# The degraded sentinels, spelled once.
+note_is_base_sentinel() {
+    [[ "${1:-}" == "none" || "${1:-}" == "unknown" ]]
+}
+
+# A claimed_at is a date or an ISO instant — the original note's own precision,
+# never free text.
+note_is_date_like() {
+    [[ "${1:-}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] ||
+    [[ "${1:-}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]
+}
+
+# Branch names reach the marker line, which is whitespace-delimited.
+note_is_branch_like() {
+    [[ "${1:-}" =~ ^[A-Za-z0-9._/-]+$ ]]
+}
+
+# --- Single-line output contract --------------------------------------------
+
+# Structured fields live in a '|'-delimited single line, so a value carrying a
+# newline or a '|' would split the record or forge a field. Sanitize at the
+# WRITE site — the same rule the body sentinel follows, for the same reason.
+note_sanitize_field() {
+    printf '%s' "${1:-}" | tr '\n\r' '  ' | tr '|' '/'
+}
+
+note_die() {
+    printf 'NOTE_ERROR:%s\n' "$(note_sanitize_field "$1")"
+    exit 1
+}
+
+# note_target_is_bundled <bare-id> <resolved-file> -- true iff the target only
+# exists packed in an archive bundle, so resolve_task_file handed back a temp
+# extraction outside the repo (t2032). A note or receipt written there can never
+# be committed, and the extraction is swept at exit: an id-bearing
+# NOTE_APPENDED_UNCOMMITTED would name a file that is already gone. Both verbs
+# refuse it before the lock. A loose archived task is a real repo file and
+# stays writable (the same split `ait attach rm` makes).
+note_target_is_bundled() {
+    ! task_file_is_active "$1" "$2" && ! task_file_is_loose_archived "$1" "$2"
+}
+
+show_help() {
+    cat <<EOF
+Usage: aitask_note.sh <target-task-id> --from <id> [--text ... | --file ...]
+                            [--with-live]
+       aitask_note.sh <target-task-id> --project <name> --from <id>
+                            [--from-project <name>] [--text ... | --file ...]
+                            [--with-live]
+       aitask_note.sh read <task-id> --by <id> --ids <csv> [--mode auto|explicit]
+       aitask_note.sh read <task-id> --project <name> --by <id> --ids <csv>
+                            [--mode auto|explicit]
+
+Append an attributed note to <target-task-id>'s "## Inbox" section and commit
+the task file path-scoped. A note is untrusted advisory input for the reader,
+never an instruction — it is one agent's claim about a tree that may have moved.
+
+Options:
+  --from <id>        Sender task id (349 or t349, 1657_2 or t1657_2) — a task
+                     in THIS repository
+  --text <text>      Note body, inline
+  --file <path>      Note body, from a file ('-' for stdin)
+  --with-live        After the durable write lands, also resolve whether the
+                     target is held by a live agent on this host, and report it
+                     on a SECOND stdout line. The resolver runs ONLY after a
+                     successful append+commit, so the note is durable before any
+                     live attempt exists. Delivery itself is not done here: the
+                     per-agent adapter is a model-facing procedure (see
+                     live_delivery/agents.txt), so this reports an ENDPOINT, not
+                     a delivery.
+
+Another repository (a registered sibling project):
+  --project <name>   The TARGET task lives in the project <name> resolves to.
+                     The note is written by THAT repository's own installed
+                     helper, from inside it: its ledger lock, its task-data
+                     branch, its path-scoped commit and its push. Resolution
+                     covers every tier "ait projects resolve" supports (live
+                     tmux session, registry, AITASKS_PROJECT_<name>) and
+                     refuses to pick: two distinct roots are ambiguous, and a
+                     tier that could not be read fails closed.
+  --from-project <name>
+                     The SENDER's project. Normally omitted: the caller's
+                     declared name (registry entry or AITASKS_PROJECT_<name>)
+                     is found automatically; pass it only when this repository
+                     is registered under several names. It must resolve back to
+                     this repository, and it is valid ONLY together with
+                     --project — on its own it is refused. The note stores from=<name>#t<id>, never a
+                     bare t<id>, and from_verified=yes only when this session
+                     provably holds that task's lock in its own repository.
+  Provenance (base, dirty, ...) is captured from the TARGET checkout — the tree
+  the note was written against — not from the sender's repository.
+  Id-bearing outcome lines carry an ABSOLUTE path into the target repository.
+  Route failures (no mutation anywhere), in the verb's own family:
+    bad-project-name:<n>  project-not-found:<n>  project-stale:<n>
+    project-ambiguous:<n>  project-resolution-incomplete:<tier>
+    project-is-local:<n>  project-incompatible:<n>  duplicate-option:<flag>
+    missing-value:<flag>  source-unregistered  source-ambiguous:<names>
+    from-project-mismatch:<n>  from-project-is-target:<n>
+    source-task-missing:<name>#t<id>  project-not-valid-with-migrate
+    from-project-requires-project (--from-project given without --project:
+    it is only the target half of a routed call, never standalone)
+
+Migration (for content that predates the mailbox):
+  --migrate                Enable the migration path
+  --claimed-from <ref>     Sender: a local id OR a cross-repo <project>#<id>
+  --claimed-at <date>      The original note's own timestamp
+  --base <oid>             The historical base object id (FULL, never abbreviated)
+  --base-branch <branch>   The historical base branch
+
+  On this path from_verified is never written (the proof is not run at all),
+  migrated=yes is always written, and no dirty/host is recorded — none of the
+  three was ever observed, and claiming them would fabricate provenance.
+
+Body limit: ${NOTE_MAX_BODY_BYTES} bytes. NUL is rejected; CR is stripped.
+
+Reading (acknowledgement receipts):
+  read <task-id> --by <id> --ids <csv> [--mode auto|explicit]
+
+  Marks the listed note ids read for <task-id>. Unread state is DERIVED — a
+  note is unread while its id appears in no valid receipt — so there is no
+  field to update and concurrent receipts union instead of conflicting.
+
+  --by  MUST be <task-id> itself: the reader is the session working on that
+        task, and the task id is the only durable identity (session names are
+        ephemeral). A mismatch is refused rather than recorded.
+  --ids Comma-separated note ids, each naming a note present in this file.
+  --mode  explicit (a human acknowledged) | auto (a headless run did).
+        Defaults to explicit — the case that applies when a human runs this by
+        hand. Recorded so the difference stays auditable rather than invisible.
+
+  DISPLAYING A NOTE IS NOT ACKNOWLEDGING IT. Use
+  'aitask_query_files.sh inbox <task-id>' to read; it never writes a receipt,
+  which is what makes it safe over a list of candidate tasks.
+
+  A commit failure ROLLS THE RECEIPT BACK (unlike a note, whose body is
+  irreplaceable): a receipt that is on disk but uncommitted would hide a note
+  locally with nothing durable to show for it.
+
+Output (one line per lane; advisories go to stderr):
+  NOTE_APPENDED:<note-id>|<path>
+  NOTE_APPENDED_UNCOMMITTED:<note-id>|<path>|<reason>
+  NOTE_TARGET_MISSING:<id>
+  NOTE_SELF:<id>
+  NOTE_ERROR:<reason>
+
+  Without --with-live that is exactly ONE line, always. With --with-live a
+  SECOND line follows, but only after NOTE_APPENDED: — every other outcome
+  short-circuits the live lane and still prints one line:
+  LIVE_PANE:<%pane>|<session>:<@win>.<%pane>|<pid>|agent=<family>
+  LIVE_NONE:<reason>              no live endpoint (unlocked, remote_host,
+                                  holder_dead, holder_unknown, agent_unknown,
+                                  agent_unsupported:<f>, no_pane)
+  LIVE_ERROR:<reason>             the resolver itself could not run;
+                                  resolver_unavailable means it produced no
+                                  parseable answer at all
+
+  THE DURABLE RESULT IS AUTHORITATIVE. The exit status follows the note, not
+  the live lane: a LIVE_NONE or LIVE_ERROR after a NOTE_APPENDED: is a SUCCESS
+  with live delivery unavailable, exit 0 — never a partial failure, and never a
+  reason to resend the note.
+
+  read:
+  READ_RECORDED:<receipt-id>|<path>|<n-ids>            committed
+  READ_RECORDED_UNPUSHED:<receipt-id>|<path>|<n-ids>   committed, not pushed;
+                                                       other checkouts may
+                                                       re-show these notes
+  READ_NOOP:<task-id>                                  already acknowledged
+  READ_TARGET_MISSING:<id>
+  READ_ERROR:<reason>                                  no receipt; still unread
+  READ_ERROR:rollback-failed:<receipt-id>               needs a human
+
+Example:
+  aitask_note.sh 357 --from 349 --text "the line numbers in your task are stale"
+  aitask_note.sh 357 --from 349 --with-live --file - <<'NOTE_BODY'
+  multi-line body; the quoted heredoc keeps the shell out of it
+  NOTE_BODY
+  aitask_note.sh read 357 --by 357 --ids 2026-09-01T15:59:51Z.ffc6cbc52b41e6e70ad5fa49
+  aitask_note.sh 42 --project mobile --from 349 --text "your API client depends on t349's change"
+  aitask_note.sh read 42 --project mobile --by 42 --ids <id>
+EOF
+}
+
+# --- Provenance (t1657_2 §3) ------------------------------------------------
+#
+# THE OBVIOUS IMPLEMENTATION IS WRONG. `aitasks/` is a symlink into the data
+# worktree (aitasks -> .aitask-data/aitasks), so resolving git context from the
+# task file's own path records the AITASK-DATA sha — a confident, wrong answer
+# to the only question `base` exists to answer. Query the CODE repo root, always,
+# and capture BEFORE the append and its commit.
+#
+# Storage is exact; presentation may abbreviate. `git rev-parse HEAD`, never
+# --short: core.abbrev is unset, so git auto-scales abbreviation to repo size,
+# and a prefix frozen into a durable note keeps that width as the repo grows —
+# defeating the exact-tree promise for exactly the oldest notes.
+#
+# Sets: PROV_BASE PROV_BASE_BRANCH PROV_MERGEBASE PROV_DIRTY
+note_capture_provenance() {
+    local root="${AIT_DIR:-$(cd "$SCRIPT_DIR/.." && pwd)}"
+    PROV_BASE=""; PROV_BASE_BRANCH=""; PROV_MERGEBASE=""; PROV_DIRTY=""
+
+    if ! git -C "$root" rev-parse --git-dir >/dev/null 2>&1; then
+        # No repository. `dirty` is UNMEASURABLE here, and this is the only case
+        # that earns the sentinel: 'no' would fabricate a clean-state claim and
+        # 'yes' is equally unsupported. Absence is not an option — a missing
+        # field reads as "fine" (or as an old writer) to a parser, which is the
+        # same argument that makes base=none a sentinel rather than an empty.
+        PROV_BASE="none"
+        PROV_DIRTY="unknown"
+        return 0
+    fi
+
+    if ! PROV_BASE="$(git -C "$root" rev-parse HEAD 2>/dev/null)"; then
+        # HEAD unresolvable (unborn branch). The repo and the working tree DO
+        # exist, so `git status` still reports and dirty is measured normally —
+        # 'unknown' here would be a false disclaimer.
+        PROV_BASE="unknown"
+    fi
+
+    if [[ -n "$(git -C "$root" status --porcelain 2>/dev/null)" ]]; then
+        PROV_DIRTY="yes"
+    else
+        PROV_DIRTY="no"
+    fi
+
+    [[ "$PROV_BASE" == "unknown" ]] && return 0
+
+    # Full ref, never --abbrev-ref: beside a same-named tag it answers
+    # "heads/<b>" (t2132). A detached HEAD keeps the literal HEAD it always had.
+    local ref_rc=0
+    PROV_BASE_BRANCH="$(git -C "$root" symbolic-ref --quiet HEAD 2>/dev/null)" || ref_rc=$?
+    case "$ref_rc:$PROV_BASE_BRANCH" in
+        0:refs/heads/?*) PROV_BASE_BRANCH="${PROV_BASE_BRANCH#refs/heads/}" ;;
+        0:* | 1:*)       PROV_BASE_BRANCH="HEAD" ;;
+        *)               PROV_BASE_BRANCH="unknown" ;;
+    esac
+
+    # Off-primary HEAD gets a merge base. Discover the primary with the existing
+    # helper — never hardcode 'main': this is framework code shipped into other
+    # people's repos, and a master-default repo would otherwise get the wrong
+    # merge base or none at all.
+    local primary
+    primary="$(cd "$root" && detect_primary_branch)"
+    if [[ -n "$primary" && "$PROV_BASE_BRANCH" != "$primary" ]]; then
+        PROV_MERGEBASE="$(git -C "$root" merge-base HEAD "$primary" 2>/dev/null || true)"
+    fi
+    return 0
+}
+
+# --- Sender proof (t1657_2 §5) ----------------------------------------------
+#
+# `from=` is a CLAIM. The note append lock is keyed note_<target> — it protects
+# the TARGET's Inbox and says nothing whatsoever about the claimed sender, so
+# --from is unauthenticated unless proven separately.
+#
+# Do not invent a mechanism: lib/pid_anchor.sh already has the right primitive
+# with the right fail-closed semantics. Returns 0 only when this very session
+# provably holds the sender task's lock.
+note_sender_is_self() {
+    local from_bare="$1" root="${2:-}"
+    # The record parse lives in lib/lock_record.sh — aitask_live_endpoint.sh asks
+    # a different question of the same four fields, and one reader is what keeps
+    # the two from drifting about what a lock says.
+    #
+    # <root> (t1869) names the SOURCE repository of a cross-repository sender:
+    # its own lock script answers. The anchor comparison below is unchanged —
+    # this process was started by the caller's session, so it carries the same
+    # anchor, and a lock held by that session proves exactly what it proves
+    # locally. Nothing crosses the boundary as a trusted flag.
+    lock_record_read "$from_bare" "$root" || return 1
+
+    [[ "$LOCK_REC_HOST" == "$(hostname)" ]] || return 1
+    # All three of pid, start-time token and token KIND must match — a recycled
+    # PID carries the same number with a different token. An own-anchor this
+    # process cannot resolve can never claim identity, so an unverifiable anchor
+    # fails TOWARD the gate rather than around it.
+    lock_anchor_is_self "$LOCK_REC_PID" "${LOCK_REC_TOKEN:--}" "${LOCK_REC_KIND:-proc}" || return 1
+    return 0
+}
+
+# --- Body rendering (t1657_2 §5) --------------------------------------------
+#
+# THE INJECTION DEFENCE. Markers match '^>\s*\*\*'. A body line emitted as a
+# plain '> <text>' beginning '**👁 note:read** … ids=…' IS a syntactically valid
+# receipt — letting a note forge an acknowledgement of itself. The '| ' sentinel
+# sits between the quote marker and the text so '^>\s*\*\*' can never match a
+# body line; it also neutralizes '## Inbox' / '## Gate Runs' inside a body.
+#
+# Sanitize at the WRITE site, never at the read site.
+note_render_body() {
+    local raw="$1"
+    printf '%s' "$raw" | tr -d '\r' | while IFS= read -r line || [[ -n "$line" ]]; do
+        printf '> | %s\n' "$line"
+    done
+}
+
+# --- Note identity (t1657_2 §4) ---------------------------------------------
+#
+# <iso-utc>.<24-hex> — 96 bits from a CSPRNG. Minted INSIDE the append lock and
+# verified absent before writing: within a checkout uniqueness is a guarantee,
+# and the 96 bits cover what no lock can (two PCs appending concurrently). A
+# 4-hex suffix would only reduce the hazard — and since `ids=` is the
+# ASSOCIATION key, a collision makes a receipt acknowledge the wrong entry.
+#
+note_random_suffix() { od -An -tx1 -N12 /dev/urandom | tr -d ' \n'; }
+
+note_iso_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+# The WHOLE id is the test seam, not just the suffix. A suffix-only override
+# cannot force a collision: the id is "<iso>.<suffix>", so two calls a second
+# apart differ even with an identical suffix — a collision test built on it
+# would pass without ever exercising the re-mint. Overriding the whole id makes
+# the collision exact and the retry bound provable.
+note_mint_id() {
+    if [[ -n "${AIT_NOTE_ID_CMD:-}" ]]; then
+        eval "$AIT_NOTE_ID_CMD"
+        return
+    fi
+    printf '%s.%s' "$(note_iso_now)" "$(note_random_suffix)"
+}
+
+# --- The locked append ------------------------------------------------------
+#
+# Mint the id INSIDE the lock and verify it is absent from the section before
+# writing. Sets NOTE_ID.
+#
+# RUNS IN A SUBSHELL, deliberately (F21). The seam's lock helpers call `die` on
+# exhaustion — stderr plus `exit` — which would tear this script down with
+# NOTHING on stdout, breaking the "exactly one line, always" contract in exactly
+# the way a missing flag value did. `die` cannot be caught in-process, so the
+# whole locked section runs in a subshell whose exit status the caller inspects:
+# a death there is converted to a typed NOTE_ERROR by note_append_guarded below.
+# The id crosses the boundary through a file, since a subshell cannot set a
+# variable in its parent.
+_note_append_inner() {
+    local file="$1" name="$2" body="$3"; shift 3
+    local -a extra_kv=("$@")
+
+    ait_ledger_lock_acquire "$NOTE_NAMESPACE" "$LOCK_KEY" \
+        "note lock" "note append lock"
+    # The seam's trap releases the lock errexit-safely and exits; chain our
+    # scratch-file cleanup in front of it, or binding this would silently drop
+    # the EXIT handler set at startup.
+    #
+    # This is the seam's chained spelling (lib/ledger_block.sh): capture the
+    # dying status FIRST, then hand it to ait_ledger_lock_exit_trap explicitly.
+    # Anything running in front of that function resets $?, which is why the
+    # status cannot simply be left implicit here — a plain
+    # `note_cleanup_body; ait_ledger_lock_exit_trap' chain reported every death
+    # inside this section as SUCCESS (measured in t1657_2: a release die exited
+    # 0 and the wrapper emitted NOTE_APPENDED for a wedged lock). Since t1681
+    # the seam detects that spelling and refuses to report success, so this is
+    # the correct form rather than merely the working one.
+    trap 'ait_note_rc=$?; note_cleanup_body; ait_ledger_lock_exit_trap "$ait_note_rc"' EXIT
+    ait_archive_rearm_exit_trap
+
+    local attempt=0 candidate
+    NOTE_ID=""
+    while (( attempt < NOTE_ID_RETRIES )); do
+        candidate="$(note_mint_id)"
+        if ! grep -qF "id=$candidate" "$file" 2>/dev/null; then
+            NOTE_ID="$candidate"
+            break
+        fi
+        attempt=$(( attempt + 1 ))
+    done
+    if [[ -z "$NOTE_ID" ]]; then
+        # Bounded, so a degenerate generator terminates rather than spinning.
+        # Nothing has been appended, so this is a pre-append failure: the
+        # id-less NOTE_ERROR half of the contract is the correct one.
+        ait_ledger_lock_release || true
+        trap note_cleanup_body EXIT
+        ait_archive_rearm_exit_trap
+        note_die "id-collision-retries-exhausted"
+    fi
+
+    local marker
+    marker="$(ait_ledger_marker "$NOTE_NAMESPACE" "$name" "$NOTE_ICON" \
+        "id=$NOTE_ID" "${extra_kv[@]}")"
+
+    if ! ait_ledger_append_section "$file" "$NOTE_SECTION_HEADER" \
+            "$NOTE_SECTION_COMMENT" "$marker" "$body" \
+            "$NOTE_ANCHOR_HEADER" "section_end"; then
+        # The seam fails closed: nothing was written and the target is
+        # byte-for-byte untouched (t1741). So this is a PRE-append failure and
+        # owes the id-less NOTE_ERROR half of the contract — the same shape, and
+        # the same release-then-retrap spelling, as the collision exhaustion
+        # above. Reporting NOTE_APPENDED here is exactly how a truncated task
+        # file once got committed as a success.
+        ait_ledger_lock_release || true
+        trap note_cleanup_body EXIT
+        ait_archive_rearm_exit_trap
+        note_die "append-write-failed"
+    fi
+
+    # THE NOTE HAS LANDED. Publish the id NOW, before anything that can still
+    # fail (F22). ait_ledger_lock_release_checked below genuinely can `die` —
+    # stale_lock_release returns 1 on a retained lock or a retained guard — and
+    # writing the id after it would leave the parent seeing a bare failed
+    # subshell for a note that is already on disk. It would then report a
+    # pre-append error, the caller would retry, and the note would be
+    # duplicated: exactly the disjointness the CLI contract exists to provide.
+    printf '%s' "$NOTE_ID" > "$NOTE_ID_FILE"
+
+    # Test-only fault injection through a documented seam, so the post-append
+    # failure path above is provable rather than asserted. Never set in normal
+    # operation.
+    [[ -z "${AIT_NOTE_FAIL_AFTER_APPEND:-}" ]] || exit 97
+
+    ait_ledger_lock_release_checked
+    trap note_cleanup_body EXIT
+    ait_archive_rearm_exit_trap
+}
+
+# Wrapper: run the locked append in a subshell and translate any death into a
+# typed single-line outcome. Sets NOTE_ID on success.
+# Set when the append landed but a LATER in-subshell step failed. main() then
+# owes an id-bearing outcome, never a pre-append error.
+NOTE_POST_APPEND_FAILURE=""
+
+# Status carrier for the EXIT trap below. Declared here because the assignment
+# lives inside a single-quoted trap string, which shellcheck cannot see into.
+ait_note_rc=0
+
+note_append_locked() {
+    : > "$NOTE_ID_FILE"
+    : > "$NOTE_ERR_FILE"
+    if ( _note_append_inner "$@" ) >"$NOTE_ERR_FILE" 2>>"$NOTE_STDERR_FILE"; then
+        NOTE_ID="$(cat "$NOTE_ID_FILE")"
+        cat "$NOTE_STDERR_FILE" >&2 2>/dev/null || true
+        [[ -n "$NOTE_ID" ]] || note_die "append-produced-no-id"
+        return 0
+    fi
+    cat "$NOTE_STDERR_FILE" >&2 2>/dev/null || true
+
+    # THE ID FILE IS THE WITNESS (F22). It is written the instant the append
+    # lands, so a non-empty file means the note EXISTS on disk no matter what
+    # failed afterwards. Reporting a pre-append error here would invite a retry
+    # that duplicates it.
+    NOTE_ID="$(cat "$NOTE_ID_FILE" 2>/dev/null || true)"
+    if [[ -n "$NOTE_ID" ]]; then
+        NOTE_POST_APPEND_FAILURE="lock-release-failed"
+        return 0
+    fi
+
+    # Genuinely nothing landed. An inner typed line (a collision exhaustion,
+    # say) is the better message; a bare death is the lock giving up.
+    local inner; inner="$(head -n1 "$NOTE_ERR_FILE" 2>/dev/null || true)"
+    if [[ -n "$inner" ]]; then
+        printf '%s\n' "$inner"
+    else
+        printf 'NOTE_ERROR:%s\n' "lock-unavailable:$LOCK_KEY"
+    fi
+    exit 1
+}
+
+# --- The `read` verb: acknowledgement receipts (t1657_3) --------------------
+#
+# `ait note read <target> --by <id> --ids <csv> [--mode auto|explicit]`
+#
+# OUTPUT CONTRACT — exactly ONE line on stdout, always. Disjoint classes, so
+# "is this note acknowledged?" is answerable from stdout alone:
+#
+#   durable (a COMMITTED receipt exists):
+#     READ_RECORDED:<receipt-id>|<path>|<n-ids>
+#     READ_RECORDED_UNPUSHED:<receipt-id>|<path>|<n-ids>
+#   no receipt needed:
+#     READ_NOOP:<task-id>
+#   no receipt, the note stays UNREAD:
+#     READ_TARGET_MISSING:<id>  ·  READ_ERROR:<reason>
+#   needs a human:
+#     READ_ERROR:rollback-failed:<receipt-id>
+#
+# There is deliberately NO READ_RECORDED_UNCOMMITTED, and that is the one place
+# this path diverges from the write path above. An uncommitted receipt is the
+# worst of both worlds: the in-lock subtraction below SEES it, so the note is
+# hidden locally and a retry returns READ_NOOP, while nothing about it is
+# durable — clean the working tree and the note vanishes with no record it was
+# ever acknowledged. So a commit failure ROLLS BACK.
+#
+#   note (write) : keep on commit failure — the body is irreplaceable content,
+#                  and a retry would duplicate it.
+#   receipt (read): roll back — bookkeeping is reconstructible, and the retry is
+#                  free and idempotent by construction.
+READ_ICON="👁"
+
+note_read_die() {
+    printf 'READ_ERROR:%s\n' "$(note_sanitize_field "$1")"
+    exit 1
+}
+
+# Ids covered by valid receipts / ids of valid notes, both from the ONE shared
+# parse in lib/note_inbox.py. Never re-derived in bash.
+_note_read_py() {
+    "$NOTE_PY" "$SCRIPT_DIR/lib/note_inbox.py" "$@"
+}
+
+# Runs INSIDE the append lock, and owns the commit (see the rollback note
+# above). Prints exactly one line. Runs in a subshell for the F21 reason: the
+# seam's lock helpers `die`, which would otherwise tear the script down with
+# nothing on stdout.
+_note_read_inner() {
+    local file="$1" target_bare="$2" by="$3" mode="$4"; shift 4
+    local -a want=("$@")
+
+    ait_ledger_lock_acquire "$NOTE_NAMESPACE" "$LOCK_KEY" \
+        "note lock" "note append lock"
+    # Chained trap, seam spelling: capture the dying status FIRST. Anything in
+    # front of ait_ledger_lock_exit_trap resets $?, and since t1681 the seam
+    # detects that spelling and refuses to report success anyway.
+    trap 'ait_note_rc=$?; note_cleanup_body; ait_ledger_lock_exit_trap "$ait_note_rc"' EXIT
+    ait_archive_rearm_exit_trap
+
+    # --- The subtraction, decided in-lock -----------------------------------
+    #
+    # The caller's unread query ran OUTSIDE this lock, so between that query and
+    # this moment another session on this checkout may have acknowledged the
+    # same notes — and a plain retry re-sends the same ids. Appending
+    # unconditionally would write a second receipt covering ids already
+    # acknowledged. Set-union keeps the derived state right, but the file would
+    # accumulate redundant receipts and "a re-run appends nothing" would be a
+    # false claim.
+    local acked_out present_out
+    acked_out="$(_note_read_py acked "$file" 2>/dev/null)" \
+        || note_read_die "inbox-parse-failed"
+    present_out="$(_note_read_py note-ids "$file" 2>/dev/null)" \
+        || note_read_die "inbox-parse-failed"
+
+    local id remaining=() n=0
+    for id in "${want[@]}"; do
+        # Every requested id must name a note present in THIS file. The caller
+        # just displayed them from it, so an unknown id is a caller bug rather
+        # than a sync gap. (This constrains only the write path — the merger
+        # still accepts a well-formed receipt whose note has not reached that
+        # checkout yet.)
+        printf '%s\n' "$present_out" | grep -qxF "$id" \
+            || note_read_die "unknown-note-id:$id"
+        if ! printf '%s\n' "$acked_out" | grep -qxF "$id"; then
+            remaining+=("$id"); n=$(( n + 1 ))
+        fi
+    done
+
+    if (( n == 0 )); then
+        # Nothing left to acknowledge. Typed no-op: no receipt, nothing to retry.
+        ait_ledger_lock_release_checked
+        trap note_cleanup_body EXIT
+        ait_archive_rearm_exit_trap
+        printf 'READ_NOOP:%s\n' "$(note_sanitize_field "$target_bare")"
+        return 0
+    fi
+
+    # --- Mint and append ----------------------------------------------------
+    local attempt=0 candidate
+    NOTE_ID=""
+    while (( attempt < NOTE_ID_RETRIES )); do
+        candidate="$(note_mint_id)"
+        if ! grep -qF "id=$candidate" "$file" 2>/dev/null; then
+            NOTE_ID="$candidate"; break
+        fi
+        attempt=$(( attempt + 1 ))
+    done
+    [[ -n "$NOTE_ID" ]] || note_read_die "id-collision-retries-exhausted"
+
+    local ids_csv marker
+    ids_csv="$(IFS=,; printf '%s' "${remaining[*]}")"
+    # Exactly the merger's required key set, and NO provenance: a receipt is
+    # bookkeeping, not a tree-relative claim, so base/base_branch/base_mergebase/
+    # dirty/host are rejected on one.
+    marker="$(ait_ledger_marker "$NOTE_NAMESPACE" "read" "$READ_ICON" \
+        "id=$NOTE_ID" "by=$by" "at=$(note_iso_now)" "mode=$mode" "ids=$ids_csv")"
+    # No receipt was written and the target is untouched (the seam fails closed,
+    # t1741), so the notes stay UNREAD — the documented fail-safe direction, and
+    # cheaper than a receipt that hides a note nobody has seen.
+    ait_ledger_append_section "$file" "$NOTE_SECTION_HEADER" \
+        "$NOTE_SECTION_COMMENT" "$marker" "" \
+        "$NOTE_ANCHOR_HEADER" "section_end" \
+        || note_read_die "append-write-failed"
+    printf '%s' "$NOTE_ID" > "$NOTE_ID_FILE"
+
+    # --- Commit, INSIDE the lock -------------------------------------------
+    #
+    # The write path deliberately releases first (contention is on the global
+    # .git/index.lock, so spanning it lengthens the window for a second
+    # `ait note`). A rollback cannot be done outside the lock, so this path
+    # accepts the longer hold. The cost is bounded: `ait note read` runs once
+    # per pick.
+    local reason=""
+    task_git add -- "$file" 2>/dev/null || reason="git-add-failed"
+    if [[ -z "$reason" ]]; then
+        [[ -z "${AIT_NOTE_READ_FAIL_COMMIT:-}" ]] || reason="git-commit-failed"
+    fi
+    if [[ -z "$reason" ]]; then
+        task_git commit -m "ait: Record note read receipt for t${target_bare}" \
+            -- "$file" >/dev/null 2>&1 || reason="git-commit-failed"
+    fi
+
+    if [[ -n "$reason" ]]; then
+        # Roll back by removing OUR block by its id — never by restoring a
+        # snapshot. The task file is a shared multi-writer surface, and another
+        # writer may legitimately have appended since our block landed.
+        if [[ -n "${AIT_NOTE_READ_FAIL_ROLLBACK:-}" ]] \
+           || ! _note_read_py drop "$file" "$NOTE_ID" >/dev/null 2>&1; then
+            # A failed rollback is its own terminal state, never swallowed: the
+            # receipt is on disk, uncommitted, hiding a note. Only a human can
+            # settle it.
+            task_git reset -q -- "$file" 2>/dev/null || true
+            warn "receipt appended but NOT committed, and the rollback failed.
+  The note is hidden locally until this is resolved. Remove the block with
+  id=$NOTE_ID from $file, or commit it:
+  ./ait git add -- $file && ./ait git commit -m \"ait: Record note read receipt for t${target_bare}\" -- $file"
+            ait_ledger_lock_release_checked
+            trap note_cleanup_body EXIT
+            ait_archive_rearm_exit_trap
+            printf 'READ_ERROR:rollback-failed:%s\n' "$NOTE_ID"
+            return 0
+        fi
+        # Unstage, or the next writer's path-scoped commit would carry our
+        # rolled-back content back in.
+        task_git reset -q -- "$file" 2>/dev/null || true
+        ait_ledger_lock_release_checked
+        trap note_cleanup_body EXIT
+        ait_archive_rearm_exit_trap
+        warn "receipt could not be committed ($reason) — rolled back; the note stays unread."
+        printf 'READ_ERROR:%s\n' "$(note_sanitize_field "$reason")"
+        return 0
+    fi
+
+    ait_ledger_lock_release_checked
+    trap note_cleanup_body EXIT
+    ait_archive_rearm_exit_trap
+
+    # Push is best-effort, but its failure is NOT silent here: an unpushed
+    # receipt means other checkouts still show these notes as unread. That is
+    # the accepted duplicate-display failure — stated rather than hidden.
+    # AIT_NOTE_READ_FAIL_{COMMIT,ROLLBACK,PUSH} are test-only fault injection
+    # through documented seams, so each degraded branch is provable rather than
+    # asserted. Never set in normal operation. (task_push retries three times
+    # before giving up, so driving this branch with a broken remote would make
+    # the test both slow and flaky.)
+    if [[ -z "${AIT_NOTE_READ_FAIL_PUSH:-}" ]] && task_push >/dev/null 2>&1; then
+        printf 'READ_RECORDED:%s|%s|%s\n' "$NOTE_ID" "$file" "$n"
+    else
+        warn "receipt committed locally but not pushed — other checkouts may
+  re-show these notes until the task data branch syncs."
+        printf 'READ_RECORDED_UNPUSHED:%s|%s|%s\n' "$NOTE_ID" "$file" "$n"
+    fi
+    return 0
+}
+
+note_read_main() {
+    local target_raw="${1:-}"
+    [[ -n "$target_raw" ]] || note_read_die "missing-target"
+    case "$target_raw" in -*) note_read_die "missing-target" ;; esac
+    shift
+
+    local by_raw="" ids_raw="" mode="explicit"
+    local n_by=0 n_ids=0 n_mode=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --by|--ids|--mode)
+                [[ $# -ge 2 ]] || note_read_die "missing-value:$1" ;;
+        esac
+        case "$1" in
+            --by)   by_raw="$2";  n_by=$((n_by+1));     shift 2 ;;
+            --ids)  ids_raw="$2"; n_ids=$((n_ids+1));   shift 2 ;;
+            --mode) mode="$2";    n_mode=$((n_mode+1)); shift 2 ;;
+            *) note_read_die "unknown-option:$1" ;;
+        esac
+    done
+    (( n_by   <= 1 )) || note_read_die "duplicate-option:--by"
+    (( n_ids  <= 1 )) || note_read_die "duplicate-option:--ids"
+    (( n_mode <= 1 )) || note_read_die "duplicate-option:--mode"
+    (( n_by  == 1 ))  || note_read_die "missing-by"
+    (( n_ids == 1 ))  || note_read_die "missing-ids"
+    # `mode` defaults to explicit rather than being required: the only caller
+    # that can omit it is a human typing this by hand, and that IS the explicit
+    # case. Every skill call site passes it, and the render assertions check so.
+    case "$mode" in auto|explicit) ;; *) note_read_die "bad-mode:$mode" ;; esac
+
+    local target_bare
+    target_bare="$(note_id_normalize "$target_raw")" \
+        || note_read_die "bad-task-id:$target_raw"
+
+    local file
+    if ! file="$(resolve_task_file "$target_bare" 2>/dev/null)"; then
+        printf 'READ_TARGET_MISSING:%s\n' "$(note_sanitize_field "$target_bare")"
+        return 1
+    fi
+    if note_target_is_bundled "$target_bare" "$file"; then
+        note_read_die "target-bundled"
+    fi
+
+    # A read receipt is a task-file mutation too. Guarded HERE, at the outer
+    # level, and never inside _note_read_inner: that runs in a subshell whose
+    # die is captured and reshaped into a typed READ_ERROR: line, which would
+    # swallow the guard's message (t1725_2). Also before the ledger lock, so a
+    # refusal never takes a lock it is about to abandon.
+    assert_task_data_writable
+
+    # ONE convention for receipt identity, enforced here rather than remembered
+    # at four call sites: `--by` is always the TARGET task's own id. The reader
+    # is the session working on that task, and the task id is the only durable
+    # identity available — session names are ephemeral, which is the whole
+    # premise of the note mailbox. A receipt naming its own task is legal; the
+    # writer refuses self-addressed *notes*, not receipts.
+    local by_bare
+    by_bare="$(note_id_normalize "$by_raw")" \
+        || note_read_die "bad-task-id:$by_raw"
+    [[ "$by_bare" == "$target_bare" ]] \
+        || note_read_die "by-must-be-target:$by_raw"
+
+    local -a raw_ids=()
+    local IFS_SAVE="$IFS" id
+    IFS=','; read -r -a raw_ids <<< "$ids_raw"; IFS="$IFS_SAVE"
+    (( ${#raw_ids[@]} > 0 )) || note_read_die "missing-ids"
+
+    # `ids=` is a SET: it names which notes this receipt acknowledges, and a
+    # note can only be acknowledged once. Canonicalize here, BEFORE the lock,
+    # rather than letting the in-lock loop see repeats — otherwise
+    # `--ids A,A` stores `ids=A,A` and reports two acknowledgements for one
+    # note. The derived unread state survives that (the reader unions into a
+    # set), but the stored record and the count would both be untrue.
+    #
+    # De-duplicate rather than reject: a caller assembling ids from two display
+    # passes has committed no error, and the set it means is unambiguous.
+    # First-seen order is preserved so the emitted receipt is deterministic.
+    local -a want=()
+    for id in "${raw_ids[@]}"; do
+        [[ "$id" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\.[0-9a-f]{24}$ ]] \
+            || note_read_die "bad-note-id:$id"
+        local seen="" prev
+        for prev in ${want[@]+"${want[@]}"}; do
+            [[ "$prev" == "$id" ]] && { seen=1; break; }
+        done
+        [[ -n "$seen" ]] || want+=("$id")
+    done
+
+    NOTE_PY="$(resolve_python 2>/dev/null || true)"
+    [[ -n "$NOTE_PY" ]] || note_read_die "python-unavailable"
+
+    LOCK_KEY="$target_bare"
+    : > "$READ_OUT_FILE"
+    if ( _note_read_inner "$file" "$target_bare" "$(note_id_render "$by_bare")" \
+             "$mode" "${want[@]}" ) >"$READ_OUT_FILE" 2>>"$NOTE_STDERR_FILE"; then
+        cat "$NOTE_STDERR_FILE" >&2 2>/dev/null || true
+        local line; line="$(head -n1 "$READ_OUT_FILE" 2>/dev/null || true)"
+        [[ -n "$line" ]] || { printf 'READ_ERROR:%s\n' "no-outcome-reported"; return 1; }
+        printf '%s\n' "$line"
+        case "$line" in READ_RECORDED:*|READ_RECORDED_UNPUSHED:*|READ_NOOP:*) return 0 ;; esac
+        return 1
+    fi
+    cat "$NOTE_STDERR_FILE" >&2 2>/dev/null || true
+
+    # A typed inner line is the better message; a bare death is the lock giving up.
+    local inner; inner="$(head -n1 "$READ_OUT_FILE" 2>/dev/null || true)"
+    if [[ -n "$inner" ]]; then
+        printf '%s\n' "$inner"
+    else
+        printf 'READ_ERROR:%s\n' "lock-unavailable:$LOCK_KEY"
+    fi
+    return 1
+}
+
+# --- Cross-repository routing (t1869) ---------------------------------------
+#
+# `ait note ... --project <name>` and `ait note read ... --project <name>` send
+# to / acknowledge in a task that lives in ANOTHER registered repository. This
+# half runs in the CALLER's repository and only routes: it validates, resolves
+# both project identities, probes the target's installed helper, and then runs
+# THAT repository's own aitask_note.sh from inside it — so the ledger lock, the
+# task-data branch, the path-scoped commit and the push all belong to the
+# target. Every refusal here happens before any mutation, anywhere.
+#
+# The grammar is strictly additive: routing engages ONLY when the option-aware
+# pre-scan finds `--project` in option position. A command without it never
+# reaches this code, and runs the local path byte for byte.
+#
+# Failures are reported in the verb's own outcome family — NOTE_ERROR: for a
+# write, READ_ERROR: for a read — so a caller parsing `read` output never sees
+# a NOTE_* line.
+
+PROJECT_RESOLVE_SH="${AIT_PROJECT_RESOLVE_SH:-$SCRIPT_DIR/aitask_project_resolve.sh}"
+
+# note_route_die <write|read> <reason>
+note_route_die() {
+    local verb="$1" reason="$2"
+    if [[ "$verb" == "read" ]]; then
+        note_read_die "$reason"
+    fi
+    note_die "$reason"
+}
+
+# A logical project name as it may appear in a stored `<project>#t<id>` sender:
+# the same charset _XREPO_TASK_RE accepts on the read side, so every name this
+# writer stores is one every reader can parse.
+note_project_name_ok() { [[ "${1:-}" =~ ^[a-z0-9_-]+$ ]]; }
+
+note_canon_dir() { (cd "${1:-}" 2>/dev/null && pwd -P); }
+
+# The repository this invocation acts on. `ait` always runs from the repo
+# root, and every task path this script touches is cwd-relative.
+note_self_root() { pwd -P; }
+
+# note_project_resolve <name>
+#
+# Resolve a logical project name across EVERY tier the resolver supports (live
+# tmux session, registry, AITASKS_PROJECT_<name>) and refuse to pick silently:
+# more than one distinct root is an ambiguity, and a tier that could not be
+# enumerated fails closed, because the conflict it might hide cannot be ruled
+# out. Sets NOTE_RESOLVED_ROOT on success; NOTE_RESOLVE_REASON on failure.
+note_project_resolve() {
+    local name="$1" out="" rc=0
+    NOTE_RESOLVED_ROOT=""; NOTE_RESOLVE_REASON=""
+    out="$("$PROJECT_RESOLVE_SH" candidates "$name" 2>/dev/null)" || rc=$?
+    local last="${out##*$'\n'}"
+    case "$last" in
+        CANDIDATES_COMPLETE) ;;
+        CANDIDATES_INCOMPLETE:*)
+            NOTE_RESOLVE_REASON="project-resolution-incomplete:${last#CANDIDATES_INCOMPLETE:}"
+            return 1 ;;
+        *)  # Missing resolver, a pre-t1869 one without the mode, or garbage.
+            NOTE_RESOLVE_REASON="project-resolution-incomplete:resolver"
+            return 1 ;;
+    esac
+    (( rc == 0 )) || { NOTE_RESOLVE_REASON="project-resolution-incomplete:resolver"; return 1; }
+
+    local line rest status path canon distinct="" n=0 first_status="" first_root=""
+    while IFS= read -r line; do
+        [[ "$line" == CANDIDATE:* ]] || continue
+        rest="${line#CANDIDATE:}"; rest="${rest#*:}"
+        status="${rest%%:*}"; path="${rest#*:}"
+        canon="$(note_canon_dir "$path")" || canon="$path"
+        [[ -n "$canon" ]] || canon="$path"
+        if ! printf '%s' "$distinct" | grep -qxF -- "$canon"; then
+            distinct+="$canon"$'\n'; n=$(( n + 1 ))
+            if (( n == 1 )); then first_status="$status"; first_root="$canon"; fi
+        fi
+    done <<<"$out"
+
+    if (( n == 0 )); then
+        NOTE_RESOLVE_REASON="project-not-found:$name"; return 1
+    fi
+    if (( n > 1 )); then
+        warn "project '$name' resolves to more than one root — fix the registration:
+$(printf '%s' "$distinct" | sed 's/^/  /')"
+        NOTE_RESOLVE_REASON="project-ambiguous:$name"; return 1
+    fi
+    if [[ "$first_status" != "RESOLVED" ]]; then
+        NOTE_RESOLVE_REASON="project-stale:$name"; return 1
+    fi
+    NOTE_RESOLVED_ROOT="$first_root"
+    return 0
+}
+
+# note_source_project <self-root>
+#
+# The calling repository's own logical name, from its DECLARED bindings only
+# (registry entries and AITASKS_PROJECT_<name> env vars — a tmux session name is
+# incidental, never auto-selected). A name qualifies only if it also resolves
+# forward, unambiguously, back to this root — which is what the TARGET will do
+# with it. Never invents a name. Sets NOTE_SOURCE_NAME or NOTE_RESOLVE_REASON.
+#
+# When NO declared name survives, the reason is the first one a declared name
+# failed with (project-ambiguous:<n>, project-resolution-incomplete:<tier>,
+# bad-project-name:<n>, ...) — never `source-unregistered`, which is reserved
+# for "no declared name at all". The two need different fixes: register the
+# repository, versus repair a registration that conflicts.
+note_source_project() {
+    local self="$1" out="" last line name names="" kept="" n=0 first_fail=""
+    NOTE_SOURCE_NAME=""; NOTE_RESOLVE_REASON=""
+    out="$("$PROJECT_RESOLVE_SH" bindings "$self" 2>/dev/null)" || true
+    last="${out##*$'\n'}"
+    case "$last" in
+        BINDINGS_COMPLETE) ;;
+        BINDINGS_INCOMPLETE:*)
+            NOTE_RESOLVE_REASON="project-resolution-incomplete:${last#BINDINGS_INCOMPLETE:}"
+            return 1 ;;
+        *)  NOTE_RESOLVE_REASON="project-resolution-incomplete:resolver"; return 1 ;;
+    esac
+    while IFS= read -r line; do
+        [[ "$line" == BINDING:* ]] || continue
+        name="${line#BINDING:}"; name="${name#*:}"
+        printf '%s' "$names" | grep -qxF -- "$name" && continue
+        names+="$name"$'\n'
+    done <<<"$out"
+    while IFS= read -r name; do
+        [[ -n "$name" ]] || continue
+        if ! note_project_name_ok "$name"; then
+            [[ -n "$first_fail" ]] || first_fail="bad-project-name:$name"
+            continue
+        fi
+        if ! note_project_resolve "$name"; then
+            [[ -n "$first_fail" ]] || first_fail="$NOTE_RESOLVE_REASON"
+            continue
+        fi
+        if [[ "$NOTE_RESOLVED_ROOT" != "$self" ]]; then
+            # Declared here, resolved elsewhere: the name does not identify
+            # this checkout, which is an ambiguity by any other name.
+            [[ -n "$first_fail" ]] || first_fail="project-ambiguous:$name"
+            continue
+        fi
+        kept+="${kept:+,}$name"; n=$(( n + 1 ))
+    done <<<"$names"
+    NOTE_RESOLVE_REASON=""
+    if (( n == 0 )); then
+        NOTE_RESOLVE_REASON="${first_fail:-source-unregistered}"
+        return 1
+    fi
+    if (( n > 1 )); then
+        warn "this repository is registered under several names ($kept) — pass --from-project <name>"
+        NOTE_RESOLVE_REASON="source-ambiguous:$kept"; return 1
+    fi
+    NOTE_SOURCE_NAME="$kept"
+    return 0
+}
+
+# note_prescan <write|read> <args...>
+#
+# The OPTION-AWARE scan that decides whether to route. It walks argv exactly as
+# the real parsers do, consuming each value-taking option's value WITHOUT
+# inspecting it — so `--text --project` is a body, `--file --project` a path and
+# `--ids --project` an id list, exactly as today. An unrecognized token stops the
+# scan: what follows cannot be parsed reliably, and the local parser (when not
+# routing) reports it exactly as it always has.
+#
+# Sets PS_ROUTE PS_PROJECT PS_N_PROJECT PS_MISSING PS_FROM_PROJECT
+#      PS_N_FROM_PROJECT PS_N_FROM PS_MIGRATE PS_UNKNOWN
+note_prescan() {
+    local verb="$1"; shift
+    PS_ROUTE=0; PS_PROJECT=""; PS_N_PROJECT=0; PS_MISSING=""
+    PS_FROM_PROJECT=""; PS_N_FROM_PROJECT=0; PS_N_FROM=0; PS_MIGRATE=0
+    PS_UNKNOWN=""
+    [[ $# -gt 0 ]] && shift    # the target id (positional)
+    while [[ $# -gt 0 ]]; do
+        case "$verb:$1" in
+            write:--project|read:--project)
+                [[ $# -ge 2 ]] || { PS_MISSING="--project"; PS_N_PROJECT=$(( PS_N_PROJECT + 1 )); break; }
+                PS_PROJECT="$2"; PS_N_PROJECT=$(( PS_N_PROJECT + 1 )); shift 2 ;;
+            write:--from-project)
+                [[ $# -ge 2 ]] || { PS_MISSING="--from-project"; break; }
+                PS_FROM_PROJECT="$2"; PS_N_FROM_PROJECT=$(( PS_N_FROM_PROJECT + 1 )); shift 2 ;;
+            write:--from)
+                [[ $# -ge 2 ]] || { PS_MISSING="--from"; break; }
+                PS_N_FROM=$(( PS_N_FROM + 1 )); shift 2 ;;
+            write:--text|write:--file|write:--claimed-from|write:--claimed-at|\
+            write:--base|write:--base-branch|read:--by|read:--ids|read:--mode)
+                [[ $# -ge 2 ]] || { PS_MISSING="$1"; break; }
+                shift 2 ;;
+            write:--with-live) shift ;;
+            write:--migrate) PS_MIGRATE=1; shift ;;
+            *) PS_UNKNOWN="$1"; break ;;
+        esac
+    done
+    (( PS_N_PROJECT > 0 )) && PS_ROUTE=1
+    return 0
+}
+
+# note_rewrite_path_line <root> <line>
+#
+# Id-bearing outcomes carry a path RELATIVE TO THE TARGET's root. Printed
+# verbatim in the caller's repository it would name a local file that is not the
+# one written, so it is made absolute — the same prefixing `create --project`
+# does. Every other line (errors, LIVE_*) passes through untouched.
+note_rewrite_path_line() {
+    local root="$1" line="$2" code rest id path tail
+    case "$line" in
+        NOTE_APPENDED:*|NOTE_APPENDED_UNCOMMITTED:*|READ_RECORDED:*|READ_RECORDED_UNPUSHED:*)
+            code="${line%%:*}"; rest="${line#*:}"
+            id="${rest%%|*}"; rest="${rest#*|}"
+            path="${rest%%|*}"
+            if [[ "$rest" == *"|"* ]]; then tail="|${rest#*|}"; else tail=""; fi
+            [[ "$path" == /* ]] || path="$root/$path"
+            printf '%s:%s|%s%s\n' "$code" "$id" "$path" "$tail" ;;
+        *) printf '%s\n' "$line" ;;
+    esac
+}
+
+# note_xrepo_route <write|read> <args...>   (args exclude the `read` verb)
+note_xrepo_route() {
+    local verb="$1"; shift
+
+    # Counted before anything is resolved: a repeated flag must never be able
+    # to mutate an unintended repository through a last-one-wins parse.
+    (( PS_N_PROJECT <= 1 )) || note_route_die "$verb" "duplicate-option:--project"
+    (( PS_N_FROM_PROJECT <= 1 )) || note_route_die "$verb" "duplicate-option:--from-project"
+    [[ -z "$PS_MISSING" ]] || note_route_die "$verb" "missing-value:$PS_MISSING"
+    [[ -z "$PS_UNKNOWN" ]] || note_route_die "$verb" "unknown-option:$PS_UNKNOWN"
+    if [[ "$verb" == "write" ]]; then
+        (( ! PS_MIGRATE )) || note_die "project-not-valid-with-migrate"
+        (( PS_N_FROM == 1 )) || note_die "missing-from"
+    fi
+
+    local name="$PS_PROJECT"
+    note_project_name_ok "$name" || note_route_die "$verb" "bad-project-name:$name"
+    if [[ -n "$PS_FROM_PROJECT" ]]; then
+        note_project_name_ok "$PS_FROM_PROJECT" \
+            || note_route_die "$verb" "bad-project-name:$PS_FROM_PROJECT"
+    fi
+
+    local self root
+    self="$(note_self_root)"
+    note_project_resolve "$name" || note_route_die "$verb" "$NOTE_RESOLVE_REASON"
+    root="$NOTE_RESOLVED_ROOT"
+    [[ "$root" != "$self" ]] || note_route_die "$verb" "project-is-local:$name"
+
+    # Probe the TARGET's installed helper for exactly the grammar we are about
+    # to hand it, so an older installation never receives an argument it would
+    # misparse. A read delegates only the existing receipt grammar, so any
+    # target with the receipt verb qualifies — even one that predates t1869.
+    local helper="$root/.aitask-scripts/aitask_note.sh" help_out=""
+    [[ -x "$helper" ]] || note_route_die "$verb" "project-incompatible:$name"
+    help_out="$(cd "$root" && env -u AIT_DIR "$helper" --help 2>/dev/null)" || true
+    if [[ "$verb" == "write" ]]; then
+        grep -qF -- '--from-project' <<<"$help_out" \
+            || note_die "project-incompatible:$name"
+    else
+        grep -qF -- 'read <task-id> --by' <<<"$help_out" \
+            || note_read_die "project-incompatible:$name"
+    fi
+
+    # Rebuild argv for the target: drop the routing pair(s), and absolutize a
+    # --file path, which the target would otherwise resolve against ITS root.
+    local -a fwd=()
+    local src=""
+    if [[ "$verb" == "write" ]]; then
+        if [[ -n "$PS_FROM_PROJECT" ]]; then
+            note_project_resolve "$PS_FROM_PROJECT" || note_die "$NOTE_RESOLVE_REASON"
+            [[ "$NOTE_RESOLVED_ROOT" == "$self" ]] \
+                || note_die "from-project-mismatch:$PS_FROM_PROJECT"
+            src="$PS_FROM_PROJECT"
+        else
+            note_source_project "$self" || note_die "$NOTE_RESOLVE_REASON"
+            src="$NOTE_SOURCE_NAME"
+        fi
+        fwd+=("$1"); shift
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --project|--from-project) shift 2 ;;
+                --file)
+                    if [[ "$2" == "-" || "$2" == /* ]]; then
+                        fwd+=("$1" "$2")
+                    else
+                        fwd+=("$1" "$PWD/$2")
+                    fi
+                    shift 2 ;;
+                --from|--text|--claimed-from|--claimed-at|--base|--base-branch)
+                    fwd+=("$1" "$2"); shift 2 ;;
+                *) fwd+=("$1"); shift ;;
+            esac
+        done
+        fwd+=(--from-project "$src")
+    else
+        fwd+=(read "$1"); shift
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --project) shift 2 ;;
+                *) fwd+=("$1" "$2"); shift 2 ;;
+            esac
+        done
+    fi
+
+    # Delegate. AIT_DIR and the task-dir variables are scrubbed: inherited from
+    # the caller they would point the target's provenance capture, or its task
+    # lookup, back at THIS repository. Stdin passes through (--file -), stderr
+    # passes through, stdout is buffered for the path rewrite.
+    #
+    # AIT_NOTE_XREPO_CALLER is the caller handoff: THIS repository's canonical
+    # root. The target's --from-project refuses to run without it and requires
+    # the resolved sender project to BE that root — so the qualified sender is
+    # always the repository the call actually came from, never merely a project
+    # that exists.
+    local out="" rc=0 line
+    out="$(cd "$root" && env -u AIT_DIR -u TASK_DIR -u PLAN_DIR \
+            -u ARCHIVED_DIR -u ARCHIVED_PLAN_DIR \
+            AIT_NOTE_XREPO_CALLER="$self" "$helper" "${fwd[@]}")" || rc=$?
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        note_rewrite_path_line "$root" "$line"
+    done <<<"$out"
+    return "$rc"
+}
+
+main() {
+    case "${1:-}" in
+        --help | -h | help | "") show_help; return 0 ;;
+        # Dispatch BEFORE target resolution: note_id_normalize "read" would
+        # otherwise fail with bad-task-id:read. The name is reserved by
+        # construction — a note's marker name must equal its sender (t<id>),
+        # which can never be the bare word "read".
+        read)
+            shift
+            # Cross-repository receipt (t1869): routed ONLY when --project sits
+            # in option position; otherwise the local path, unchanged.
+            note_prescan read "$@"
+            if (( PS_ROUTE )); then note_xrepo_route read "$@"; return $?; fi
+            note_read_main "$@"; return $? ;;
+    esac
+
+    # Cross-repository send (t1869). Decided by the option-aware pre-scan
+    # BEFORE the local parser runs; without --project nothing below changes.
+    note_prescan write "$@"
+    if (( PS_ROUTE )); then note_xrepo_route write "$@"; return $?; fi
+
+    local target_raw="$1"; shift
+    local from_raw="" body_text="" body_file="" migrate=0
+    local claimed_from="" claimed_at="" cli_base="" cli_base_branch=""
+    local with_live=0 from_project=""
+
+    # Every flag is counted, not just captured. A last-one-wins parser turns a
+    # contradictory command line into a silently different note: `--text a
+    # --file b` would drop the inline text, and `--text a --text b` would keep
+    # only b — both without a word to the caller (F19).
+    local n_from=0 n_text=0 n_file=0 n_claimed_from=0 n_claimed_at=0
+    local n_base=0 n_base_branch=0 n_with_live=0 n_from_project=0
+    while [[ $# -gt 0 ]]; do
+        # A value-taking flag must HAVE its value before we shift past it.
+        # `shift 2` with one argument left fails, and under `set -e` that exits
+        # the script with NOTHING on stdout — which breaks the "exactly one
+        # line, always" contract and leaves the caller unable to tell malformed
+        # input from a died process (F21).
+        case "$1" in
+            --from|--text|--file|--claimed-from|--claimed-at|--base|--base-branch|--from-project)
+                [[ $# -ge 2 ]] || note_die "missing-value:$1" ;;
+        esac
+        case "$1" in
+            --from)          from_raw="$2";        n_from=$((n_from+1));       shift 2 ;;
+            --text)          body_text="$2";       n_text=$((n_text+1));       shift 2 ;;
+            --file)          body_file="$2";       n_file=$((n_file+1));       shift 2 ;;
+            --migrate)       migrate=1; shift ;;
+            --with-live)     with_live=1; n_with_live=$((n_with_live+1)); shift ;;
+            --claimed-from)  claimed_from="$2";    n_claimed_from=$((n_claimed_from+1)); shift 2 ;;
+            --claimed-at)    claimed_at="$2";      n_claimed_at=$((n_claimed_at+1));     shift 2 ;;
+            --base)          cli_base="$2";        n_base=$((n_base+1));       shift 2 ;;
+            --base-branch)   cli_base_branch="$2"; n_base_branch=$((n_base_branch+1));   shift 2 ;;
+            --from-project)  from_project="$2";    n_from_project=$((n_from_project+1)); shift 2 ;;
+            *) note_die "unknown-option:$1" ;;
+        esac
+    done
+
+    # --- Argument matrix -----------------------------------------------------
+    # Exactly one body source, no repeats, and the two sender/provenance modes
+    # are mutually exclusive. Refusing is the only honest answer: there is no
+    # defensible way to pick which of two bodies the caller meant.
+    # Duplicates FIRST: `--text a --text b` also fails the exactly-one rule
+    # below, and reporting that instead would name the wrong problem.
+    # The reason field is '|'-delimited, so the message must not contain one —
+    # note_sanitize_field would rewrite it (F17).
+    (( n_text <= 1 )) || note_die "duplicate-option:--text"
+    (( n_file <= 1 )) || note_die "duplicate-option:--file"
+    (( n_from <= 1 )) || note_die "duplicate-option:--from"
+    (( n_text + n_file == 1 )) \
+        || note_die "need-exactly-one-body-source:--text-or---file"
+    (( n_claimed_from <= 1 )) || note_die "duplicate-option:--claimed-from"
+    (( n_claimed_at <= 1 ))   || note_die "duplicate-option:--claimed-at"
+    (( n_base <= 1 ))         || note_die "duplicate-option:--base"
+    (( n_base_branch <= 1 ))  || note_die "duplicate-option:--base-branch"
+    (( n_with_live <= 1 ))    || note_die "duplicate-option:--with-live"
+    (( n_from_project <= 1 )) || note_die "duplicate-option:--from-project"
+
+    if (( migrate )); then
+        # --from is IGNORED on this path (the proof is never run), so accepting
+        # it would let a caller believe they had attributed a verified sender.
+        (( n_from == 0 )) || note_die "from-not-valid-with-migrate"
+        # Migration preserves a HISTORICAL claim; the normal cross-repository
+        # send (--from-project) must never become a way into it, or out of it.
+        (( n_from_project == 0 )) || note_die "from-project-not-valid-with-migrate"
+    else
+        local n_mig=$(( n_claimed_from + n_claimed_at + n_base + n_base_branch ))
+        # Provenance is CAPTURED in normal mode, so a supplied value would be
+        # silently discarded.
+        (( n_mig == 0 )) || note_die "migration-options-require-migrate"
+    fi
+
+    # --- Target resolution (bare form for every helper call) ---
+    local target_bare
+    target_bare="$(note_id_normalize "$target_raw")" \
+        || note_die "bad-task-id:$target_raw"
+
+    local file
+    if ! file="$(resolve_task_file "$target_bare" 2>/dev/null)"; then
+        printf 'NOTE_TARGET_MISSING:%s\n' "$(note_sanitize_field "$target_bare")"
+        return 1
+    fi
+    if note_target_is_bundled "$target_bare" "$file"; then
+        note_die "target-bundled"
+    fi
+
+    # Outer level, for the same reason as the read path above: _note_append_inner
+    # is a subshell whose die becomes a typed NOTE_ERROR: line (t1725_2).
+    assert_task_data_writable
+
+    # --- Sender resolution ---
+    local sender_name sender_field="" verified=0
+    if (( migrate )); then
+        [[ -n "$claimed_from" ]] || note_die "migrate-requires-claimed-from"
+        local local_part
+        if local_part="$(note_xrepo_local_part "$claimed_from")"; then
+            sender_name="$(note_id_render "$local_part")"
+        elif local_part="$(note_id_normalize "$claimed_from")"; then
+            sender_name="$(note_id_render "$local_part")"
+        else
+            note_die "bad-claimed-from:$claimed_from"
+        fi
+        sender_field="$claimed_from"
+
+        # Validate the COMPLETE variant before anything is written. Checking
+        # only non-emptiness would let a short oid or a free-text date through
+        # to a committed block the merger rejects everywhere else (F18).
+        [[ -n "$claimed_at" ]] || note_die "migrate-requires-claimed-at"
+        note_is_date_like "$claimed_at" \
+            || note_die "bad-claimed-at:$claimed_at"
+        [[ -n "$cli_base" ]] || note_die "migrate-requires-base"
+        if note_is_base_sentinel "$cli_base"; then
+            # No repo / no HEAD => no branch. Accepting one here would emit a
+            # block whose base and base_branch disagree.
+            [[ -z "$cli_base_branch" ]] \
+                || note_die "base-branch-with-sentinel-base:$cli_base"
+        else
+            note_is_full_oid "$cli_base" \
+                || note_die "base-not-a-full-oid:$cli_base"
+            [[ -n "$cli_base_branch" ]] \
+                || note_die "migrate-requires-base-branch"
+            note_is_branch_like "$cli_base_branch" \
+                || note_die "bad-base-branch:$cli_base_branch"
+        fi
+        [[ "$local_part" != "$target_bare" ]] || {
+            printf 'NOTE_SELF:%s\n' "$(note_sanitize_field "$target_bare")"; return 1; }
+    else
+        [[ -n "$from_raw" ]] || note_die "missing-from"
+        local from_bare
+        from_bare="$(note_id_normalize "$from_raw")" \
+            || note_die "bad-task-id:$from_raw"
+        if (( n_from_project )); then
+            # --- Cross-repository sender (t1869) ---------------------------
+            #
+            # This is the TARGET half: the caller's repository resolved its own
+            # name and ran this script from inside the target. Nothing is taken
+            # on trust — the name is re-resolved HERE, the source task must
+            # exist THERE, and the proof below reads the source repository's
+            # own lock. A direct caller passing --from-project gets exactly the
+            # same checks.
+            note_project_name_ok "$from_project" \
+                || note_die "bad-project-name:$from_project"
+            # Standalone use is refused: --from-project is only meaningful as
+            # the target half of a routed call, which hands over the caller's
+            # canonical root. Without it, the "calling repository" is this one,
+            # and no foreign project can be the sender.
+            local caller_root="${AIT_NOTE_XREPO_CALLER:-}"
+            [[ -n "$caller_root" ]] || note_die "from-project-requires-project"
+            caller_root="$(note_canon_dir "$caller_root")" \
+                || note_die "from-project-requires-project"
+            note_project_resolve "$from_project" || note_die "$NOTE_RESOLVE_REASON"
+            local src_root="$NOTE_RESOLVED_ROOT"
+            [[ "$src_root" != "$(note_self_root)" ]] \
+                || note_die "from-project-is-target:$from_project"
+            [[ "$src_root" == "$caller_root" ]] \
+                || note_die "from-project-mismatch:$from_project"
+            ( cd "$src_root" && TASK_DIR=aitasks ARCHIVED_DIR=aitasks/archived \
+                resolve_task_file "$from_bare" ) >/dev/null 2>&1 \
+                || note_die "source-task-missing:${from_project}#$(note_id_render "$from_bare")"
+            # No NOTE_SELF check: equal numbers in two projects are two tasks.
+            # The marker NAME is the local t<id> part ('#' is not a legal name
+            # character); from= carries the qualified identity, so a reader can
+            # never mistake it for this repository's own t<id>.
+            sender_name="$(note_id_render "$from_bare")"
+            sender_field="${from_project}#${sender_name}"
+            note_sender_is_self "$from_bare" "$src_root" && verified=1
+        else
+            if [[ "$from_bare" == "$target_bare" ]]; then
+                printf 'NOTE_SELF:%s\n' "$(note_sanitize_field "$target_bare")"
+                return 1
+            fi
+            sender_name="$(note_id_render "$from_bare")"
+            sender_field="$sender_name"
+            # from_verified=yes ONLY when this session provably holds the
+            # sender's lock; otherwise the field is OMITTED — never 'no', so
+            # absence and disproof stay distinct.
+            note_sender_is_self "$from_bare" && verified=1
+        fi
+    fi
+
+    # --- Body ---
+    #
+    # NUL must be checked on the SOURCE BYTES, not on the variable: a bash
+    # string cannot hold a NUL at all (command substitution silently drops it),
+    # so by the time the body is in a variable the evidence is already gone.
+    # `[[ "$b" != *$'\0'* ]]` in particular is a trap — $'\0' is the empty
+    # string, so the pattern degenerates to `**` and matches everything.
+    local raw_body="" src=""
+    if [[ -n "$body_file" ]]; then
+        src="$TMPBODY"
+        if [[ "$body_file" == "-" ]]; then
+            cat > "$src"
+        else
+            [[ -r "$body_file" ]] || note_die "unreadable-file:$body_file"
+            cat -- "$body_file" > "$src"
+        fi
+        # Portable NUL detection: stripping NULs changes the byte count iff any
+        # were present. `grep -P '\x00'` is not available on BSD/macOS.
+        # shellcheck disable=SC2094  # both sides READ $src; nothing writes it.
+        if ! LC_ALL=C tr -d '\000' < "$src" | cmp -s - "$src"; then
+            note_die "body-contains-nul"
+        fi
+        local bytes; bytes=$(wc -c < "$src" | tr -d ' ')
+        (( bytes <= NOTE_MAX_BODY_BYTES )) \
+            || note_die "body-too-large:${bytes}>${NOTE_MAX_BODY_BYTES}"
+        raw_body="$(cat "$src")"
+    elif [[ -n "$body_text" ]]; then
+        # argv is NUL-terminated by the kernel, so a --text value provably
+        # cannot contain one; only the size bound applies here.
+        raw_body="$body_text"
+        local bytes; bytes=$(printf '%s' "$raw_body" | wc -c | tr -d ' ')
+        (( bytes <= NOTE_MAX_BODY_BYTES )) \
+            || note_die "body-too-large:${bytes}>${NOTE_MAX_BODY_BYTES}"
+    else
+        note_die "missing-body"
+    fi
+
+    local body; body="$(note_render_body "$raw_body")"
+
+    # --- Marker fields, in contract order ---
+    local -a kv=("from=$sender_field")
+    (( verified )) && kv+=("from_verified=yes")
+    kv+=("at=$(note_iso_now)")
+
+    if (( migrate )); then
+        # Provenance is SUPPLIED, never captured: capturing today's HEAD would
+        # misrepresent exactly the stale-context claim the entry records. No
+        # dirty/host — neither was ever observed, and writing dirty=no on a
+        # historical note would be a fabricated observation.
+        kv+=("claimed_at=$claimed_at" "base=$cli_base")
+        [[ -n "$cli_base_branch" ]] && kv+=("base_branch=$cli_base_branch")
+        kv+=("migrated=yes")
+    else
+        note_capture_provenance
+        kv+=("base=$PROV_BASE")
+        [[ -n "$PROV_BASE_BRANCH" ]] && kv+=("base_branch=$PROV_BASE_BRANCH")
+        [[ -n "$PROV_MERGEBASE" ]] && kv+=("base_mergebase=$PROV_MERGEBASE")
+        kv+=("dirty=$PROV_DIRTY" "host=$(hostname)")
+    fi
+
+    LOCK_KEY="$target_bare"
+    note_append_locked "$file" "$sender_name" "$body" "${kv[@]}"
+
+    # --- Persist: path-scoped commit, then best-effort push ---
+    #
+    # The lock does NOT span the commit: contention is on the repo-global
+    # .git/index.lock, not the per-task key, so spanning it would only lengthen
+    # the window in which a second `ait note` to this task exhausts its acquire
+    # budget. What must be right is the REPORTING — see below.
+    # A post-append failure inside the locked section (F22) already means the
+    # note is on disk in a degraded state: the lock key is wedged and needs
+    # human attention. Do not pile more git work on top — report the id-bearing
+    # outcome with the scoped recovery command and let the operator act.
+    local reason="$NOTE_POST_APPEND_FAILURE"
+    if [[ -z "$reason" ]]; then
+        task_git add -- "$file" 2>/dev/null || reason="git-add-failed"
+    fi
+    if [[ -z "$reason" ]]; then
+        task_git commit -m "ait: Record note $NOTE_ID for t${target_bare}" \
+            -- "$file" >/dev/null 2>&1 || reason="git-commit-failed"
+    fi
+
+    if [[ -n "$reason" ]]; then
+        # The append LANDED, so the note is durable on disk and owns an id.
+        # Reporting this as NOTE_ERROR would read as "nothing happened" and the
+        # caller's retry would append a SECOND note. Id-bearing outcome instead,
+        # mirroring aitask_gate.sh's MATERIALIZED_UNCOMMITTED.
+        #
+        # The recovery hint is path-scoped: task data is a shared multi-writer
+        # branch, so a blanket `add aitasks/` would sweep another session's
+        # uncommitted work into this note's commit. It goes to STDERR — stdout
+        # stays exactly one parseable line.
+        warn "note recorded but not committed. Recover with:
+  ./ait git add -- $file && ./ait git commit -m \"ait: Record note $NOTE_ID for t${target_bare}\" -- $file"
+        printf 'NOTE_APPENDED_UNCOMMITTED:%s|%s|%s\n' \
+            "$NOTE_ID" "$file" "$(note_sanitize_field "$reason")"
+        return 1
+    fi
+
+    task_push >/dev/null 2>&1 || true
+    printf 'NOTE_APPENDED:%s|%s\n' "$NOTE_ID" "$file"
+
+    # --- LIVE lane (opt-in) -------------------------------------------------
+    #
+    # Reached ONLY from here, i.e. only after a fully successful durable write.
+    # Every other outcome above returns before this point, so the resolver is
+    # never invoked when there is no committed note to tell anyone about. That
+    # placement IS the write-before-live guarantee.
+    (( with_live )) || return 0
+    note_emit_live "$target_bare"
+    # The DURABLE result is authoritative: a live lane that found nothing — or
+    # that could not run at all — is still a successfully delivered note.
+    # Returned explicitly rather than as $?, so no later edit can let the live
+    # lane leak into the exit status.
+    return 0
+}
+
+# note_emit_live <bare-target-id>
+#
+# Prints exactly one LIVE_* line. The resolver DELIBERATELY exits 2 on
+# LIVE_ERROR:* (aitask_live_endpoint.sh), and this script runs under
+# `set -euo pipefail` — so a bare invocation or a plain "$( )" would abort here,
+# AFTER the note is already appended and committed, leaving the caller with a
+# NOTE_APPENDED: line, no second line, and a non-zero status. Three traps, all
+# avoided below:
+#   - declare-then-assign: `local x="$(...)"` masks the status in `local`'s own
+#     exit code, so `|| rc=$?` would never fire;
+#   - no pipe: `... | head -n1` hands the resolver's 2 straight back via pipefail;
+#   - a reason code is passed through VERBATIM, never remapped — LIVE_NONE and
+#     LIVE_ERROR are disjoint by design, and collapsing them would make "no live
+#     endpoint" and "the resolver broke" indistinguishable.
+note_emit_live() {
+    local target_bare="$1"
+    local live_out="" live_line=""
+    local live_rc=0
+    live_out="$("$LIVE_ENDPOINT_SH" "$target_bare" 2>/dev/null)" || live_rc=$?
+    live_line="${live_out%%$'\n'*}"
+    case "$live_line" in
+        LIVE_PANE:*|LIVE_NONE:*|LIVE_ERROR:*) ;;
+        # No parseable answer is NOT "no live endpoint" — the resolver is
+        # missing, not executable, or its contract changed. Say so.
+        *)  warn "live endpoint unreadable (exit $live_rc) — the note is durable"
+            live_line="LIVE_ERROR:resolver_unavailable" ;;
+    esac
+    printf '%s\n' "$live_line"
+}
+
+main "$@"

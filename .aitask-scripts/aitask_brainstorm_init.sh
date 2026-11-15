@@ -1,0 +1,196 @@
+#!/usr/bin/env bash
+# aitask_brainstorm_init.sh - Initialize a brainstorm session for a task.
+#
+# Usage: ait brainstorm init <task_num>
+#
+# Creates an AgentCrew crew and initializes brainstorm session files
+# (br_session.yaml, br_graph_state.yaml, br_groups.yaml, subdirectories).
+#
+# Output: INITIALIZED:<task_num>
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/aitask_path.sh
+source "$SCRIPT_DIR/lib/aitask_path.sh"
+# shellcheck source=lib/python_resolve.sh
+source "$SCRIPT_DIR/lib/python_resolve.sh"
+# shellcheck source=lib/terminal_compat.sh
+source "$SCRIPT_DIR/lib/terminal_compat.sh"
+
+PYTHON="$(require_ait_python)"
+if ! "$PYTHON" -c "import yaml" 2>/dev/null; then
+    die "Missing Python package: pyyaml. Run 'ait setup' or: pip install pyyaml"
+fi
+
+# --- Usage ---
+show_help() {
+    cat <<'HELP'
+Usage: ait brainstorm init <task_num> [--proposal-file <path>]
+
+Initialize a brainstorm session for the given task. Creates an AgentCrew
+crew worktree and brainstorm session files.
+
+Arguments:
+  <task_num>               Task number (required)
+  --proposal-file <path>   Optional markdown file to use as the initial proposal.
+                           Triggers the initializer agent to reformat the file
+                           into the brainstorm node format (n000_init).
+
+Output:
+  INITIALIZED:<task_num>             Session successfully initialized
+  INITIALIZER_AGENT:<name>           Initializer agent registered (only with --proposal-file)
+  RUNNER_STARTED:<crew_id>           Crew runner auto-started (only with --proposal-file)
+
+Examples:
+  ait brainstorm init 42
+  ait brainstorm init 42 --proposal-file /path/to/proposal.md
+HELP
+}
+
+# --- Argument parsing ---
+TASK_NUM=""
+PROPOSAL_FILE=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --help|-h)
+            show_help; exit 0 ;;
+        --proposal-file)
+            [[ $# -ge 2 ]] || die "--proposal-file requires an argument."
+            PROPOSAL_FILE="$2"; shift 2 ;;
+        --proposal-file=*)
+            PROPOSAL_FILE="${1#*=}"; shift ;;
+        -*)
+            die "Unknown option: $1. Run 'ait brainstorm init --help' for usage." ;;
+        *)
+            if [[ -z "$TASK_NUM" ]]; then
+                TASK_NUM="$1"; shift
+            else
+                die "Unexpected argument: $1. Run 'ait brainstorm init --help' for usage."
+            fi
+            ;;
+    esac
+done
+
+[[ -z "$TASK_NUM" ]] && die "Missing required <task_num>. Run 'ait brainstorm init --help' for usage."
+
+# --- Validate --proposal-file (if given) ---
+if [[ -n "$PROPOSAL_FILE" ]]; then
+    [[ -f "$PROPOSAL_FILE" ]] || die "Proposal file not found: $PROPOSAL_FILE"
+    [[ -r "$PROPOSAL_FILE" ]] || die "Proposal file not readable: $PROPOSAL_FILE"
+    [[ -s "$PROPOSAL_FILE" ]] || die "Proposal file is empty: $PROPOSAL_FILE"
+    case "$PROPOSAL_FILE" in
+        *.md|*.markdown) ;;
+        *) warn "Proposal file has no .md/.markdown extension; continuing." ;;
+    esac
+    # Resolve to absolute path (python3 fallback for macOS portability).
+    PROPOSAL_FILE="$("$PYTHON" -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$PROPOSAL_FILE")"
+fi
+
+# --- Resolve task file ---
+resolve_output=$("$SCRIPT_DIR/aitask_query_files.sh" resolve "$TASK_NUM")
+first_line=$(echo "$resolve_output" | head -1)
+
+if [[ "$first_line" == "NOT_FOUND" ]]; then
+    die "Task t${TASK_NUM} not found."
+fi
+
+TASK_FILE="${first_line#TASK_FILE:}"
+
+# --- Check session doesn't already exist ---
+exists_output=$("$PYTHON" "$SCRIPT_DIR/brainstorm/brainstorm_cli.py" exists --task-num "$TASK_NUM")
+if [[ "$exists_output" == "EXISTS" ]]; then
+    die "Brainstorm session for task $TASK_NUM already exists."
+fi
+
+# --- Resolve brainstorm agent strings from config ---
+_get_brainstorm_agent_string() {
+    local agent_type="$1"
+    local default_val="${2:-}"
+    local config_key="brainstorm-${agent_type}"
+    local val
+    val=$("$PYTHON" -c "
+import json, sys
+for p in ['aitasks/metadata/codeagent_config.local.json', 'aitasks/metadata/codeagent_config.json']:
+    try:
+        d = json.load(open(p))
+        v = d.get('defaults', {}).get('$config_key')
+        if v:
+            print(v)
+            sys.exit(0)
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+print('${default_val}')
+" 2>/dev/null) || val="$default_val"
+    if [[ -z "$val" ]]; then
+        die "No agent_string for brainstorm type '$agent_type': missing '$config_key' in codeagent_config.json. Run 'ait setup' or add the key manually."
+    fi
+    echo "$val"
+}
+
+# --- Resolve brainstorm per-type launch_mode default (config overlaid) ---
+_get_brainstorm_launch_mode() {
+    local agent_type="$1"
+    "$PYTHON" -c "
+import sys
+from pathlib import Path
+sys.path.insert(0, '$SCRIPT_DIR')
+from brainstorm.brainstorm_crew import get_agent_types
+print(get_agent_types(config_root=Path('.')).get('$agent_type', {}).get('launch_mode', 'headless'))
+" 2>/dev/null || echo "headless"
+}
+
+# --- Create AgentCrew crew ---
+info "Creating brainstorm crew for task $TASK_NUM..."
+crew_output=$(bash "$SCRIPT_DIR/aitask_crew_init.sh" \
+    --id "brainstorm-${TASK_NUM}" \
+    --name "Brainstorm t${TASK_NUM}" \
+    --add-type "explorer:$(_get_brainstorm_agent_string explorer):$(_get_brainstorm_launch_mode explorer)" \
+    --add-type "comparator:$(_get_brainstorm_agent_string comparator):$(_get_brainstorm_launch_mode comparator)" \
+    --add-type "synthesizer:$(_get_brainstorm_agent_string synthesizer):$(_get_brainstorm_launch_mode synthesizer)" \
+    --add-type "initializer:$(_get_brainstorm_agent_string initializer):$(_get_brainstorm_launch_mode initializer)" \
+    --batch 2>&1) || {
+    die "Failed to create crew: $crew_output"
+}
+
+# --- Get user email ---
+USER_EMAIL=""
+if [[ -f "aitasks/metadata/userconfig.yaml" ]]; then
+    USER_EMAIL=$(grep '^email:' "aitasks/metadata/userconfig.yaml" 2>/dev/null | sed 's/^email:[[:space:]]*//' | head -n 1)
+fi
+
+# --- Write task spec to temp file ---
+SPEC_FILE=$(mktemp_suffixed "${TMPDIR:-/tmp}/brainstorm_spec_XXXXXX.md")
+trap 'rm -f "$SPEC_FILE"' EXIT
+cat "$TASK_FILE" > "$SPEC_FILE"
+
+# --- Initialize brainstorm session ---
+init_args=(
+    --task-num "$TASK_NUM"
+    --task-file "$TASK_FILE"
+    --email "$USER_EMAIL"
+    --spec-file "$SPEC_FILE"
+)
+if [[ -n "$PROPOSAL_FILE" ]]; then
+    init_args+=(--proposal-file "$PROPOSAL_FILE")
+fi
+
+init_output=$("$PYTHON" "$SCRIPT_DIR/brainstorm/brainstorm_cli.py" init "${init_args[@]}") || {
+    die "Failed to initialize brainstorm session: $init_output"
+}
+echo "$init_output"
+
+success "Brainstorm session initialized for task $TASK_NUM"
+echo "INITIALIZED:${TASK_NUM}"
+
+# --- Initializer auto-start hint (only when --proposal-file was given) ---
+if [[ -n "$PROPOSAL_FILE" ]] && grep -q '^INITIALIZER_AGENT:' <<<"$init_output"; then
+    crew_id="brainstorm-${TASK_NUM}"
+    if grep -q '^RUNNER_STARTED:' <<<"$init_output"; then
+        info "Initializer agent started in interactive mode."
+        info "Attach with: ait crew runner --crew $crew_id --check  (or open 'ait brainstorm $TASK_NUM' TUI)"
+    else
+        warn "Initializer agent registered but runner did not auto-start. Run manually: ait crew runner --crew $crew_id"
+    fi
+fi

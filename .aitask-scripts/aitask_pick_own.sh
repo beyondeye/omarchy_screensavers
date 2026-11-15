@@ -1,0 +1,830 @@
+#!/usr/bin/env bash
+# aitask_pick_own.sh - Claim ownership of a task (sync, lock, update status, commit, push)
+#
+# Consolidates Step 4 of the task-workflow skill into a single script call.
+# The calling LLM handles email selection interactively, then passes the
+# chosen email here for lock acquisition, metadata update, and git operations.
+#
+# Also supports a sync-only mode (--sync) for pre-task-selection sync,
+# replacing the manual git pull + lock cleanup commands in calling skills.
+#
+# Usage:
+#   ./.aitask-scripts/aitask_pick_own.sh <task_id> [--email <email>]   # Full ownership
+#   ./.aitask-scripts/aitask_pick_own.sh <task_id> --force --email <e>  # Override a held lock
+#   ./.aitask-scripts/aitask_pick_own.sh --sync                         # Sync-only mode
+#
+# Output format (structured lines for LLM parsing):
+#   OWNED:<task_id>              Task successfully claimed
+#   LOCK_FAILED:<owner>|<locked_at>|<hostname>   Lock held by another user (exit 1)
+#   LOCK_LIVE_HOLDER:<owner>|<locked_at>|<hostname>|<pid>
+#                                Lock held by ANOTHER LIVE SESSION of yours on
+#                                this host (exit 1). Nothing was claimed: the
+#                                refusal happens before the lock, the status
+#                                write and the commit, so there is nothing to
+#                                give back. Re-run with --force to take it.
+#   LOCK_UNVERIFIABLE_HOLDER:<owner>|<locked_at>|<hostname>|<pid>
+#                                Same, but the holder's liveness could not be
+#                                established ("cannot tell" is its own state,
+#                                never rounded to alive or dead). Also exit 1.
+#   LOCK_INFRA_MISSING           Lock infrastructure not initialized (exit 1)
+#   LOCK_ERROR:<message>         Lock system error (exit 1)
+#   FORCE_UNLOCKED:<prev_owner>  Prior lock force-unlocked, then re-locked
+#   STATUS_CHANGED:<actual>|<expected>
+#                                --expect-status only (t1663_4): the status read
+#                                UNDER the lock is not the expected one. Lock
+#                                released, nothing written (exit 1).
+#   STATUS_UNVERIFIED:<reason>   --expect-status only: the re-sync under the
+#                                lock failed, or the status could not be read.
+#                                Lock released, nothing written (exit 1).
+#   LOCK_REQUIRED:no_email       --expect-status only: no email, so no lock;
+#                                refused before anything is written (exit 1).
+#   SYNCED                       Sync-only mode completed (pulled, already up to
+#                                date, or no remote configured)
+#   SYNC_FAILED:<reason>         Sync-only mode: the pull failed; <reason> is a
+#                                task_utils.sh classifier code (dirty_worktree,
+#                                rebase_conflict, rebase_in_progress,
+#                                data_midop, pull_locked, no_upstream,
+#                                remote_unreachable, diverged, unknown).
+#                                Still exits 0 — sync is best-effort; details
+#                                and a recovery hint go to stderr.
+#
+# Stale-lock cleanup runs alongside the pull in both modes and is likewise
+# best-effort: a failed sweep never blocks a pick (this script still exits 0 and
+# --sync still prints SYNCED / SYNC_FAILED), but it is no longer silent —
+# aitask_lock.sh's own diagnosis is forwarded to stderr together with a warning
+# naming the consequence. Successful and nothing-to-do sweeps stay silent.
+#
+# Called by:
+#   .claude/skills/task-workflow/SKILL.md (Step 4)
+#   .claude/skills/aitask-pick/SKILL.md (Step 0c sync)
+#   .claude/skills/aitask-explore/SKILL.md (sync)
+#   .claude/skills/aitask-fold/SKILL.md (sync)
+#   .claude/skills/aitask-review/SKILL.md (sync)
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/terminal_compat.sh
+source "$SCRIPT_DIR/lib/terminal_compat.sh"
+source "$SCRIPT_DIR/lib/task_utils.sh"
+# shellcheck source=lib/pid_anchor.sh
+source "$SCRIPT_DIR/lib/pid_anchor.sh"
+# shellcheck source=lib/registry_lock.sh
+source "$SCRIPT_DIR/lib/registry_lock.sh"
+
+# --- Configuration ---
+TASK_ID=""
+EMAIL=""
+SYNC_ONLY=false
+FORCE=false
+EXPECT_STATUS=""
+EMAILS_FILE="$AIT_EMAILS_FILE"
+
+# "This claim OWES the contributor list a commit." Set by store_email() in TWO
+# disjoint cases (t1626): a successful APPEND, and a membership hit on an address
+# that is on disk but NOT at HEAD. See store_email()'s header for why the second
+# one exists — without it a write whose commit was lost is swallowed forever.
+#
+# It is NOT "this invocation added a new address". Narrowing it back to that
+# removes the recovery, which is the failure this flag now guards against.
+#
+# Still false by default, and still false for a claim carrying no email at all:
+# a foreign line someone else left on disk is never committed under this claim.
+EMAIL_STORED=false
+
+# Seconds to wait for the contributor-list mutex before giving up on recording
+# the email. Overridable so tests can exercise the busy path without waiting out
+# the full budget; the default matches the other registry_lock callers.
+EMAILS_LOCK_TIMEOUT="${EMAILS_LOCK_TIMEOUT:-10}"
+
+# --- Help ---
+show_help() {
+    cat <<'EOF'
+Usage: aitask_pick_own.sh [options] <task_id>
+       aitask_pick_own.sh --sync
+
+Claim ownership of a task: sync remote, acquire lock, set status to
+Implementing, commit and push. In sync-only mode, just pull and clean
+up stale locks.
+
+Arguments:
+  task_id         Task number: 166 or t166 (parent), 16_2 or t16_2 (child)
+                  Not required in --sync mode.
+
+Options:
+  --email EMAIL   Email of the person claiming the task. If provided and new,
+                  it is stored to aitasks/metadata/emails.txt (deduplicated).
+  --force         Claim the task even though the lock is already held:
+                  by another user, or by another session of your own on this
+                  host that is still running or cannot be verified as gone
+                  (see LOCK_LIVE_HOLDER / LOCK_UNVERIFIABLE_HOLDER below).
+                  The lock is released and re-taken. Requires --email.
+                  Only pass this on an explicit human decision — forcing past
+                  a LIVE holder leaves two agents working one task.
+  --sync          Sync-only mode: git pull + stale lock cleanup, then exit.
+                  No task_id required.
+  --expect-status STATUS
+                  Claim only if the task's status is still STATUS, read UNDER
+                  the lock from task data re-synced UNDER the lock (t1663_4).
+                  For a caller that decided something about the task before
+                  claiming it (the task-workflow premise prompt): a status
+                  changed meanwhile by a session that has since released the
+                  lock would otherwise be silently overwritten. A failed
+                  re-sync refuses (STATUS_UNVERIFIED) rather than trusting the
+                  local file, so a checkout whose task data cannot sync refuses
+                  these claims until it is reconciled (ait syncer). Absent:
+                  behaviour unchanged.
+  --help, -h      Show this help
+
+Output format (one structured line to stdout):
+  OWNED:<task_id>              Task successfully claimed
+  LOCK_FAILED:<owner>|<locked_at>|<hostname>
+                               Lock held by another user (exit 1)
+  LOCK_LIVE_HOLDER:<owner>|<locked_at>|<hostname>|<pid>
+                               Held by another session of YOURS on this host
+                               that is still running (exit 1). Nothing was
+                               claimed — the refusal precedes the lock, the
+                               status write and the commit. Overridable with
+                               --force.
+  LOCK_UNVERIFIABLE_HOLDER:<owner>|<locked_at>|<hostname>|<pid>
+                               Same, but the holder could not be shown to be
+                               either running or gone (exit 1). Also
+                               overridable with --force.
+  LOCK_INFRA_MISSING           Lock infrastructure not initialized (exit 1)
+  LOCK_ERROR:<message>         Lock system error (exit 1)
+  FORCE_UNLOCKED:<prev_owner>  Prior lock force-unlocked, then re-locked
+  STATUS_CHANGED:<actual>|<expected>
+                               --expect-status only: the task's status is no
+                               longer the expected one (`missing` when the task
+                               file is gone). The lock this run took was
+                               released; nothing else was written (exit 1).
+  STATUS_UNVERIFIED:<reason>   --expect-status only: the re-sync under the lock
+                               failed (<reason> = the sync classifier code), or
+                               the status could not be read (python_unavailable,
+                               unreadable_status). Lock released, nothing
+                               written (exit 1).
+  LOCK_REQUIRED:no_email       --expect-status only: no email resolved, so no
+                               lock could be taken; refused before anything
+                               was locked or written (exit 1).
+  SYNCED                       Sync-only mode completed
+
+Full ownership mode performs these steps in order:
+  1. git pull --ff-only (best-effort sync with remote)
+  2. Stale lock cleanup (best-effort)
+  3. Store email to emails.txt if provided (deduplicated)
+  4. Acquire atomic lock via aitask_lock.sh
+  5. Update task status to Implementing via aitask_update.sh
+  6. git add + commit + push (push is best-effort)
+
+Examples:
+  ./.aitask-scripts/aitask_pick_own.sh 166 --email "user@example.com"
+  ./.aitask-scripts/aitask_pick_own.sh t16_2 --email "user@example.com"
+  ./.aitask-scripts/aitask_pick_own.sh 166          # No email (skip lock)
+  ./.aitask-scripts/aitask_pick_own.sh --sync       # Sync-only mode
+EOF
+}
+
+# --- Argument Parsing ---
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --email)
+                EMAIL="${2:?Missing email address after --email}"
+                shift 2
+                ;;
+            --force)
+                FORCE=true
+                shift
+                ;;
+            --sync)
+                SYNC_ONLY=true
+                shift
+                ;;
+            --expect-status)
+                EXPECT_STATUS="${2:?Missing status after --expect-status}"
+                case "$EXPECT_STATUS" in
+                    Ready|Editing|Implementing|Postponed|Done|Folded) ;;
+                    *) die "Invalid --expect-status: $EXPECT_STATUS (expected one of: Ready Editing Implementing Postponed Done Folded)" ;;
+                esac
+                shift 2
+                ;;
+            --help|-h)
+                show_help
+                exit 0
+                ;;
+            -*)
+                die "Unknown option: $1. Use --help for usage."
+                ;;
+            *)
+                if [[ "$1" =~ ^t?[0-9]+(_[0-9]+)?$ ]]; then
+                    TASK_ID="${1#t}"
+                    shift
+                else
+                    die "Invalid task ID: $1 (expected format: 166, t166, 16_2, or t16_2)"
+                fi
+                ;;
+        esac
+    done
+
+    if [[ "$SYNC_ONLY" == false && -z "$TASK_ID" ]]; then
+        die "Task ID is required (or use --sync for sync-only mode). Use --help for usage."
+    fi
+}
+
+# Outcome of the most recent lock_cleanup call. Like task_sync, lock_cleanup
+# always returns 0 — a failed sweep must never block a pick — so read these
+# when the outcome matters.
+LOCK_CLEANUP_STATUS=""   # ok | failed
+LOCK_CLEANUP_REASON=""   # branch_unreadable | push_failed | invoke_failed
+
+# --- Sync with remote (best-effort) ---
+sync_remote() {
+    task_sync
+    lock_cleanup
+}
+
+# Sweep locks abandoned by finished sessions. Best-effort but never silent:
+# a swallowed failure lets stale locks pile up until a later pick reports
+# LOCK_FAILED for a task nobody is actually working on.
+# shellcheck disable=SC2034  # the LOCK_CLEANUP_* globals ARE the return value; they are read by tests and by callers that care about the outcome
+lock_cleanup() {
+    LOCK_CLEANUP_STATUS=""
+    LOCK_CLEANUP_REASON=""
+
+    local out="" rc=0
+    # Combined capture: on success the child's progress notices are dropped
+    # (our stdout is a machine contract, and a successful housekeeping sweep is
+    # not worth reporting); on failure everything it said is forwarded.
+    out="$("$SCRIPT_DIR/aitask_lock.sh" --cleanup 2>&1)" || rc=$?
+
+    if [[ $rc -eq 0 ]]; then
+        LOCK_CLEANUP_STATUS="ok"
+        return 0
+    fi
+
+    LOCK_CLEANUP_STATUS="failed"
+    case $rc in
+        11) LOCK_CLEANUP_REASON="branch_unreadable" ;;
+        12) LOCK_CLEANUP_REASON="push_failed" ;;
+        *)  LOCK_CLEANUP_REASON="invoke_failed" ;;
+    esac
+    [[ -n "$out" ]] && printf '%s\n' "$out" >&2
+    _lock_cleanup_warn "$rc"
+    return 0
+}
+
+# Internal: name the consequence. aitask_lock.sh already reported the specific
+# git failure (forwarded above); this adds why the user should care.
+_lock_cleanup_warn() {
+    local rc="$1" what
+    case "$LOCK_CLEANUP_REASON" in
+        branch_unreadable) what="stale lock cleanup did not complete" ;;
+        push_failed)       what="stale locks could not be removed" ;;
+        *)                 what="stale lock cleanup failed (aitask_lock.sh --cleanup exited ${rc})" ;;
+    esac
+    warn "${what} — locks abandoned by finished sessions may persist, and a later pick can report LOCK_FAILED for a task nobody is working on; inspect with './ait lock --list'"
+}
+
+# --- Store email (idempotent, deduplicated, serialized) ---
+# EMAIL_STORED means "this claim OWES the contributor list a commit" (t1626).
+# Two disjoint things set it: a successful APPEND, and a membership hit on an
+# address that is on disk but NOT at HEAD.
+#
+# It used to mean only the former, and that is what made the stranding permanent:
+# an address appended by a write whose commit never happened is invisible to
+# every later call, because a membership short-circuit returns before the flag
+# can be set again. There are TWO such short-circuits — the pre-lock fast path
+# below and the under-lock re-check further down — and BOTH now consult HEAD.
+# Adding a third membership check without that consult re-opens the hole.
+#
+# The append is still what the flag's PLACEMENT in the chain answers for: it sits
+# between the append and the sort, never behind both (t1614).
+store_email() {
+    local email="$1"
+    if [[ -z "$email" ]]; then
+        return 0
+    fi
+    local dir
+    dir=$(dirname "$EMAILS_FILE")
+    mkdir -p "$dir"
+    touch "$EMAILS_FILE"
+    if grep -qxF -- "$email" "$EMAILS_FILE" 2>/dev/null; then
+        # Already on disk — but membership alone must NOT end the call. If this
+        # address was appended by a write whose commit never landed, this is
+        # exactly where it gets swallowed forever. Claim it for this claim's
+        # contributor commit instead.
+        ait_email_is_committed "$email" || EMAIL_STORED=true
+        return 0
+    fi
+
+    # `echo >> ; sort -u -o` is a read-modify-write: sort SNAPSHOTS the file and
+    # renames its output over the target, so a concurrent session's append made
+    # after that snapshot is erased. Atomicity is not serialization (see the
+    # lib/atomic_write.sh header) — hold the shared mutex, or do not write.
+    #
+    # Both writers of this file hold this mutex (t1608): here, and
+    # add_email_to_file() in aitask_create.sh. They reach it through different
+    # adapters — registry_lock.sh here, stale_lock.sh directly there — but the
+    # former delegates to the latter on the caller's dir, so both contend on one
+    # mkdir mutex. A mutex excludes only writers that honour it: keep both call
+    # sites on `ait_lock_dir emails`.
+    local lockdir
+    lockdir="$(ait_lock_dir emails)" || return 0
+    if ! registry_lock_acquire "$lockdir" "$EMAILS_LOCK_TIMEOUT" store_email; then
+        warn "contributor list busy — email not recorded$(registry_lock_describe "$lockdir")"
+        return 0    # best-effort: a busy email list must never fail a claim
+    fi
+    local rc=0
+    {
+        # Re-check under the lock: a holder we waited on may have added it.
+        if ! grep -qxF -- "$email" "$EMAILS_FILE" 2>/dev/null; then
+            # CHAINED ON PURPOSE (t1614, mirroring t1608's add_email_to_file).
+            # errexit is suppressed inside a group tested by `|| rc=$?`, so as
+            # three statements a failed append followed by a SUCCEEDING sort
+            # leaves the group's status at 0 — reporting success for an address
+            # that was never written.
+            #
+            # ORDER MATTERS. EMAIL_STORED sits BETWEEN the append and the sort,
+            # not after both: it is what tells commit_and_push the contributor
+            # list is this claim's to commit, and the APPEND is the write it
+            # answers for. Behind the sort as well, a normalization failure
+            # would leave THIS claim walking away from an address it just
+            # appended — recoverable now that both membership checks consult
+            # HEAD (t1626), but only by some later call, and only if one ever
+            # comes. Recording it here is what makes it this claim's problem.
+            printf '%s\n' "$email" >> "$EMAILS_FILE" &&
+                EMAIL_STORED=true &&
+                sort -u "$EMAILS_FILE" -o "$EMAILS_FILE"
+        else
+            # The holder we waited on added it — but it may have died, or had
+            # its own commit fail, between releasing the mutex and committing.
+            # Our PRE-LOCK check ran while the address was still absent, so this
+            # is the only place this interleaving can be caught, and we are
+            # holding the mutex looking straight at the dirty file. Walking away
+            # here re-creates the stranding this whole function guards (t1626).
+            #
+            # Pure read plus an assignment, and kept LAST in the branch: it
+            # cannot set rc, so the group's status still answers for the append.
+            ait_email_is_committed "$email" || EMAIL_STORED=true
+        fi
+    } || rc=$?
+    registry_lock_release "$lockdir"
+    if [[ $rc -ne 0 ]]; then
+        if [[ "$EMAIL_STORED" == true ]]; then
+            # The append landed and will be committed; only the normalization
+            # was lost. Report the OBSERVED failure and the one thing that is
+            # certain — do NOT claim the file is now unsorted: a failed
+            # `sort -u` does not establish that, since an appended address may
+            # already be in lexical order.
+            warn "store_email: recorded ${email}, but normalizing the contributor list failed (rc=$rc)"
+        else
+            warn "store_email: failed to record ${email} (rc=$rc)"
+        fi
+    fi
+    return 0
+}
+
+# --- Acquire lock ---
+# Returns: 0=success, 1=lock held by other (LOCK_FAILED printed),
+#          2=infra missing (LOCK_INFRA_MISSING printed), 3=other error (LOCK_ERROR printed),
+#          4=live session of ours holds it (LOCK_LIVE_HOLDER printed),
+#          5=holder's liveness undecidable (LOCK_UNVERIFIABLE_HOLDER printed)
+acquire_lock() {
+    local task_id="$1"
+    local email="$2"
+
+    if [[ -z "$email" ]]; then
+        # No email = no locking possible (user chose to skip)
+        return 0
+    fi
+
+    local lock_output lock_exit=0
+    lock_output=$("$SCRIPT_DIR/aitask_lock.sh" --lock "$task_id" --email "$email" 2>&1) || lock_exit=$?
+
+    if [[ $lock_exit -eq 0 ]]; then
+        # Forward LOCK_RECLAIM: signal (same-email-different-host re-lock)
+        # and PRIOR_LOCK: (PID anchor info from prior lock — used by main()
+        # to decide RECLAIM_CRASH vs. RECLAIM_STATUS) to our caller.
+        echo "$lock_output" | grep -E '^(LOCK_RECLAIM|PRIOR_LOCK):' || true
+        # Our stdout is a machine contract, so the lock script's chatter is
+        # dropped — but a WARNING is a diagnostic the user must still see.
+        # It goes to stderr, which cannot corrupt that contract. Without this
+        # the "AIT_AGENT_PID does not name a live process" notice from
+        # lib/pid_anchor.sh was captured into $lock_output and silently
+        # discarded, i.e. a broken launcher anchor failed invisibly (t1465).
+        echo "$lock_output" | grep -i 'warning:' >&2 || true
+        return 0
+    fi
+
+    case $lock_exit in
+        1)  # Already locked by another user
+            local holder_line owner locked_at locked_hostname
+            holder_line=$(echo "$lock_output" | grep '^LOCK_HOLDER:' || true)
+            if [[ -n "$holder_line" ]]; then
+                local details="${holder_line#LOCK_HOLDER:}"
+                owner=$(echo "$details" | cut -d'|' -f1)
+                locked_at=$(echo "$details" | cut -d'|' -f2)
+                locked_hostname=$(echo "$details" | cut -d'|' -f3)
+            else
+                owner=$(echo "$lock_output" | grep -o 'already locked by [^ ]*' | sed 's/already locked by //')
+                locked_at="unknown"
+                locked_hostname="unknown"
+            fi
+            [[ -z "$owner" ]] && owner="unknown"
+            echo "LOCK_FAILED:${owner}|${locked_at}|${locked_hostname}"
+            return 1 ;;
+        10) echo "LOCK_INFRA_MISSING"; return 2 ;;
+        11) echo "LOCK_ERROR:fetch_failed"; return 3 ;;
+        12) echo "LOCK_ERROR:race_exhaustion"; return 3 ;;
+        13|14)  # Same-host, same-email acquire gate (t1466). The lock script
+                # already printed the structured line and refused BEFORE
+                # writing anything; forward it verbatim and let main() decide
+                # whether --force applies.
+            local gate_line
+            gate_line=$(echo "$lock_output" \
+                | grep -E '^LOCK_(LIVE|UNVERIFIABLE)_HOLDER:' || true)
+            if [[ -n "$gate_line" ]]; then
+                echo "$gate_line"
+            elif [[ $lock_exit -eq 13 ]]; then
+                echo "LOCK_LIVE_HOLDER:unknown|unknown|unknown|-"
+            else
+                echo "LOCK_UNVERIFIABLE_HOLDER:unknown|unknown|unknown|-"
+            fi
+            # Plain `if`, not `[[ … ]] && return 4`: under `set -e` an AND-list
+            # whose test fails takes the list's non-zero status and kills the
+            # function before the fallback return is reached.
+            if [[ $lock_exit -eq 13 ]]; then
+                return 4
+            fi
+            return 5 ;;
+        *)  echo "LOCK_ERROR:unknown"; return 3 ;;
+    esac
+}
+
+# --- Expected-status precondition (t1663_4) ---
+# verify_expected_status <task_id> <email> -> 0 when the claim may proceed.
+#
+# Runs with the lock HELD and BEFORE any write. The status the caller decided
+# on was read before the lock existed, and update_task_status writes
+# Implementing unconditionally, so a status that changed meanwhile (Postponed,
+# Done, ...) by a session that has since RELEASED the lock would be silently
+# overwritten -- the RECLAIM_* signals below only describe a prior Implementing.
+# Such a session committed and pushed before releasing, so a pull UNDER the lock
+# is what makes the read current. task_sync returns 0 on failure by design, so
+# its outcome is read from TASK_SYNC_STATUS, never from the exit code: a failed
+# sync refuses (STATUS_UNVERIFIED) instead of trusting the stale local file.
+verify_expected_status() {
+    local task_id="$1" email="$2"
+    task_sync
+    case "$TASK_SYNC_STATUS" in
+        synced|up-to-date|no-remote) ;;
+        *)
+            _release_claim_lock "$task_id" "$email"
+            echo "STATUS_UNVERIFIED:${TASK_SYNC_REASON:-unknown}"
+            return 1 ;;
+    esac
+
+    local tf="" actual="" py rc=0
+    tf=$(resolve_task_file "$task_id" 2>/dev/null) || tf=""
+    if [[ -z "$tf" || ! -f "$tf" ]]; then
+        # The task file is gone (deleted, or archived into a bundle): a real
+        # state change, reported as such.
+        _release_claim_lock "$task_id" "$email"
+        echo "STATUS_CHANGED:missing|${EXPECT_STATUS}"
+        return 1
+    fi
+    # Read the status AS YAML, through the framework's reader, so `"Ready"`,
+    # `Ready  # note` and `Ready` are one value; comparing the raw spelling
+    # would refuse a valid file. A file whose status cannot be read is NOT a
+    # state change -- it is unverified, and says so.
+    py="$(resolve_python 2>/dev/null || true)"
+    if [[ -z "$py" ]]; then
+        _release_claim_lock "$task_id" "$email"
+        echo "STATUS_UNVERIFIED:python_unavailable"
+        return 1
+    fi
+    actual=$("$py" -c "$_EXPECT_STATUS_GLUE" "$SCRIPT_DIR/lib" "$tf" 2>/dev/null) || rc=$?
+    if [[ $rc -ne 0 || -z "$actual" ]]; then
+        _release_claim_lock "$task_id" "$email"
+        echo "STATUS_UNVERIFIED:unreadable_status"
+        return 1
+    fi
+    if [[ "$actual" != "$EXPECT_STATUS" ]]; then
+        _release_claim_lock "$task_id" "$email"
+        echo "STATUS_CHANGED:${actual}|${EXPECT_STATUS}"
+        return 1
+    fi
+    return 0
+}
+
+# The status reader for verify_expected_status. Exit 0 with the value on
+# stdout; 3 = no parseable frontmatter; 4 = no usable string status. The glue is
+# the PROGRAM (argv[1] = lib dir, argv[2] = task file), never stdin.
+_EXPECT_STATUS_GLUE='
+import sys
+sys.path = [p for p in sys.path if p not in ("", ".")]
+sys.path.append(sys.argv[1])
+import task_yaml
+try:
+    with open(sys.argv[2], encoding="utf-8") as fh:
+        parsed = task_yaml.parse_frontmatter(fh.read())
+except Exception:
+    sys.exit(3)
+meta = parsed[0] if parsed else None
+if not isinstance(meta, dict):
+    sys.exit(3)
+value = meta.get("status")
+if not isinstance(value, str) or not value.strip() or "\n" in value:
+    sys.exit(4)
+sys.stdout.write(value.strip())
+'
+
+# Release the lock this claim took (no email = no lock was taken). A failed
+# release is reported, never fatal: the refusal itself must still be printed.
+_release_claim_lock() {
+    local task_id="$1" email="$2"
+    [[ -n "$email" ]] || return 0
+    if ! "$SCRIPT_DIR/aitask_lock.sh" --unlock "$task_id" >/dev/null 2>&1; then
+        warn "could not release the lock on t${task_id} after refusing the claim; run: ait lock --unlock ${task_id}"
+    fi
+}
+
+# --- Force-acquire lock (unlock then re-lock) ---
+# Returns: 0=success (FORCE_UNLOCKED printed), 3=error (LOCK_ERROR printed)
+force_acquire_lock() {
+    local task_id="$1"
+    local email="$2"
+
+    if [[ -z "$email" ]]; then
+        return 0
+    fi
+
+    # Check who currently holds the lock
+    local check_output previous_owner
+    check_output=$("$SCRIPT_DIR/aitask_lock.sh" --check "$task_id" 2>&1) || true
+    previous_owner=$(echo "$check_output" | grep '^locked_by:' | sed 's/locked_by: *//')
+    [[ -z "$previous_owner" ]] && previous_owner="unknown"
+
+    # Force unlock then re-lock
+    "$SCRIPT_DIR/aitask_lock.sh" --unlock "$task_id" 2>/dev/null || true
+
+    local lock_output lock_exit=0
+    lock_output=$("$SCRIPT_DIR/aitask_lock.sh" --lock "$task_id" --email "$email" 2>&1) || lock_exit=$?
+
+    if [[ $lock_exit -eq 0 ]]; then
+        echo "FORCE_UNLOCKED:$previous_owner"
+        return 0
+    fi
+    echo "LOCK_ERROR:force_lock_failed"
+    return 3
+}
+
+# --- Update task status ---
+update_task_status() {
+    local task_id="$1"
+    local email="$2"
+
+    if [[ -n "$email" ]]; then
+        "$SCRIPT_DIR/aitask_update.sh" --batch "$task_id" --status Implementing --assigned-to "$email"
+    else
+        "$SCRIPT_DIR/aitask_update.sh" --batch "$task_id" --status Implementing
+    fi
+}
+
+# --- Commit and push ---
+
+# _commit_scoped <msg> <path>... — thin alias for task_git_commit_scoped in
+# lib/task_utils.sh, where the body now lives so that aitask_create.sh's
+# add_email_to_file() commits the shared contributor list through the SAME seam
+# (t1626). Contract is unchanged: 0 = committed, 2 = verified nothing to commit,
+# 1 = commit failed. Kept as an alias so every call site below stays as it was.
+_commit_scoped() { task_git_commit_scoped "$@"; }
+
+commit_and_push() {
+    local task_id="$1"; shift
+    local paths=( "$@" )
+    local rc
+
+    # The contributor list is a SHARED global file with no task owner: two
+    # claims of different tasks hold different task locks, so both can append
+    # before either commits. Path-scoping cannot give it per-claim provenance —
+    # only a message that stays true regardless of who appended can. So it gets
+    # its own commit, and never rides inside a claim commit.
+    if [[ "$EMAIL_STORED" == true ]]; then
+        rc=0; _commit_scoped "ait: Record contributor email" "$EMAILS_FILE" || rc=$?
+        [[ $rc -eq 1 ]] && warn "could not commit ${EMAILS_FILE}"
+    fi
+
+    # The claim commit — task-owned paths only. Committed LAST so HEAD is the
+    # claim, which the workflow and its tests read.
+    rc=0
+    _commit_scoped "ait: Start work on t${task_id}: set status to Implementing" \
+        ${paths[@]+"${paths[@]}"} || rc=$?
+    case $rc in
+        2) info "No changes to commit (task may already be in Implementing status)" ;;
+        1) warn "could not commit the t${task_id} claim" ;;
+    esac
+
+    # Push is best-effort — network failure should not block the workflow
+    task_push
+}
+
+# --- Main ---
+main() {
+    parse_args "$@"
+
+    # Step 1: Sync with remote (both modes)
+    sync_remote
+
+    # Sync-only mode: done. Report the real outcome — a failed sync used to be
+    # indistinguishable from a successful one here (always "SYNCED").
+    if [[ "$SYNC_ONLY" == true ]]; then
+        if [[ "$TASK_SYNC_STATUS" == "failed" ]]; then
+            echo "SYNC_FAILED:${TASK_SYNC_REASON}"
+        else
+            echo "SYNCED"
+        fi
+        return 0
+    fi
+
+    # Step 1b: Resolve email from task metadata or userconfig if not provided
+    local task_file=""
+    task_file=$(resolve_task_file "$TASK_ID" 2>/dev/null) || true
+    if [[ -z "$EMAIL" ]]; then
+        # Try assigned_to from the task file's frontmatter
+        if [[ -n "$task_file" && -f "$task_file" ]]; then
+            EMAIL=$(grep '^assigned_to:' "$task_file" 2>/dev/null | sed 's/assigned_to: *//' || true)
+        fi
+        # Fall back to userconfig.yaml
+        if [[ -z "$EMAIL" ]]; then
+            EMAIL=$(get_user_email)
+        fi
+    fi
+
+    # Step 1b' (t1663_4): the guarded claim needs a REAL lock. acquire_lock
+    # succeeds without locking anything when no email resolves, so a claim made
+    # "under the lock" would hold nothing and could overwrite another owner's
+    # task. Refuse before any lock, status or commit write.
+    if [[ -n "$EXPECT_STATUS" && -z "$EMAIL" ]]; then
+        echo "LOCK_REQUIRED:no_email"
+        exit 1
+    fi
+
+    # Step 1c: Capture prior status for self-reclaim detection.
+    # If the task was already in Implementing assigned to this email, the
+    # caller (task-workflow Step 4) surfaces a reclaim prompt — even if the
+    # lock branch is missing or out of sync (the LOCK_RECLAIM: path in
+    # acquire_lock cannot see this case).
+    local prev_status="" prev_assigned=""
+    if [[ -n "$task_file" && -f "$task_file" ]]; then
+        prev_status=$(grep '^status:' "$task_file" 2>/dev/null | sed 's/status: *//' || true)
+        prev_assigned=$(grep '^assigned_to:' "$task_file" 2>/dev/null | sed 's/assigned_to: *//' || true)
+    fi
+
+    # Step 2: Acquire lock — capture stdout so we can parse PRIOR_LOCK:
+    # before it's lost. Forward the captured output verbatim to our caller.
+    local lock_result=0 acquire_stdout=""
+    acquire_stdout=$(acquire_lock "$TASK_ID" "$EMAIL") || lock_result=$?
+    [[ -n "$acquire_stdout" ]] && echo "$acquire_stdout"
+
+    # 1 = another user's lock; 4/5 = our own email, but a different session on
+    # this host that is live (4) or undecidable (5). All three are overridable
+    # the same way, and force_acquire_lock unlocks first — so the re-lock sees
+    # no prior lock and the acquire gate cannot re-fire.
+    local forced_takeover=false
+    if [[ ( $lock_result -eq 1 || $lock_result -eq 4 || $lock_result -eq 5 ) \
+          && "$FORCE" == true ]]; then
+        local force_result=0
+        force_acquire_lock "$TASK_ID" "$EMAIL" || force_result=$?
+        if [[ $force_result -ne 0 ]]; then
+            exit 1
+        fi
+        forced_takeover=true
+    elif [[ $lock_result -eq 1 || $lock_result -eq 4 || $lock_result -eq 5 ]]; then
+        # LOCK_FAILED / LOCK_LIVE_HOLDER / LOCK_UNVERIFIABLE_HOLDER already
+        # printed by acquire_lock. Nothing was claimed — the gate refuses
+        # before the lock write, the status update, the contributor-list write
+        # and the commit — so there is no state to roll back here.
+        #
+        # The contributor list is named explicitly because it is the one that
+        # was NOT true until t1626: store_email used to run before this gate,
+        # so a refused claim reached here with emails.txt already appended and
+        # dirty. It is now written at Step 4, below every exit on this path.
+        exit 1
+    elif [[ $lock_result -eq 2 ]]; then
+        # LOCK_INFRA_MISSING already printed by acquire_lock
+        die "Run 'ait setup' to initialize lock infrastructure."
+    elif [[ $lock_result -eq 3 ]]; then
+        # LOCK_ERROR already printed by acquire_lock
+        exit 1
+    fi
+
+    # Parse PRIOR_LOCK: from acquire output (one line; format
+    # PRIOR_LOCK:<pid>|<starttime>|<host>|<locked_at>|<starttime_kind>).
+    # Empty fields are "-". A 4-field line from a writer that predates the
+    # kind field leaves prior_starttime_kind empty, which the ${…:-proc}
+    # default below resolves the same way aitask_lock.sh does.
+    local prior_pid="-" prior_starttime="-" prior_lock_host="-" prior_locked_at="-"
+    local prior_starttime_kind=""
+    local prior_line
+    prior_line=$(echo "$acquire_stdout" | grep '^PRIOR_LOCK:' | head -1 || true)
+    if [[ -n "$prior_line" ]]; then
+        IFS='|' read -r prior_pid prior_starttime prior_lock_host prior_locked_at \
+            prior_starttime_kind <<<"${prior_line#PRIOR_LOCK:}"
+    fi
+
+    # Step 2b (t1663_4): opt-in precondition, under the lock and above every
+    # write (status, contributor list, commit) -- see verify_expected_status.
+    if [[ -n "$EXPECT_STATUS" ]]; then
+        verify_expected_status "$TASK_ID" "$EMAIL" || exit 1
+    fi
+
+    # Step 3: Update task metadata
+    update_task_status "$TASK_ID" "$EMAIL"
+
+    # Step 4: Store email — AFTER the lock gate and the status write, and
+    # immediately before the commit that persists it (t1626).
+    #
+    # This used to run before acquire_lock, which meant a claim refused with
+    # LOCK_FAILED / LOCK_LIVE_HOLDER / LOCK_UNVERIFIABLE_HOLDER exited having
+    # already appended its address, leaving emails.txt dirty with nothing left
+    # to commit it. Every refusal path now precedes this write, so a refused
+    # claim writes nothing at all.
+    #
+    # Placed after update_task_status, not merely after the lock: there is no
+    # `set -e` early exit left between the append and commit_and_push below.
+    if [[ -n "$EMAIL" ]]; then
+        store_email "$EMAIL"
+    fi
+
+    # Step 5: Commit and push — ONLY the paths this claim owns. The task file is
+    # the sole task-owned path a claim writes: lock artifacts are blobs on the
+    # orphan aitask-locks branch, .aitask-gates/ is gitignored and written after
+    # this, and active_gates is committed separately by aitask_gate.sh
+    # materialize-active. emails.txt is handled inside commit_and_push, in its
+    # own commit, because it is shared rather than task-owned.
+    # -f, not -n: resolve_task_file also searches archived dirs and tar bundles,
+    # so it can return a path that is not on disk (same guard as Steps 1b/1c).
+    local commit_paths=( )
+    [[ -f "$task_file" ]] && commit_paths+=( "$task_file" )
+    commit_and_push "$TASK_ID" ${commit_paths[@]+"${commit_paths[@]}"}
+
+    # Output success
+    echo "OWNED:$TASK_ID"
+
+    # Post-claim: emit a reclaim signal when the task was already
+    # Implementing by this same email. Two cases:
+    #   RECLAIM_CRASH  — same host, prior PID anchor is PROVABLY dead
+    #   RECLAIM_STATUS — anomaly fallback (anything else)
+    # LOCK_RECLAIM: (cross-host) is emitted separately by aitask_lock.sh
+    # and forwarded above; we still emit one of the below for completeness —
+    # task-workflow's dispatcher prefers LOCK_RECLAIM > CRASH > STATUS.
+    if [[ "$prev_status" == "Implementing" && -n "$EMAIL" \
+          && "$prev_assigned" == "$EMAIL" && "$forced_takeover" == false ]]; then
+        local current_host liveness
+        current_host=$(hostname 2>/dev/null || echo "unknown")
+        liveness=$(lock_holder_liveness "$prior_pid" "$prior_starttime" \
+                                        "${prior_starttime_kind:-proc}")
+        # ONLY a provably dead same-host anchor is a crash. The other two
+        # verdicts no longer reach this point on a same-host lock: aitask_lock.sh's
+        # acquire gate refuses a live holder (LOCK_LIVE_HOLDER) and an
+        # undecidable one (LOCK_UNVERIFIABLE_HOLDER) BEFORE anything is claimed
+        # (t1466). What still lands on RECLAIM_STATUS here is the honest
+        # remainder: a lock that never recorded an anchor at all (pre-anchor,
+        # or a claim made outside tmux), a cross-host lock, this session's own
+        # refreshed lock, or a task whose Implementing status outlived its lock
+        # entirely.
+        #
+        # `forced_takeover` suppresses the whole block: the user has just
+        # confirmed a --force past one of those refusals, and re-asking
+        # "reclaim and continue?" immediately afterwards would prompt twice for
+        # one decision. (Different-email forces never matched the
+        # prev_assigned test above, so this changes nothing for them.)
+        if [[ "$prior_lock_host" == "$current_host" && "$liveness" == "dead" ]]; then
+            echo "RECLAIM_CRASH:${prior_locked_at}|${prior_lock_host}|${prior_pid}"
+        else
+            echo "RECLAIM_STATUS:${prev_status}|${prev_assigned}"
+        fi
+    fi
+
+    # Post-claim: snapshot the working tree's dirty set as this task's
+    # attribution baseline (t1263). It is the "proven negative" signal
+    # aitask_change_surface.sh uses to tell OTHER work's dirty paths from this
+    # task's -- without it, a consumer like the docs_updated gate sees the whole
+    # dirty tree with no way to know whose it is.
+    #
+    # FRESH CLAIMS ONLY. A reclaim/resume must keep the original baseline, or
+    # this session's own in-progress work would be re-baselined as "other work".
+    #
+    # Runs LAST and fully silenced: every stdout line above is part of this
+    # script's parsed output contract, so the capture must not be able to add to
+    # it. Best-effort (`|| true`) per shell_conventions.md -- a capture failure
+    # must never fail a claim; it degrades to BASELINE:missing, which makes the
+    # consumer escalate rather than misattribute. Measured at ~17ms on a large
+    # repo, against a claim that already does a fetch, a commit and a push.
+    if [[ "$prev_status" != "Implementing" ]]; then
+        "$SCRIPT_DIR/aitask_change_surface.sh" capture "$TASK_ID" >/dev/null 2>&1 || true
+    fi
+}
+
+main "$@"

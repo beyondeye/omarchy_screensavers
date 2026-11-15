@@ -1,0 +1,1003 @@
+#!/usr/bin/env bash
+# tmux_bootstrap.sh - Spawn a project's tmux session detached.
+#
+# Shared between `aitask_ide.sh` (sourced), `tui_switcher.py` and
+# `agent_restore.py` (both via the standalone CLI form below). Single source of
+# truth for: how a session is named, which window is seeded first, how a
+# session is claimed for a project (the @aitask_project_root stamp, t1922),
+# and whether the syncer auto-starts.
+#
+# Sourced form (from aitask_ide.sh):
+#     source "$SCRIPT_DIR/lib/tmux_bootstrap.sh"
+#     # then call any of the public helpers below.
+#
+# Standalone form (from tui_switcher.py via `bash <path> <root>`):
+#     bash .aitask-scripts/lib/tmux_bootstrap.sh /path/to/project
+#         Idempotent — no-op if the target session already exists.
+#
+# Create-only form (from agent_restore.py, restoring a frozen agent whose
+# project has no tmux session — t1784):
+#     bash .aitask-scripts/lib/tmux_bootstrap.sh --create-only /path/to/project
+#         Create the session or change nothing; see spawn_session_detached.
+#         Also refuses (exit 44) when tmux.default_session is unreadable.
+
+# Guard against double-sourcing.
+if [[ -n "${_AIT_TMUX_BOOTSTRAP_LOADED:-}" ]]; then
+    # shellcheck disable=SC2317  # `return` is reachable when sourced.
+    return 0 2>/dev/null || true
+fi
+_AIT_TMUX_BOOTSTRAP_LOADED=1
+
+# Resolve our own SCRIPT_DIR so the standalone form can find sibling
+# scripts (terminal_compat.sh, aitask_projects.sh). When sourced, the
+# caller's SCRIPT_DIR already points at .aitask-scripts/; we recompute
+# our own anchor here to stay robust to either case.
+_TMUX_BOOTSTRAP_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+_TMUX_BOOTSTRAP_SCRIPTS_DIR="$(cd "$_TMUX_BOOTSTRAP_LIB_DIR/.." && pwd)"
+
+# Gateway for all tmux invocations (socket flag + exact-match targeting),
+# shared with the Python TmuxClient. Pulls in terminal_compat.sh (die/warn/info)
+# transitively; both are guarded against double-sourcing.
+# shellcheck source=tmux_exec.sh disable=SC1091
+source "$_TMUX_BOOTSTRAP_LIB_DIR/tmux_exec.sh"
+# Interpreter for the session-claim ownership evidence (t1922). Already in the
+# scaffold baseline (tests/lib/test_scaffold.sh); guarded against re-sourcing.
+# shellcheck source=python_resolve.sh disable=SC1091
+source "$_TMUX_BOOTSTRAP_LIB_DIR/python_resolve.sh"
+# Cross-process mutex serializing session claims (t1922). In the scaffold
+# baseline together with its stale_lock.sh core.
+# shellcheck source=registry_lock.sh disable=SC1091
+source "$_TMUX_BOOTSTRAP_LIB_DIR/registry_lock.sh"
+
+# --- Public helpers (callable after sourcing) ---------------------------
+
+# --- tmux.default_session reader (t1800, t1811) -------------------------
+#
+# Twin of agent_launch_utils.py::read_default_session_status /
+# _classify_line_value; tests/test_tmux_default_session_resolvers.py pins the
+# two against each other and against PyYAML (fixed rows plus a generated
+# corpus). The shared rule, measured against PyYAML 6.0.3:
+#
+#   * The key counts only as a direct child of a column-0 `tmux:` block (the
+#     block's first indented content line fixes the child indent). The key may
+#     be quoted and may have spaces before its colon.
+#   * The value is read only when YAML would read back the same string:
+#       - only a space separates; a non-empty value must start with one, and
+#         trimming removes spaces only (NBSP is content);
+#       - a tab outside quotes or a comment, and any C0/DEL/C1, U+2028/2029 or
+#         U+FFFE/FFFF byte sequence on the line, is an error for YAML;
+#       - quoted: closed on this line, no `\` in "…", no `''` in '…', and only
+#         spaces (then an optional `#` comment) after the closing quote;
+#       - plain: `#` starts a comment only first or after a space; no leading
+#         indicator, no ": " and no trailing ":", and not typed by one of
+#         PyYAML's implicit resolvers unless it round-trips (canonical decimal
+#         ints, True, False).
+#   * Structure it cannot follow is reported, not guessed: a flow or non-mapping
+#     `tmux` block holding the key, a value continued onto a line indented
+#     differently from the key, and a second key or later `tmux` block (YAML
+#     keeps the last one).
+#   * Null spellings, empty, comment-only and Unicode-whitespace-only values mean
+#     "not configured".
+#   * The whole file is checked for the bytes PyYAML's Reader refuses before it
+#     parses anything: invalid UTF-8 (`encoding`, which wins over every other
+#     shape) and a non-printable character on any line (`non_printable`, reported
+#     only when no line shape was). NUL is mapped to \001 first, since awk cannot
+#     carry it portably; both are non-printable, and \001 is a line control.
+#   * Not detected, by decision (t1825): a structurally invalid line elsewhere in
+#     the file. Only a full YAML parse sees it; there load_tmux_defaults falls
+#     back to "aitasks" while this reader returns the configured value.
+#   * Readable is not the same as usable (t1828). A value the rules above accept
+#     is additionally refused when tmux cannot address it — `.` or `:` anywhere
+#     in the name — as `illegal_tmux_name`, the last shape in precedence and the
+#     only one where YAML read the value correctly. That check lives in
+#     _tmux_bootstrap_default_session_scan_checked, NOT in the awk below, which
+#     keeps reporting only what YAML reads. load_tmux_defaults applies the same
+#     rule, so every reader agrees on a name tmux can target.
+#
+# `tr '\r\000' '\n\001'` gives awk the universal newlines Python's open() applies, so
+# a CRLF blank line (a lone "\r" record) cannot end the block and a CR-only
+# file is not read as one record. awk reads to end of input rather than
+# `exit`ing on the match: an early exit leaves `tr` writing into a closed pipe
+# (SIGPIPE, exit 141), which aborts a direct call under set -e + pipefail. The
+# awk runs under LC_ALL=C and matches multibyte sequences as literal byte
+# strings passed through the environment, so no awk needs `\x` escapes or
+# locale-aware character classes. Output uses printf, never echo — bash's echo
+# swallows an option-like name such as `-n`.
+
+# Byte strings for the awk classifier (see _tmux_bootstrap_default_session_scan).
+_TMUX_BOOTSTRAP_YAML_CTRL="$(printf '\001\002\003\004\005\006\007\010\013\014\015\016\017\020\021\022\023\024\025\026\027\030\031\032\033\034\035\036\037\177')"
+_TMUX_BOOTSTRAP_YAML_C1LEAD="$(printf '\302')"
+_TMUX_BOOTSTRAP_YAML_C1TAIL="$(printf '\200\201\202\203\204\205\206\207\210\211\212\213\214\215\216\217\220\221\222\223\224\225\226\227\230\231\232\233\234\235\236\237')"
+_TMUX_BOOTSTRAP_YAML_BREAKS="$(printf '\342\200\250|\342\200\251|\357\277\276|\357\277\277')"
+_TMUX_BOOTSTRAP_YAML_BLANKS="$(printf ' |\t|\302\240|\341\232\200|\342\200\200|\342\200\201|\342\200\202|\342\200\203|\342\200\204|\342\200\205|\342\200\206|\342\200\207|\342\200\210|\342\200\211|\342\200\212|\342\200\257|\342\201\237|\343\200\200')"
+_TMUX_BOOTSTRAP_YAML_BOM="$(printf '\357\273\277')"
+# Bytes \001-\377 in order, so awk can map a byte to its ordinal (ORD[]) without
+# `\x` escapes or locale-dependent classes.
+_TMUX_BOOTSTRAP_YAML_BYTES="$(for _b in {1..255}; do printf '%b' "\\0$(printf '%03o' "$_b")"; done)"
+unset _b
+
+# awk functions shared by the reader (scan) and the writer (render), so both
+# agree on which line opens the `tmux` block and which carries the key. Callers
+# pass `-v SQ="'"`.
+#   key_match(s, name): 1 if s opens key `name` (plain or quoted, spaces allowed
+#     before the colon); sets KREST to the text after the colon.
+#   header_kind(line): for a column-0 line, "" unless it opens `tmux`; "map"
+#     (nothing, a comment, a named `&anchor` or exactly `!!map` after the colon),
+#     "flow" (`{`/`[`) or "invalid" (any other inline content — every other tag
+#     included, since YAML fails or reads a non-mapping). Mirrors
+#     agent_launch_utils._tmux_header_kind.
+# shellcheck disable=SC2016  # awk source, not shell expansions
+_TMUX_BOOTSTRAP_AWK_KEYS='
+        function key_match(s, name,    n, q) {
+            n = length(name)
+            if (substr(s, 1, n) == name) {
+                s = substr(s, n + 1)
+            } else {
+                q = substr(s, 1, 1)
+                if ((q == "\"" || q == SQ) && substr(s, 2, n) == name && substr(s, n + 2, 1) == q)
+                    s = substr(s, n + 3)
+                else
+                    return 0
+            }
+            sub(/^ */, "", s)
+            if (substr(s, 1, 1) != ":") return 0
+            KREST = substr(s, 2)
+            return 1
+        }
+        function header_kind(line,    r, p, c) {
+            if (!key_match(line, "tmux")) return ""
+            r = KREST
+            if (r == "") return "map"
+            if (substr(r, 1, 1) != " ") return ""
+            p = index(r, " #")
+            if (p) r = substr(r, 1, p - 1)
+            sub(/^ +/, "", r); sub(/ +$/, "", r)
+            if (r == "") return "map"
+            c = substr(r, 1, 1)
+            if (c == "{" || c == "[") return "flow"
+            if (r == "!!map" || r ~ /^&[0-9A-Za-z_-]+$/) return "map"
+            return "invalid"
+        }
+'
+
+# _tmux_bootstrap_default_session_scan <project_root>
+#
+# Prints exactly one line: `ok<TAB><value>` (an empty value means "not
+# configured", including a missing config file) or `bad<TAB><shape>`, with
+# <shape> from agent_launch_utils.DEFAULT_SESSION_PROBLEM_SHAPES. Writes nothing
+# to stderr and always returns 0; the public helpers below decide what to say.
+#
+# Reports only what YAML reads. Callers wanting the usability rule too (a name
+# tmux cannot address) call _tmux_bootstrap_default_session_scan_checked, which
+# wraps this — both production consumers do.
+_tmux_bootstrap_default_session_scan() {
+    local cfg="$1/aitasks/metadata/project_config.yaml"
+    if [[ ! -f "$cfg" ]]; then
+        printf 'ok\t\n'
+        return 0
+    fi
+    # `tr` needs LC_ALL=C too, not just the awk below it: BSD tr (macOS) reads
+    # its input as characters in the caller's locale and aborts with "Illegal
+    # byte sequence" on invalid UTF-8, truncating the stream — so the very bytes
+    # the ENC_BAD check exists to find never reach awk, and `encoding` is
+    # silently never reported on macOS.
+    LC_ALL=C tr '\r\000' '\n\001' < "$cfg" | LC_ALL=C BYTES="$_TMUX_BOOTSTRAP_YAML_BYTES" \
+        CTRL="$_TMUX_BOOTSTRAP_YAML_CTRL" C1LEAD="$_TMUX_BOOTSTRAP_YAML_C1LEAD" \
+        C1TAIL="$_TMUX_BOOTSTRAP_YAML_C1TAIL" BREAKS="$_TMUX_BOOTSTRAP_YAML_BREAKS" \
+        BLANKS="$_TMUX_BOOTSTRAP_YAML_BLANKS" BOM="$_TMUX_BOOTSTRAP_YAML_BOM" \
+        awk -v SQ="'" "$_TMUX_BOOTSTRAP_AWK_KEYS"'
+        function has_control(s,    i, n, c, k) {
+            n = length(s)
+            for (i = 1; i <= n; i++) {
+                c = substr(s, i, 1)
+                if (index(ENVIRON["CTRL"], c)) return 1
+                if (c == ENVIRON["C1LEAD"] && i < n && index(ENVIRON["C1TAIL"], substr(s, i + 1, 1))) return 1
+            }
+            for (k = 1; k <= nbreaks; k++) if (index(s, BRK[k])) return 1
+            return 0
+        }
+        # Whole-file byte check (see the header): sets ENC_BAD on invalid UTF-8
+        # (RFC 3629 table, as Python strict decode) and NON_PRINT on a character
+        # PyYAML 6.0.3 Reader.NON_PRINTABLE refuses. Keep in sync with
+        # agent_launch_utils._YAML_NON_PRINTABLE.
+        function bytes_check(s,    i, n, b, need, lo, hi, lead, b2) {
+            n = length(s); need = 0
+            for (i = 1; i <= n; i++) {
+                b = ORD[substr(s, i, 1)]
+                if (need) {
+                    if (b < lo || b > hi) { ENC_BAD = 1; return }
+                    if (b2 < 0) b2 = b
+                    lo = 128; hi = 191; need--
+                    # NON_PRINTABLE multibyte: U+0080-U+0084, U+0086-U+009F, U+FFFE/F.
+                    if (need == 0 && lead == 194 && b2 <= 159 && b2 != 133) NON_PRINT = 1
+                    if (need == 0 && lead == 239 && b2 == 191 && b >= 190) NON_PRINT = 1
+                    continue
+                }
+                if (b < 128) {
+                    if (b < 9 || b == 11 || b == 12 || (b >= 14 && b <= 31) || b == 127) NON_PRINT = 1
+                    continue
+                }
+                lead = b; b2 = -1; lo = 128; hi = 191
+                if (b >= 194 && b <= 223) need = 1
+                else if (b == 224) { need = 2; lo = 160 }
+                else if ((b >= 225 && b <= 236) || b == 238 || b == 239) need = 2
+                else if (b == 237) { need = 2; hi = 159 }
+                else if (b == 240) { need = 3; lo = 144 }
+                else if (b >= 241 && b <= 243) need = 3
+                else if (b == 244) { need = 3; hi = 143 }
+                else { ENC_BAD = 1; return }
+            }
+            if (need) ENC_BAD = 1
+        }
+        function strip_blank(s,    k, p, seq) {
+            for (k = 1; k <= nblanks; k++) {
+                seq = BLK[k]
+                while ((p = index(s, seq)) > 0) s = substr(s, 1, p - 1) substr(s, p + length(seq))
+            }
+            return s
+        }
+        # PyYAML 6.0.3 implicit resolvers (yaml/resolver.py): bool, int, float,
+        # timestamp, merge, value. Keep in sync with _YAML_TYPED_PLAIN.
+        function typed(v) {
+            if (v ~ /^(yes|Yes|YES|no|No|NO|true|True|TRUE|false|False|FALSE|on|On|ON|off|Off|OFF)$/) return 1
+            if (v ~ /^[-+]?(0b[0-1_]+|0[0-7_]+|0|[1-9][0-9_]*|0x[0-9a-fA-F_]+|[1-9][0-9_]*(:[0-5]?[0-9])+)$/) return 1
+            if (v ~ /^([-+]?[0-9][0-9_]*\.[0-9_]*([eE][-+][0-9]+)?|\.[0-9][0-9_]*([eE][-+][0-9]+)?|[-+]?[0-9][0-9_]*(:[0-5]?[0-9])+\.[0-9_]*|[-+]?\.(inf|Inf|INF)|\.(nan|NaN|NAN))$/) return 1
+            if (v ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]$/) return 1
+            if (v ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]?-[0-9][0-9]?([Tt]|[ \t]+)[0-9][0-9]?:[0-9][0-9]:[0-9][0-9](\.[0-9]*)?([ \t]*(Z|[-+][0-9][0-9]?(:[0-9][0-9])?))?$/) return 1
+            return (v == "<<" || v == "=")
+        }
+        # Sets CVAL to the value (empty = not configured); returns a shape or "".
+        function classify(raw,    h, s, q, e, body, tr, cut, v) {
+            CVAL = ""
+            if (raw == "") return ""
+            if (has_control(raw)) return "tab_or_control"
+            h = substr(raw, 1, 1)
+            if (h != " ") return (h == "\t" ? "tab_or_control" : "missing_separator")
+            s = raw
+            sub(/^ +/, "", s)
+            if (s == "") return ""
+            q = substr(s, 1, 1)
+            if (q == "\"" || q == SQ) {
+                e = index(substr(s, 2), q)
+                if (e == 0) return "continuation"
+                e = e + 1
+                if (q == SQ && substr(s, e + 1, 1) == SQ) return "quoted_escape"
+                body = substr(s, 2, e - 2)
+                if (q == "\"" && index(body, "\\")) return "quoted_escape"
+                tr = substr(s, e + 1)
+                sub(/^ +/, "", tr)
+                if (tr != "" && substr(tr, 1, 1) != "#")
+                    return (substr(tr, 1, 1) == "\t" ? "tab_or_control" : "trailing_content")
+                if (strip_blank(body) != "") CVAL = body
+                return ""
+            }
+            if (q == "#") return ""
+            cut = index(s, " #")
+            v = (cut ? substr(s, 1, cut - 1) : s)
+            sub(/ +$/, "", v)
+            if (index(v, "\t")) return "tab_or_control"
+            h = substr(v, 1, 1)
+            if (h == "|" || h == ">") return "block_scalar"
+            if (h == "[" || h == "{") return "flow_collection"
+            if (h == "&" || h == "*" || h == "!") return "node_property"
+            if (index(",]}%@`", h)) return "indicator"
+            if ((h == "-" || h == "?" || h == ":") && (length(v) == 1 || substr(v, 2, 1) == " ")) return "indicator"
+            if (v == "~" || v == "null" || v == "Null" || v == "NULL") return ""
+            if (index(v, ": ") || substr(v, length(v), 1) == ":") return "mapping_indicator"
+            if (typed(v) && v !~ /^(0|-?[1-9][0-9]*|True|False)$/) return "typed_scalar"
+            if (strip_blank(v) != "") CVAL = v
+            return ""
+        }
+        BEGIN {
+            nbreaks = split(ENVIRON["BREAKS"], BRK, "|")
+            nblanks = split(ENVIRON["BLANKS"], BLK, "|")
+            for (i = 1; i <= 255; i++) ORD[substr(ENVIRON["BYTES"], i, 1)] = i
+            ENC_BAD = 0; NON_PRINT = 0
+            block = ""; ci = -1; found = 0; val = ""; problem = ""; check_next = 0
+        }
+        {
+            if (!ENC_BAD) bytes_check($0)
+            line = $0
+            if (NR == 1 && substr(line, 1, length(ENVIRON["BOM"])) == ENVIRON["BOM"])
+                line = substr(line, length(ENVIRON["BOM"]) + 1)
+            t = line
+            gsub(/[ \t]/, "", t)
+            if (t == "") next
+            t = line
+            sub(/^[ \t]+/, "", t)
+            if (substr(t, 1, 1) == "#") next
+            c1 = substr(line, 1, 1)
+            if (check_next) {
+                # The line after the key decides whether its value continues.
+                check_next = 0
+                if (c1 == " ") {
+                    match(line, /^ +/)
+                    if (RLENGTH != ci && problem == "") problem = "continuation"
+                }
+            }
+            if (c1 != " " && c1 != "\t") {
+                h = header_kind(line)
+                if (h != "" && found && problem == "") problem = "duplicate_key"
+                if ((h == "flow" || h == "invalid") && index(line, "default_session") && problem == "")
+                    problem = (h == "flow" ? "flow_mapping" : "invalid_block")
+                block = h; ci = -1
+                next
+            }
+            # Tab indentation is invalid YAML; the Python twin ignores it too.
+            if (block == "" || c1 == "\t") next
+            if (block != "map") {
+                if (index(line, "default_session") && problem == "")
+                    problem = (block == "flow" ? "flow_mapping" : "invalid_block")
+                next
+            }
+            match(line, /^ +/)
+            ind = RLENGTH
+            if (ci < 0) ci = ind
+            if (ind != ci) next
+            if (!key_match(substr(line, ind + 1), "default_session")) next
+            if (found) {
+                if (problem == "") problem = "duplicate_key"
+                next
+            }
+            found = 1
+            shape = classify(KREST)
+            if (shape != "" && problem == "") problem = shape
+            val = CVAL
+            check_next = 1
+        }
+        END {
+            if (ENC_BAD) printf "bad\tencoding\n"
+            else if (problem != "") printf "bad\t%s\n", problem
+            else if (NON_PRINT) printf "bad\tnon_printable\n"
+            else printf "ok\t%s\n", val
+        }
+    '
+}
+
+# _tmux_bootstrap_report_unreadable <config_path> <shape>
+#
+# The structured sentinel first (parsed by
+# agent_launch_utils.parse_default_session_unreadable), then the human line —
+# the same two-line shape as the BOOTSTRAP_FAILED: refusals.
+_tmux_bootstrap_report_unreadable() {
+    printf 'DEFAULT_SESSION_UNREADABLE:%s:%s\n' "$2" "$1" >&2
+    case "$2" in
+        illegal_tmux_name)
+            # Neither sentence below is true of `a.b`: it IS a single-line plain
+            # value, and the file IS valid YAML. The value was read correctly and
+            # is simply unusable as a tmux target.
+            # shellcheck disable=SC2016  # the backticks are literal text
+            printf 'Warning: tmux.default_session in %s is a name tmux cannot address (%s: `.` and `:` are tmux target separators); write a name without them\n' "$1" "$2" >&2
+            return 0
+            ;;
+        encoding|non_printable)
+            printf 'Warning: %s is not valid YAML (%s: invalid UTF-8 or a non-printable character); tmux.default_session cannot be trusted\n' "$1" "$2" >&2
+            return 0
+            ;;
+    esac
+    # shellcheck disable=SC2016  # the backticks are literal text in the message
+    printf 'Warning: tmux.default_session in %s is not a single-line plain or quoted value (%s); write it as e.g. `default_session: myproject`\n' "$1" "$2" >&2
+}
+
+# _tmux_bootstrap_default_session_raw <project_root>
+#
+# Prints the configured `tmux.default_session`, or nothing when it is not
+# configured; returns 0. When the value cannot be read faithfully, prints
+# nothing to stdout, reports it on stderr and returns 2 — the caller decides
+# whether to fall back (ait ide, ensure-mode bootstrap) or refuse
+# (--create-only), or to leave the file alone (ait setup).
+_tmux_bootstrap_default_session_raw() {
+    local scan
+    scan=$(_tmux_bootstrap_default_session_scan_checked "$1")
+    case "$scan" in
+        bad$'\t'*)
+            _tmux_bootstrap_report_unreadable "$1/aitasks/metadata/project_config.yaml" "${scan#bad$'\t'}"
+            return 2
+            ;;
+        ok$'\t'?*)
+            printf '%s\n' "${scan#ok$'\t'}"
+            ;;
+    esac
+    return 0
+}
+
+# _tmux_bootstrap_resolve_session <project_root>
+#
+# Prints the tmux session name for <project_root>: the configured
+# `tmux.default_session`, or the literal "aitasks" when it is absent, blank, or
+# unreadable (reported on stderr by the raw reader).
+_tmux_bootstrap_resolve_session() {
+    local name rc=0
+    name=$(_tmux_bootstrap_default_session_raw "$1") || rc=$?
+    if [[ $rc -eq 2 ]]; then
+        printf "Warning: using tmux session 'aitasks' instead\n" >&2
+    fi
+    if [[ $rc -ne 0 || -z "$name" ]]; then
+        name=aitasks
+    fi
+    printf '%s\n' "$name"
+}
+
+# _tmux_bootstrap_session_name_ok <name>
+#
+# Returns 1 when <name> holds `.` or `:` — tmux reads both as target separators,
+# so such a session can be created but never addressed. Shared by `ait setup`
+# (which falls back to the default) and `ait ide --session` (which refuses).
+_tmux_bootstrap_session_name_ok() {
+    [[ "$1" != *[.:]* ]]
+}
+
+# _tmux_bootstrap_default_session_scan_checked <project_root>
+#
+# _tmux_bootstrap_default_session_scan with one further rejection layered on
+# top: a value the scanner read faithfully but tmux cannot address becomes
+# `bad<TAB>illegal_tmux_name`. Same one-line contract as the scanner.
+#
+# The check is deliberately NOT inside the awk. The scanner's contract is "what
+# YAML reads", and `a.b` is read correctly — it is unusable, not unreadable. So
+# the usability layer sits here, in bash, where it can reuse
+# _tmux_bootstrap_session_name_ok and keep one definition of the rule shared
+# with `ait ide --session` and `ait setup`.
+#
+# Both scan consumers route through this, which is the point: spawn_session_detached
+# reads the scan directly and would otherwise still hand tmux the name (t1828).
+_tmux_bootstrap_default_session_scan_checked() {
+    local scan
+    scan=$(_tmux_bootstrap_default_session_scan "$1")
+    case "$scan" in
+        ok$'\t'?*)
+            _tmux_bootstrap_session_name_ok "${scan#ok$'\t'}" \
+                || scan=$'bad\tillegal_tmux_name'
+            ;;
+    esac
+    printf '%s\n' "$scan"
+}
+
+# _tmux_bootstrap_session_for <project_root> [override]
+#
+# The session `ait ide` targets: a non-empty <override> verbatim (`--session`),
+# otherwise the resolved session for <project_root>.
+_tmux_bootstrap_session_for() {
+    if [[ -n "${2:-}" ]]; then
+        printf '%s\n' "$2"
+        return 0
+    fi
+    _tmux_bootstrap_resolve_session "$1"
+}
+
+# _tmux_bootstrap_yaml_session_literal <name>
+#
+# The YAML spelling of <name> that the reader above reads back verbatim: plain
+# for an identifier YAML does not type (not a bool or null spelling), otherwise
+# single-quoted, or double-quoted when the name holds a `'` (the reader refuses
+# a doubled `''`). Returns 1 for a name no spelling carries — one holding both a
+# `'` and a `"` or `\`. Control characters are left to the caller's read-back.
+_tmux_bootstrap_yaml_session_literal() {
+    local v="$1"
+    if [[ "$v" =~ ^[A-Za-z_][A-Za-z0-9_-]*$ ]] \
+        && ! [[ "$v" =~ ^(yes|Yes|YES|no|No|NO|true|True|TRUE|false|False|FALSE|on|On|ON|off|Off|OFF|null|Null|NULL)$ ]]; then
+        printf '%s' "$v"
+    elif [[ "$v" != *\'* ]]; then
+        printf "'%s'" "$v"
+    elif [[ "$v" != *\"* && "$v" != *\\* ]]; then
+        printf '"%s"' "$v"
+    else
+        return 1
+    fi
+}
+
+# _tmux_bootstrap_render_default_session <config_file> <yaml_literal>
+#
+# Prints <config_file> with `tmux.default_session` set to <yaml_literal>, without
+# modifying the file. Only the direct child of the LAST column-0 `tmux:` block
+# (the one YAML keeps) at the block's child indent is replaced, keeping the key's
+# own spelling and dropping its old value and comment; a nested
+# `syncer: default_session:` is left alone. With no key in that block the key is
+# inserted right after the header at the child indent (2 when the block has no
+# children); with no block, one is appended. The literal is passed through the
+# environment, never `awk -v`, which would process backslash escapes. CRLF line
+# endings are preserved, including on inserted lines.
+_tmux_bootstrap_render_default_session() {
+    LC_ALL=C LITERAL="$2" BOM="$_TMUX_BOOTSTRAP_YAML_BOM" \
+        awk -v SQ="'" "$_TMUX_BOOTSTRAP_AWK_KEYS"'
+        function bare(i,    l) {
+            l = L[i]
+            sub(/\r$/, "", l)
+            if (i == 1 && substr(l, 1, length(ENVIRON["BOM"])) == ENVIRON["BOM"])
+                l = substr(l, length(ENVIRON["BOM"]) + 1)
+            return l
+        }
+        function eol(i) { return (L[i] ~ /\r$/) ? "\r" : "" }
+        { L[NR] = $0 }
+        END {
+            n = NR; hdr = 0
+            for (i = 1; i <= n; i++) {
+                c = substr(bare(i), 1, 1)
+                if (c == "" || c == " " || c == "\t" || c == "#") continue
+                if (header_kind(bare(i)) == "map") hdr = i
+            }
+            if (!hdr) {
+                for (i = 1; i <= n; i++) print L[i]
+                e = (n ? eol(1) : "")
+                printf "%s\ntmux:%s\n  default_session: %s%s\n", e, e, ENVIRON["LITERAL"], e
+                exit
+            }
+            ci = -1; key = 0
+            for (i = hdr + 1; i <= n; i++) {
+                l = bare(i)
+                t = l; gsub(/[ \t]/, "", t)
+                if (t == "") continue
+                t = l; sub(/^[ \t]+/, "", t)
+                if (substr(t, 1, 1) == "#") continue
+                c = substr(l, 1, 1)
+                if (c != " " && c != "\t") break
+                if (c == "\t") continue
+                match(l, /^ +/); ind = RLENGTH
+                if (ci < 0) ci = ind
+                if (ind == ci && key_match(substr(l, ind + 1), "default_session")) { key = i; break }
+            }
+            for (i = 1; i <= n; i++) {
+                if (i == key) {
+                    l = bare(i)
+                    key_match(substr(l, ci + 1), "default_session")
+                    print substr(l, 1, length(l) - length(KREST)) " " ENVIRON["LITERAL"] eol(i)
+                    continue
+                }
+                print L[i]
+                if (i == hdr && !key) {
+                    pad = ""
+                    for (k = 0; k < (ci > 0 ? ci : 2); k++) pad = pad " "
+                    print pad "default_session: " ENVIRON["LITERAL"] eol(i)
+                }
+            }
+        }
+    ' "$1"
+}
+
+# _tmux_bootstrap_read_syncer_autostart <project_root>
+#
+# Echoes "1" if tmux.syncer.autostart is true in <project_root>'s
+# project_config.yaml; "0" otherwise (mirrors
+# aitask_ide.sh::read_syncer_autostart).
+_tmux_bootstrap_read_syncer_autostart() {
+    local root="$1"
+    local cfg="$root/aitasks/metadata/project_config.yaml"
+    [[ -f "$cfg" ]] || { echo "0"; return; }
+    local out
+    out=$(awk '
+        /^tmux:/ { intmux=1; next }
+        intmux && /^  syncer:/ { insyncer=1; next }
+        insyncer && /^    autostart:/ {
+            sub(/^    autostart:[ \t]*/, "")
+            gsub(/"/, "")
+            gsub(/'"'"'/, "")
+            sub(/[[:space:]]+$/, "")
+            if ($0 == "true") { print "1"; exit }
+            print "0"; exit
+        }
+        /^[^ #]/ && !/^tmux:/ { intmux=0; insyncer=0 }
+        intmux && /^  [^ ]/ && !/^  syncer:/ { insyncer=0 }
+    ' "$cfg" 2>/dev/null)
+    [[ -z "$out" ]] && out="0"
+    echo "$out"
+}
+
+# Session-scoped tmux user option naming the project that owns a session
+# (t1922). Mirrors agent_launch_utils.PROJECT_ROOT_OPTION, which discovery
+# treats as authoritative. It dies with the session, so — unlike the global
+# AITASKS_PROJECT_<session> it supersedes — no later session reusing the name
+# can inherit it.
+_TMUX_BOOTSTRAP_ROOT_OPTION="@aitask_project_root"
+
+# _tmux_bootstrap_realpath <dir> — physical path, or empty if not a directory.
+_tmux_bootstrap_realpath() {
+    (cd "$1" 2>/dev/null && pwd -P) || true
+}
+
+# _tmux_bootstrap_is_project <dir> — 0 if <dir> carries the project marker.
+_tmux_bootstrap_is_project() {
+    [[ -n "$1" && -f "$1/aitasks/metadata/project_config.yaml" ]]
+}
+
+# _tmux_bootstrap_read_stamp <session>
+#
+# Prints the session's @aitask_project_root (empty when unset) and returns 0,
+# or returns 1 when the read could not be done. Read from the same
+# `list-sessions` line discovery parses, not from show-options/display-message:
+# both of those answer rc 0 with empty output for a session that does not
+# exist (measured, tmux 3.7c), which would turn a failed read into "unset".
+# A missing row is a failure too — every caller has just seen the session.
+_tmux_bootstrap_read_stamp() {
+    local session="$1" out line name
+    if ! out=$(ait_tmux list-sessions -F "#{session_name}	#{${_TMUX_BOOTSTRAP_ROOT_OPTION}}" 2>/dev/null); then
+        return 1
+    fi
+    while IFS= read -r line; do
+        name="${line%%	*}"
+        [[ "$name" == "$session" ]] || continue
+        [[ "$line" == *"	"* ]] && printf '%s\n' "${line#*	}" || printf '\n'
+        return 0
+    done <<<"$out"
+    return 1
+}
+
+# _tmux_bootstrap_session_evidence <session>
+#
+# Which project discovery gives <session> WITHOUT its stamp (pane vote, then
+# the legacy global) — asked of discovery itself
+# (agent_launch_utils.unregistered_session_attribution), so the claim and the
+# monitor can never disagree about a pre-stamp session. Prints ROOT:<path>,
+# NONE, or UNVERIFIED; anything that prevents a complete answer (no Python, a
+# crash, a failed tmux query) is UNVERIFIED, never NONE.
+_tmux_bootstrap_session_evidence() {
+    local session="$1" py out
+    py=$(resolve_python 2>/dev/null) || py=""
+    if [[ -z "$py" ]]; then
+        echo UNVERIFIED
+        return 0
+    fi
+    out=$("$py" - "$_TMUX_BOOTSTRAP_LIB_DIR" "$session" 2>/dev/null <<'PYEOF'
+import sys
+lib, session = sys.argv[1:3]
+sys.path.insert(0, lib)
+import agent_launch_utils as alu
+root, complete = alu.unregistered_session_attribution(session)
+if not complete:
+    print("UNVERIFIED")
+elif root is None:
+    print("NONE")
+else:
+    print(f"ROOT:{root}")
+PYEOF
+) || out=""
+    case "$out" in
+        ROOT:*|NONE) printf '%s\n' "$out" ;;
+        *) echo UNVERIFIED ;;
+    esac
+}
+
+# _tmux_bootstrap_report_claim <code> <session> [owner]
+#
+# A claim refusal: the structured sentinel first, the human-readable line LAST
+# (tui_switcher._ensure_session_live shows the last stderr line).
+_tmux_bootstrap_report_claim() {
+    local code="$1" session="$2" owner="${3:-}"
+    case "$code" in
+        45)
+            echo "BOOTSTRAP_FAILED:session_owned:$session:$owner" >&2
+            echo "tmux session '$session' belongs to project $owner — not re-pointing it. Use 'ait ide --session NAME' for a separate session." >&2
+            ;;
+        46)
+            echo "BOOTSTRAP_FAILED:claim_unverified:$session" >&2
+            echo "Could not verify which project owns tmux session '$session' — leaving it untouched." >&2
+            ;;
+        47)
+            echo "BOOTSTRAP_FAILED:claim_write_failed:$session" >&2
+            echo "Could not register tmux session '$session' to this project." >&2
+            ;;
+    esac
+}
+
+# _tmux_bootstrap_set_project_registry <project_root> <session> [--created]
+#
+# Claims <session> for <project_root> (t1922): stamps the session option
+# @aitask_project_root, which discovery treats as authoritative, then — only
+# once the stamp is verified — the legacy global AITASKS_PROJECT_<session>
+# (read by older framework versions) and the per-user index
+# (`aitask_projects.sh add`); those two stay best-effort.
+#
+# Ownership rule, in order:
+#   1. Read the stamp. A failed read is NEVER "unset"            -> 46.
+#   2. Stamped with a valid project: ours -> refresh, return 0;
+#      another project's                                          -> 45.
+#   3. Unstamped (or stamp names no project) and --created (THIS
+#      invocation's new-session made the session)                 -> claim.
+#   4. Unstamped, existing session: ask discovery's evidence. Unverified -> 46;
+#      another project -> 45 (a session that predates the stamp is not free
+#      just because it carries none); ours or nothing             -> claim.
+#   5. Claim: set-option, then RE-READ and compare. Either failing -> 47.
+#
+# Steps 1-5 run under a per-(tmux server, session) cross-process mutex
+# (registry_lock / stale_lock): without it two claimers on an unowned session
+# both read "no owner" and both stamp. A mutex held past
+# _TMUX_BOOTSTRAP_CLAIM_LOCK_TIMEOUT (15s) is "cannot verify" -> 46.
+#
+# Returns 0 claimed/already ours, 45 owned by another project, 46 ownership
+# unverifiable, 47 the stamp could not be written. Refusals touch nothing and
+# print a sentinel (see _tmux_bootstrap_report_claim). Callers must stop on any
+# non-zero BEFORE modifying or attaching to the session. Every mandatory
+# command is checked explicitly: callers invoke this in `|| …` contexts, where
+# bash suspends errexit inside the function.
+_tmux_bootstrap_set_project_registry() {
+    local root="$1"
+    local session="$2"
+    local created="${3:-}"
+    local lock rc=0
+    lock="$(_tmux_bootstrap_claim_lock_dir "$session")"
+    if ! _tmux_bootstrap_claim_lock_acquire "$lock"; then
+        _tmux_bootstrap_report_claim 46 "$session"
+        return 46
+    fi
+    _tmux_bootstrap_claim_locked "$root" "$session" "$created" || rc=$?
+    _tmux_bootstrap_claim_lock_release "$lock"
+    [[ "$rc" -eq 0 ]] || return "$rc"
+
+    ait_tmux set-environment -g "AITASKS_PROJECT_${session}" "$root" 2>/dev/null || true
+    "$_TMUX_BOOTSTRAP_SCRIPTS_DIR/aitask_projects.sh" add "$root" >/dev/null 2>&1 || true
+    return 0
+}
+
+# _tmux_bootstrap_claim_lock_dir <session> — the claim mutex for <session> on
+# THIS tmux server: keyed by the server's socket path and the session name, so
+# claims on different servers (or different sessions) never contend. Per-user
+# and shared across repositories, because two projects racing for one session
+# name is exactly what it serializes.
+_tmux_bootstrap_claim_lock_dir() {
+    local session="$1" out socket key base
+    out=$(ait_tmux list-sessions -F '#{socket_path}' 2>/dev/null) || out=""
+    socket="${out%%$'\n'*}"
+    key=$(printf '%s|%s' "${socket:-$(ait_tmux_socket_name)}" "$session" | cksum)
+    key="${key%% *}"
+    base="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/aitasks-$(id -u)/session-claim"
+    printf '%s/%s.lock\n' "$base" "$key"
+}
+
+# Seams so a test can disable the mutex and prove the concurrent-claim
+# regression it guards actually fails without it.
+_tmux_bootstrap_claim_lock_acquire() {
+    mkdir -p "$(dirname "$1")" 2>/dev/null || return 1
+    registry_lock_acquire "$1" "${_TMUX_BOOTSTRAP_CLAIM_LOCK_TIMEOUT:-15}" "tmux session claim"
+}
+
+_tmux_bootstrap_claim_lock_release() {
+    registry_lock_release "$1"
+}
+
+# _tmux_bootstrap_claim_locked <project_root> <session> [--created]
+#
+# Steps 1-5 of the claim rule, run ONLY while holding the session's claim
+# mutex: the read, the evidence and the write must be one critical section, or
+# two projects can both read "no owner" and both stamp (the second silently
+# replacing the first). Returns 0 / 45 / 46 / 47; the best-effort writes are
+# the caller's, after release.
+_tmux_bootstrap_claim_locked() {
+    local root="$1"
+    local session="$2"
+    local created="${3:-}"
+    local root_real owner owner_real evidence verify target
+    root_real="$(_tmux_bootstrap_realpath "$root")"
+    [[ -n "$root_real" ]] || root_real="$root"
+
+    if ! owner=$(_tmux_bootstrap_read_stamp "$session"); then
+        _tmux_bootstrap_report_claim 46 "$session"
+        return 46
+    fi
+
+    owner_real=""
+    _tmux_bootstrap_is_project "$owner" && owner_real="$(_tmux_bootstrap_realpath "$owner")"
+    if [[ -n "$owner_real" && "$owner_real" != "$root_real" ]]; then
+        _tmux_bootstrap_report_claim 45 "$session" "$owner_real"
+        return 45
+    fi
+
+    if [[ -z "$owner_real" && "$created" != "--created" ]]; then
+        evidence="$(_tmux_bootstrap_session_evidence "$session")"
+        case "$evidence" in
+            NONE) ;;
+            ROOT:*)
+                owner_real="$(_tmux_bootstrap_realpath "${evidence#ROOT:}")"
+                if [[ "$owner_real" != "$root_real" ]]; then
+                    _tmux_bootstrap_report_claim 45 "$session" "${owner_real:-${evidence#ROOT:}}"
+                    return 45
+                fi
+                ;;
+            *)
+                _tmux_bootstrap_report_claim 46 "$session"
+                return 46
+                ;;
+        esac
+    fi
+
+    target="$(ait_tmux_window_target "$session" "")"
+    if ! ait_tmux set-option -t "$target" "$_TMUX_BOOTSTRAP_ROOT_OPTION" "$root" 2>/dev/null; then
+        _tmux_bootstrap_report_claim 47 "$session"
+        return 47
+    fi
+    if ! verify=$(_tmux_bootstrap_read_stamp "$session") || [[ "$verify" != "$root" ]]; then
+        _tmux_bootstrap_report_claim 47 "$session"
+        return 47
+    fi
+    return 0
+}
+
+# _tmux_bootstrap_ensure_syncer_window <project_root> <session>
+#
+# If the project's syncer autostart flag is on AND the session does
+# not already have a `syncer` window, creates one (with cwd anchored
+# at <project_root> so `ait syncer` resolves correctly).
+_tmux_bootstrap_ensure_syncer_window() {
+    local root="$1"
+    local session="$2"
+    local autostart
+    autostart=$(_tmux_bootstrap_read_syncer_autostart "$root")
+    [[ "$autostart" == "1" ]] || return 0
+    local session_t
+    session_t="$(ait_tmux_session_target "$session")"
+    if ! ait_tmux list-windows -t "$session_t" -F '#{window_name}' 2>/dev/null | grep -qx 'syncer'; then
+        ait_tmux new-window -t "${session_t}:" -c "$root" -n syncer 'ait syncer' 2>/dev/null || true
+    fi
+}
+
+# _tmux_bootstrap_report_exists <session>
+#
+# The --create-only refusal: a structured sentinel first (parsed by
+# agent_restore._bootstrap_project_session), then the human-readable detail —
+# the same two-line shape as the BOOTSTRAP_FAILED:stale_path refusal.
+_tmux_bootstrap_report_exists() {
+    echo "BOOTSTRAP_FAILED:session_exists:$1" >&2
+    echo "spawn_session_detached: session '$1' already exists; --create-only leaves it untouched" >&2
+}
+
+# spawn_session_detached <project_root> [--create-only]
+#
+# Idempotently spawns a detached tmux session for <project_root> with
+# the project's configured session name and a seeded `monitor` window.
+# If the session already exists, only the claim / persistent registry /
+# syncer-window steps run (the existing session's windows are left untouched).
+# Safe to call from inside another tmux session.
+#
+# Every path claims the session through _tmux_bootstrap_set_project_registry
+# (t1922) BEFORE the syncer step, and returns its refusal unchanged: a session
+# stamped by — or, pre-stamp, attributed to — another project is never
+# re-pointed or given this project's syncer window (45), and an ownership read
+# or stamp write that fails stops the bootstrap too (46 / 47). Only a session
+# THIS call created is claimed without evidence (--created).
+#
+# --create-only: CREATE the session or change NOTHING (t1784). The default
+# mode is "ensure", which is right for `ait ide` — a user running it in a
+# project means "this session is mine" — but wrong for a caller that must not
+# claim a session it does not own: the registry and syncer steps would re-point
+# a same-named session belonging to another project at <project_root>, and
+# `discover_aitasks_sessions()` falls back to that registry entry. With the flag:
+#   - an existing session of that name is left completely untouched (no env,
+#     no registry, no syncer window) and reported on stderr as
+#     BOOTSTRAP_FAILED:session_exists:<name>, exit 43;
+#   - so is one created concurrently between the check and `new-session`: the
+#     duplicate `new-session` fails and the name now exists — same report;
+#   - only after THIS call created the session do the registry and syncer steps
+#     run, and stdout then carries BOOTSTRAP_CREATED:<name> — the one answer a
+#     caller may treat as ownership;
+#   - an unreadable `tmux.default_session` is refused before any tmux call
+#     (BOOTSTRAP_FAILED:default_session_unreadable:<shape>, exit 44). Ensure
+#     mode instead warns (DEFAULT_SESSION_UNREADABLE:<shape>:<cfg>) and uses
+#     "aitasks": its callers can show that warning, a detached restore cannot.
+#
+# Exit codes: 2 usage / not a directory, 3 tmux missing, 4 new-session failed,
+# 42 not an aitasks project (BOOTSTRAP_FAILED:stale_path), 43 the session
+# already exists (--create-only only), 44 unreadable default_session
+# (--create-only only), 45 the session belongs to another project
+# (BOOTSTRAP_FAILED:session_owned:<s>:<owner>), 46 its ownership could not be
+# verified (BOOTSTRAP_FAILED:claim_unverified:<s>), 47 the ownership stamp could
+# not be written (BOOTSTRAP_FAILED:claim_write_failed:<s>).
+spawn_session_detached() {
+    local root="$1"
+    local mode="${2:-}"
+    if [[ -n "$mode" && "$mode" != "--create-only" ]]; then
+        echo "spawn_session_detached: unknown option: $mode" >&2
+        return 2
+    fi
+    if [[ -z "$root" ]]; then
+        echo "spawn_session_detached: missing <project_root>" >&2
+        return 2
+    fi
+    if [[ ! -d "$root" ]]; then
+        echo "spawn_session_detached: not a directory: $root" >&2
+        return 2
+    fi
+    if [[ ! -f "$root/aitasks/metadata/project_config.yaml" ]]; then
+        # Structured sentinel consumed by tui_switcher._ensure_session_live
+        # (race-condition path: entry was OK at switcher mount but went
+        # STALE before bootstrap). Followed by the human-readable detail
+        # so casual CLI users still see what went wrong.
+        echo "BOOTSTRAP_FAILED:stale_path" >&2
+        echo "spawn_session_detached: not an aitasks project: $root" >&2
+        return 42
+    fi
+
+    local session session_t scan shape created=""
+    scan=$(_tmux_bootstrap_default_session_scan_checked "$root")
+    if [[ "$scan" == bad$'\t'* ]]; then
+        shape="${scan#bad$'\t'}"
+        _tmux_bootstrap_report_unreadable "$root/aitasks/metadata/project_config.yaml" "$shape"
+        if [[ "$mode" == "--create-only" ]]; then
+            # A caller that cannot show a warning must not create a session
+            # under a guessed name: refuse before touching tmux (t1811).
+            echo "BOOTSTRAP_FAILED:default_session_unreadable:$shape" >&2
+            echo "spawn_session_detached: tmux.default_session is unreadable ($shape); --create-only creates nothing" >&2
+            return 44
+        fi
+        echo "spawn_session_detached: using tmux session 'aitasks' instead" >&2
+        session=aitasks
+    else
+        session="${scan#ok$'\t'}"
+        [[ -n "$session" ]] || session=aitasks
+    fi
+    session_t="$(ait_tmux_session_target "$session")"
+
+    command -v tmux >/dev/null || {
+        echo "spawn_session_detached: tmux is not installed" >&2
+        return 3
+    }
+
+    if ! ait_tmux has-session -t "$session_t" 2>/dev/null; then
+        # Legacy-session detection (t953): a same-name session may still live
+        # on the user's default server from before the dedicated-socket move
+        # (tmux cannot move sessions between servers). Warn-only here — this
+        # path is non-interactive (tui_switcher bootstrap); `ait ide` runs its
+        # own interactive offer before reaching this helper. Skipped when the
+        # gateway already targets the default server.
+        local sock_name
+        sock_name="$(ait_tmux_socket_name)"
+        if [[ -n "$sock_name" && "$sock_name" != "default" ]] \
+            && ait_tmux_legacy has-session -t "$session_t" 2>/dev/null; then
+            echo "WARNING: session '$session' also exists on the legacy default tmux server;" >&2
+            echo "         run 'AITASKS_TMUX_SOCKET=default ait ide' to reach it." >&2
+        fi
+        # First session => this call creates the tmux SERVER. Spawn it inside a
+        # persistent systemd-user service (session.slice) so a compositor /
+        # app.slice teardown no longer kills the server (t943). The socket flag
+        # comes from the gateway (dedicated `-L ait` by default, t953); the
+        # helper also fixes the new server's cgroup placement. It degrades
+        # gracefully (setsid → plain tmux) where systemd --user is unavailable.
+        # new-session -s takes a literal session name; do not prefix '='.
+        ait_tmux_new_session_persistent "$session" "$root" monitor 'ait monitor' \
+            || {
+                # --create-only: a name that exists NOW was created concurrently
+                # by someone else. It is not ours — report it and touch nothing.
+                if [[ "$mode" == "--create-only" ]] \
+                    && ait_tmux has-session -t "$session_t" 2>/dev/null; then
+                    _tmux_bootstrap_report_exists "$session"
+                    return 43
+                fi
+                echo "spawn_session_detached: tmux new-session failed for '$session'" >&2
+                return 4
+            }
+        created="--created"
+    elif [[ "$mode" == "--create-only" ]]; then
+        # An existing session, and the caller asked to create or change nothing:
+        # return BEFORE the registry / syncer steps, which would re-point it.
+        _tmux_bootstrap_report_exists "$session"
+        return 43
+    fi
+
+    _tmux_bootstrap_set_project_registry "$root" "$session" ${created:+"$created"} \
+        || return $?
+    _tmux_bootstrap_ensure_syncer_window "$root" "$session"
+    if [[ "$mode" == "--create-only" ]]; then
+        echo "BOOTSTRAP_CREATED:$session"
+    fi
+    return 0
+}
+
+# --- Standalone CLI dispatch -------------------------------------------
+
+# When invoked as `bash tmux_bootstrap.sh <project_root>`, dispatch
+# to spawn_session_detached. Distinguish "sourced vs. executed" via
+# BASH_SOURCE[0] == $0.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    set -euo pipefail
+    _tmux_bootstrap_mode=""
+    if [[ "${1:-}" == "--create-only" ]]; then
+        _tmux_bootstrap_mode="--create-only"
+        shift
+    fi
+    if [[ $# -lt 1 ]]; then
+        echo "Usage: tmux_bootstrap.sh [--create-only] <project_root>" >&2
+        exit 2
+    fi
+    # Source error helpers only when standalone (saves a round-trip
+    # when sourced by aitask_ide.sh, which already loads them).
+    # shellcheck source=terminal_compat.sh disable=SC1091
+    source "$_TMUX_BOOTSTRAP_LIB_DIR/terminal_compat.sh"
+    spawn_session_detached "$1" ${_tmux_bootstrap_mode:+"$_tmux_bootstrap_mode"}
+fi

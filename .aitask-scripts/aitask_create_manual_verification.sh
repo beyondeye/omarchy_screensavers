@@ -1,0 +1,213 @@
+#!/usr/bin/env bash
+# aitask_create_manual_verification.sh - Create a manual-verification task with
+# a seeded checklist. Wraps aitask_create.sh --batch and aitask_verification_parse.sh
+# seed in one call. Used by planning.md (aggregate-sibling + single-task follow-up
+# branches) and aitask-explore/SKILL.md.
+#
+# Usage:
+#   aitask_create_manual_verification.sh \
+#     --name <task_name> \
+#     --verifies <csv_of_ids> \
+#     --items <items_file> \
+#     (--parent <parent_num> | --related <task_id>)
+#
+# Exit codes:
+#   0 - success; stdout ends with MANUAL_VERIFICATION_CREATED:<new_id>:<new_path>
+#   1 - usage error, file-not-found, or downstream script failure
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/terminal_compat.sh
+source "$SCRIPT_DIR/lib/terminal_compat.sh"
+# task_utils.sh carries ait_commit_paths_staging_untracked, the seam the
+# post-seed commit below goes through (t1728). Sourcing it is idempotent -- it
+# is double-source guarded and sources terminal_compat.sh itself -- and its top
+# level is pure definitions plus `${VAR:-default}` assignments.
+# shellcheck source=lib/task_utils.sh
+source "$SCRIPT_DIR/lib/task_utils.sh"
+
+NAME=""
+VERIFIES=""
+ITEMS=""
+PARENT=""
+RELATED=""
+tmp_desc=""
+
+show_help() {
+    cat <<'EOF'
+Usage: aitask_create_manual_verification.sh \
+         --name <task_name> \
+         --verifies <csv_of_ids> \
+         --items <items_file> \
+         (--parent <parent_num> | --related <task_id>)
+
+Creates a manual-verification task (issue_type: manual_verification) with a
+seeded "## Verification Checklist" populated from the items file. Exactly one
+of --parent or --related must be specified:
+
+  --parent <N>       aggregate-sibling mode: creates a child of parent N
+  --related <id>     follow-up mode: creates a standalone task with --deps
+                     <id> and a "Related to:" note in the body
+
+Required:
+  --name <name>      Task name slug (sanitized by aitask_create.sh)
+  --verifies <csv>   Comma-separated list of task IDs this task verifies
+  --items <path>     Path to a file with one checklist item per line
+
+Structured output:
+  MANUAL_VERIFICATION_CREATED:<new_id>:<path>   on success (exit 0)
+  ERROR:<message>                               on failure (exit 1)
+EOF
+}
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --name)     NAME="$2"; shift 2 ;;
+            --verifies) VERIFIES="$2"; shift 2 ;;
+            --items)    ITEMS="$2"; shift 2 ;;
+            --parent)   PARENT="$2"; shift 2 ;;
+            --related)  RELATED="$2"; shift 2 ;;
+            -h|--help)  show_help; exit 0 ;;
+            *) die "Unknown argument: $1" ;;
+        esac
+    done
+    [[ -n "$NAME" ]] || die "--name is required"
+    [[ -n "$VERIFIES" ]] || die "--verifies is required"
+    [[ -n "$ITEMS" ]] || die "--items is required"
+    [[ -f "$ITEMS" ]] || die "Items file not found: $ITEMS"
+    if [[ -n "$PARENT" && -n "$RELATED" ]]; then
+        die "Specify either --parent or --related, not both"
+    fi
+    if [[ -z "$PARENT" && -z "$RELATED" ]]; then
+        die "One of --parent or --related is required"
+    fi
+}
+
+# Strip leading 't' from a task id (accepts both "t571_4" and "571_4").
+strip_t_prefix() {
+    echo "${1#t}"
+}
+
+# The one EXIT handler. Both halves must run: the seam's unstage cleanup for any
+# path it staged, and the temp file this script owns.
+mv_create_cleanup() {
+    ait_unstage_staged_by_us
+    rm -f "${tmp_desc:-}"
+}
+
+main() {
+    parse_args "$@"
+
+    tmp_desc=$(mktemp_suffixed "${TMPDIR:-/tmp}/mv_desc_XXXXXX.md")
+    # Composed, not replaced. The commit seam's unstage cleanup is armed by the
+    # CALLER by design (lib/task_utils.sh), but a bare
+    # `trap 'ait_unstage_staged_by_us' EXIT` here would clobber the temp-file
+    # cleanup instead. One function, both jobs.
+    trap 'mv_create_cleanup' EXIT
+    ait_archive_rearm_exit_trap
+
+    # Build description body.
+    {
+        printf '## Manual Verification Task\n\n'
+        printf 'This task is handled by the manual-verification module: run\n'
+        # shellcheck disable=SC2016
+        printf '`/aitask-pick <id>` and the workflow will dispatch to the\n'
+        printf 'interactive checklist runner. Each item below must reach a\n'
+        printf 'terminal state (Pass / Fail / Skip) before the task can be\n'
+        printf 'archived; Defer is allowed but creates a carry-over task.\n\n'
+        if [[ -n "$RELATED" ]]; then
+            local bare_related; bare_related=$(strip_t_prefix "$RELATED")
+            printf '**Related to:** t%s\n\n' "$bare_related"
+        fi
+    } > "$tmp_desc"
+
+    # Compose aitask_create.sh invocation.
+    local -a create_args=(
+        --batch
+        --type manual_verification
+        --followup-kind manual_verification
+        --priority medium
+        --effort medium
+        --labels "verification,manual"
+        --name "$NAME"
+        --verifies "$VERIFIES"
+        --desc-file "$tmp_desc"
+        --commit
+    )
+    if [[ -n "$PARENT" ]]; then
+        # A child created with --parent auto-inherits the parent's anchor, and
+        # --followup-of is REJECTED alongside --parent — so this branch must not
+        # thread it.
+        create_args+=(--parent "$PARENT")
+    else
+        local bare_related; bare_related=$(strip_t_prefix "$RELATED")
+        create_args+=(--deps "$bare_related")
+        # Best-effort topic anchor (t1468_2), mirroring
+        # aitask_verification_followup.sh: thread --followup-of only when the
+        # origin actually resolves. --related is a loose reference (it may name
+        # a commit-only task with no file) and --followup-of validation *dies*
+        # on an unresolvable id, so an unconditional flag would turn a
+        # previously-working creation into a hard failure. Skipping it leaves
+        # the task a topic root — exactly the prior behaviour.
+        local origin_status
+        origin_status=$("$SCRIPT_DIR/aitask_query_files.sh" task-status "$bare_related" 2>/dev/null || true)
+        if [[ "$origin_status" == STATUS:* && "$origin_status" != STATUS:NOT_FOUND ]]; then
+            create_args+=(--followup-of "$bare_related")
+        fi
+    fi
+
+    # Run create; capture combined output so we can surface errors.
+    local create_output
+    if ! create_output=$("$SCRIPT_DIR/aitask_create.sh" "${create_args[@]}" 2>&1); then
+        echo "ERROR:aitask_create.sh failed: $create_output"
+        exit 1
+    fi
+
+    # Last non-empty line of output is the final "Created: <path>" line.
+    local last_line new_path
+    last_line=$(printf '%s\n' "$create_output" | awk 'NF { last = $0 } END { print last }')
+    new_path="${last_line#Created: }"
+    if [[ -z "$new_path" || ! -f "$new_path" ]]; then
+        echo "ERROR:could not parse created filepath from aitask_create.sh output: $last_line"
+        exit 1
+    fi
+
+    # Parse the task id out of the basename (e.g., t583_10_foo.md -> 583_10).
+    local new_basename new_id
+    new_basename=$(basename "$new_path")
+    new_id=$(echo "$new_basename" | sed -E 's/^t([0-9]+(_[0-9]+)?)_.*\.md$/\1/')
+    if [[ -z "$new_id" || "$new_id" == "$new_basename" ]]; then
+        echo "ERROR:could not parse task id from $new_path"
+        exit 1
+    fi
+
+    # Seed the checklist into the newly created task.
+    if ! "$SCRIPT_DIR/aitask_verification_parse.sh" seed "$new_path" --items "$ITEMS" >/dev/null 2>&1; then
+        echo "ERROR:aitask_verification_parse.sh seed failed for $new_path"
+        exit 1
+    fi
+
+    # Commit the seeded checklist (aitask_create.sh --commit only covered the
+    # frontmatter + description body; the seed edited the file post-commit).
+    # `./ait git commit` with no `--` pathspec commits the WHOLE index, so a
+    # concurrent session's staged work on the shared task-data branch would land
+    # in a commit whose message names this task (t1728). `./ait git` is
+    # `task_git` in a subprocess, so the same seam serves it.
+    #
+    # Best-effort, as before -- but the status is absorbed deliberately rather
+    # than by `|| true`: under `set -e` a bare call returning 2 ("nothing to
+    # commit") would abort after the checklist was already seeded.
+    local crc=0
+    ait_commit_paths_staging_untracked \
+        "ait: Seed verification checklist for t${new_id}" \
+        "$new_path" || crc=$?
+    if (( crc == 1 )); then
+        warn "checklist seeded into $new_path but not committed"
+    fi
+
+    echo "MANUAL_VERIFICATION_CREATED:${new_id}:${new_path}"
+}
+
+main "$@"

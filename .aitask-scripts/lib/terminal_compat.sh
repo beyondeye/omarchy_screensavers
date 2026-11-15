@@ -1,0 +1,243 @@
+#!/usr/bin/env bash
+# terminal_compat.sh - Terminal capability detection and shared helpers
+# Source this file from aitask scripts; do not execute directly.
+
+# --- Guard against double-sourcing ---
+[[ -n "${_AIT_TERMINAL_COMPAT_LOADED:-}" ]] && return 0
+_AIT_TERMINAL_COMPAT_LOADED=1
+
+# --- Color definitions ---
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+# --- Common logging helpers ---
+die()     { echo -e "${RED}Error: $1${NC}" >&2; exit 1; }
+die_code() { local code="$1"; shift; echo -e "${RED}Error: $1${NC}" >&2; exit "$code"; }
+info()    { echo -e "${BLUE}$1${NC}"; }
+success() { echo -e "${GREEN}$1${NC}"; }
+warn()    { echo -e "${YELLOW}Warning: $1${NC}" >&2; }
+
+# --- Terminal capability check ---
+# Returns 0 if running in a capable modern terminal, 1 otherwise.
+# Caches result in AIT_TERMINAL_CAPABLE (1=capable, 0=not).
+ait_check_terminal_capable() {
+    # Use cached result if available
+    if [[ -n "${AIT_TERMINAL_CAPABLE:-}" ]]; then
+        [[ "$AIT_TERMINAL_CAPABLE" == "1" ]] && return 0 || return 1
+    fi
+
+    AIT_TERMINAL_CAPABLE=0
+
+    # Check 1: COLORTERM (most universal modern-terminal indicator)
+    if [[ "${COLORTERM:-}" == "truecolor" || "${COLORTERM:-}" == "24bit" ]]; then
+        AIT_TERMINAL_CAPABLE=1
+        return 0
+    fi
+
+    # Check 2: Windows Terminal session ID
+    if [[ -n "${WT_SESSION:-}" ]]; then
+        AIT_TERMINAL_CAPABLE=1
+        return 0
+    fi
+
+    # Check 3: Known modern terminal emulators via TERM_PROGRAM
+    case "${TERM_PROGRAM:-}" in
+        WezTerm|Alacritty|iTerm.app|vscode|Hyper|tmux|Tabby)
+            AIT_TERMINAL_CAPABLE=1
+            return 0
+            ;;
+    esac
+
+    # Check 4: TERM value hints at an advanced terminal
+    case "${TERM:-}" in
+        xterm-256color|xterm-kitty|alacritty|tmux-256color|screen-256color)
+            AIT_TERMINAL_CAPABLE=1
+            return 0
+            ;;
+    esac
+
+    # Check 5: Running inside tmux or screen (they handle rendering)
+    if [[ -n "${TMUX:-}" || -n "${STY:-}" ]]; then
+        AIT_TERMINAL_CAPABLE=1
+        return 0
+    fi
+
+    # None of the checks passed
+    return 1
+}
+
+# --- WSL detection ---
+ait_is_wsl() {
+    [[ -f /proc/version ]] && grep -qi microsoft /proc/version 2>/dev/null
+}
+
+# --- Portable sed -i wrapper ---
+# macOS BSD sed requires 'sed -i "" expr', GNU sed requires 'sed -i expr'.
+# Usage: sed_inplace "s/foo/bar/" file
+sed_inplace() {
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        sed -i '' "$@"
+    else
+        sed -i "$@"
+    fi
+}
+
+# --- Portable suffixed temp file ---
+# BSD mktemp only substitutes the XXXXXX placeholder when it is the LAST thing
+# in the template. `mktemp "$TMPDIR/foo_XXXXXX.log"` therefore does NOT fail
+# loudly on macOS -- it creates a file named literally `foo_XXXXXX.log` and
+# exits 0. Every later call then fails with "File exists", permanently, because
+# that fixed name persists in $TMPDIR. GNU mktemp substitutes happily, so the
+# bug is invisible on Linux and the caller looks correct on both (t1729).
+#
+# This wrapper takes the SAME single argument the broken calls already pass, so
+# migrating a call site is just `mktemp` -> `mktemp_suffixed`. It splits the
+# template at the last XXXXXX, lets mktemp create a genuinely unique file, then
+# renames it to carry the suffix. The rename cannot collide: the name mktemp
+# chose is already exclusive, so appending a fixed suffix to it is too.
+#
+# Usage: tmpfile=$(mktemp_suffixed "${TMPDIR:-/tmp}/prefix_XXXXXX.ext")
+mktemp_suffixed() {
+    local template="$1"
+    if [[ "$template" != *XXXXXX* ]]; then
+        echo "mktemp_suffixed: template has no XXXXXX: $template" >&2
+        return 1
+    fi
+    local head="${template%XXXXXX*}"
+    local suffix="${template##*XXXXXX}"
+    local base
+    base="$(mktemp "${head}XXXXXX")" || return 1
+    if [[ -z "$suffix" ]]; then
+        printf '%s\n' "$base"
+        return 0
+    fi
+    if mv "$base" "${base}${suffix}"; then
+        printf '%s\n' "${base}${suffix}"
+    else
+        rm -f "$base"
+        return 1
+    fi
+}
+
+# --- Portable date wrapper ---
+# macOS BSD date does not support 'date -d'. Use gdate (from brew coreutils) on macOS.
+# Usage: portable_date -d "2026-01-01" +%s  (same args as GNU date)
+portable_date() {
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        gdate "$@"
+    else
+        date "$@"
+    fi
+}
+
+# --- Print terminal warning with fix suggestions ---
+# Call from interactive scripts after batch-mode has been ruled out.
+# Always returns 0 (warns but never blocks).
+ait_warn_if_incapable_terminal() {
+    # Allow suppression via env var
+    [[ "${AIT_SKIP_TERMINAL_CHECK:-}" == "1" ]] && return 0
+
+    if ait_check_terminal_capable; then
+        return 0
+    fi
+
+    echo "" >&2
+    warn "Your terminal may not fully support TUI features (fzf, colors, interactive board)."
+    echo "" >&2
+
+    if ait_is_wsl; then
+        echo -e "  ${YELLOW}You appear to be running WSL in a legacy console (conhost.exe).${NC}" >&2
+        echo -e "  ${BLUE}For the best experience, use Windows Terminal:${NC}" >&2
+        echo -e "    1. Install from Microsoft Store: ${BLUE}https://aka.ms/terminal${NC}" >&2
+        echo -e "    2. Set it as default: Settings > Privacy & Security > For developers > Terminal" >&2
+        echo -e "    3. Or launch WSL from Windows Terminal directly" >&2
+    else
+        echo -e "  ${BLUE}For the best experience, use a modern terminal emulator that supports${NC}" >&2
+        echo -e "  ${BLUE}true color (e.g., Windows Terminal, Alacritty, WezTerm, iTerm2).${NC}" >&2
+    fi
+
+    echo "" >&2
+    echo -e "  ${YELLOW}To suppress this warning: export AIT_SKIP_TERMINAL_CHECK=1${NC}" >&2
+    echo "" >&2
+    return 0
+}
+
+# --- Persistent-scope tmux session spawn (t943) ---------------------------
+# Background: every ait-managed tmux session shares one server (on the
+# dedicated `-L ait` socket since t953; the gateway owns socket selection).
+# When that server is started inside a *transient* systemd user scope (the
+# app.slice scope an Omarchy/uwsm workspace launch creates), a compositor /
+# app.slice teardown dies as a unit and takes the tmux server — and all its
+# sessions — with it. These helpers let the framework start *its own* new
+# server inside a persistent session.slice service instead, so it survives an
+# app.slice teardown.
+
+# ait_systemd_user_available
+# Returns 0 iff a usable systemd --user manager is reachable for systemd-run.
+ait_systemd_user_available() {
+    [[ -n "${AIT_NO_SYSTEMD_RUN:-}" ]] && return 1   # test/escape hatch
+    command -v systemd-run >/dev/null 2>&1 || return 1
+    command -v systemctl   >/dev/null 2>&1 || return 1
+    [[ -n "${XDG_RUNTIME_DIR:-}" ]] || return 1
+    systemctl --user is-system-running >/dev/null 2>&1 && return 0
+    [[ "$(systemctl --user is-system-running 2>/dev/null)" == "degraded" ]]
+}
+
+# ait_tmux_new_session_persistent <session> <root> <window> <command>
+# Create a brand-new DETACHED tmux session whose SERVER lands in a persistent
+# systemd-user service under session.slice, so a compositor / app.slice
+# teardown does not reach it. The socket flag comes from the gateway (dedicated
+# `-L ait` by default, t953). Falls back to setsid, then plain tmux. Precondition: caller has confirmed the server does NOT yet
+# exist (otherwise wrapping is pointless — a plain new-session just attaches).
+ait_tmux_new_session_persistent() {
+    local session="$1" root="$2" window="$3" cmd="$4"
+    # Route the socket flag through the gateway (single source of socket policy,
+    # shared with lib/tmux_exec.sh / the Python TmuxClient). Sourced lazily here
+    # rather than at file scope so terminal_compat.sh stays a leaf for its many
+    # other consumers; the _AIT_TMUX_EXEC_LOADED guard makes repeat calls cheap.
+    local _tc_lib_dir
+    _tc_lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    # shellcheck source=tmux_exec.sh disable=SC1091
+    source "$_tc_lib_dir/tmux_exec.sh"
+    # Client flags (`-u`, t2236) + socket flag, via the client-args emitter.
+    local -a sock=()
+    local _line
+    while IFS= read -r _line; do sock+=("$_line"); done < <(ait_tmux_client_args)
+    # The first window's PATH must not depend on ours (t1689): tmux copies the
+    # issuing client's PATH into it, and under systemd-run the client runs in
+    # the user manager's environment instead, so that rung is handed the PATH
+    # explicitly. Normalized once; tmux_exec.sh brought in spawn_path.sh.
+    ait_spawn_path_normalize "${PATH-}"
+    local spawn_path="$AIT_SPAWN_PATH"
+    local -a setenv=()
+    [[ -n "${PATH+x}" ]] && setenv=("--setenv=PATH=$spawn_path")
+    # The launchers that run under that PATH stay the binaries OURS resolves.
+    local tmux_exe setsid_exe
+    ait_spawn_exe tmux "${PATH-}" "$spawn_path"; tmux_exe="$AIT_SPAWN_EXE"
+    ait_spawn_exe setsid "${PATH-}" "$spawn_path"; setsid_exe="$AIT_SPAWN_EXE"
+
+    if ait_systemd_user_available; then
+        local safe unit
+        safe="$(systemd-escape -- "$session" 2>/dev/null || echo session)"
+        unit="ait-tmux-${safe}-$$-${RANDOM}"
+        # --slice=session.slice escapes app.slice (the load-bearing flag).
+        # Type=forking matches tmux's double-fork; KillMode=none keeps systemd
+        # from signalling the server cgroup when the launching transaction
+        # finishes; --collect GCs the unit in the benign loser-of-a-race case.
+        # The socket flag goes into the tmux argv *inside* the unit command.
+        systemd-run --user --slice=session.slice --unit="$unit" \
+            --property=Type=forking --property=KillMode=none \
+            --collect --quiet ${setenv[@]+"${setenv[@]}"} -- \
+            "$tmux_exe" ${sock[@]+"${sock[@]}"} new-session -d -s "$session" -c "$root" -n "$window" "$cmd"
+        return $?
+    fi
+    # `PATH=<same value>` is a no-op wherever normalization changed nothing.
+    if command -v setsid >/dev/null 2>&1; then
+        PATH="$spawn_path" "$setsid_exe" "$tmux_exe" ${sock[@]+"${sock[@]}"} new-session -d -s "$session" -c "$root" -n "$window" "$cmd"
+        return $?
+    fi
+    PATH="$spawn_path" "$tmux_exe" ${sock[@]+"${sock[@]}"} new-session -d -s "$session" -c "$root" -n "$window" "$cmd"
+}

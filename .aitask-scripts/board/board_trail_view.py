@@ -1,0 +1,1691 @@
+"""The By-Trail view's pure rendering half (t1794_3).
+
+Extracted verbatim from ``aitask_board.py``: the trail projection model
+(constants, ``TrailEntryView`` / ``TrailWaveLane``, ``build_trail_lanes`` and its
+helpers, ``run_trail_drift``), the wave cards and columns, and the three trail
+modals (select / detail / summary), plus ``TRAIL_CSS``. The stand-alone trails
+app renders with this module (parent plan t1794), and its model half runs
+headless — see ``HeadlessTrailModelTests`` in tests/test_board_bytrail_view.py.
+
+``aitask_board.py`` re-exports every name, so ``ab.build_trail_lanes`` /
+``ab.TrailDetailScreen`` keep resolving. Inside this module the helpers call
+each other through THIS namespace, so a stub of one of them must target
+``board_trail_view`` (reachable as ``ab.board_trail_view``), not the board.
+
+This is the board's RENDERING half of implementation trails (RFC §9 in
+aidocs/implementation_trail_design.md). Discovery, dedup, overlap and blob
+loading live in lib/trail_discovery.py (t1647_1). Trail projections are
+rendered READ-ONLY: the only verbs ever spawned are the read verbs (trail_gather
+drift, artifact get/versions) — every trail write happens in the launched
+/aitask-trail skill after its own confirmation (RFC §9.3).
+
+Contracts (see ``board/__init__.py`` and the parent plan):
+
+* C1 — imported by bare name; imports ``board_widgets`` and no other board
+  module, never ``aitask_board``, and adds nothing to ``sys.path``: every
+  importer has already put ``.aitask-scripts/lib`` there.
+* C2 — resolves no task directory, neither at import nor at runtime:
+  ``load_local_project_name`` takes the resolved ``tasks_dir`` from its caller.
+
+The view state, workers, trail actions and launch live on ``TrailScreenMixin``
+(``board_trail_screen.py``); the board's view switch and footer gating stay in
+``KanbanApp``.
+
+The linked-trail modals (t1957_4) render rows that come from OTHER
+repositories' exports — project names, handles, error details. They are
+untrusted text: every such value is put on screen as a ``rich.Text``, never
+interpolated into markup.
+"""
+
+from __future__ import annotations
+
+import re
+import subprocess
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+
+import yaml
+from rich.text import Text
+from textual import on
+from textual.binding import Binding
+from textual.containers import Container, Horizontal, Vertical, VerticalScroll
+from textual.screen import ModalScreen
+from textual.widgets import Button, Input, Label, OptionList, Static
+from textual.widgets.option_list import Option
+
+from board_widgets import (
+    ColumnHeader, PickerItem, TaskCard,
+    _followup_glyph_text, _followup_marker, _plan_approved_marker,
+    _status_badge_text,
+)
+from cross_repo_notation import parse_ref as parse_cross_repo_ref
+from fuzzy_filter import rank
+from guarded_dismiss import GuardedModalScreen
+from topic_semantics import task_own_id
+from trail_discovery import TrailInfo, trail_entry_refs
+from trail_links import (
+    EXPORT_FAILED, LOCAL_UNREADABLE, NOT_FOUND, PARTIAL, REGISTRY_UNREADABLE,
+    STALE, TIMEOUT,
+)
+from cross_repo_deps import classify_xdep_status, xdep_ref_pairs
+
+
+# Artifact-version watch cadence (t1268): how often to poll `artifact
+# versions` for the active trail after an agent refresh was launched, and how
+# many polls before giving up (~30 min at 20s).
+TRAIL_WATCH_INTERVAL = 20
+TRAIL_WATCH_MAX_TICKS = 90
+
+#: What `TrailSelectScreen` dismisses with when its Ctrl+R key asks for a fresh
+#: scan (a tabbed host only). Not a valid handle: handles never contain NUL.
+TRAIL_SELECT_RESCAN = "\x00rescan"
+TRAIL_GATHER_SCRIPT = Path(".aitask-scripts") / "aitask_trail_gather.sh"
+
+# Classification glyphs (RFC §15 wireframe pins ◆ hard prereq / ● core; the
+# remaining enum members get distinct glyphs here). Landed entries additionally
+# render ✔ + strike-through. Pinned by tests/test_board_bytrail_view.py.
+TRAIL_CLASSIFICATION_GLYPHS = {
+    "hard_prerequisite": "◆",
+    "preferred_predecessor": "▲",
+    "core": "●",
+    "coordination_only": "⇄",
+    "optional": "○",
+}
+
+_TRAIL_GHOST_LABELS = {
+    "cross_repo": "cross-repo member",
+    "archived": "archived",
+    "missing": "missing",
+}
+
+
+# The CSS the By-Trail view owns (t1794_3; parent contract C7). Every App that
+# renders the view appends this to its own `CSS` — `KanbanApp.CSS` ends with
+# `+ TRAIL_CSS`, and the stand-alone trails app must do the same.
+# Deliberately NOT here: the rules for the board_widgets widgets these cards
+# and modals build on (`.task-title`, `.task-info`, `.col-header-*`,
+# `PickerItem*`, `#loading_*`). They belong to the widget layer and live in
+# `board_widgets.WIDGET_CSS`, which every host App prepends to its own CSS.
+TRAIL_CSS = """
+    /* Drift marker on trail cards. Two classes, not `.trail-drift` alone: the
+       label also carries `.task-info` (colour $text-muted, owned by the host
+       App's card rules), and a two-class selector wins whichever stylesheet
+       the host puts first. */
+    .task-info.trail-drift { color: #FFB86C; }
+    /* By-Trail summary pane (t1505_1). The explicit height is LOAD-BEARING,
+       not cosmetic: VerticalScroll inherits `height: 1fr` from
+       ScrollableContainer, so without it this pane and #board_container would
+       split the vertical space evenly instead of the pane taking six rows.
+       NEVER add `dock: bottom` — see the compose() comment and t1278. */
+    #trail_summary { height: 6; border-top: hkey $secondary-background; padding: 0 1; }
+"""
+
+
+@dataclass
+class TrailEntryView:
+    """A wave entry resolved against live board state."""
+    entry: dict
+    task: "Task | None"      # live local task, when active
+    ghost_kind: str          # "" | "cross_repo" | "archived" | "missing"
+    landed: bool             # live/archived status == Done → strike-through
+    # Drift reasons owned by THIS entry's task ref (t1268). Keyed on the raw
+    # entry ref, so ghosts carry their own reasons too.
+    drift_reasons: list = field(default_factory=list)
+    # Cross-repo state (t1957_1), from the session's probe results — never
+    # probed here. `xdeps`: a live member's per-ref display strings;
+    # `xdep_blocked`: some COMPLETED probe says not Done. For a cross_repo
+    # ghost, `remote_state` is its XDEP_* coverage and `remote_status` the
+    # probed status (meaningful only when resolved).
+    xdeps: list = field(default_factory=list)
+    xdep_blocked: bool = False
+    remote_state: str = ""
+    remote_status: str = ""
+    # The archived task an `archived` ghost resolved to (t2111), so the detail
+    # modal can show its header and description. Kept apart from `task`, which
+    # means "live" to every card and gating seam.
+    archived_task: "Task | None" = None
+
+
+@dataclass
+class TrailWaveLane:
+    wave: dict
+    entries: list
+
+
+def load_local_project_name(tasks_dir: Path,
+                            config_path: Path | None = None) -> str:
+    """Read ``project.name`` from project_config.yaml ('' when unavailable).
+
+    A missing name never crashes the view — refs just resolve as
+    unresolvable (cross-repo) ghosts and the banner notes the problem.
+
+    ``tasks_dir`` is the caller's resolved task directory. This module never
+    resolves one itself (t1794 C2): under the fixture harness only
+    ``aitask_board.py`` is re-executed against the fixture tree, so a lookup
+    here would read the live tree or the already-restored env."""
+    path = config_path or (tasks_dir / "metadata" / "project_config.yaml")
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError):
+        return ""
+    project = data.get("project") if isinstance(data, dict) else None
+    if isinstance(project, dict) and project.get("name"):
+        return str(project["name"])
+    return ""
+
+
+def trail_ref_to_local_id(ref, local_project: str):
+    """Map a canonical ``<project>#<id>`` task ref to a bare local id, or None
+    when the ref is foreign / unparseable / the local project name is unknown."""
+    parsed = parse_cross_repo_ref(str(ref or ""))
+    if not parsed:
+        return None
+    project, task_id = parsed
+    if not local_project or project != local_project:
+        return None
+    return task_id
+
+
+def canonical_trail_ref(ref) -> str:
+    """Normalize a task ref to the ``<project>#<id>`` form drift reasons use.
+
+    The stored trail may spell a member ``aitasks#t42`` (the ``t`` prefix is
+    accepted notation), but trail_gather always emits drift reasons against
+    the canonical ``aitasks#42``. Keying both sides through here is what makes
+    the per-card lookup hit regardless of which spelling the trail stored
+    (t1268). Unparseable refs fall back to their raw text so nothing is lost."""
+    parsed = parse_cross_repo_ref(str(ref or ""))
+    if not parsed:
+        return str(ref or "")
+    project, task_id = parsed
+    return f"{project}#{task_id}"
+
+
+#: Per-ref coverage of the session's cross-repo status probes (t1957_1).
+XDEP_RESOLVED = "resolved"     # a completed probe result exists
+XDEP_CHECKING = "checking"     # the current probe covers it, no result yet
+XDEP_UNCHECKED = "unchecked"   # nobody probed it (e.g. added by `r`)
+
+
+def xdep_ref_state(key: str, status_map, inflight) -> str:
+    """Coverage of one ``repo#id`` ref — the ONE rule cards and tests share.
+
+    Only a key present in ``status_map`` (completed probe results) is
+    resolved; an absent key is never a failure. It is ``checking`` when the
+    in-flight probe covers it and ``unchecked`` otherwise, so a ref nobody
+    probed is never reported UNREACHABLE (t1957_1)."""
+    if key in (status_map or {}):
+        return XDEP_RESOLVED
+    if key in (inflight or ()):
+        return XDEP_CHECKING
+    return XDEP_UNCHECKED
+
+
+def _xdep_member_display(task, status_map, inflight):
+    """``(per-ref display strings, blocked)`` for a live member's xdeps.
+
+    Only resolved refs can block; checking / unchecked refs carry a suffix
+    instead, so an unprobed ref is visibly unknown rather than silently clear
+    or falsely unreachable."""
+    display = []
+    blocked = False
+    for repo, xid in xdep_ref_pairs(task.metadata.get("xdeprepo"),
+                                    task.metadata.get("xdeps", []) or []):
+        key = f"{repo}#{xid}"
+        state = xdep_ref_state(key, status_map, inflight)
+        if state == XDEP_RESOLVED:
+            text, ref_blocked = classify_xdep_status(key, status_map[key])
+            display.append(text)
+            blocked = blocked or ref_blocked
+        elif state == XDEP_CHECKING:
+            display.append(f"{key} (checking…)")
+        else:
+            display.append(f"{key} (not checked)")
+    return display, blocked
+
+
+def trail_xdep_refs(doc, tasks_by_id, local_project) -> dict:
+    """Every ref the trail's cross-repo display needs probed (t1957_1).
+
+    Maps ``repo#id`` to ``(repo, id)``: each live local member's
+    ``xdeprepo``/``xdeps`` pairs, plus each foreign member ref (a
+    ``cross_repo`` ghost) that parses as ``<project>#<id>``. Local and
+    unparseable refs are excluded; duplicates collapse onto one key."""
+    refs: dict = {}
+    for wave in (doc or {}).get("waves") or []:
+        for entry in wave.get("entries") or []:
+            ref = entry.get("task")
+            local_id = trail_ref_to_local_id(ref, local_project)
+            if local_id is None:
+                parsed = parse_cross_repo_ref(str(ref or ""))
+                if parsed:
+                    refs[f"{parsed[0]}#{parsed[1]}"] = parsed
+                continue
+            task = tasks_by_id.get(local_id)
+            if task is None:
+                continue
+            for repo, xid in xdep_ref_pairs(
+                    task.metadata.get("xdeprepo"),
+                    task.metadata.get("xdeps", []) or []):
+                refs[f"{repo}#{xid}"] = (repo, xid)
+    return refs
+
+
+def build_trail_lanes(doc, tasks_by_id, local_project, archived_lookup,
+                      drift_by_ref=None, xdep_status=None, xdep_inflight=()):
+    """Project a validated trail document onto live board state.
+
+    Returns ``TrailWaveLane``s with waves in ``ordinal`` order and entries in
+    ``position`` order (RFC §9.1). Each entry resolves to a live task, or to a
+    ghost (``cross_repo`` / ``archived`` / ``missing``); ``landed`` is derived
+    from live/archived status == Done — the trail snapshot is never trusted
+    over the task file (schema: "the task file remains the source of truth").
+
+    ``drift_by_ref`` (t1268) maps a CANONICAL entry task ref to its drift
+    reasons (see ``trail_drift_by_ref``). Looked up on the ref rather than the
+    resolved local id, so archived / cross-repo ghosts carry their reasons
+    too, and through ``canonical_trail_ref`` so a stored ``aitasks#t42``
+    still matches the gatherer's ``aitasks#42``.
+
+    ``xdep_status`` (t1957_1) holds COMPLETED cross-repo probe results keyed
+    ``repo#id``; ``xdep_inflight`` the keys the current probe covers. A live
+    member's xdeps and a cross-repo ghost's own status resolve through
+    ``xdep_ref_state``. A cross-repo ghost is landed only when its probed
+    status is ``Done``."""
+    lanes = []
+    by_ref = drift_by_ref or {}
+    status_map = xdep_status or {}
+    for wave in sorted(doc.get("waves") or [],
+                       key=lambda w: w.get("ordinal", 0)):
+        views = []
+        for entry in sorted(wave.get("entries") or [],
+                            key=lambda e: e.get("position", 0)):
+            drift = by_ref.get(canonical_trail_ref(entry.get("task")), [])
+            local_id = trail_ref_to_local_id(entry.get("task"), local_project)
+            if local_id is None:
+                key = canonical_trail_ref(entry.get("task"))
+                state = xdep_ref_state(key, status_map, xdep_inflight)
+                remote = status_map.get(key, "") if state == XDEP_RESOLVED else ""
+                views.append(TrailEntryView(
+                    entry, None, "cross_repo", remote == "Done", drift,
+                    remote_state=state, remote_status=remote))
+                continue
+            task = tasks_by_id.get(local_id)
+            if task is not None:
+                landed = task.metadata.get("status") == "Done"
+                xdeps, blocked = _xdep_member_display(task, status_map,
+                                                      xdep_inflight)
+                views.append(TrailEntryView(entry, task, "", landed, drift,
+                                            xdeps=xdeps, xdep_blocked=blocked))
+                continue
+            archived_task = archived_lookup(local_id)
+            if archived_task is not None:
+                landed = archived_task.metadata.get("status") == "Done"
+                views.append(TrailEntryView(
+                    entry, None, "archived", landed, drift,
+                    archived_task=archived_task))
+            else:
+                views.append(TrailEntryView(entry, None, "missing", False,
+                                            drift))
+        lanes.append(TrailWaveLane(wave, views))
+    return lanes
+
+
+def trail_drift_by_ref(reasons) -> dict:
+    """Group drift reasons ``(code, task_ref, detail)`` by owning task ref.
+
+    Keys are canonicalized (``canonical_trail_ref``) so they match however the
+    trail document spelled the member.
+
+    Trail-level reasons (``task_ref`` == "-", e.g. ``input_missing``) and
+    reasons naming a task that is not a trail member (``new_related_task``)
+    have no owning card; they are dropped here and stay visible in the
+    subtitle count and the trail detail modal."""
+    by_ref: dict = {}
+    for code, task_ref, detail in reasons or []:
+        if not task_ref or task_ref == "-":
+            continue
+        key = canonical_trail_ref(task_ref)
+        by_ref.setdefault(key, []).append((code, task_ref, detail))
+    return by_ref
+
+
+def trail_summary_text(doc) -> str:
+    """The trail's free-form summary for the By-Trail pane (t1505_1).
+
+    Prefers ``narrative.overview`` — t1505_3's advisory prose field — and falls
+    back to the always-required ``narrative.recommendation_summary``, so a trail
+    written before that field existed still shows something useful. `overview`
+    is optional in the schema, so the fallback stays a live path for every trail
+    that does not carry one.
+
+    Returns "" when neither carries text; the caller hides the pane rather than
+    showing an empty frame. Whitespace-only counts as empty at every level, so a
+    summary of spaces cannot mount a blank six-row pane.
+
+    Advisory only: nothing here may feed lane construction, ordering or
+    classification — waves and entries remain the binding structure."""
+    narrative = (doc or {}).get("narrative")
+    if not isinstance(narrative, dict):
+        return ""
+    for field in ("overview", "recommendation_summary"):
+        value = narrative.get(field)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+# The trail schema's `$defs.timestamp` pattern, verbatim
+# (implementation_trail.schema.json; a test pins the two together).
+_GENERATED_AT_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?Z$", re.ASCII)
+
+
+def trail_generated_label(value, *, tz=None, now=None) -> str:
+    """Local-time label for a trail's ``generation.generated_at`` (t2112).
+
+    ``"07-10 17:00"`` when the generation falls in the current local year,
+    ``"2025-07-10"`` otherwise — an old trail must never read as recent, and
+    telling its age is the whole point of the label.
+
+    Accepts exactly the schema's UTC timestamp grammar (seconds optional, ``Z``
+    only); anything else — absent, non-string, date-only, an offset, an
+    out-of-range field — returns ``""``. ``fullmatch`` rather than ``match``:
+    Python's ``$`` also matches before a trailing newline. Parsing AND the
+    local conversion are guarded together, because a schema-valid boundary
+    date overflows on conversion (``9999-12-31T23:59:59Z`` east of UTC) and
+    this runs inside banner and modal rendering.
+
+    ``tz=None`` converts to the system local zone; ``tz`` / ``now`` are seams
+    for tests."""
+    if not isinstance(value, str) or not _GENERATED_AT_RE.fullmatch(value):
+        return ""
+    try:
+        local = datetime.fromisoformat(value[:-1] + "+00:00").astimezone(tz)
+        # Converted on its own, never in `local.tzinfo`: with tz=None that is
+        # the fixed offset AT GENERATION, which differs from today's across a
+        # DST change and can put "now" in the wrong year on New Year's Eve.
+        today = (now or datetime.now(timezone.utc)).astimezone(tz)
+    except (ValueError, OverflowError, OSError):
+        return ""
+    if local.year == today.year:
+        return local.strftime("%m-%d %H:%M")
+    return local.strftime("%Y-%m-%d")
+
+
+def run_trail_drift(handle: str):
+    """Run the read-only drift verb; returns ``(verdict, reasons)``.
+
+    ``verdict``: first stdout token — ``CURRENT`` / ``STALE`` /
+    ``ERROR:<kind>:<id>`` — or ``UNAVAILABLE:<why>`` for infra failures.
+    ``reasons``: parsed ``DRIFT:<code>|<task_ref or ->|<detail>`` triples.
+    Passive observation (RFC §8.2): results update rendered badges only;
+    the artifact is never written."""
+    try:
+        result = subprocess.run(
+            [str(TRAIL_GATHER_SCRIPT), "drift", "--trail", handle],
+            capture_output=True, text=True, timeout=15,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
+        return f"UNAVAILABLE:{type(exc).__name__}", []
+    lines = [ln for ln in result.stdout.splitlines() if ln.strip()]
+    if result.returncode != 0 or not lines:
+        return "UNAVAILABLE:infra", []
+    verdict = lines[0].strip()
+    reasons = []
+    for ln in lines[1:]:
+        if ln.startswith("DRIFT:"):
+            parts = ln[len("DRIFT:"):].split("|", 2)
+            while len(parts) < 3:
+                parts.append("")
+            reasons.append((parts[0], parts[1], parts[2]))
+    return verdict, reasons
+
+
+class _GhostTaskStub:
+    """Minimal Task stand-in carried by TrailGhostCard.
+
+    Satisfies every accessor the board's focus/refocus/search seams touch
+    (filename, filepath, metadata, archived) without ever matching a real
+    task. Defensive completeness only — the primary safety is the explicit
+    check_action ghost guard that hides all task-only actions."""
+
+    def __init__(self, ref: str):
+        slug = re.sub(r"[^0-9A-Za-z._#-]+", "-", str(ref)) or "unknown"
+        self.filename = f"trail-ghost-{slug}.md"
+        self.filepath = Path(self.filename)
+        self.metadata: dict = {}
+        self.content = ""
+        self.archived = False
+
+
+def _trail_badge_text(entry: dict) -> str:
+    """Literal badge line for a trail entry card: glyph, classification,
+    confidence. Rendered with markup=False (literal UI text)."""
+    classification = str(entry.get("classification") or "?")
+    glyph = TRAIL_CLASSIFICATION_GLYPHS.get(classification, "·")
+    confidence = str(entry.get("confidence") or "?")
+    return f"{glyph} {classification} · conf: {confidence}"
+
+
+def _trail_drift_text(reasons, max_shown: int = 2,
+                      max_detail: int = 48) -> str:
+    """Literal per-card drift marker (rendered with markup=False).
+
+    The *detail* is what makes the marker actionable ("status 'Ready' ->
+    'Implementing'"), so it is rendered alongside the code rather than the code
+    alone. Bounded by ``max_shown`` reasons and a truncated detail to fit a
+    card; the complete list stays in TrailDetailScreen."""
+    if not reasons:
+        return ""
+    parts = []
+    for code, _ref, detail in reasons[:max_shown]:
+        detail = " ".join(str(detail or "").split())
+        if len(detail) > max_detail:
+            detail = detail[:max_detail - 1].rstrip() + "…"
+        parts.append(f"{code}: {detail}" if detail else str(code))
+    extra = len(reasons) - max_shown
+    if extra > 0:
+        parts.append(f"(+{extra} more)")
+    return "⚠ " + " · ".join(parts)
+
+
+def _remote_status_text(view: TrailEntryView) -> str:
+    """A cross-repo ghost's live status line (t1957_1; markup=False)."""
+    if view.remote_state == XDEP_CHECKING:
+        return "🌐 (checking…)"
+    if view.remote_state != XDEP_RESOLVED:
+        return "🌐 (not checked)"
+    if not view.remote_status or view.remote_status == "NOT_FOUND":
+        return "🌐 (UNREACHABLE)"
+    return _status_badge_text(view.remote_status, "")
+
+
+class TrailTaskCard(TaskCard):
+    """Card for a live local task inside a By-Trail wave column (RFC §9.1)."""
+
+    def __init__(self, view: TrailEntryView, wave: dict,
+                 manager: "TaskManager", column_id: str):
+        super().__init__(view.task, manager,
+                         is_child=("_" in (task_own_id(view.task) or "")),
+                         column_id=column_id)
+        self.trail_entry = view.entry
+        self.trail_view = view
+        self.trail_wave = wave
+        self.is_ghost = False
+
+    def compose(self):
+        task_num, task_name = self._parse_filename(self.task_data.filename)
+        title = Text()
+        # There is no `.task-title-row` Horizontal on this card — the title is
+        # one Rich Text — so the follow-up glyph is prepended into it rather
+        # than yielded as a gutter Label. It goes BEFORE the landed `✔ `, so the
+        # leading column is the provenance marker on every By-Trail card.
+        # Source is frontmatter, NOT `self.trail_entry`: the trail snapshot
+        # serves the trail document, which is what keeps this independent of
+        # t1468_5.
+        followup = _followup_marker(self.task_data.metadata)
+        if followup:
+            title.append_text(_followup_glyph_text(followup))
+            title.append(" ")
+        if self.trail_view.landed:
+            title.append("✔ ")
+            title.append(f"{task_num} {task_name}".strip(), style="strike")
+        else:
+            title.append(f"{task_num} {task_name}".strip())
+        yield Label(title, classes="task-title")
+        yield Label(_trail_badge_text(self.trail_entry),
+                    classes="task-info trail-badges", markup=False)
+        # Deferred-plan qualifier (t1603_1). The guard is `status or
+        # plan_marker`, not `status` -- a hand-edited task with a marker and no
+        # `status:` key must still surface `📋 Planned` here, exactly as
+        # TaskCard's suppressed-badge branch does. `_status_badge_text` returns
+        # "" iff both are falsey, so this condition is precisely "the helper has
+        # something to say": guard and helper agree by construction rather than
+        # by two separately-maintained truth tables.
+        status = self.task_data.metadata.get("status", "")
+        plan_marker = _plan_approved_marker(self.task_data.metadata)
+        if status or plan_marker:
+            yield Label(_status_badge_text(status, plan_marker),
+                        classes="task-info")
+        # Cross-repo deps (t1957_1): the same glyphs and per-ref strings as
+        # TaskCard, but read from the session's probe results carried on the
+        # view — never probed here (see _rerender_trail's precondition).
+        if self.trail_view.xdep_blocked:
+            yield Label("🌐 blocked (cross-repo)",
+                        classes="task-info trail-xdep-blocked", markup=False)
+        if self.trail_view.xdeps:
+            yield Label(f"↗ {', '.join(self.trail_view.xdeps)}",
+                        classes="task-info trail-xdeps", markup=False)
+        drift = _trail_drift_text(self.trail_view.drift_reasons)
+        if drift:
+            yield Label(drift, classes="task-info trail-drift", markup=False)
+        # markup=False: bracketed shortcut hints are literal UI text.
+        # Card-scoped actions ONLY (t1268): `r`/`s` are view-scoped and now
+        # carry truthful By-Trail labels in the footer, so naming them here
+        # duplicated — and for `s` contradicted — the footer.
+        yield Label("[enter details]",
+                    classes="task-info trail-ops", markup=False)
+
+    def on_click(self, event):
+        # No expand-children double-click in By-Trail. Overriding is not
+        # enough: Textual runs `on_click` for every class in the MRO, so the
+        # base `TaskCard.on_click` would run as well — opening the details a
+        # second time, or reading `expanded_tasks` on a host that has none
+        # (TrailsApp, t2089). Only prevent_default() stops that dispatch.
+        event.prevent_default()
+        self.focus()
+        if event.chain == 2:
+            self.app.action_view_details()
+
+
+class TrailGhostCard(TaskCard):
+    """Read-only ghost card for archived / missing / cross-repo trail members
+    (RFC §9.1: no move actions; §9.2 ghost rows).
+
+    Subclasses TaskCard so every focus/nav/refocus seam (which queries
+    TaskCard) reaches ghosts unchanged; carries a synthetic task stub whose
+    filename is the stable refocus key. check_action hides all task-only
+    actions when a ghost is focused."""
+
+    def __init__(self, view: TrailEntryView, wave: dict, column_id: str):
+        stub = _GhostTaskStub(view.entry.get("task", ""))
+        super().__init__(stub, None, is_child=False, column_id=column_id)
+        self.trail_entry = view.entry
+        self.trail_view = view
+        self.trail_wave = wave
+        self.is_ghost = True
+
+    def compose(self):
+        # No follow-up glyph here, BY DESIGN (t1468_3) — not an omission. A
+        # ghost is a referenced task with no local file, so `_GhostTaskStub`
+        # carries `metadata = {}`: there is nothing to classify and nothing to
+        # pick. `_followup_marker({})` would return None anyway; not calling it
+        # states the decision rather than leaving it to fall out.
+        ref = str(self.trail_entry.get("task") or "?")
+        title = Text()
+        if self.trail_view.landed:
+            title.append("✔ ")
+            title.append(ref, style="strike")
+        else:
+            title.append(ref)
+        yield Label(title, classes="task-title")
+        kind = _TRAIL_GHOST_LABELS.get(self.trail_view.ghost_kind,
+                                       self.trail_view.ghost_kind)
+        yield Label(f"👻 {kind} — read-only", classes="task-info")
+        if self.trail_view.ghost_kind == "cross_repo":
+            yield Label(_remote_status_text(self.trail_view),
+                        classes="task-info trail-remote-status", markup=False)
+        yield Label(_trail_badge_text(self.trail_entry),
+                    classes="task-info trail-badges", markup=False)
+        drift = _trail_drift_text(self.trail_view.drift_reasons)
+        if drift:
+            yield Label(drift, classes="task-info trail-drift", markup=False)
+
+    def _priority_border_color(self):
+        return "gray"
+
+    def _idle_border_style(self):
+        return "dashed"
+
+    def on_click(self, event):
+        # Keep the base TaskCard.on_click out (see TrailTaskCard.on_click).
+        event.prevent_default()
+        self.focus()
+        if event.chain == 2:
+            self.app.action_view_details()
+
+
+class TrailColumn(VerticalScroll):
+    """A wave column in the By-Trail view (RFC §9.1): ``W<ordinal> · <title>``
+    header over TrailTaskCards / TrailGhostCards in position order.
+
+    Non-reorderable. Carries ``self.wave`` and per-card ``trail_entry`` /
+    ``is_ghost`` as the seams for the t1210_5 move commands."""
+
+    def __init__(self, lane: TrailWaveLane, manager: "TaskManager"):
+        super().__init__()
+        self.lane = lane
+        self.wave = lane.wave
+        self.manager = manager
+        self.col_id = f"trail-w{self.wave.get('ordinal', 0)}"
+
+    def wave_entries(self) -> list:
+        """This wave's `TrailEntryView`s in `position` order (t1210_5).
+
+        The authoritative order — `compose` mounts the cards from this same
+        list — so the wave move reads it rather than walking the DOM.
+        """
+        return self.lane.entries
+
+    def compose(self):
+        title = f"W{self.wave.get('ordinal', '?')} · {self.wave.get('title', '')}"
+        header = ColumnHeader(self.col_id, title, len(self.lane.entries),
+                              is_collapsed=False, editable=False)
+        header.styles.width = "100%"
+        header.styles.text_align = "center"
+        yield header
+        for view in self.lane.entries:
+            if view.task is not None:
+                yield TrailTaskCard(view, self.wave, self.manager,
+                                    column_id=self.col_id)
+            else:
+                yield TrailGhostCard(view, self.wave, column_id=self.col_id)
+
+    def on_mount(self):
+        self.styles.width = 44
+        self.styles.min_width = 34
+        self.styles.border = ("round", "#8BE9FD")
+        self.styles.margin = (0, 1)
+
+
+def _trail_stored_freshness(info: TrailInfo) -> str:
+    """Selection-modal freshness badge from the trail's *stored* verdict (the
+    live drift check runs only for the active trail).
+
+    Labelled "(recorded)" (t1268): ``freshness`` records what was true when the
+    trail was last written, so a trail a live drift run calls STALE can still
+    carry ``state: current`` here. Without the qualifier the badge reads as a
+    live verdict and is actively misleading. Running drift per discovered trail
+    would cost one ~0.5s subprocess each on the discovery path — deliberately
+    not done; the active trail gets the live check."""
+    if info.load_error:
+        return "✗ unreadable"
+    doc = info.doc or {}
+    freshness = doc.get("freshness") or {}
+    state = str(freshness.get("state") or "unknown")
+    if state == "stale":
+        n = len(freshness.get('drift_reasons') or [])
+        return f"⚠ stale ({n}, recorded)"
+    if state == "current":
+        return "✓ current (recorded)"
+    return "? unknown"
+
+
+def _trail_select_title(info: TrailInfo) -> str:
+    """The one title string the selector both shows and filters on."""
+    doc = info.doc or {}
+    return str(doc.get("title") or info.name or info.handle)
+
+
+def trail_select_prompt(info: TrailInfo, is_open: bool = False) -> Text:
+    """One selector list row: the title only, plus ``● open`` for a trail that
+    already has a tab (t1895: choosing it switches, never duplicates).
+
+    Always a ``Text``: an ``OptionList`` parses a ``str`` prompt as markup, so a
+    title such as ``Plan [bold]`` would render as ``Plan`` — and no longer read
+    as the string the title filter matches on."""
+    text = Text(_trail_select_title(info))
+    if is_open:
+        text.append("  ● open", style="bold")
+    return text
+
+
+def trail_select_detail(info: TrailInfo, overlap_notes, is_open: bool = False,
+                        ) -> Text:
+    """The selector's detail pane for one trail: owner, scope, stored
+    freshness, generation time, the "also in" shared-task notes (§9.2) and,
+    for a trail that failed to load, its error and the recorded versions.
+
+    Every value is appended as plain text, never interpolated into markup —
+    titles, refs and error details are stored data."""
+    doc = info.doc or {}
+    text = Text()
+    text.append(_trail_select_title(info), style="bold")
+    if is_open:
+        text.append("  ● open", style="bold")
+    text.append("\n")
+    text.append(info.handle, style="dim")
+    text.append("\n\n")
+
+    owner = f"t{info.owner_id}" if info.owner_id else "?"
+    if info.owner_archived:
+        owner += " (archived)"
+    if info.owner_folded:
+        owner += " (folded)"
+    raw = (doc.get("generation") or {}).get("generated_at")
+    # Same local-time label as the banner (t2112), so the two agree; an
+    # unparseable value keeps the pre-t2112 raw / "?" rendering.
+    generated = trail_generated_label(raw) or str(raw or "?")
+    rows = (
+        ("Owner", owner),
+        ("Scope", str((doc.get("scope") or {}).get("kind") or "?")),
+        ("Freshness", _trail_stored_freshness(info)),
+        ("Generated", generated),
+    )
+    for label, value in rows:
+        text.append(f"{label:<10} ", style="dim")
+        text.append(value)
+        text.append("\n")
+
+    if overlap_notes:
+        text.append("\nShared tasks\n", style="bold")
+        for ref, other_title in overlap_notes:
+            text.append(f"  {ref} — also in ")
+            text.append(str(other_title), style="italic")
+            text.append("\n")
+
+    if info.load_error:
+        text.append("\nError\n", style="bold")
+        text.append(f"  {info.load_error}\n")
+        if info.versions:
+            text.append(f"\nRecorded versions (ait artifact versions "
+                        f"{info.handle}):\n", style="dim")
+            for version in info.versions:
+                text.append(f"  {version}\n")
+    text.rstrip()
+    return text
+
+
+class TrailTitleList(OptionList):
+    """The selector's title list. Never focusable: the search box keeps focus
+    and the screen drives this list's cursor, so ↑/↓ move the highlight while
+    typed keys still reach the box."""
+
+    can_focus = False
+
+
+class TrailDetailPane(VerticalScroll):
+    """The selector's detail pane. Never focusable — ``VerticalScroll`` is by
+    default, and a focused pane would re-activate both host Apps' priority
+    ``nav_up`` / ``nav_down`` (focus would move instead of the list cursor).
+    It scrolls with PgUp/PgDn (screen bindings) and the mouse wheel."""
+
+    can_focus = False
+
+
+class TrailSelectScreen(GuardedModalScreen):
+    """Trail selection modal (RFC §9.1): dismisses the chosen handle or None.
+
+    Two panes: a title-only list under a fuzzy search box on the left, the
+    highlighted trail's details on the right. The search box and the Cancel
+    button are the only focusable widgets, so the box keeps focus while ↑/↓
+    (screen bindings — both host Apps' priority arrows stand down while an
+    ``Input`` is focused) move the list highlight and PgUp/PgDn scroll the
+    details.
+
+    Guarded (tui_conventions.md "Modal dismissal"): a key still dispatched to
+    this selector after it closed — a Ctrl+R re-scan, a repeated `Esc` — must
+    not pop whatever screen replaced it."""
+
+    # Self-contained (tui_conventions.md "Modals pushed by multiple Apps"): the
+    # board and `ait trails` both push this modal, and neither App's CSS styles
+    # these ids. The highlight rule matters most — the list never has focus, so
+    # OptionList's own focused-cursor styling never applies.
+    DEFAULT_CSS = """
+    TrailSelectScreen {
+        align: center middle;
+    }
+    #trail_select_dialog {
+        width: 90%;
+        height: 80%;
+        background: $surface;
+        border: thick $accent;
+        padding: 0 1;
+    }
+    #trail_select_title {
+        width: 100%;
+        text-align: center;
+        text-style: bold;
+    }
+    #trail_select_hint {
+        width: 100%;
+        text-align: center;
+        color: $text-muted;
+        margin: 0 0 1 0;
+    }
+    #trail_select_body { height: 1fr; }
+    #trail_select_left { width: 40%; min-width: 24; height: 100%; }
+    #trail_select_search { width: 100%; }
+    #trail_select_list {
+        height: 1fr;
+        border: none;
+        padding: 0;
+        background: $surface;
+    }
+    #trail_select_list > .option-list--option-highlighted {
+        background: $primary 40%;
+        text-style: bold;
+    }
+    #trail_select_detail {
+        width: 1fr;
+        height: 100%;
+        border-left: solid $accent 50%;
+        padding: 0 1;
+    }
+    #trail_select_detail_body { width: 100%; height: auto; }
+    #trail_select_buttons { height: auto; align: center middle; }
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel", show=False),
+        # Re-scan from inside the selector — the tabbed host serves the list
+        # from its cache, so this is how a trail created since is found. Inert
+        # unless the pusher allows it (the board's `s` always re-scans). Not a
+        # plain `r`: a typed `r` belongs to the search box.
+        Binding("ctrl+r", "rescan", "Rescan", show=False),
+        Binding("up", "cursor_up", "Up", show=False),
+        Binding("down", "cursor_down", "Down", show=False),
+        Binding("pageup", "detail_page_up", "Scroll details up", show=False),
+        Binding("pagedown", "detail_page_down", "Scroll details down",
+                show=False),
+    ]
+
+    def __init__(self, infos: list, overlaps: dict, open_handles=(),
+                 allow_rescan: bool = False):
+        super().__init__()
+        self.infos = infos
+        self.overlaps = overlaps
+        self.open_handles = frozenset(open_handles)
+        self.allow_rescan = allow_rescan
+        self._by_handle = {info.handle: info for info in infos}
+        self._query = ""
+        # The handle the detail pane shows (None = the no-match message); a
+        # sentinel until the first render, so that render scrolls home too.
+        self._detail_handle = object()
+
+    def compose(self):
+        rescan = " · Ctrl+R rescan" if self.allow_rescan else ""
+        hint = Text("Type to filter · ↑/↓ move · Enter open · Esc cancel\n"
+                    f"PgUp/PgDn scroll details{rescan}")
+        with Container(id="trail_select_dialog"):
+            yield Label("Select trail", id="trail_select_title")
+            yield Label(hint, id="trail_select_hint")
+            with Horizontal(id="trail_select_body"):
+                with Vertical(id="trail_select_left"):
+                    yield Input(placeholder="Filter by title…",
+                                id="trail_select_search")
+                    yield TrailTitleList(id="trail_select_list")
+                with TrailDetailPane(id="trail_select_detail"):
+                    yield Static(id="trail_select_detail_body")
+            with Horizontal(id="trail_select_buttons"):
+                yield Button("Cancel", id="btn_trail_select_cancel")
+
+    def on_mount(self):
+        self._apply_filter("")
+        self.query_one("#trail_select_search", Input).focus()
+
+    def _list(self) -> TrailTitleList:
+        return self.query_one("#trail_select_list", TrailTitleList)
+
+    def _highlighted_handle(self):
+        options = self._list()
+        index = options.highlighted
+        if index is None or index >= options.option_count:
+            return None
+        return options.get_option_at_index(index).id
+
+    def _apply_filter(self, query: str):
+        """Show the trails whose title matches ``query`` (all of them, in
+        discovery order, for a blank one), highlighting the first."""
+        self._query = query
+        shown = rank(query, self.infos, key=_trail_select_title)
+        options = self._list()
+        options.clear_options()
+        options.add_options([
+            Option(trail_select_prompt(info, info.handle in self.open_handles),
+                   id=info.handle)
+            for info in shown])
+        options.highlighted = 0 if shown else None
+        self._show_detail(shown[0].handle if shown else None)
+
+    def _show_detail(self, handle):
+        body = self.query_one("#trail_select_detail_body", Static)
+        info = self._by_handle.get(handle) if handle is not None else None
+        if info is None:
+            body.update(Text(f'No trail title matches "{self._query}"'
+                             if self.infos else "No trails found."))
+        else:
+            body.update(trail_select_detail(
+                info, self.overlaps.get(handle, []),
+                is_open=handle in self.open_handles))
+        if handle != self._detail_handle:
+            # A different trail opens at its title: replacing the body keeps
+            # the pane's scroll offset, which would leave the new trail's
+            # header above the viewport after paging through a long one.
+            self._detail_handle = handle
+            self.query_one("#trail_select_detail",
+                           TrailDetailPane).scroll_home(animate=False)
+
+    @on(Input.Changed, "#trail_select_search")
+    def _search_changed(self, event):
+        self._apply_filter(event.value)
+
+    @on(Input.Submitted, "#trail_select_search")
+    def _search_submitted(self, event):
+        handle = self._highlighted_handle()
+        if handle is not None:
+            self.dismiss(handle)
+
+    @on(OptionList.OptionHighlighted, "#trail_select_list")
+    def _option_highlighted(self, event):
+        # Messages queue: act on the list's current highlight, not on a
+        # highlight a later filter has already replaced.
+        handle = self._highlighted_handle()
+        if handle is not None and event.option.id == handle:
+            self._show_detail(handle)
+
+    @on(OptionList.OptionSelected, "#trail_select_list")
+    def _option_selected(self, event):
+        self.dismiss(event.option.id)
+
+    @on(Button.Pressed, "#btn_trail_select_cancel")
+    def cancel_button(self):
+        self.dismiss(None)
+
+    def action_cursor_up(self):
+        self._list().action_cursor_up()
+
+    def action_cursor_down(self):
+        self._list().action_cursor_down()
+
+    def action_detail_page_up(self):
+        self.query_one("#trail_select_detail",
+                       TrailDetailPane).scroll_page_up(animate=False)
+
+    def action_detail_page_down(self):
+        self.query_one("#trail_select_detail",
+                       TrailDetailPane).scroll_page_down(animate=False)
+
+    def action_cancel(self):
+        self.dismiss(None)
+
+    def action_rescan(self):
+        if self.allow_rescan:
+            self.dismiss(TRAIL_SELECT_RESCAN)
+
+
+class TrailDetailScreen(ModalScreen):
+    """Entry-first projection of a trail (RFC §9.1 detail modal): the focused
+    entry, its wave, the drift and observations that concern it, the evidence
+    backing everything shown, the trail narrative, and exclusions. Read-only
+    prose, not tooltips.
+
+    Until t1505_2 this rendered the WHOLE document on every card — all 19
+    observations, all 56 evidence records and every drift reason of the live
+    gate-framework trail — so two cards' text was ~95% identical and the part
+    that distinguished them scrolled off the top. `_scope` now partitions the
+    document against the focused entry and `a` reveals what was withheld."""
+
+    DEFAULT_CSS = """
+    TrailDetailScreen {
+        align: center middle;
+    }
+    #trail_detail_dialog {
+        width: 80%;
+        height: 80%;
+        background: $surface;
+        border: thick $accent;
+        padding: 1 2;
+    }
+    #trail_detail_body {
+        height: 1fr;
+    }
+    #trail_detail_buttons {
+        height: auto;
+    }
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Close", show=False),
+        # No modal in this app mounts a Footer, so `show=True` would surface
+        # nowhere; the in-body hint line is the discoverability surface and it
+        # renders exactly when something is withheld. `a` is also bound at App
+        # level (`view_all`) WITHOUT priority, so this screen binding shadows
+        # it while the modal is up — pinned by a negative control asserting
+        # `base_filter` does not change.
+        Binding("a", "toggle_all", "Show all", show=False),
+        # Opens the task description in its own viewer (t2111). Not `d` / `v`
+        # (the host's Freshness / Summary) nor `T`; the board's App-level `o`
+        # is non-priority, so this shadows it the same way `a` does.
+        Binding("o", "view_description", "Description", show=False),
+    ]
+
+    def __init__(self, doc: dict, drift_reasons: list,
+                 entry: dict | None = None, wave: dict | None = None,
+                 entry_task=None, ghost_kind: str = ""):
+        super().__init__()
+        self.doc = doc or {}
+        self.drift_reasons = drift_reasons or []
+        self.entry = entry
+        self.wave = wave
+        # The entry's task — live, or the archived one an `archived` ghost
+        # resolved to — handed over by the host, never looked up here (C2).
+        # Not `self.task`: that is Textual's read-only MessagePump property.
+        self.entry_task = entry_task
+        self.ghost_kind = ghost_kind
+        self.show_all = False
+
+    def _scope(self) -> dict:
+        """Partition the document three ways against the focused entry: owned
+        by it, owned by ANOTHER member, and UNOWNED.
+
+        Only the middle bucket is ever withheld. Unowned material — a
+        trail-level or non-member drift reason (both categories
+        ``trail_drift_by_ref`` drops), an observation affecting no member, an
+        evidence record nothing cites — has no owning card, so filing it under
+        "other" would hide it on EVERY card instead of duplicating it on every
+        card: strictly worse than the defect this scoping removes.
+
+        Displayed evidence follows what is DISPLAYED, not just the entry: an
+        observation shown here without the record it cites is an unsupported
+        claim in an evidence-backed artifact. A record cited by nothing at all
+        is unowned like the rest — and that is the whole of a lite trail's
+        evidence, since the lite writer omits per-entry ``evidence_refs``
+        while the schema still requires >= 1 record.
+
+        Read by ``_sections``, ``check_action`` and ``action_toggle_all``
+        alike; a second computation could let the hint line offer a reveal
+        that reveals nothing. With no focused entry there is no anchor to
+        scope against, so nothing is withheld and the full document renders.
+
+        Every ref comparison goes through ``canonical_trail_ref`` on BOTH
+        sides: a trail may spell a member ``aitasks#t42`` while drift reasons
+        and ``affects`` use ``aitasks#42``, and raw string comparison would
+        silently drop the match."""
+        members = {canonical_trail_ref(ref)
+                   for ref in trail_entry_refs(self.doc)}
+        entry_ref = (canonical_trail_ref(self.entry.get("task"))
+                     if self.entry is not None else "")
+        records = self.doc.get("evidence") or []
+        by_id = {str(rec.get("evidence_id")): rec for rec in records}
+
+        # THE EVIDENCE UNIVERSE — computed once, above the no-anchor branch,
+        # because both projections must agree on what "everything" is. A cited
+        # ref that resolves to NO record is still document content: it exists
+        # only in the citation, never in `evidence`, so any projection built
+        # from the records alone silently drops it. `cited_anywhere` keeps
+        # discovery order so the universe is deterministic.
+        cited_anywhere, cited_seen = [], set()
+
+        def _cite(ref):
+            ref = str(ref)
+            if ref not in cited_seen:
+                cited_seen.add(ref)
+                cited_anywhere.append(ref)
+
+        for wave in self.doc.get("waves") or []:
+            for item in wave.get("entries") or []:
+                for ref in item.get("evidence_refs") or []:
+                    _cite(ref)
+        for obs in self.doc.get("observations") or []:
+            for ref in obs.get("evidence_refs") or []:
+                _cite(ref)
+        universe = [str(rec.get("evidence_id")) for rec in records]
+        universe += [ref for ref in cited_anywhere if ref not in by_id]
+
+        totals = (len(self.doc.get("observations") or []),
+                  len(self.doc.get("exclusions") or []),
+                  len(records), len(self.drift_reasons))
+
+        if not entry_ref:
+            # No anchor: everything is in scope, nothing is withheld. Resolved
+            # here rather than compensated for in `_sections` so the one
+            # partition stays the single truth its consumers rely on — and
+            # built from `universe`, so "Showing the full trail." is true of
+            # unresolved refs too.
+            return {
+                "entry_drift": list(self.drift_reasons),
+                "unowned_drift": [], "other_drift": [],
+                "entry_obs": list(self.doc.get("observations") or []),
+                "unowned_obs": [], "other_obs": [],
+                "shown_evidence": [(ref, by_id.get(ref), "")
+                                   for ref in universe],
+                "other_evidence": [],
+                "exclusions": self.doc.get("exclusions") or [],
+                "totals": totals,
+                "withheld": 0,
+            }
+
+        by_ref = trail_drift_by_ref(self.drift_reasons)
+        entry_drift = list(by_ref.get(entry_ref, []))
+        unowned_drift, other_drift = [], []
+        for reason in self.drift_reasons:
+            _code, task_ref, _detail = reason
+            if not task_ref or task_ref == "-":
+                unowned_drift.append(reason)
+                continue
+            key = canonical_trail_ref(task_ref)
+            if key == entry_ref:
+                continue                      # already in entry_drift
+            (other_drift if key in members else unowned_drift).append(reason)
+
+        entry_obs, unowned_obs, other_obs = [], [], []
+        for obs in self.doc.get("observations") or []:
+            affects = obs.get("affects") or []
+            if isinstance(affects, str):
+                affects = [affects]
+            refs = {canonical_trail_ref(ref) for ref in affects}
+            if entry_ref in refs:
+                entry_obs.append(obs)
+            elif refs & members:
+                other_obs.append(obs)
+            else:
+                unowned_obs.append(obs)
+
+        # (ref, record-or-None, provenance) in a stable order: the entry's own
+        # citations first, then what the displayed observations pull in, then
+        # the uncited records.
+        shown_evidence, seen = [], set()
+
+        def _show(ref, provenance):
+            ref = str(ref)
+            if ref in seen:
+                return
+            seen.add(ref)
+            shown_evidence.append((ref, by_id.get(ref), provenance))
+
+        for ref in self.entry.get("evidence_refs") or []:
+            _show(ref, "")
+        for obs in entry_obs + unowned_obs:
+            for ref in obs.get("evidence_refs") or []:
+                _show(ref, f"cited by {obs.get('observation_id', '?')}")
+        for rec in records:
+            if str(rec.get("evidence_id")) not in cited_seen:
+                _show(rec.get("evidence_id"), "trail-level (uncited)")
+        # Drawn from `universe`, so an unresolved ref owned by another entry is
+        # counted and revealed like any other withheld record. Same
+        # (ref, record, provenance) shape as `shown_evidence`, so the reveal
+        # renders both through one path.
+        other_evidence = [(ref, by_id.get(ref), "")
+                          for ref in universe if ref not in seen]
+
+        return {
+            "entry_drift": entry_drift,
+            "unowned_drift": unowned_drift,
+            "other_drift": other_drift,
+            "entry_obs": entry_obs,
+            "unowned_obs": unowned_obs,
+            "other_obs": other_obs,
+            "shown_evidence": shown_evidence,
+            "other_evidence": other_evidence,
+            "exclusions": self.doc.get("exclusions") or [],
+            "totals": totals,
+            "withheld": (len(other_drift) + len(other_obs)
+                         + len(other_evidence)),
+        }
+
+    def _sections(self) -> Text:
+        text = Text()
+
+        def head(label):
+            if text.plain:
+                text.append("\n\n")
+            text.append(label, style="bold underline")
+            text.append("\n")
+
+        def line(label, value):
+            if value in (None, "", [], {}):
+                return
+            text.append(f"{label}: ", style="bold")
+            if isinstance(value, list):
+                value = "; ".join(str(v) for v in value)
+            text.append(f"{value}\n")
+
+        def drift_bullet(reason, suffix=""):
+            code, task_ref, detail = reason
+            where = f" {task_ref}" if task_ref and task_ref != "-" else ""
+            text.append(f"• {code}{where}: {detail}{suffix}\n")
+
+        def more(count, noun):
+            if count:
+                plural = "" if count == 1 else "s"
+                text.append(f"… {count} more {noun}{plural}\n")
+
+        scope = self._scope()
+        full = self.show_all or self.entry is None
+
+        if self.entry is not None:
+            heading, lines = self._task_header()
+            head(heading)
+            for row in lines:
+                text.append(f"{row}\n")
+            head(f"Entry {self.entry.get('task', '?')}")
+            line("classification", self.entry.get("classification"))
+            line("confidence", self.entry.get("confidence"))
+            line("rationale", self.entry.get("rationale"))
+            line("expected outcome", self.entry.get("expected_outcome"))
+            line("why order matters", self.entry.get("why_order_matters"))
+            line("caveats", self.entry.get("caveats"))
+        if self.wave is not None:
+            head(f"Wave W{self.wave.get('ordinal', '?')} · "
+                 f"{self.wave.get('title', '')}")
+            line("purpose", self.wave.get("purpose"))
+            line("why now", self.wave.get("why_now"))
+            line("consequence of delay", self.wave.get("consequence_of_delay"))
+
+        drift = (scope["entry_drift"] + scope["unowned_drift"]
+                 + (scope["other_drift"] if full else []))
+        if drift:
+            label = ("Drift reasons" if full
+                     else "Drift affecting this entry")
+            head(f"{label} ({len(drift)})")
+            for reason in scope["entry_drift"]:
+                drift_bullet(reason)
+            for reason in scope["unowned_drift"]:
+                drift_bullet(reason, "  [trail-level]")
+            for reason in (scope["other_drift"] if full else []):
+                drift_bullet(reason)
+            if not full:
+                more(len(scope["other_drift"]), "reason for other entries")
+
+        narrative = self.doc.get("narrative") or {}
+        head(f"Trail: {self.doc.get('title', '?')}")
+        line("problem", narrative.get("problem_statement"))
+        line("recommendation", narrative.get("recommendation_summary"))
+        # `overview` (t1505_3) is rendered as its own field rather than through
+        # `trail_summary_text`: that resolver picks ONE of the two for the
+        # single-slot summary pane, and using it here would hide the required
+        # `recommendation_summary` whenever an overview exists.
+        line("overview", narrative.get("overview"))
+        line("method note", narrative.get("method_note"))
+        line("caveats", narrative.get("caveats"))
+
+        unowned_ids = {id(obs) for obs in scope["unowned_obs"]}
+        for obs in (scope["entry_obs"] + scope["unowned_obs"]
+                    + (scope["other_obs"] if full else [])):
+            mark = " [trail-level]" if id(obs) in unowned_ids else ""
+            head(f"Observation: {obs.get('kind', '?')}{mark}")
+            line("statement", obs.get("statement"))
+            line("affects", obs.get("affects"))
+        if not full:
+            more(len(scope["other_obs"]),
+                 "observation not affecting this entry")
+
+        # Withheld records are appended AFTER the shown ones rather than
+        # re-sorted into document order, so toggling `a` never reshuffles what
+        # is already on screen — same reason the observation buckets keep
+        # their order above.
+        shown = list(scope["shown_evidence"])
+        if full:
+            shown += list(scope["other_evidence"])
+        if shown:
+            head("Evidence")
+            for ref, rec, provenance in shown:
+                suffix = f" — {provenance}" if provenance else ""
+                if rec is None:
+                    text.append(f"• {ref} (unresolved){suffix}\n")
+                    continue
+                text.append(f"• {rec.get('evidence_id', '?')} "
+                            f"({rec.get('source_type', '?')}): "
+                            f"{rec.get('summary', '')}{suffix}\n")
+            if not full:
+                more(len(scope["other_evidence"]), "evidence record")
+
+        if scope["exclusions"]:
+            head("Exclusions")
+            for exc in scope["exclusions"]:
+                text.append(f"• {exc.get('task', '?')} "
+                            f"[{exc.get('reason_code', '?')}] "
+                            f"{exc.get('reason', '')}\n")
+
+        # ALWAYS rendered. An omitted section and a failed render look
+        # identical to a reader — a lite trail legitimately has no
+        # observations, exclusions or relations — so the totals state the
+        # zeroes explicitly and the mode line says which projection is on
+        # screen (t1505_2).
+        obs_n, exc_n, ev_n, drift_n = scope["totals"]
+        if text.plain:
+            text.append("\n\n")
+        text.append(f"Trail totals: {obs_n} observations · {exc_n} "
+                    f"exclusions · {ev_n} evidence · {drift_n} drift "
+                    f"reasons\n")
+        if self.show_all:
+            text.append("Showing the full document — press a to scope back "
+                        "to this entry.\n")
+        elif self.entry is None:
+            text.append("Showing the full trail.\n")
+        elif scope["withheld"]:
+            text.append("Showing what concerns this entry — press a for the "
+                        "full document.\n")
+        else:
+            text.append("Showing the full trail.\n")
+        return text
+
+    def _description_available(self) -> bool:
+        """Whether there is a task body to open — the one rule the header
+        hint, the button, ``check_action`` and the action all read."""
+        task = self.entry_task
+        return (task is not None
+                and bool((getattr(task, "content", "") or "").strip()))
+
+    def _task_title(self) -> str:
+        task_num, task_name = TaskCard._parse_filename(
+            self.entry_task.filename)
+        return f"{task_num} {task_name}".strip()
+
+    def _task_header(self) -> tuple:
+        """``(heading, lines)`` naming the entry's task (t2111).
+
+        Built from the task FILE (live, or the archived one an ``archived``
+        ghost resolved to) — never from ``entry.snapshot``, which is the trail
+        document's frozen copy. The body is deliberately not rendered here:
+        the modal is long already, so the description opens in its own viewer.
+        """
+        if self.entry_task is None:
+            heading = f"Task {self.entry.get('task', '?')}"
+            if self.ghost_kind == "cross_repo":
+                reason = ("Lives in another repository — no local task file, "
+                          "so its description is not available here.")
+            else:
+                reason = ("No task file found (active or archived) — "
+                          "description not available.")
+            return heading, [reason]
+        heading = f"Task {self._task_title()}"
+        if self.ghost_kind == "archived":
+            heading += " (archived)"
+        meta = self.entry_task.metadata or {}
+        parts = [str(meta[key]) for key in ("status", "priority", "effort")
+                 if meta.get(key)]
+        if meta.get("issue_type"):
+            parts.append(f"type: {meta['issue_type']}")
+        labels = meta.get("labels")
+        if isinstance(labels, list):
+            labels = ", ".join(str(label) for label in labels)
+        if labels:
+            parts.append(f"labels: {labels}")
+        lines = [" · ".join(parts)] if parts else []
+        if self._description_available():
+            lines.append("Description: press o (or the Description button) "
+                         "to open it")
+        else:
+            lines.append("Description: the task file has no description")
+        return heading, lines
+
+    def compose(self):
+        with Container(id="trail_detail_dialog"):
+            with VerticalScroll(id="trail_detail_body"):
+                yield Static(self._sections(), id="trail_detail_text")
+            with Horizontal(id="trail_detail_buttons"):
+                if self._description_available():
+                    yield Button("Description (o)",
+                                 id="btn_trail_detail_desc")
+                yield Button("Close", id="btn_trail_detail_close")
+
+    def check_action(self, action: str, parameters):
+        if action == "toggle_all":
+            # Live while revealed too, so the user can scope back.
+            return self.show_all or bool(self._scope()["withheld"])
+        if action == "view_description":
+            return self._description_available()
+        return True
+
+    def action_view_description(self):
+        # Re-checked here, not only in check_action: a binding gate is not an
+        # action guard (see action_toggle_all).
+        if not self._description_available():
+            return
+        try:
+            from section_viewer import SectionViewerScreen
+        except Exception as exc:
+            self.app.notify(f"Section viewer unavailable: {exc}",
+                            severity="warning")
+            return
+        self.app.push_screen(SectionViewerScreen(
+            self.entry_task.content,
+            title=f"{self._task_title()} — description"))
+
+    @on(Button.Pressed, "#btn_trail_detail_desc")
+    def description_button(self):
+        self.action_view_description()
+
+    def action_toggle_all(self):
+        # Re-checked here, not only in check_action: a binding gate is not an
+        # action guard — the action stays reachable through the command
+        # palette and a remap.
+        if not self.show_all and not self._scope()["withheld"]:
+            return
+        self.show_all = not self.show_all
+        self.query_one("#trail_detail_text", Static).update(self._sections())
+        self.refresh_bindings()
+
+    @on(Button.Pressed, "#btn_trail_detail_close")
+    def close_button(self):
+        self.dismiss(None)
+
+    def action_cancel(self):
+        self.dismiss(None)
+
+
+def linked_scan_error_text(err, max_detail: int = 200) -> str:
+    """One modal row for a ``trail_links.ProjectScanError`` (t1957_4).
+
+    Every kind says what it means for the result: ``partial`` still returned
+    that project's links, ``local_unreadable`` is about THIS trail, and
+    ``registry_unreadable`` names the registry file rather than a project. A
+    detail longer than ``max_detail`` is cut with `…`."""
+    project, kind = str(err.project), str(err.kind)
+    detail = str(err.detail or "")
+    if len(detail) > max_detail:
+        detail = detail[:max_detail - 1] + "…"
+    tail = f" ({detail})" if detail else ""
+    if kind == STALE:
+        return f"{project}: could not search — stale path{tail}"
+    if kind == NOT_FOUND:
+        return f"{project}: could not search — not registered{tail}"
+    if kind == EXPORT_FAILED:
+        return f"{project}: could not search — export failed{tail}"
+    if kind == TIMEOUT:
+        return f"{project}: could not search — timed out{tail}"
+    if kind == PARTIAL:
+        return f"{project}: searched in part{tail}"
+    if kind == REGISTRY_UNREADABLE:
+        return f"project registry {project} could not be read{tail}"
+    if kind == LOCAL_UNREADABLE:
+        return f"this trail ({project}): member(s) could not be read{tail}"
+    return f"{project}: {kind}{tail}"
+
+
+class LinkedTrailItem(PickerItem):
+    """Focusable row for one linked trail in another project: project ·
+    handle · name, with the link's reasons as sub-lines."""
+
+    MAX_REASONS = 3
+
+    def __init__(self, link):
+        text = Text()
+        text.append(str(link.project), style="bold")
+        text.append(f" · {link.handle} · {link.name}")
+        reasons = list(link.reasons)
+        for reason in reasons[:self.MAX_REASONS]:
+            text.append(f"\n  └ {reason}", style="dim italic")
+        if len(reasons) > self.MAX_REASONS:
+            text.append(f"\n  └ (+{len(reasons) - self.MAX_REASONS} more)",
+                        style="dim italic")
+        super().__init__(text)
+        self.link = link
+
+    def on_key(self, event):
+        if event.key == "enter":
+            self.screen.dismiss(self.link)
+            event.prevent_default()
+            event.stop()
+
+    def on_click(self, event):
+        self.screen.dismiss(self.link)
+
+
+class LinkedTrailsScreen(GuardedModalScreen):
+    """Trails in other projects linked to the active one (t1957_4).
+
+    Dismisses the chosen ``LinkedTrail`` or None. Each scan error is a
+    non-focusable row. An incomplete scan says so above the list, and with no
+    links it never claims there are none — only that none were FOUND."""
+
+    DEFAULT_CSS = """
+    LinkedTrailsScreen {
+        align: center middle;
+    }
+    #dep_picker_dialog {
+        width: 70%;
+        height: auto;
+        max-height: 70%;
+        background: $surface;
+        border: thick $accent;
+        padding: 1 2;
+    }
+    #dep_picker_title {
+        text-align: center;
+        padding: 0 0 1 0;
+        text-style: bold;
+    }
+    #dep_picker_dialog.picker-dialog { overflow-y: auto; }
+    .picker-dialog #dep_picker_title { width: 100%; dock: top; }
+    PickerItem { height: auto; width: 100%; padding: 0 1; }
+    PickerItem.dep-item-focused { background: $primary 20%; outline-left: thick $accent; }
+    .linked-trail-note { padding: 1 1 0 1; }
+    .linked-trail-error { color: $warning; padding: 0 1; }
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel", show=False),
+    ]
+
+    def __init__(self, links: list, errors: list, complete: bool):
+        super().__init__()
+        self.links = list(links)
+        self.errors = list(errors)
+        self.complete = complete
+
+    def compose(self):
+        with Container(id="dep_picker_dialog", classes="picker-dialog"):
+            yield Label(
+                "Linked trails — [dim]↑/↓ move · Enter jump · Esc cancel[/]",
+                id="dep_picker_title",
+            )
+            for link in self.links:
+                yield LinkedTrailItem(link)
+            if not self.complete:
+                note = ("Some projects could not be fully searched — the list "
+                        "may be incomplete:" if self.links else
+                        "No linked trails found — the search was incomplete:")
+                yield Static(Text(note), classes="linked-trail-note")
+            for err in self.errors:
+                yield Static(Text(linked_scan_error_text(err)),
+                             classes="linked-trail-error")
+            yield Button("Cancel", id="btn_linked_cancel")
+
+    def on_mount(self):
+        items = list(self.query(LinkedTrailItem))
+        if items:
+            items[0].focus()
+
+    @on(Button.Pressed, "#btn_linked_cancel")
+    def cancel_button(self):
+        self.dismiss(None)
+
+    def action_cancel(self):
+        self.dismiss(None)
+
+
+class TrailJumpConfirmScreen(GuardedModalScreen):
+    """Warnings about a linked-trail jump, shown BEFORE the client switches
+    (t1957_4). Once the client is in the other session, this App is no longer
+    on screen, so anything it said afterwards would go unread. Dismisses True
+    to switch, False to stay."""
+
+    DEFAULT_CSS = """
+    TrailJumpConfirmScreen {
+        align: center middle;
+    }
+    #trail_jump_dialog {
+        width: 70%;
+        height: auto;
+        max-height: 70%;
+        background: $surface;
+        border: thick $warning;
+        padding: 1 2;
+    }
+    #trail_jump_buttons { height: auto; padding: 1 0 0 0; }
+    #trail_jump_buttons Button { margin: 0 1 0 0; }
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Stay here", show=False),
+    ]
+
+    def __init__(self, session: str, warnings):
+        super().__init__()
+        self.session = str(session)
+        self.warnings = [str(w) for w in warnings]
+
+    def compose(self):
+        with Container(id="trail_jump_dialog"):
+            yield Static(Text(
+                f"Before switching to tmux session '{self.session}':",
+                style="bold"))
+            for warning in self.warnings:
+                yield Static(Text(f"• {warning}"))
+            with Horizontal(id="trail_jump_buttons"):
+                yield Button("Switch", id="btn_jump_switch", variant="primary")
+                yield Button("Stay here", id="btn_jump_stay")
+
+    def on_mount(self):
+        self.query_one("#btn_jump_switch", Button).focus()
+
+    @on(Button.Pressed, "#btn_jump_switch")
+    def switch_button(self):
+        self.dismiss(True)
+
+    @on(Button.Pressed, "#btn_jump_stay")
+    def stay_button(self):
+        self.dismiss(False)
+
+    def action_cancel(self):
+        self.dismiss(False)
+
+
+class TrailSummaryScreen(ModalScreen):
+    """The By-Trail summary, full and scrollable (t1505_1).
+
+    The bottom pane shows a fixed six rows of the same prose; this is the
+    read-it-all surface behind `v`. It is constructed with the **already
+    resolved** text rather than a trail document, so it cannot disagree with
+    the pane about which trail's summary is on screen — `_refresh_trail_summary`
+    resolves once and both surfaces render that one value.
+
+    Modeled on TrailDetailScreen: own DEFAULT_CSS (it is pushed by an App whose
+    CSS it cannot rely on), a plain `escape` binding, and no `_shortcuts_scope`,
+    so `lib/shortcut_scopes.py` needs no manifest entry."""
+
+    DEFAULT_CSS = """
+    TrailSummaryScreen {
+        align: center middle;
+    }
+    #trail_summary_dialog {
+        width: 80%;
+        height: 80%;
+        background: $surface;
+        border: thick $accent;
+        padding: 1 2;
+    }
+    #trail_summary_modal_body {
+        height: 1fr;
+    }
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Close", show=False),
+    ]
+
+    def __init__(self, summary: str, title: str = ""):
+        super().__init__()
+        self.summary = summary or ""
+        self.trail_title = title or ""
+
+    def compose(self):
+        with Container(id="trail_summary_dialog"):
+            header = (f"Trail summary — {self.trail_title}"
+                      if self.trail_title else "Trail summary")
+            yield Static(Text(header, style="bold"))
+            with VerticalScroll(id="trail_summary_modal_body"):
+                yield Static(Text(self.summary))
+            yield Button("Close", id="btn_trail_summary_close")
+
+    @on(Button.Pressed, "#btn_trail_summary_close")
+    def close_button(self):
+        self.dismiss(None)
+
+    def action_cancel(self):
+        self.dismiss(None)

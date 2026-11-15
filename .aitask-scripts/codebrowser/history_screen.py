@@ -1,0 +1,566 @@
+"""History screen composing left pane + detail pane for browsing completed tasks."""
+
+import shutil
+import sys
+import time
+from pathlib import Path
+from typing import List, Optional
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+from agent_command_screen import AgentCommandScreen, resolve_skill_profile
+from agent_launch_utils import resolve_dry_run_command, resolve_agent_string, TmuxLaunchConfig, launch_in_tmux, maybe_spawn_minimonitor
+
+from textual.app import ComposeResult
+from textual.binding import Binding
+from textual.containers import Container, Horizontal
+from textual.screen import ModalScreen, Screen
+from textual.widgets import Footer, Header, LoadingIndicator, Static
+from textual import work
+
+from history_list import HistoryLeftPane, HistoryTaskList, HistoryTaskItem, TaskSelected
+from history_detail import HistoryDetailPane, NavigateToFile, HistoryBrowseEvent
+from history_data import load_task_index, load_task_index_progressive, detect_platform_info, CompletedTask, PlatformInfo
+
+
+class HistoryRefreshModal(ModalScreen):
+    """Blocking loading indicator shown while the history refresh runs."""
+
+    DEFAULT_CSS = """
+    HistoryRefreshModal {
+        align: center middle;
+        background: $background 60%;
+    }
+    HistoryRefreshModal #refresh_box {
+        width: 40;
+        height: 5;
+        background: $surface;
+        border: thick $accent;
+        padding: 1 2;
+        content-align: center middle;
+    }
+    """
+
+    def compose(self) -> ComposeResult:
+        with Container(id="refresh_box"):
+            yield Static("⟳ Refreshing history…")
+
+
+class HistoryScreen(Screen):
+    """Full-screen view for browsing completed task history."""
+
+    BINDINGS = [
+        Binding("h", "dismiss_screen", "Back to browser"),
+        Binding("escape", "dismiss_screen", "Back to browser"),
+        Binding("q", "quit", "Quit"),
+        Binding("tab", "toggle_focus", "Toggle Focus", priority=True),
+        Binding("left", "focus_left", "Focus list"),
+        Binding("right", "focus_right", "Focus detail"),
+        Binding("v", "toggle_view", "Toggle task/plan"),
+        Binding("l", "label_filter", "Label filter"),
+        Binding("a", "launch_qa", "Launch QA"),
+        Binding("r", "refresh_history", "Refresh"),
+        # Override codebrowser app bindings to hide them from footer
+        Binding("t", "noop", show=False),
+        Binding("g", "noop", show=False),
+        Binding("e", "noop", show=False),
+        Binding("d", "noop", show=False),
+        Binding("D", "noop", show=False),
+        Binding("H", "noop", show=False),
+    ]
+
+    DEFAULT_CSS = """
+    HistoryScreen #history_loading { width: 100%; height: 100%; }
+    HistoryScreen #history_detail { width: 1fr; }
+    """
+
+    # Skip the on-open background reload if the cached index is fresher than
+    # this (seconds) — avoids re-scanning on quick screen toggles.
+    AUTO_RELOAD_DEBOUNCE_S = 5.0
+
+    def __init__(
+        self,
+        project_root: Path,
+        cached_index: Optional[List[CompletedTask]] = None,
+        cached_platform: Optional[PlatformInfo] = None,
+        restore_task_id: Optional[str] = None,
+        restore_chunks: int = 0,
+        restore_showing_plan: bool = False,
+        restore_scroll_y: int = 0,
+        restore_labels: Optional[set] = None,
+        navigate_to_task_id: Optional[str] = None,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self._project_root = project_root
+        self._task_index = cached_index
+        self._platform_info = cached_platform
+        self._restore_task_id = restore_task_id
+        self._restore_chunks = restore_chunks
+        self._restore_showing_plan = restore_showing_plan
+        self._restore_scroll_y = restore_scroll_y
+        self._restore_labels = restore_labels
+        self._navigate_to_task_id = navigate_to_task_id
+        self._refreshing = False
+        self._refresh_modal: Optional[HistoryRefreshModal] = None
+        self._refresh_start_time = 0.0
+        self._reload_baseline_ids: set = set()
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=True)
+        if self._task_index is not None:
+            # Data already cached — render content immediately
+            with Horizontal():
+                yield HistoryLeftPane(self._project_root, id="history_left")
+                yield HistoryDetailPane(
+                    project_root=self._project_root, id="history_detail"
+                )
+        else:
+            yield LoadingIndicator(id="history_loading")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        if self._task_index is not None:
+            self._populate_and_restore()
+        else:
+            self._load_data()
+
+    def _populate_and_restore(self) -> None:
+        """Populate panes with cached data and restore previous view state."""
+        left = self.query_one("#history_left", HistoryLeftPane)
+        detail = self.query_one("#history_detail", HistoryDetailPane)
+        left.set_data(self._task_index)
+        detail.set_context(self._project_root, self._task_index, self._platform_info)
+        # Restore label filter before loading chunks
+        if self._restore_labels:
+            left.apply_label_filter(self._restore_labels)
+        # Restore additional chunks that were loaded previously
+        if self._restore_chunks > 1:
+            task_list = left.query_one("#history_list", HistoryTaskList)
+            for _ in range(self._restore_chunks - 1):
+                if task_list._has_more:
+                    task_list._load_chunk()
+        # Restore last viewed task in detail pane
+        if self._restore_task_id:
+            detail.show_task(self._restore_task_id, is_explicit_browse=False)
+            # Set plan view state AFTER show_task (which resets it to False).
+            # The actual render runs deferred via call_from_thread, so it will
+            # read the restored value when it executes on the main thread.
+            if self._restore_showing_plan:
+                detail._showing_plan = True
+        # Navigate to specific task if requested (takes priority over restore)
+        if self._navigate_to_task_id:
+            detail.show_task(self._navigate_to_task_id, is_explicit_browse=True)
+        # Defer scroll restoration to after layout completes
+        if self._restore_scroll_y > 0:
+            self.set_timer(0.1, self._restore_scroll)
+        # Cache rendered immediately above; now reload in the background so
+        # tasks archived mid-session (e.g. by agents in other tmux windows)
+        # appear without a manual `r`.
+        self._maybe_auto_reload()
+
+    def _maybe_auto_reload(self) -> None:
+        """Kick off a debounced background reload of the history index."""
+        cached_at = getattr(self.app, "_history_cached_at", 0.0)
+        if cached_at and (time.monotonic() - cached_at) < self.AUTO_RELOAD_DEBOUNCE_S:
+            return  # cache is fresh (quick screen toggle) — skip
+        self._reload_baseline_ids = {t.task_id for t in (self._task_index or [])}
+        self._reload_data(auto=True)
+
+    def _finish_auto_reload(self) -> None:
+        """After a background reload finishes, notify only if the index changed."""
+        if not self.is_mounted:
+            return
+        new_ids = {t.task_id for t in (self._task_index or [])}
+        if new_ids != self._reload_baseline_ids:
+            self.notify("History updated", timeout=2)
+
+    def _restore_scroll(self) -> None:
+        """Restore the task list scroll position after layout."""
+        try:
+            left = self.query_one("#history_left", HistoryLeftPane)
+            task_list = left.query_one("#history_list", HistoryTaskList)
+            task_list.scroll_y = self._restore_scroll_y
+        except Exception:
+            pass
+
+    @work(thread=True)
+    def _load_data(self) -> None:
+        platform = detect_platform_info(self._project_root)
+        for index_chunk in load_task_index_progressive(self._project_root):
+            self.app.call_from_thread(self._on_index_chunk, index_chunk, platform)
+
+    @work(thread=True, exclusive=True, group="history_reload")
+    def _reload_data(self, auto: bool = False) -> None:
+        platform = detect_platform_info(self._project_root)
+        first = True
+        for index_chunk in load_task_index_progressive(self._project_root):
+            self.app.call_from_thread(self._on_reload_chunk, index_chunk, platform, first, auto)
+            first = False
+        if auto:
+            self.app.call_from_thread(self._finish_auto_reload)
+
+    async def _on_index_chunk(self, index, platform) -> None:
+        # Always cache on app (even if screen dismissed, so re-open is fast)
+        self.app._history_index = index
+        self.app._history_platform = platform
+        self.app._history_cached_at = time.monotonic()
+        # Guard: skip UI updates if screen was dismissed while worker ran
+        if not self.is_mounted:
+            return
+        if self._task_index is None:
+            # First chunk: mount the UI
+            self._task_index = index
+            self._platform_info = platform
+            # Remove loading indicator
+            try:
+                self.query_one("#history_loading").remove()
+            except Exception:
+                pass
+            # Mount the actual content. Mounts must be awaited so the panes'
+            # compose() runs before set_data()/set_context() query their children.
+            container = Horizontal()
+            left = HistoryLeftPane(self._project_root, id="history_left")
+            detail = HistoryDetailPane(project_root=self._project_root, id="history_detail")
+            await self.mount(container, before=self.query_one(Footer))
+            await container.mount(left)
+            await container.mount(detail)
+            # Populate with data
+            left.set_data(index)
+            detail.set_context(self._project_root, index, platform)
+            # Navigate to specific task if requested
+            if self._navigate_to_task_id:
+                detail.show_task(self._navigate_to_task_id, is_explicit_browse=True)
+        else:
+            # Subsequent chunks: update existing UI progressively
+            self._task_index = index
+            try:
+                left = self.query_one("#history_left", HistoryLeftPane)
+                left.update_index(index)
+                detail = self.query_one("#history_detail", HistoryDetailPane)
+                detail._task_index = index
+            except Exception:
+                pass
+
+    def _on_reload_chunk(self, index, platform, is_first: bool, auto: bool = False) -> None:
+        self.app._history_index = index
+        self.app._history_platform = platform
+        self.app._history_cached_at = time.monotonic()
+        if not self.is_mounted:
+            return
+        self._task_index = index
+        self._platform_info = platform
+        try:
+            left = self.query_one("#history_left", HistoryLeftPane)
+            detail = self.query_one("#history_detail", HistoryDetailPane)
+        except Exception:
+            return
+        if is_first:
+            try:
+                task_list = left.query_one("#history_list", HistoryTaskList)
+                saved_scroll = int(task_list.scroll_y)
+                saved_labels = set(task_list._active_labels)
+            except Exception:
+                saved_scroll = 0
+                saved_labels = set()
+            # Race guard: when auto-reload fires right after _populate_and_restore
+            # (whose scroll restore runs on a 0.1s timer), the live scroll_y may
+            # still be 0 — fall back to the pending restore value.
+            if saved_scroll == 0 and self._restore_scroll_y > 0:
+                saved_scroll = self._restore_scroll_y
+            saved_task_id = detail._nav_stack[-1] if detail._nav_stack else None
+            saved_showing_plan = detail._showing_plan
+            left.set_data(index)
+            detail.set_context(self._project_root, index, platform)
+            if saved_labels:
+                left.apply_label_filter(saved_labels)
+            if saved_task_id:
+                detail.show_task(saved_task_id, is_explicit_browse=False)
+                if saved_showing_plan:
+                    detail._showing_plan = True
+            if saved_scroll > 0:
+                self._restore_scroll_y = saved_scroll
+                self.set_timer(0.1, self._restore_scroll)
+            if not auto:
+                # Manual `r` shows the blocking modal; dismiss it after a brief
+                # minimum display time. Auto-reload has no modal.
+                elapsed = time.monotonic() - self._refresh_start_time
+                remaining = max(0.0, 1.0 - elapsed)
+                if remaining > 0.0:
+                    self.set_timer(remaining, self._dismiss_refresh_modal)
+                else:
+                    self._dismiss_refresh_modal()
+        else:
+            try:
+                left.update_index(index)
+                detail._task_index = index
+            except Exception:
+                pass
+
+    def _dismiss_refresh_modal(self) -> None:
+        modal = self._refresh_modal
+        self._refresh_modal = None
+        self._refreshing = False
+        if modal is not None:
+            try:
+                modal.dismiss()
+            except Exception:
+                pass
+        self.notify("History refreshed", timeout=2)
+
+    def _save_state_to_app(self) -> None:
+        """Save current view state to the app for restoration on re-open."""
+        try:
+            detail = self.query_one("#history_detail", HistoryDetailPane)
+            if detail._nav_stack:
+                self.app._history_last_task_id = detail._nav_stack[-1]
+            self.app._history_showing_plan = detail._showing_plan
+            left = self.query_one("#history_left", HistoryLeftPane)
+            task_list = left.query_one("#history_list", HistoryTaskList)
+            # Save scroll position
+            self.app._history_scroll_y = int(task_list.scroll_y)
+            # Number of chunks loaded = offset / chunk_size (rounded up)
+            if task_list._offset > 0:
+                chunks = (task_list._offset + task_list._chunk_size - 1) // task_list._chunk_size
+                self.app._history_loaded_chunks = chunks
+            # Save label filter state
+            self.app._history_active_labels = set(task_list._active_labels)
+        except Exception:
+            pass
+
+    def on_task_selected(self, event: TaskSelected) -> None:
+        detail = self.query_one("#history_detail", HistoryDetailPane)
+        detail.show_task(event.task.task_id, is_explicit_browse=True)
+
+    def on_history_browse_event(self, event: HistoryBrowseEvent) -> None:
+        left = self.query_one("#history_left", HistoryLeftPane)
+        left.get_recently_opened_list().add_to_history(event.task_id)
+
+    def on_navigate_to_file(self, event: NavigateToFile) -> None:
+        self._save_state_to_app()
+        self.dismiss(result=event.file_path)
+
+    def action_dismiss_screen(self) -> None:
+        self._save_state_to_app()
+        self.dismiss(result=None)
+
+    def action_toggle_view(self) -> None:
+        """Delegate plan/task toggle to the detail pane."""
+        try:
+            detail = self.query_one("#history_detail", HistoryDetailPane)
+            detail.action_toggle_view()
+        except Exception:
+            pass
+
+    def action_noop(self) -> None:
+        """No-op action to suppress inherited codebrowser bindings."""
+        pass
+
+    def action_refresh_history(self) -> None:
+        """Re-scan aitasks/archived and refresh the history list in place."""
+        if self._task_index is None:
+            self.notify("History is still loading…", severity="warning", timeout=2)
+            return
+        if self._refreshing:
+            return
+        self._refreshing = True
+        self._refresh_start_time = time.monotonic()
+        self._refresh_modal = HistoryRefreshModal()
+        self.app.push_screen(self._refresh_modal)
+        self._reload_data()
+
+    def action_label_filter(self) -> None:
+        """Open the label filter modal dialog."""
+        if self._task_index is None:
+            return
+        from history_label_filter import LabelFilterModal, load_labels, compute_label_counts
+        labels_list = load_labels(self._project_root)
+        label_counts = compute_label_counts(self._task_index)
+        try:
+            left = self.query_one("#history_left", HistoryLeftPane)
+            task_list = left.query_one("#history_list", HistoryTaskList)
+            current = set(task_list._active_labels)
+        except Exception:
+            current = set()
+        modal = LabelFilterModal(
+            all_labels=labels_list,
+            label_counts=label_counts,
+            currently_selected=current,
+            task_index=self._task_index,
+        )
+        self.app.push_screen(modal, callback=self._on_label_filter_result)
+
+    def _on_label_filter_result(self, result: set | None) -> None:
+        """Handle label filter modal result."""
+        if result is None:
+            return  # Cancel — keep existing filter
+        try:
+            left = self.query_one("#history_left", HistoryLeftPane)
+            left.apply_label_filter(result)
+        except Exception:
+            pass
+
+    def action_launch_qa(self) -> None:
+        """Launch QA agent for the currently viewed task."""
+        try:
+            detail = self.query_one("#history_detail", HistoryDetailPane)
+        except Exception:
+            return
+        if not detail._nav_stack:
+            self.notify("No task selected", severity="warning")
+            return
+        task_id = detail._nav_stack[-1]
+
+        from agent_utils import resolve_agent_binary
+
+        agent_name, binary, error_msg = resolve_agent_binary(self._project_root, "qa")
+        if not binary:
+            self.notify(error_msg or "Could not resolve QA agent configuration", severity="error")
+            return
+        if not shutil.which(binary):
+            self.notify(f"{agent_name} CLI ({binary}) not found in PATH", severity="error")
+            return
+
+        full_cmd = resolve_dry_run_command(self._project_root, "qa", task_id)
+        if full_cmd:
+            prompt_str = f"/aitask-qa {task_id}"
+            agent_string = resolve_agent_string(self._project_root, "qa")
+            screen = AgentCommandScreen(
+                f"QA for t{task_id}", full_cmd, prompt_str,
+                default_window_name=f"agent-qa-{task_id}",
+                project_root=self._project_root,
+                operation="qa",
+                operation_args=[task_id],
+                default_agent_string=agent_string,
+                skill_name="qa",
+                default_profile=resolve_skill_profile("qa", self._project_root),
+            )
+            def on_result(result):
+                if result == "run":
+                    # The dialog's command, never full_cmd: it carries the
+                    # user's edits and agent/profile changes (t1225, t1929).
+                    self.app.run_launch_command(["sh", "-c", screen.full_command])
+                elif isinstance(result, TmuxLaunchConfig):
+                    _, err = launch_in_tmux(screen.full_command, result)
+                    if err:
+                        self.app.notify(err, severity="error")
+                    elif result.new_window:
+                        maybe_spawn_minimonitor(result.session, result.window)
+            self.app.push_screen(screen, on_result)
+        else:
+            self.app.run_launch_command(self.app._codeagent_argv("qa", task_id))
+
+    def action_toggle_focus(self) -> None:
+        """Cycle focus: history_list → recent_list → detail → history_list."""
+        try:
+            left = self.query_one("#history_left", HistoryLeftPane)
+            detail = self.query_one("#history_detail", HistoryDetailPane)
+        except Exception:
+            return
+        try:
+            task_list = left.query_one("#history_list", HistoryTaskList)
+            recent_list = left.query_one("#recent_list")
+        except Exception:
+            return
+
+        if task_list.has_focus_within:
+            self._focus_in_list(recent_list)
+            return
+
+        if recent_list.has_focus_within:
+            if not detail._focus_first_field():
+                detail.focus()
+            return
+
+        if detail.has_focus_within:
+            self._focus_in_list(task_list)
+            return
+
+        # Fallback: focus the task list
+        self._focus_in_list(task_list)
+
+    def action_focus_right(self) -> None:
+        """Move focus to first focusable field in the detail pane."""
+        try:
+            detail = self.query_one("#history_detail", HistoryDetailPane)
+        except Exception:
+            return
+        if detail.has_focus_within:
+            return
+        for child in detail.children:
+            if child.can_focus and child.display and child.styles.display != "none":
+                child.focus()
+                child.scroll_visible()
+                return
+
+    def action_focus_left(self) -> None:
+        """Move focus leftward: detail->task list->recent list, cycling."""
+        try:
+            left = self.query_one("#history_left", HistoryLeftPane)
+            detail = self.query_one("#history_detail", HistoryDetailPane)
+        except Exception:
+            return
+        task_list = left.query_one("#history_list", HistoryTaskList)
+        recent_list = left.query_one("#recent_list")
+
+        if detail.has_focus_within:
+            # Detail pane -> focus current task in either list
+            current_task_id = detail._nav_stack[-1] if detail._nav_stack else None
+            if self._focus_in_list(task_list, current_task_id):
+                return
+            if self._focus_in_list(recent_list, current_task_id):
+                return
+            # Fallback: first visible in task list
+            if not self._focus_in_list(task_list):
+                self._focus_in_list(recent_list)
+            return
+
+        if task_list.has_focus_within:
+            # Remember focused task before switching to recent list
+            focused = self.app.focused
+            if isinstance(focused, HistoryTaskItem):
+                self._last_task_list_focus_id = focused.completed_task.task_id
+            # Full task list -> recent tasks list
+            self._focus_in_list(recent_list)
+            return
+
+        if recent_list.has_focus_within:
+            # Recent tasks list -> full task list (restore last focused if possible)
+            last_id = getattr(self, "_last_task_list_focus_id", None)
+            if last_id and self._focus_in_list(task_list, last_id):
+                return
+            self._focus_in_list(task_list)
+            return
+
+        # No focus anywhere -> full task list, then recent list
+        if not self._focus_in_list(task_list):
+            self._focus_in_list(recent_list)
+
+    def _focus_in_list(self, container, target_task_id: str | None = None) -> bool:
+        """Focus a task item in the given container. Returns True if focused."""
+        items = list(container.query(HistoryTaskItem))
+        if target_task_id:
+            for item in items:
+                if item.completed_task.task_id == target_task_id:
+                    item.focus()
+                    item.scroll_visible()
+                    return True
+        # Find the first item visible in the scroll viewport
+        try:
+            scroll_y = container.scroll_y
+            viewport_h = container.size.height
+            for item in items:
+                if not item.display or item.styles.display == "none":
+                    continue
+                item_y = item.virtual_region.y
+                if item_y + item.virtual_region.height > scroll_y and item_y < scroll_y + viewport_h:
+                    item.focus()
+                    return True
+        except Exception:
+            pass
+        # Fallback: first visible item
+        for item in items:
+            if item.display and item.styles.display != "none":
+                item.focus()
+                item.scroll_visible()
+                return True
+        return False

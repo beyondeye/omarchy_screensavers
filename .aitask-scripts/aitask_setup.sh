@@ -1,0 +1,6364 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# aitask_setup.sh - Cross-platform dependency installer for aitask framework
+# Invoked via: ait setup
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VENV_DIR="$HOME/.aitask/venv"
+SHIM_DIR="${SHIM_DIR:-$HOME/.local/bin}"
+VERSION_FILE="$SCRIPT_DIR/VERSION"
+REPO="beyondeye/aitasks"
+# The framework's own lib/ as resolved at source time. Tests re-point
+# SCRIPT_DIR at a fixture project after sourcing (it doubles as the project
+# locator), and a fixture carries no lib/ -- so helpers are found through this.
+SETUP_LIB_DIR="$SCRIPT_DIR/lib"
+
+# Source python_resolve.sh for AIT_VENV_PYTHON_MIN (single source of truth).
+# shellcheck source=lib/python_resolve.sh
+source "$SCRIPT_DIR/lib/python_resolve.sh"
+
+# Shared GitHub-release resolver (rate-limit-aware, git-tag fallback).
+# shellcheck source=lib/github_release.sh
+source "$SCRIPT_DIR/lib/github_release.sh"
+
+# Canonical creator of the aitasks/aiplans data symlinks (Step 6 below).
+# shellcheck source=lib/data_symlinks.sh
+source "$SCRIPT_DIR/lib/data_symlinks.sh"
+
+# Per-user framework root ($AITASKS_HOME) — the engine install dir (t1852_1).
+# shellcheck source=lib/aitasks_home.sh
+source "$SCRIPT_DIR/lib/aitasks_home.sh"
+
+# Preferred is the version we install when no modern python is found.
+AIT_VENV_PYTHON_PREFERRED="${AIT_VENV_PYTHON_PREFERRED:-3.13}"
+
+# Python dependency specs — single source of truth (previously duplicated inline
+# at the two pip-install sites). The PyPy venv (board-only fast path) installs
+# COMMON; the CPython venv installs COMMON + CPYTHON_EXTRA. The parallel
+# *_IMPORTS arrays list the import names to verify after install (the import name
+# differs from the distribution name for some: pyyaml->yaml, linkify-it-py->linkify_it).
+#
+# rich is not a direct dependency: it is a version FLOOR on textual's transitive
+# one (textual only asks for rich>=14.2.0). rich 14.3.2's split_graphemes loops
+# forever on a zero-width char before any visible one (U+200E, U+FE0F, raw ESC),
+# hanging any TUI that truncates such text (t2133; also the t940 codebrowser
+# hang). verify_venv_specs is what enforces the floor on an existing venv; its
+# `rich` import entry (lib/python_resolve.sh) only keeps specs and imports
+# paired, since importing textual already imports rich.
+AIT_PIP_SPECS_COMMON=('textual>=8.2.7,<9' 'rich>=14.3.3' 'pyyaml==6.0.3' 'linkify-it-py==2.1.0' 'tomli>=2.4.0,<3')
+AIT_PIP_SPECS_CPYTHON_EXTRA=('minijinja>=2.0,<3' 'segno>=1.5,<2' 'plotext==5.3.2' 'websockets>=12,<17' 'msgpack>=1,<2')
+# Derived, not duplicated: lib/python_resolve.sh (sourced above) owns this list
+# because resolve_pypy_python() must import exactly the same set before it will
+# hand the board a PyPy. Add a module in that one place and both the post-install
+# verification here and the fast-path probe there pick it up.
+AIT_IMPORTS_COMMON=("${AIT_PYPY_RUNTIME_IMPORTS[@]}")
+AIT_IMPORTS_CPYTHON_EXTRA=(minijinja segno plotext websockets msgpack)
+
+# Chat dependency tier (opt-in via `ait setup --with-chat`): SDKs for the
+# chat adapter layer (.aitask-scripts/chat/) — Discord (discord.py) and
+# Slack (slack-bolt / slack-sdk). Installed into the CPython venv only when
+# the user opts in; the default install never pulls these.
+AIT_PIP_SPECS_CHAT=('discord.py>=2,<3' 'slack-bolt>=1,<2' 'slack-sdk>=3,<4')
+AIT_IMPORTS_CHAT=(discord slack_bolt slack_sdk)
+
+# Dev/test dependency tier (opt-in via `ait setup --with-dev`): pytest and
+# pytest-xdist, which give `tests/run_all_python_tests.sh` its parallel lane.
+# Installed into the CPython venv only when the user opts in; the default
+# install never pulls these and the runner's unittest fallback stays the
+# supported path for everyone who does not (t1354_3).
+AIT_PIP_SPECS_DEV=('pytest>=8,<9' 'pytest-xdist>=3,<4')
+AIT_IMPORTS_DEV=(pytest xdist)
+
+# Marker recording that the user opted into the dev tier. Deliberately NOT an
+# import probe (which is how the chat tier detects itself): `discord` is never
+# in this venv by accident, but a developer may well have installed `pytest`
+# for unrelated reasons — reading that as consent would make a plain
+# `ait setup` install pytest-xdist for someone who never passed --with-dev,
+# silently turning an opt-in tier into an ambient dependency.
+#
+# It lives BESIDE the venv, not inside it: setup_python_venv recreates
+# $VENV_DIR when the interpreter is too old, and an in-venv marker would
+# vanish with it — silently opting the user back out of a tier they chose.
+# Outside, a venv recreation correctly triggers a reinstall on the next setup.
+AIT_DEV_TIER_MARKER="$HOME/.aitask/dev_tier"
+
+# verify_venv_imports <python> <module>... — populate global `missing_imports`
+# with the modules that fail to import under the given interpreter. Catches the
+# "package directory present but not importable" failure mode directly.
+verify_venv_imports() {
+    local py="$1"; shift
+    missing_imports=()
+    local mod
+    for mod in "$@"; do
+        "$py" -c "import $mod" 2>/dev/null || missing_imports+=("$mod")
+    done
+    return 0  # never fail the caller (set -e); result is in $missing_imports
+}
+
+# verify_venv_specs <python> <pip-spec>... — populate global `bad_specs` with
+# distributions that are missing OR whose installed version violates the spec.
+# Uses pip's vendored packaging (no extra dependency — pip is in every venv);
+# importlib.metadata.version() resolves the distribution name from each spec
+# (e.g. pyyaml, linkify-it-py), independent of the import name.
+#
+# Also sets global `specs_check_ok` (true|false): false when the inspection
+# itself failed (broken interpreter, no importable packaging). bad_specs is then
+# empty, which must NOT be read as "all in range" — venv_deps_bad and
+# report_venv_dep_drift both distinguish the two.
+verify_venv_specs() {
+    local py="$1"; shift
+    bad_specs=()
+    specs_check_ok=true
+    local out
+    out="$("$py" - "$@" <<'PY' 2>/dev/null
+import sys
+try:
+    from packaging.requirements import Requirement
+except ImportError:
+    from pip._vendor.packaging.requirements import Requirement
+from importlib.metadata import version, PackageNotFoundError
+for spec in sys.argv[1:]:
+    req = Requirement(spec)
+    try:
+        inst = version(req.name)
+    except PackageNotFoundError:
+        print(f"{req.name} (missing)"); continue
+    if not req.specifier.contains(inst, prereleases=True):
+        print(f"{req.name} {inst} (need {req.specifier})")
+PY
+)" || { out=""; specs_check_ok=false; }
+    [[ -n "$out" ]] && while IFS= read -r line; do bad_specs+=("$line"); done <<< "$out"
+    return 0  # never fail the caller (set -e); result is in $bad_specs
+}
+
+# venv_deps_bad — true when the last verify_venv_imports + verify_venv_specs
+# pair found a problem: a module that will not import, a spec out of range, or
+# a version inspection that itself failed. The last leaves bad_specs empty, so
+# testing bad_specs alone reads a failed check as "all in range" (t2135).
+venv_deps_bad() {
+    [[ ${#missing_imports[@]} -gt 0 || ${#bad_specs[@]} -gt 0 || "$specs_check_ok" != true ]]
+}
+
+# venv_deps_detail — the "missing: …; version: …" text for the warn/die that
+# follows venv_deps_bad. A failed inspection is named as such, never rendered
+# as "version: none".
+venv_deps_detail() {
+    if [[ "$specs_check_ok" == true ]]; then
+        printf 'missing: %s; version: %s' "${missing_imports[*]:-none}" "${bad_specs[*]:-none}"
+    else
+        printf 'missing: %s; version check failed' "${missing_imports[*]:-none}"
+    fi
+}
+
+# pip_install_guarded <label> <pip-binary> <pip-arg>... — run a `pip install`
+# that must never abort `ait setup`.
+#
+# ALWAYS returns 0 — deliberately, and this is load-bearing. The script runs
+# under `set -euo pipefail`, so a bare `pip install` that fails (offline machine,
+# unreachable index, a wheel that will not build) aborts the WHOLE run at that
+# line, never reaching the validate / warn / degrade path its caller wrote below
+# it. Keeping the call inside an `if !` condition is what makes that contract
+# true rather than merely stated; returning pip's real status here would just
+# move the same abort out to every call site.
+#
+# The helper does NOT decide what a failure means — each caller keeps its own
+# policy, decided by the verify_venv_* check that follows: an optional tier warns
+# (or removes itself), the core CPython venv still dies. That split matters
+# because a failed pip does not imply a broken venv: on an offline machine whose
+# deps are already installed and in range, verification passes and setup
+# continues instead of falsely reporting a broken tier.
+pip_install_guarded() {
+    local label="$1" pip_bin="$2"
+    shift 2
+    if ! "$pip_bin" install "$@"; then
+        warn "$label: pip install failed (network or index unavailable?). Continuing — the dependency check below decides whether this is fatal."
+    fi
+    return 0
+}
+
+# --- Color helpers ---
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
+info()    { echo -e "${BLUE}[ait]${NC} $1"; }
+success() { echo -e "${GREEN}[ait]${NC} $1"; }
+warn()    { echo -e "${YELLOW}[ait]${NC} $1"; }
+die()     { echo -e "${RED}[ait] Error:${NC} $1" >&2; exit 1; }
+
+# --- OS detection ---
+detect_os() {
+    OS=""
+    local kernel
+    kernel="$(uname -s)"
+
+    case "$kernel" in
+        Darwin)
+            OS="macos"
+            ;;
+        Linux)
+            # Check WSL first
+            if grep -qi microsoft /proc/version 2>/dev/null; then
+                OS="wsl"
+                return
+            fi
+
+            # Source os-release for distro detection
+            if [[ -f /etc/os-release ]]; then
+                # shellcheck disable=SC1091
+                source /etc/os-release
+                local id="${ID:-}"
+                local id_like="${ID_LIKE:-}"
+
+                case "$id" in
+                    arch|manjaro|endeavouros)
+                        OS="arch" ;;
+                    ubuntu|debian|pop|linuxmint|elementary)
+                        OS="debian" ;;
+                    fedora|rhel|centos|rocky|alma)
+                        OS="fedora" ;;
+                    *)
+                        # Fallback to ID_LIKE
+                        case "$id_like" in
+                            *arch*)   OS="arch" ;;
+                            *debian*|*ubuntu*) OS="debian" ;;
+                            *fedora*|*rhel*)   OS="fedora" ;;
+                            *)        OS="linux-unknown" ;;
+                        esac
+                        ;;
+                esac
+            else
+                OS="linux-unknown"
+            fi
+            ;;
+        *)
+            die "Unsupported operating system: $kernel"
+            ;;
+    esac
+}
+
+# --- Git platform detection (inline — duplicates detect_platform() from task_utils.sh) ---
+# This is intentionally inlined rather than sourced because:
+# 1. setup.sh defines its own die/info/warn/success helpers with "[ait]" prefix formatting
+#    that would conflict with terminal_compat.sh's definitions (task_utils.sh depends on it)
+# 2. setup.sh must be self-contained — it runs before the framework is fully initialized
+_detect_git_platform() {
+    local remote_url
+    remote_url=$(git remote get-url origin 2>/dev/null || echo "")
+    if [[ "$remote_url" == *"gitlab"* ]]; then
+        echo "gitlab"
+    elif [[ "$remote_url" == *"bitbucket"* ]]; then
+        echo "bitbucket"
+    elif [[ "$remote_url" == *"github"* ]]; then
+        echo "github"
+    else
+        echo ""
+    fi
+}
+
+# Check if a code agent CLI is installed on PATH.
+# Uses `command -v` which is a shell builtin that only checks if a command
+# exists on $PATH — it does NOT execute the agent or load anything.
+_is_agent_installed() {
+    case "$1" in
+        claude)    command -v claude &>/dev/null ;;
+        codex)     command -v codex &>/dev/null ;;
+        opencode)  command -v opencode &>/dev/null ;;
+        *)         return 1 ;;
+    esac
+}
+
+# --- CLI tools installation ---
+install_cli_tools() {
+    local os="$1"
+
+    # Detect git platform to install the right CLI tool
+    local platform
+    platform=$(_detect_git_platform)
+
+    # Build tools list: always fzf, jq, git; platform-specific CLI
+    local tools=(fzf jq git zstd)
+    case "$platform" in
+        gitlab)
+            tools+=(glab)
+            info "Detected GitLab remote — will install glab CLI"
+            ;;
+        bitbucket)
+            tools+=(bkt)
+            info "Detected Bitbucket remote — will install bkt CLI"
+            ;;
+        github|"")
+            tools+=(gh)
+            if [[ -z "$platform" ]]; then
+                info "Could not detect git remote platform — defaulting to GitHub CLI (gh)"
+            fi
+            ;;
+    esac
+
+    local missing=()
+    for tool in "${tools[@]}"; do
+        if ! command -v "$tool" &>/dev/null; then
+            missing+=("$tool")
+        fi
+    done
+
+    # Optional tier advisory (warn-not-block, never auto-installed):
+    # docker powers the chatlink sandbox (`ait chatlink`) — see
+    # aidocs/chat/chatlink_sandbox.md.
+    if ! command -v docker &>/dev/null; then
+        warn "Optional: 'docker' not found — the chatlink sandbox tier needs it (install Docker separately to enable sandboxed agents)"
+    fi
+
+    if [[ ${#missing[@]} -eq 0 ]]; then
+        success "All CLI tools already installed (${tools[*]})"
+        return
+    fi
+
+    info "Installing missing CLI tools: ${missing[*]}"
+
+    case "$os" in
+        arch)
+            # Map tool names to Arch package names
+            local pkgs=()
+            local need_bkt_arch=false
+            for tool in "${missing[@]}"; do
+                case "$tool" in
+                    gh) pkgs+=("github-cli") ;;
+                    bkt) need_bkt_arch=true ;;
+                    *)  pkgs+=("$tool") ;;
+                esac
+            done
+            if [[ ${#pkgs[@]} -gt 0 ]]; then
+                sudo pacman -S --needed --noconfirm "${pkgs[@]}"
+            fi
+            if $need_bkt_arch; then
+                # NOTE: bkt (bitbucket-cli) is hosted on GitHub — these api.github.com URLs are intentional
+                info "Installing Bitbucket CLI from GitHub release..."
+                local bkt_ver bkt_url
+                bkt_ver=$(curl -s "https://api.github.com/repos/avivsinai/bitbucket-cli/releases/latest" | jq -r '.tag_name' 2>/dev/null | sed 's/^v//')
+                if [[ -n "$bkt_ver" && "$bkt_ver" != "null" ]]; then
+                    bkt_url="https://github.com/avivsinai/bitbucket-cli/releases/download/v${bkt_ver}/bkt_${bkt_ver}_linux_x86_64.tar.gz"
+                    curl -sLO "$bkt_url" \
+                        && tar -xzf "bkt_${bkt_ver}_linux_x86_64.tar.gz" bkt \
+                        && install -m 755 bkt "$HOME/.local/bin/bkt" \
+                        && rm -f bkt "bkt_${bkt_ver}_linux_x86_64.tar.gz" \
+                        || warn "Failed to install bkt. Install manually: https://github.com/avivsinai/bitbucket-cli/releases"
+                else
+                    warn "Could not determine latest bkt version. Install manually: https://github.com/avivsinai/bitbucket-cli/releases"
+                fi
+            fi
+            ;;
+
+        debian|wsl)
+            local apt_pkgs=()
+            local need_gh=false
+            local need_glab=false
+            local need_bkt_deb=false
+            for tool in "${missing[@]}"; do
+                case "$tool" in
+                    gh) need_gh=true ;;
+                    glab) need_glab=true ;;
+                    bkt) need_bkt_deb=true ;;
+                    *)  apt_pkgs+=("$tool") ;;
+                esac
+            done
+
+            if $need_gh; then
+                info "Adding GitHub CLI repository..."
+                (type -p wget >/dev/null || sudo apt-get install wget -y -qq) \
+                    && sudo mkdir -p -m 755 /etc/apt/keyrings \
+                    && wget -qO- https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+                       | sudo tee /etc/apt/keyrings/githubcli-archive-keyring.gpg > /dev/null \
+                    && sudo chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+                    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+                       | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null \
+                    && sudo apt-get update -qq
+                apt_pkgs+=("gh")
+            fi
+
+            if $need_glab; then
+                info "Installing GitLab CLI from release package..."
+                local deb_arch
+                deb_arch=$(dpkg --print-architecture)
+                local glab_ver
+                glab_ver=$(curl -s "https://gitlab.com/api/v4/projects/34675721/releases" | jq -r '.[0].tag_name' 2>/dev/null | sed 's/^v//')
+                if [[ -n "$glab_ver" && "$glab_ver" != "null" ]]; then
+                    local deb_file="glab_${glab_ver}_Linux_${deb_arch}.deb"
+                    curl -sLO "https://gitlab.com/gitlab-org/cli/-/releases/v${glab_ver}/downloads/${deb_file}" \
+                        && sudo dpkg -i "$deb_file" \
+                        && rm -f "$deb_file" \
+                        || warn "Failed to install glab .deb package. Install manually: https://gitlab.com/gitlab-org/cli/-/releases"
+                else
+                    warn "Could not determine latest glab version. Install manually: https://gitlab.com/gitlab-org/cli/-/releases"
+                fi
+            fi
+
+            if $need_bkt_deb; then
+                # NOTE: bkt (bitbucket-cli) is hosted on GitHub — these api.github.com URLs are intentional
+                info "Installing Bitbucket CLI from release package..."
+                local deb_arch
+                deb_arch=$(dpkg --print-architecture)
+                local bkt_ver
+                bkt_ver=$(curl -s "https://api.github.com/repos/avivsinai/bitbucket-cli/releases/latest" | jq -r '.tag_name' 2>/dev/null | sed 's/^v//')
+                if [[ -n "$bkt_ver" && "$bkt_ver" != "null" ]]; then
+                    local deb_file="bkt_${bkt_ver}_${deb_arch}.deb"
+                    curl -sLO "https://github.com/avivsinai/bitbucket-cli/releases/download/v${bkt_ver}/${deb_file}" \
+                        && sudo dpkg -i "$deb_file" \
+                        && rm -f "$deb_file" \
+                        || warn "Failed to install bkt .deb package. Install manually: https://github.com/avivsinai/bitbucket-cli/releases"
+                else
+                    warn "Could not determine latest bkt version. Install manually: https://github.com/avivsinai/bitbucket-cli/releases"
+                fi
+            fi
+
+            # Also ensure python3 and python3-venv are installed
+            apt_pkgs+=("python3" "python3-venv")
+
+            sudo apt-get install -y -qq "${apt_pkgs[@]}"
+            ;;
+
+        fedora)
+            local dnf_pkgs=()
+            local need_bkt_fedora=false
+            for tool in "${missing[@]}"; do
+                case "$tool" in
+                    bkt) need_bkt_fedora=true ;;
+                    *)   dnf_pkgs+=("$tool") ;;
+                esac
+            done
+            if [[ ${#dnf_pkgs[@]} -gt 0 ]]; then
+                sudo dnf install -y -q "${dnf_pkgs[@]}"
+            fi
+            if $need_bkt_fedora; then
+                # NOTE: bkt (bitbucket-cli) is hosted on GitHub — these api.github.com URLs are intentional
+                info "Installing Bitbucket CLI from GitHub release..."
+                local bkt_ver bkt_url
+                bkt_ver=$(curl -s "https://api.github.com/repos/avivsinai/bitbucket-cli/releases/latest" | jq -r '.tag_name' 2>/dev/null | sed 's/^v//')
+                if [[ -n "$bkt_ver" && "$bkt_ver" != "null" ]]; then
+                    bkt_url="https://github.com/avivsinai/bitbucket-cli/releases/download/v${bkt_ver}/bkt_${bkt_ver}_linux_x86_64.tar.gz"
+                    curl -sLO "$bkt_url" \
+                        && tar -xzf "bkt_${bkt_ver}_linux_x86_64.tar.gz" bkt \
+                        && sudo install -m 755 bkt /usr/local/bin/bkt \
+                        && rm -f bkt "bkt_${bkt_ver}_linux_x86_64.tar.gz" \
+                        || warn "Failed to install bkt. Install manually: https://github.com/avivsinai/bitbucket-cli/releases"
+                else
+                    warn "Could not determine latest bkt version. Install manually: https://github.com/avivsinai/bitbucket-cli/releases"
+                fi
+            fi
+            ;;
+
+        macos)
+            if ! command -v brew &>/dev/null; then
+                die "Homebrew is required on macOS. Install from https://brew.sh"
+            fi
+
+            local brew_pkgs=()
+            for tool in "${missing[@]}"; do
+                case "$tool" in
+                    bkt) brew_pkgs+=("avivsinai/tap/bitbucket-cli") ;;
+                    *)   brew_pkgs+=("$tool") ;;
+                esac
+            done
+
+            # Also install bash 5.x (macOS ships 3.2) and coreutils for gdate
+            brew_pkgs+=("bash" "coreutils")
+
+            brew install "${brew_pkgs[@]}"
+            ;;
+
+        linux-unknown)
+            warn "Unknown Linux distribution. Please install these tools manually:"
+            warn "  ${missing[*]}"
+            warn "Continuing with the rest of setup..."
+            return
+            ;;
+    esac
+
+    success "CLI tools installed"
+}
+
+# --- Bash version verification ---
+# Must work under Bash 3.2 (macOS default)
+check_bash_version() {
+    local required_major=4
+    local current_major="${BASH_VERSINFO[0]}"
+    local current_minor="${BASH_VERSINFO[1]}"
+
+    if [[ "$current_major" -ge "$required_major" ]]; then
+        success "Bash $BASH_VERSION meets minimum (4.0+)"
+        return 0
+    fi
+
+    warn "Current Bash version is $BASH_VERSION (aitask requires 4.0+)"
+
+    if [[ "$OS" = "macos" ]]; then
+        # Look for brew-installed bash
+        local brew_bash=""
+        if [[ -x "/opt/homebrew/bin/bash" ]]; then
+            brew_bash="/opt/homebrew/bin/bash"
+        elif [[ -x "/usr/local/bin/bash" ]]; then
+            brew_bash="/usr/local/bin/bash"
+        fi
+
+        if [[ -n "$brew_bash" ]]; then
+            local brew_ver
+            brew_ver="$("$brew_bash" -c 'echo $BASH_VERSION')"
+            info "Homebrew Bash $brew_ver is available at: $brew_bash"
+            info ""
+            info "To use it, ensure it appears before /bin/bash in your PATH."
+            local brew_prefix
+            brew_prefix="$(dirname "$brew_bash")"
+            info "  Add to your ~/.zshrc or ~/.bash_profile:"
+            info "    export PATH=\"$brew_prefix:\$PATH\""
+            info ""
+            info "  To make it your default shell:"
+            info "    sudo bash -c 'echo $brew_bash >> /etc/shells'"
+            info "    chsh -s $brew_bash"
+        else
+            warn "Homebrew bash not found at expected paths."
+            if command -v brew &>/dev/null; then
+                info "Installing Bash via Homebrew..."
+                brew install bash
+                # Re-check after install
+                if [[ -x "/opt/homebrew/bin/bash" ]]; then
+                    brew_bash="/opt/homebrew/bin/bash"
+                elif [[ -x "/usr/local/bin/bash" ]]; then
+                    brew_bash="/usr/local/bin/bash"
+                fi
+                if [[ -n "$brew_bash" ]]; then
+                    local brew_ver
+                    brew_ver="$("$brew_bash" -c 'echo $BASH_VERSION')"
+                    success "Installed Bash $brew_ver at $brew_bash"
+                    info "Update your PATH as described above to use it."
+                fi
+            fi
+        fi
+        warn "Some aitask commands (stats, board, review) require Bash 4.0+."
+    else
+        warn "Please upgrade Bash to 4.0+ using your package manager."
+    fi
+}
+
+# --- Modern-Python resolution and installation (used by setup_python_venv) ---
+
+# Resolve a Python interpreter that meets $1 (e.g. "3.11"), defaulting to
+# AIT_VENV_PYTHON_MIN. Echoes the absolute path or empty. Always returns 0.
+find_modern_python() {
+    local min="${1:-$AIT_VENV_PYTHON_MIN}"
+    local major="${min%%.*}" minor="${min##*.}"
+    local cand resolved candidates=(
+        "$HOME/.aitask/venv/bin/python"
+        "$HOME/.aitask/bin/python3"
+        "$HOME/.aitask/python/$AIT_VENV_PYTHON_PREFERRED/bin/python3"
+        python3.13 python3.12 python3.11 python3
+    )
+    for cand in "${candidates[@]}"; do
+        if [[ "$cand" == /* ]]; then
+            resolved="$cand"
+        else
+            resolved="$(command -v "$cand" 2>/dev/null || true)"
+        fi
+        [[ -z "$resolved" || ! -x "$resolved" ]] && continue
+        if "$resolved" -c "import sys; sys.exit(0 if sys.version_info >= ($major, $minor) else 1)" 2>/dev/null; then
+            echo "$resolved"
+            return 0
+        fi
+    done
+    return 0
+}
+
+# Install a modern Python user-scoped (no sudo). macOS uses brew; Linux uses uv.
+install_modern_python() {
+    case "$OS" in
+        macos) _install_modern_python_macos ;;
+        *)     _install_modern_python_linux ;;
+    esac
+}
+
+_install_modern_python_macos() {
+    if ! command -v brew >/dev/null 2>&1; then
+        die "Homebrew not found. Install from https://brew.sh and re-run 'ait setup'."
+    fi
+    info "Installing python@$AIT_VENV_PYTHON_PREFERRED via Homebrew..."
+    brew install "python@$AIT_VENV_PYTHON_PREFERRED" \
+        || brew upgrade "python@$AIT_VENV_PYTHON_PREFERRED" \
+        || die "brew install python@$AIT_VENV_PYTHON_PREFERRED failed."
+    hash -r
+}
+
+# Locate or install uv (the Astral binary). Echoes the absolute path to the
+# uv binary on stdout. Idempotent: skips download if a usable binary is
+# already present at the expected location. Single source of truth for the
+# uv install layout — callers must not hardcode paths.
+_ensure_uv() {
+    local uv_dir="$HOME/.aitask/uv"
+    local uv_bin="$uv_dir/uv"
+    if [[ ! -x "$uv_bin" ]]; then
+        info "Downloading uv (astral-sh/uv) into $uv_dir (user-scoped, no sudo)..."
+        if ! command -v curl >/dev/null 2>&1; then
+            die "curl is required to download uv. Install curl and re-run."
+        fi
+        UV_INSTALL_DIR="$uv_dir" \
+        INSTALLER_NO_MODIFY_PATH=1 \
+            sh -c 'curl -LsSf https://astral.sh/uv/install.sh | sh' \
+            || die "uv install failed."
+        [[ -x "$uv_bin" ]] || die "uv installer ran but binary not found at $uv_bin."
+    fi
+    printf '%s\n' "$uv_bin"
+}
+
+_install_modern_python_linux() {
+    local uv_bin
+    uv_bin="$(_ensure_uv)"
+    info "Installing Python $AIT_VENV_PYTHON_PREFERRED via uv..."
+    "$uv_bin" python install "$AIT_VENV_PYTHON_PREFERRED" \
+        || die "uv python install $AIT_VENV_PYTHON_PREFERRED failed."
+    local installed
+    installed="$("$uv_bin" python find "$AIT_VENV_PYTHON_PREFERRED" 2>/dev/null)"
+    [[ -z "$installed" || ! -x "$installed" ]] && \
+        die "uv reported Python $AIT_VENV_PYTHON_PREFERRED installed but interpreter is not executable: ${installed:-<empty>}"
+    mkdir -p "$HOME/.aitask/python/$AIT_VENV_PYTHON_PREFERRED/bin"
+    ln -sf "$installed" "$HOME/.aitask/python/$AIT_VENV_PYTHON_PREFERRED/bin/python3"
+    info "Python $AIT_VENV_PYTHON_PREFERRED installed at $installed (symlinked at ~/.aitask/python/$AIT_VENV_PYTHON_PREFERRED/bin/python3)."
+    hash -r
+}
+
+# --- PyPy resolution and installation (opt-in via `ait setup --with-pypy`) ---
+
+# Resolve a PyPy interpreter. Echoes the absolute path or empty. Always
+# returns 0. Confirms `sys.implementation.name == 'pypy'` to avoid false
+# positives from misnamed CPython binaries.
+find_pypy() {
+    local cand resolved
+    local candidates=(
+        "$PYPY_VENV_DIR/bin/python"
+        "$HOME/.aitask/python/pypy-$AIT_PYPY_PREFERRED/bin/python3"
+        "pypy$AIT_PYPY_PREFERRED" pypy3
+    )
+    for cand in "${candidates[@]}"; do
+        if [[ "$cand" == /* ]]; then
+            resolved="$cand"
+        else
+            resolved="$(command -v "$cand" 2>/dev/null || true)"
+        fi
+        [[ -z "$resolved" || ! -x "$resolved" ]] && continue
+        if "$resolved" -c "import sys; sys.exit(0 if sys.implementation.name == 'pypy' else 1)" 2>/dev/null; then
+            echo "$resolved"
+            return 0
+        fi
+    done
+    return 0
+}
+
+# Install PyPy user-scoped (no sudo). macOS uses brew; Linux uses uv.
+install_pypy() {
+    case "$OS" in
+        macos) _install_pypy_macos ;;
+        *)     _install_pypy_linux ;;
+    esac
+}
+
+_install_pypy_macos() {
+    if ! command -v brew >/dev/null 2>&1; then
+        die "Homebrew not found. Install from https://brew.sh and re-run 'ait setup --with-pypy'."
+    fi
+    local formula="pypy$AIT_PYPY_PREFERRED"
+    info "Installing $formula via Homebrew..."
+    brew install "$formula" \
+        || brew install pypy3 \
+        || die "brew install $formula / pypy3 failed."
+    hash -r
+
+    # Layout symmetry with the Linux path: create a stable user-scoped symlink
+    # so find_pypy()'s ~/.aitask/python/pypy-<ver>/bin/python3 candidate is
+    # honored regardless of PATH state.
+    local brew_pypy
+    brew_pypy="$(command -v "pypy$AIT_PYPY_PREFERRED" 2>/dev/null \
+                 || command -v pypy3 2>/dev/null \
+                 || true)"
+    if [[ -n "$brew_pypy" && -x "$brew_pypy" ]]; then
+        if "$brew_pypy" -c "import sys; sys.exit(0 if sys.implementation.name == 'pypy' else 1)" 2>/dev/null; then
+            mkdir -p "$HOME/.aitask/python/pypy-$AIT_PYPY_PREFERRED/bin"
+            ln -sf "$brew_pypy" "$HOME/.aitask/python/pypy-$AIT_PYPY_PREFERRED/bin/python3"
+            info "PyPy symlinked at ~/.aitask/python/pypy-$AIT_PYPY_PREFERRED/bin/python3 -> $brew_pypy"
+        else
+            warn "Resolved PyPy candidate $brew_pypy is not a PyPy interpreter; skipping symlink."
+        fi
+    else
+        warn "Brew install reported success but no pypy binary was found on PATH; skipping symlink."
+    fi
+}
+
+_install_pypy_linux() {
+    local uv_bin
+    uv_bin="$(_ensure_uv)"
+    info "Installing PyPy $AIT_PYPY_PREFERRED via uv..."
+    "$uv_bin" python install "pypy@$AIT_PYPY_PREFERRED" \
+        || die "uv python install pypy@$AIT_PYPY_PREFERRED failed."
+    local installed
+    installed="$("$uv_bin" python find "pypy@$AIT_PYPY_PREFERRED" 2>/dev/null)"
+    [[ -z "$installed" || ! -x "$installed" ]] && \
+        die "uv reported PyPy installed but interpreter is not executable: ${installed:-<empty>}"
+    mkdir -p "$HOME/.aitask/python/pypy-$AIT_PYPY_PREFERRED/bin"
+    ln -sf "$installed" "$HOME/.aitask/python/pypy-$AIT_PYPY_PREFERRED/bin/python3"
+    info "PyPy $AIT_PYPY_PREFERRED installed at $installed (symlinked at ~/.aitask/python/pypy-$AIT_PYPY_PREFERRED/bin/python3)."
+    hash -r
+}
+
+# Create the PyPy venv at $PYPY_VENV_DIR with the same dependency set as the
+# CPython venv. Idempotent: skips recreation if the venv already exists and
+# reports `sys.implementation.name == 'pypy'`.
+setup_pypy_venv() {
+    # Reuse an existing, valid PyPy venv as-is (the revalidate-on-every-setup
+    # path must be cheap — no find_pypy/install_pypy when the venv is already a
+    # PyPy interpreter). Only resolve/install a PyPy interpreter when we actually
+    # need to create or recreate the venv.
+    local pypy_cmd="" have_valid_venv=false impl=""
+    if [[ -x "$PYPY_VENV_DIR/bin/python" ]]; then
+        impl="$("$PYPY_VENV_DIR/bin/python" -c 'import sys; print(sys.implementation.name)' 2>/dev/null)" || impl=""
+        [[ "$impl" == "pypy" ]] && have_valid_venv=true
+    fi
+
+    if [[ "$have_valid_venv" == true ]]; then
+        info "PyPy virtual environment already exists at $PYPY_VENV_DIR"
+    else
+        pypy_cmd="$(find_pypy)"
+        if [[ -z "$pypy_cmd" ]]; then
+            info "No PyPy $AIT_PYPY_PREFERRED found. Installing one..."
+            install_pypy
+            pypy_cmd="$(find_pypy)"
+            [[ -z "$pypy_cmd" ]] && \
+                die "PyPy install completed but interpreter still not found."
+        fi
+        info "Using PyPy for venv: $pypy_cmd ($("$pypy_cmd" --version 2>&1 | head -1))"
+        rm -rf "$PYPY_VENV_DIR"
+        mkdir -p "$(dirname "$PYPY_VENV_DIR")"
+        "$pypy_cmd" -m venv "$PYPY_VENV_DIR"
+    fi
+
+    info "Installing/upgrading Python deps into PyPy venv..."
+    pip_install_guarded "PyPy venv pip self-upgrade" "$PYPY_VENV_DIR/bin/pip" \
+        --quiet --upgrade pip
+    pip_install_guarded "PyPy venv deps" "$PYPY_VENV_DIR/bin/pip" \
+        --quiet "${AIT_PIP_SPECS_COMMON[@]}"
+
+    # Validate importability + version ranges; retry once, then give up on PyPy
+    # by removing the venv so the fast-path resolver falls back to the CPython
+    # venv (resolve_pypy_python returns empty when the venv dir is gone).
+    verify_venv_imports "$PYPY_VENV_DIR/bin/python" "${AIT_IMPORTS_COMMON[@]}"
+    verify_venv_specs   "$PYPY_VENV_DIR/bin/python" "${AIT_PIP_SPECS_COMMON[@]}"
+    if venv_deps_bad; then
+        warn "PyPy venv deps need repair ($(venv_deps_detail)). Retrying..."
+        pip_install_guarded "PyPy venv dep repair" "$PYPY_VENV_DIR/bin/pip" \
+            --quiet "${AIT_PIP_SPECS_COMMON[@]}"
+        verify_venv_imports "$PYPY_VENV_DIR/bin/python" "${AIT_IMPORTS_COMMON[@]}"
+        verify_venv_specs   "$PYPY_VENV_DIR/bin/python" "${AIT_PIP_SPECS_COMMON[@]}"
+    fi
+    if venv_deps_bad; then
+        warn "PyPy venv deps could not be installed ($(venv_deps_detail)). Removing $PYPY_VENV_DIR so the board uses the CPython venv. Re-run 'ait setup --with-pypy' to retry."
+        # Removal is not cleanup — it IS half of the fallback mechanism, so a
+        # removal that silently failed would report a fallback that did not
+        # happen. (The other half lives in resolve_pypy_python(), which rejects
+        # any PyPy that cannot see `textual`. Removal alone is NOT sufficient:
+        # resolution continues to `pypy<ver>` / `pypy3` on PATH, which is very
+        # often the same system interpreter this venv was built from.)
+        if ! rm -rf "$PYPY_VENV_DIR" 2>/dev/null; then
+            # Full removal failed (permissions / busy mount). Selection keys only
+            # on the interpreter, so dropping that alone still disables the fast
+            # path.
+            rm -f "$PYPY_VENV_DIR/bin/python" "$PYPY_VENV_DIR/bin/python3" 2>/dev/null || true
+            if [[ -x "$PYPY_VENV_DIR/bin/python" ]]; then
+                die "PyPy venv at $PYPY_VENV_DIR has unusable dependencies and could not be removed (check permissions). It would still be selected ahead of the CPython venv and fail at import. Remove it manually and re-run 'ait setup'."
+            fi
+            warn "PyPy venv at $PYPY_VENV_DIR could not be fully removed, but its interpreter was — the board will fall back to the CPython venv. Delete the leftover directory at your convenience."
+        fi
+        return 0
+    fi
+
+    success "PyPy venv ready at $PYPY_VENV_DIR — TUIs will auto-use it (set AIT_USE_PYPY=0 to override)."
+}
+
+# Interactive prompt offered during `ait setup` when stdin is a TTY and PyPy
+# is not already installed. Returns 0 if the user opts in, 1 otherwise.
+prompt_install_pypy_if_tty() {
+    [[ -t 0 ]] || return 1
+    [[ -d "$PYPY_VENV_DIR" ]] && return 1
+    info "Optional: PyPy 3.11 for faster 'ait board'."
+    printf "  Install PyPy now? Adds ~100-150 MB in ~/.aitask/. [y/N] "
+    local answer=""
+    read -r answer
+    case "${answer:-N}" in
+        [Yy]*) return 0 ;;
+        *)     return 1 ;;
+    esac
+}
+
+# --- Chat dependency tier (opt-in via `ait setup --with-chat`) ---
+
+# True when the chat tier was previously installed into the CPython venv
+# (used to revalidate/repair on later plain `ait setup` runs, mirroring the
+# PyPy `-d "$PYPY_VENV_DIR"` revalidation clause). Users who never opted in
+# have no `discord` in the venv, so plain setup remains chat-free for them.
+chat_deps_present() {
+    [[ -x "$VENV_DIR/bin/python" ]] || return 1
+    "$VENV_DIR/bin/python" -c 'import discord' >/dev/null 2>&1
+}
+
+# Install/repair the chat SDK tier into the CPython venv ($VENV_DIR). Never
+# fails the overall setup: on persistent failure it warns and returns 0 so a
+# transient network problem cannot brick an otherwise-working install.
+setup_chat_deps() {
+    if [[ ! -x "$VENV_DIR/bin/pip" ]]; then
+        warn "CPython venv missing at $VENV_DIR — cannot install chat deps. Re-run 'ait setup --with-chat' after the venv exists."
+        return 0
+    fi
+
+    info "Installing/upgrading chat SDK deps into CPython venv..."
+    pip_install_guarded "Chat deps" "$VENV_DIR/bin/pip" \
+        --quiet "${AIT_PIP_SPECS_CHAT[@]}"
+
+    # Validate importability + version ranges; retry once, then warn and
+    # continue (chat is an optional tier — never block the core setup).
+    verify_venv_imports "$VENV_DIR/bin/python" "${AIT_IMPORTS_CHAT[@]}"
+    verify_venv_specs   "$VENV_DIR/bin/python" "${AIT_PIP_SPECS_CHAT[@]}"
+    if venv_deps_bad; then
+        warn "Chat deps need repair ($(venv_deps_detail)). Retrying..."
+        pip_install_guarded "Chat deps repair" "$VENV_DIR/bin/pip" \
+            --quiet "${AIT_PIP_SPECS_CHAT[@]}"
+        verify_venv_imports "$VENV_DIR/bin/python" "${AIT_IMPORTS_CHAT[@]}"
+        verify_venv_specs   "$VENV_DIR/bin/python" "${AIT_PIP_SPECS_CHAT[@]}"
+    fi
+    if venv_deps_bad; then
+        warn "Chat deps could not be installed ($(venv_deps_detail)). Re-run 'ait setup --with-chat' to retry."
+        return 0
+    fi
+
+    success "Chat SDK deps ready in $VENV_DIR."
+}
+
+# --- Dev/test dependency tier (opt-in via `ait setup --with-dev`) ---
+
+# True when the user previously opted into the dev tier. Unlike
+# chat_deps_present, this checks a persisted marker rather than importing a
+# module — see AIT_DEV_TIER_MARKER above for why an import probe would be wrong
+# here. Removing the marker stops setup reinstalling/repairing the tier; it does
+# NOT disable the runner's parallel lane (that is AIT_TEST_PARALLEL=0), because
+# the runner activates on `import xdist` and knows nothing about this marker.
+dev_deps_present() {
+    [[ -f "$AIT_DEV_TIER_MARKER" ]]
+}
+
+# Install/repair the dev/test tier into the CPython venv ($VENV_DIR). Never
+# fails the overall setup: on persistent failure it warns and returns 0 so a
+# transient network problem cannot brick an otherwise-working install.
+setup_dev_deps() {
+    if [[ ! -x "$VENV_DIR/bin/pip" ]]; then
+        warn "CPython venv missing at $VENV_DIR — cannot install dev deps. Re-run 'ait setup --with-dev' after the venv exists."
+        return 0
+    fi
+
+    info "Installing/upgrading dev/test deps (pytest, pytest-xdist) into CPython venv..."
+    # EVERY fallible command in this function is explicitly guarded. The script
+    # runs under `set -e`, so a bare `pip install` that fails — an offline
+    # machine, an unreachable index, a wheel that will not build — would abort
+    # the WHOLE of `ait setup` right here, never reaching the warn/return 0
+    # below and bricking an otherwise-working install over an optional tier.
+    # `if ! cmd` keeps the failure inside a condition, where `set -e` does not
+    # trigger, which is what makes the "never fails the overall setup" contract
+    # above actually true rather than merely stated.
+    #
+    # This function deliberately does NOT use pip_install_guarded(), which warns
+    # and lets the verify block below decide. Here an install failure must
+    # short-circuit, because the opt-in marker is written at the END of a
+    # verified-good run: falling through would let a failed attempt record the
+    # tier as wanted. Do not "harmonize" these two shapes — the difference is the
+    # marker, not an oversight.
+    if ! "$VENV_DIR/bin/pip" install --quiet "${AIT_PIP_SPECS_DEV[@]}"; then
+        warn "Dev deps install failed (network or index unavailable?). Re-run 'ait setup --with-dev' to retry."
+        return 0
+    fi
+
+    # Validate importability + version ranges; retry once, then warn and
+    # continue (dev is an optional tier — never block the core setup).
+    verify_venv_imports "$VENV_DIR/bin/python" "${AIT_IMPORTS_DEV[@]}"
+    verify_venv_specs   "$VENV_DIR/bin/python" "${AIT_PIP_SPECS_DEV[@]}"
+    if venv_deps_bad; then
+        warn "Dev deps need repair ($(venv_deps_detail)). Retrying..."
+        if ! "$VENV_DIR/bin/pip" install --quiet "${AIT_PIP_SPECS_DEV[@]}"; then
+            warn "Dev deps repair failed. Re-run 'ait setup --with-dev' to retry."
+            return 0
+        fi
+        verify_venv_imports "$VENV_DIR/bin/python" "${AIT_IMPORTS_DEV[@]}"
+        verify_venv_specs   "$VENV_DIR/bin/python" "${AIT_PIP_SPECS_DEV[@]}"
+    fi
+    if venv_deps_bad; then
+        warn "Dev deps could not be installed ($(venv_deps_detail)). Re-run 'ait setup --with-dev' to retry."
+        return 0
+    fi
+
+    # Record the opt-in only after a verified-good install, so a failed attempt
+    # does not make later plain setups think the tier is wanted. Guarded for the
+    # same reason as the installs: a read-only or full $HOME must degrade to a
+    # warning, not abort setup. The deps are installed and usable either way —
+    # only the revalidate-on-next-setup behaviour is lost.
+    if ! { mkdir -p "$(dirname "$AIT_DEV_TIER_MARKER")" &&
+           printf 'opted in via: ait setup --with-dev\n' > "$AIT_DEV_TIER_MARKER"; }; then
+        warn "Dev deps installed, but the opt-in marker $AIT_DEV_TIER_MARKER could not be written — later 'ait setup' runs will not revalidate this tier."
+        return 0
+    fi
+
+    success "Dev/test deps ready in $VENV_DIR (parallel test lane enabled; AIT_TEST_PARALLEL=0 disables it)."
+}
+
+# --- Python venv setup ---
+setup_python_venv() {
+    local python_cmd
+    python_cmd="$(find_modern_python "$AIT_VENV_PYTHON_MIN")"
+    if [[ -z "$python_cmd" ]]; then
+        info "No Python >=$AIT_VENV_PYTHON_MIN found. Installing one (user-scoped)..."
+        install_modern_python
+        python_cmd="$(find_modern_python "$AIT_VENV_PYTHON_MIN")"
+        [[ -z "$python_cmd" ]] && \
+            die "Modern Python install completed but interpreter still not found. Aborting venv setup."
+    fi
+    info "Using Python for venv: $python_cmd ($("$python_cmd" --version 2>&1))"
+
+    local min_major="${AIT_VENV_PYTHON_MIN%%.*}"
+    local min_minor="${AIT_VENV_PYTHON_MIN##*.}"
+
+    if [[ -d "$VENV_DIR" ]]; then
+        # Check if existing venv Python is adequate
+        local venv_ver=""
+        venv_ver="$("$VENV_DIR/bin/python" -c 'import sys; print("{}.{}".format(*sys.version_info[:2]))' 2>/dev/null)" || venv_ver=""
+        if [[ -n "$venv_ver" ]]; then
+            local venv_major venv_minor
+            venv_major="$(echo "$venv_ver" | cut -d. -f1)"
+            venv_minor="$(echo "$venv_ver" | cut -d. -f2)"
+            if [[ "$venv_major" -gt "$min_major" ]] || \
+               { [[ "$venv_major" -eq "$min_major" ]] && [[ "$venv_minor" -ge "$min_minor" ]]; }; then
+                info "Python virtual environment already exists at $VENV_DIR (Python $venv_ver)"
+            else
+                warn "Existing venv uses Python $venv_ver (< $AIT_VENV_PYTHON_MIN). Recreating..."
+                rm -rf "$VENV_DIR"
+                mkdir -p "$(dirname "$VENV_DIR")"
+                "$python_cmd" -m venv "$VENV_DIR"
+            fi
+        else
+            info "Python virtual environment already exists at $VENV_DIR"
+        fi
+    else
+        info "Creating Python virtual environment at $VENV_DIR..."
+        mkdir -p "$(dirname "$VENV_DIR")"
+        "$python_cmd" -m venv "$VENV_DIR"
+    fi
+
+    info "Installing/upgrading Python dependencies..."
+    # Guarded like the optional tiers, but the policy differs: this function
+    # still DIES when the venv is genuinely bad (see the verify block below).
+    # What the guard buys is the MESSAGE. pip short-circuits requirements that
+    # are already satisfied without reaching the index, so an offline setup on a
+    # healthy machine is fine either way; the failure window is offline/broken-
+    # index AND a dependency that is not yet satisfied (a spec bump above, a
+    # fresh venv). Unguarded, that aborted here with only pip's own error;
+    # guarded, it falls through to the verify block and dies saying what to do.
+    pip_install_guarded "CPython venv pip self-upgrade" "$VENV_DIR/bin/pip" \
+        --quiet --upgrade pip
+
+    # `pip show` exits 1 when textual isn't installed yet (fresh-install path);
+    # `|| true` keeps the assignment safe under `set -euo pipefail`.
+    local textual_before=""
+    textual_before=$("$VENV_DIR/bin/pip" show textual 2>/dev/null \
+        | awk '/^Version:/ {print $2}') || true
+
+    pip_install_guarded "CPython venv deps" "$VENV_DIR/bin/pip" \
+        --quiet "${AIT_PIP_SPECS_COMMON[@]}" "${AIT_PIP_SPECS_CPYTHON_EXTRA[@]}"
+
+    local textual_after=""
+    textual_after=$("$VENV_DIR/bin/pip" show textual 2>/dev/null \
+        | awk '/^Version:/ {print $2}') || true
+    if [[ -n "$textual_before" && -n "$textual_after" && "$textual_before" != "$textual_after" ]]; then
+        info "Upgraded textual: $textual_before → $textual_after"
+    fi
+
+    # Validate importability + version ranges; retry once, then die — the
+    # framework cannot run without its core CPython venv deps.
+    verify_venv_imports "$VENV_DIR/bin/python" "${AIT_IMPORTS_COMMON[@]}" "${AIT_IMPORTS_CPYTHON_EXTRA[@]}"
+    verify_venv_specs   "$VENV_DIR/bin/python" "${AIT_PIP_SPECS_COMMON[@]}" "${AIT_PIP_SPECS_CPYTHON_EXTRA[@]}"
+    if venv_deps_bad; then
+        warn "CPython venv deps need repair ($(venv_deps_detail)). Retrying..."
+        pip_install_guarded "CPython venv dep repair" "$VENV_DIR/bin/pip" \
+            --quiet "${AIT_PIP_SPECS_COMMON[@]}" "${AIT_PIP_SPECS_CPYTHON_EXTRA[@]}"
+        verify_venv_imports "$VENV_DIR/bin/python" "${AIT_IMPORTS_COMMON[@]}" "${AIT_IMPORTS_CPYTHON_EXTRA[@]}"
+        verify_venv_specs   "$VENV_DIR/bin/python" "${AIT_PIP_SPECS_COMMON[@]}" "${AIT_PIP_SPECS_CPYTHON_EXTRA[@]}"
+        venv_deps_bad && \
+            die "CPython venv still bad ($(venv_deps_detail)). Check pip/network and re-run 'ait setup'."
+    fi
+
+    # Expose venv-Python via stable wrapper scripts (t706, replacing the t695_3
+    # symlinks). These are picked up by lib/aitask_path.sh's PATH prepend and by
+    # lib/python_resolve.sh's candidate list.
+    install_python_wrappers
+
+    success "Python venv ready at $VENV_DIR"
+}
+
+# Write small wrapper scripts at ~/.aitask/bin/{python,python3} that exec the
+# venv interpreter directly. A direct exec keeps sys.executable adjacent to
+# pyvenv.cfg so the venv site-packages are picked up; symlinking through
+# venv/bin/python (which itself symlinks to the system interpreter) caused
+# Python to canonicalize past pyvenv.cfg and load system site-packages.
+# Idempotent: removes any prior symlink or wrapper before writing.
+install_python_wrappers() {
+    local bin_dir="$HOME/.aitask/bin"
+    mkdir -p "$bin_dir"
+    local name path
+    for name in python python3; do
+        path="$bin_dir/$name"
+        [[ -e "$path" || -L "$path" ]] && rm -f "$path"
+        cat > "$path" <<'WRAPPER'
+#!/usr/bin/env bash
+exec "$HOME/.aitask/venv/bin/python" "$@"
+WRAPPER
+        chmod +x "$path"
+    done
+    info "Installed framework Python wrappers at $bin_dir/{python,python3}."
+}
+
+# --- Ensure ~/.local/bin is in shell profile PATH ---
+# Appends PATH export to the user's shell profile if not already present.
+# Idempotent: skips if PATH already contains the directory or profile already has the entry.
+ensure_path_in_profile() {
+    local dir_to_add="$1"
+
+    # Already in PATH — nothing to do
+    if [[ ":$PATH:" == *":$dir_to_add:"* ]]; then
+        return
+    fi
+
+    # Determine target shell profile
+    local profile_file=""
+    local kernel
+    kernel="$(uname -s)"
+
+    if [[ "${SHELL:-}" == */zsh ]] || [[ "$kernel" == "Darwin" ]]; then
+        profile_file="$HOME/.zshrc"
+    elif [[ "${SHELL:-}" == */bash ]]; then
+        profile_file="$HOME/.bashrc"
+    else
+        profile_file="$HOME/.profile"
+    fi
+
+    # Idempotency: check if a .local/bin PATH entry already exists
+    if [[ -f "$profile_file" ]] && grep -qF '.local/bin' "$profile_file"; then
+        info "$profile_file already contains a .local/bin PATH entry"
+        return
+    fi
+
+    # Append the PATH line
+    {
+        echo ""
+        echo "# Added by aitasks installer"
+        echo 'export PATH="$HOME/.local/bin:$PATH"'
+    } >> "$profile_file"
+
+    info "Added $dir_to_add to PATH in $profile_file"
+    warn "Restart your shell or run: source $profile_file"
+}
+
+# --- Global shim installation ---
+install_global_shim() {
+    # Non-blocking: if anything fails, warn and continue
+    {
+        mkdir -p "$SHIM_DIR"
+
+        local shim_src="$SCRIPT_DIR/../packaging/shim/ait"
+        if [[ ! -f "$shim_src" ]]; then
+            # The in-project shim source is shipped only to seed the global
+            # launcher. install.sh deletes packaging/ after the first consume,
+            # so on any later run (e.g. the post-install `ait setup`) the source
+            # is gone but the global shim already exists — that is the steady
+            # state, not an error. Only a true first-time install with no global
+            # shim yet is fatal.
+            if [[ -f "$SHIM_DIR/ait" ]]; then
+                info "Shim source absent; global shim already present at $SHIM_DIR/ait — skipping refresh."
+                ensure_path_in_profile "$SHIM_DIR"
+                return 0
+            fi
+            die "Cannot locate shim source ($shim_src)"
+        fi
+        cp "$shim_src" "$SHIM_DIR/ait"
+
+        chmod +x "$SHIM_DIR/ait"
+
+        success "Global shim installed at $SHIM_DIR/ait"
+        ensure_path_in_profile "$SHIM_DIR"
+    } || {
+        warn "Could not install global shim at $SHIM_DIR/ait (non-fatal)"
+    }
+}
+
+# --- Non-regular .gitignore precondition (t2191) ---
+# git reads .gitignore files on every untracked-file walk (`ls-files --others
+# --exclude-standard`, `status`, `add`), and opening one that is a FIFO blocks
+# until a writer appears. Measured on git 2.56.0: an untracked FIFO, and a
+# tracked one swapped for a FIFO once git walks a directory, hang
+# snapshot_pre_setup_dirty — main()'s first git walk, which runs before any
+# helper that guards its own open. So main() refuses up front, before its first
+# git command. The predicate is the .gitignore helpers' own gate: the path
+# exists (-e or -L) and is not -f, so a regular file or a symlink to one passes.
+# Stat-only: nothing here opens the path.
+# Scope: the .gitignore files the framework writes, which are also the ones its
+# first probes read. Nested user .gitignore files, .git/info/exclude and
+# core.excludesFile are git's own reads of files setup never writes.
+# Mirrored by _install_framework_gitignores / _install_gitignore_nonregular_kind
+# in install.sh — change both (tests/test_install_upgrade_dirty_baseline.sh P2).
+_ait_framework_gitignores() {
+    local d="$1"
+    printf '%s\n' "$d/.gitignore" "$d/.aitask-data/.gitignore" "$d/.aitask-scripts/.gitignore"
+}
+
+# _ait_gitignore_nonregular_kind <path> -> 0, printing what the path is, when it
+# exists but is not a regular file (or a symlink to one); 1 otherwise.
+_ait_gitignore_nonregular_kind() {
+    local p="$1"
+    [[ -e "$p" || -L "$p" ]] || return 1
+    [[ -f "$p" ]] && return 1
+    if [[ -L "$p" && ! -e "$p" ]]; then echo "a dangling symlink"
+    elif [[ -L "$p" ]]; then echo "a symlink to something that is not a regular file"
+    elif [[ -p "$p" ]]; then echo "a FIFO (named pipe)"
+    elif [[ -d "$p" ]]; then echo "a directory"
+    else echo "not a regular file"
+    fi
+    return 0
+}
+
+# Refuse to run when a framework .gitignore is not a regular file, naming every
+# one. MUST run in main() before any git command (see above).
+refuse_nonregular_gitignores() {
+    local project_dir="$SCRIPT_DIR/.." p kind found=""
+    while IFS= read -r p; do
+        kind="$(_ait_gitignore_nonregular_kind "$p")" || continue
+        found="$found"$'\n'"  ${p#"$project_dir/"} is $kind"
+    done < <(_ait_framework_gitignores "$project_dir")
+    [[ -z "$found" ]] && return 0
+    die "Cannot run setup: a .gitignore is not a regular file:$found
+git reads these files on every status and add, and cannot read one that is not
+a regular file — a FIFO or a device blocks it indefinitely — so setup stops
+before running any git command.
+Fix: move each one aside (e.g. 'mv .gitignore .gitignore.bak'), put a regular
+file back ('git checkout -- .gitignore' if it is tracked), then re-run 'ait setup'."
+}
+
+# --- Ensure git repository exists (init only, no commit) ---
+ensure_git_repo() {
+    local project_dir="$SCRIPT_DIR/.."
+
+    # Check if we're inside a git repo
+    if git -C "$project_dir" rev-parse --is-inside-work-tree &>/dev/null; then
+        local git_root abs_project_dir
+        git_root="$(git -C "$project_dir" rev-parse --show-toplevel 2>/dev/null)" || true
+        abs_project_dir="$(cd "$project_dir" && pwd -P)"
+
+        if [[ -n "$git_root" && "$git_root" != "$abs_project_dir" ]]; then
+            warn "aitasks is installed in a subdirectory, not the git root."
+            info "  Git root:      $git_root"
+            info "  aitasks dir:   $abs_project_dir"
+            info "aitasks should be installed at the root of your git repository"
+            info "for task IDs, locking, and sync to work correctly."
+            if [[ -t 0 ]]; then
+                printf "  Continue with setup anyway? [y/N] "
+                read -r answer
+                case "${answer:-N}" in
+                    [Yy]*) ;;
+                    *)
+                        info "Aborted. Reinstall aitasks from the git root: $git_root"
+                        exit 1
+                        ;;
+                esac
+            fi
+        else
+            success "Git repository already initialized"
+        fi
+        return
+    fi
+
+    # Not a git repo — provide detailed explanation and offer to initialize
+    local abs_project_dir
+    abs_project_dir="$(cd "$project_dir" && pwd)"
+
+    warn "No git repository found in $abs_project_dir"
+    echo ""
+    info "aitasks is tightly integrated with git. It uses git for:"
+    info "  - Storing task and plan files as version-controlled markdown"
+    info "  - Atomic task ID assignment (via a shared counter branch)"
+    info "  - Task locking (prevents two agents picking the same task)"
+    info "  - Multi-machine sync (push/pull task data across machines)"
+    echo ""
+    info "This directory should be the root of the project where you want"
+    info "to manage tasks — the place where '.git/' lives (or will live)."
+    echo ""
+
+    if [[ -t 0 ]]; then
+        printf "  Is this the correct project directory? [Y/n] "
+        read -r dir_answer
+        case "${dir_answer:-Y}" in
+            [Yy]*|"") ;;
+            *)
+                info "Aborted. cd to the correct project directory and re-run 'ait setup'."
+                exit 1
+                ;;
+        esac
+
+        printf "  Initialize a git repository here? [Y/n] "
+        read -r answer
+    else
+        info "(non-interactive: auto-accepting defaults)"
+        answer="Y"
+    fi
+    case "${answer:-Y}" in
+        [Yy]*|"")
+            git -C "$project_dir" init
+            success "Git repository initialized"
+            ;;
+        *)
+            warn "Git repository not initialized."
+            info "Note: aitask framework is designed to be tracked in git."
+            info "You can run 'git init' later and commit the aitask files."
+            ;;
+    esac
+}
+
+# Module-level flag so warn_missing_remote_for_branch() prompts only once
+# per setup run. Both setup_id_counter and setup_lock_branch consult this.
+_AIT_SETUP_NO_REMOTE_ACKED=""
+
+# Warn that a required orphan branch cannot be initialized because no git
+# remote is configured. Explain the fix and prompt for acknowledgment.
+# On acknowledgment, set the module-level flag and return 0 — the caller
+# should then `return` to skip its lock/init step. On refusal, abort setup.
+# Subsequent calls during the same run are no-ops (return 0 silently).
+#
+# Args: $1 = branch name (e.g. "aitask-locks"), $2 = purpose label
+warn_missing_remote_for_branch() {
+    local branch="$1"
+    local purpose="$2"
+
+    if [[ "$_AIT_SETUP_NO_REMOTE_ACKED" == "1" ]]; then
+        info "Skipping '$branch' setup — no remote (already acknowledged)"
+        return 0
+    fi
+
+    warn "No git remote 'origin' configured."
+    info "Cannot initialize the '$branch' orphan branch without a remote."
+    info "$purpose will not work for cross-machine coordination, and"
+    info "later 'ait pick' calls may fail with LOCK_ERROR:fetch_failed."
+    info ""
+    info "To fix:"
+    info "  git remote add origin <url>"
+    info "  ait setup    # re-run after adding the remote"
+    info ""
+
+    local answer
+    if [[ -t 0 ]]; then
+        printf "  Continue setup without '%s' (acknowledge)? [Y/n] " "$branch"
+        read -r answer
+    else
+        info "(non-interactive: auto-accepting acknowledgment)"
+        answer="Y"
+    fi
+
+    case "${answer:-Y}" in
+        [Yy]*|"")
+            _AIT_SETUP_NO_REMOTE_ACKED=1
+            warn "Continuing without '$branch'. Re-run 'ait setup' after adding the remote."
+            return 0
+            ;;
+        *)
+            die "Setup aborted. Configure a git remote and re-run 'ait setup'."
+            ;;
+    esac
+}
+
+# --- Task ID counter setup ---
+setup_id_counter() {
+    local project_dir="$SCRIPT_DIR/.."
+
+    # Only setup if we have a git repo with a remote
+    if ! git -C "$project_dir" rev-parse --is-inside-work-tree &>/dev/null; then
+        return
+    fi
+    if ! git -C "$project_dir" remote get-url origin &>/dev/null; then
+        warn_missing_remote_for_branch "aitask-ids" "Atomic task ID assignment"
+        return
+    fi
+
+    # Check if branch already exists
+    if git ls-remote --heads origin "aitask-ids" 2>/dev/null | grep -q "aitask-ids"; then
+        success "Task ID counter branch already initialized"
+        local resync_out
+        if resync_out=$(cd "$project_dir" && "$SCRIPT_DIR/aitask_claim_id.sh" --resync 2>&1); then
+            case "$resync_out" in
+                RESYNCED:*) success "Task ID counter resynced (${resync_out#RESYNCED:})" ;;
+                OK:*) info "Task ID counter already healthy (${resync_out#OK:})" ;;
+            esac
+        else
+            warn "Task ID counter resync failed: ${resync_out:-unknown error}"
+        fi
+        return
+    fi
+
+    info "Setting up shared task ID counter..."
+    info "This creates a lightweight branch 'aitask-ids' on the remote to"
+    info "prevent ID collisions when multiple PCs create tasks."
+
+    if [[ -t 0 ]]; then
+        printf "  Initialize task ID counter? [Y/n] "
+        read -r answer
+    else
+        info "(non-interactive: auto-accepting default)"
+        answer="Y"
+    fi
+
+    case "${answer:-Y}" in
+        [Yy]*|"")
+            (cd "$project_dir" && "$SCRIPT_DIR/aitask_claim_id.sh" --init)
+            ;;
+        *)
+            warn "Skipped task ID counter setup."
+            info "You can initialize later by re-running: ait setup"
+            ;;
+    esac
+}
+
+# --- Routine-fetch exclusion for the gitbranch artifact store (t2099) ---
+# Adds ^refs/heads/<store> to every named remote so `ait sync`, `git fetch` and
+# `git fetch --all --prune` never download the store branch. Silent when the
+# gitbranch backend is not configured; best-effort — a failure warns and never
+# aborts setup. Idempotent: a re-run prints FETCH_EXCLUSION:UNCHANGED.
+setup_artifact_fetch_exclusion() {
+    local project_dir="$SCRIPT_DIR/.." out rc=0
+    git -C "$project_dir" rev-parse --is-inside-work-tree &>/dev/null || return 0
+    out="$(cd "$project_dir" && "$SCRIPT_DIR/aitask_artifact.sh" fetch-exclusion apply)" || rc=$?
+    if (( rc != 0 )); then
+        warn "Could not update the routine-fetch exclusion for the gitbranch artifact store. Re-run: ait artifact fetch-exclusion apply"
+        return 0
+    fi
+    case "$out" in
+        *FETCH_EXCLUSION:NOT_CONFIGURED*) ;;
+        *FETCH_EXCLUSION:CHANGED*)   info "Artifact store: routine fetches now skip the gitbranch store branch" ;;
+        *FETCH_EXCLUSION:UNCHANGED*) info "Artifact store: routine-fetch exclusion already in place" ;;
+        *)                           info "Artifact store fetch exclusion: ${out##*$'\n'}" ;;
+    esac
+    return 0
+}
+
+# --- Task lock branch setup ---
+setup_lock_branch() {
+    local project_dir="$SCRIPT_DIR/.."
+
+    # Only setup if we have a git repo with a remote
+    if ! git -C "$project_dir" rev-parse --is-inside-work-tree &>/dev/null; then
+        return
+    fi
+    if ! git -C "$project_dir" remote get-url origin &>/dev/null; then
+        warn_missing_remote_for_branch "aitask-locks" "Task locking"
+        return
+    fi
+
+    # Check if branch already exists
+    if git ls-remote --heads origin "aitask-locks" 2>/dev/null | grep -q "aitask-locks"; then
+        success "Task lock branch already initialized"
+        return
+    fi
+
+    info "Setting up task lock branch..."
+    info "This creates a lightweight branch 'aitask-locks' on the remote to"
+    info "prevent two users from picking the same task simultaneously."
+
+    if [[ -t 0 ]]; then
+        printf "  Initialize task lock branch? [Y/n] "
+        read -r answer
+    else
+        info "(non-interactive: auto-accepting default)"
+        answer="Y"
+    fi
+
+    case "${answer:-Y}" in
+        [Yy]*|"")
+            (cd "$project_dir" && "$SCRIPT_DIR/aitask_lock.sh" --init)
+            ;;
+        *)
+            warn "Skipped task lock branch setup."
+            info "You can initialize later by re-running: ait setup"
+            ;;
+    esac
+}
+
+# --- Assemble aitasks instructions from Layer 1 (shared) + optional Layer 2 (agent-specific) ---
+# Usage: assemble_aitasks_instructions <project_dir> [agent_type]
+# agent_type: claude, codex, opencode (omit for shared-only)
+assemble_aitasks_instructions() {
+    local project_dir="$1"
+    local agent_type="${2:-}"
+    local shared="$project_dir/aitasks/metadata/aitasks_agent_instructions.seed.md"
+
+    # Fall back to the framework seed when the per-project copy is absent.
+    # Legacy / non-data-branch installs never copy it into aitasks/metadata/,
+    # so without this fallback the function would return 1 — and because
+    # callers capture its output via "$(...)", the warning below would be
+    # swallowed and `set -e` would silently abort setup at the call site.
+    if [[ ! -f "$shared" ]]; then
+        shared="$project_dir/seed/aitasks_agent_instructions.seed.md"
+    fi
+
+    if [[ ! -f "$shared" ]]; then
+        # Emit to stderr so the message survives callers' command substitution.
+        warn "Shared instructions seed not found: $shared" >&2
+        return 1
+    fi
+
+    # Layer 1: shared content
+    cat "$shared"
+
+    # Layer 2: agent-specific additions (if requested and file exists)
+    if [[ -n "$agent_type" ]]; then
+        local specific="$project_dir/aitasks/metadata/${agent_type}_instructions.seed.md"
+        if [[ ! -f "$specific" ]]; then
+            specific="$project_dir/seed/${agent_type}_instructions.seed.md"
+        fi
+        if [[ -f "$specific" ]]; then
+            echo ""
+            # Skip header lines that reference the shared file (lines before first ## heading)
+            sed -n '/^## /,$p' "$specific"
+        fi
+    fi
+}
+
+# --- Insert or replace aitasks instructions using >>>aitasks/<<<aitasks markers ---
+# Usage: insert_aitasks_instructions <target_file> <content>
+# If markers exist: replaces content between them
+# If no markers: appends marked block
+# If file doesn't exist: creates it with marked block
+insert_aitasks_instructions() {
+    local target="$1"
+    local content="$2"
+    local marker_start=">>>aitasks"
+    local marker_end="<<<aitasks"
+    local marked_block
+    marked_block="$(printf '%s\n%s\n%s' "$marker_start" "$content" "$marker_end")"
+
+    if [[ ! -f "$target" ]]; then
+        echo "$marked_block" > "$target"
+        return
+    fi
+
+    if grep -qF "$marker_start" "$target"; then
+        # Replace content between markers
+        local tmpfile
+        tmpfile="$(mktemp "${TMPDIR:-/tmp}/aitasks_insert_XXXXXX")"
+        _awk_block="$marked_block" awk -v start="$marker_start" -v end="$marker_end" '
+            BEGIN { block = ENVIRON["_awk_block"] }
+            $0 == start { print block; skip=1; next }
+            $0 == end && skip { skip=0; next }
+            !skip { print }
+        ' "$target" > "$tmpfile"
+        mv "$tmpfile" "$target"
+    else
+        # Append marked block
+        { echo ""; echo "$marked_block"; } >> "$target"
+    fi
+}
+
+# Sentinel proving a markerless CLAUDE.md already documents the aitasks
+# conventions by hand. The shared seed's most aitasks-specific heading; pinned
+# to the live seed by tests/test_agent_instructions.sh T39.
+CLAUDEMD_HAND_MAINTAINED_SENTINEL="## Git Operations on Task/Plan Files"
+
+# --- CLAUDE.md auto-update for aitasks instructions ---
+update_claudemd_git_section() {
+    local project_dir="$1"
+    local claudemd="$project_dir/CLAUDE.md"
+
+    local content
+    # Best-effort: skip (don't abort setup) if instructions can't be assembled.
+    content="$(assemble_aitasks_instructions "$project_dir" "claude")" || return 0
+
+    # CLAUDE.md is the one project-OWNED instruction surface (AGENTS.md and the
+    # two mirrors are framework-owned files whose whole body is the block). A
+    # markerless CLAUDE.md that already documents the aitasks conventions is
+    # hand-maintained -- this repo's own, and every project set up before the
+    # markers existed -- so appending would duplicate prose the project owns.
+    # Markers win: a marker-managed block contains the sentinel and must refresh.
+    if [[ -f "$claudemd" ]] \
+        && ! grep -qF ">>>aitasks" "$claudemd" \
+        && grep -qF "$CLAUDEMD_HAND_MAINTAINED_SENTINEL" "$claudemd"; then
+        info "  CLAUDE.md documents the aitasks conventions and has no >>>aitasks markers — leaving it hand-maintained."
+        info "  To let 'ait setup' manage a block here, add an EMPTY '>>>aitasks' / '<<<aitasks' line pair where you want it."
+        info "  Everything between those markers is overwritten on every setup — never wrap prose you wrote yourself."
+        return 0
+    fi
+
+    # Since t1612 this runs on EVERY `ait setup`, so a project whose markerless
+    # CLAUDE.md carries no aitasks prose receives the managed block on upgrade --
+    # a file the framework had never touched before. Announce that case
+    # separately from "created it" and "refreshed the block I already own", so it
+    # is not indistinguishable from a routine refresh.
+    local pre_state="absent"
+    if [[ -f "$claudemd" ]]; then
+        if grep -qF ">>>aitasks" "$claudemd"; then
+            pre_state="managed"
+        else
+            pre_state="unmanaged"
+        fi
+    fi
+
+    insert_aitasks_instructions "$claudemd" "$content"
+
+    if grep -qF ">>>aitasks" "$claudemd"; then
+        if [[ "$pre_state" == "unmanaged" ]]; then
+            info "  Added a managed '>>>aitasks' block to your existing CLAUDE.md."
+            info "  Everything between the markers is regenerated on every setup; the rest of your file is untouched."
+            # Deleting the markers ALONE just makes the file append-eligible again
+            # next run -- it is the sentinel section that arms the guard above, so
+            # both halves must be named. Reuse the constant; T39 pins it to the seed.
+            info "  To keep CLAUDE.md hand-maintained instead: delete the marker pair and keep a '$CLAUDEMD_HAND_MAINTAINED_SENTINEL' section of your own — 'ait setup' then leaves the file alone."
+        else
+            info "  Updated aitasks instructions in CLAUDE.md"
+        fi
+    fi
+}
+
+# --- AGENTS.md auto-update for aitasks instructions ---
+# AGENTS.md is a cross-agent convention (codex reads it at repo root; other
+# agents may too). Uses the shared aitasks layer only — agent-specific
+# guidance stays in its own file (.codex/instructions.md).
+update_agentsmd() {
+    local project_dir="$1"
+    local agentsmd="$project_dir/AGENTS.md"
+
+    local content
+    # Best-effort: skip (don't abort setup) if instructions can't be assembled.
+    content="$(assemble_aitasks_instructions "$project_dir")" || return 0
+
+    insert_aitasks_instructions "$agentsmd" "$content"
+
+    if grep -qF ">>>aitasks" "$agentsmd"; then
+        info "  Updated aitasks instructions in AGENTS.md"
+    fi
+}
+
+# ait_data_worktree_is_registered <project_dir>
+# True only when <project_dir>/.aitask-data is a worktree registered with THIS
+# repository. This is the authorization for the `rm -rf` in
+# abort_data_branch_setup below, so it FAILS CLOSED on every non-answer: a
+# `git worktree list` that errors, empty output, or a path that will not resolve
+# are all "could not check", which is its own state — never a licence to remove
+# (t1631).
+#
+# Both sides go through ait_canon_path (lib/data_symlinks.sh), the same resolver
+# every other identity comparison in the framework uses: `worktree list
+# --porcelain` prints absolute paths, and $project_dir may reach us through
+# symlinked components, so comparing the raw strings would miss a match that is
+# really there.
+ait_data_worktree_is_registered() {
+    local project_dir="$1"
+    local target listing line wt_path resolved
+
+    target="$(ait_canon_path "$project_dir/$AIT_DATA_DIR_NAME")" || return 1
+    [[ -n "$target" ]] || return 1
+
+    listing="$(git -C "$project_dir" worktree list --porcelain 2>/dev/null)" || return 1
+    [[ -n "$listing" ]] || return 1
+
+    while IFS= read -r line; do
+        [[ "$line" == worktree\ * ]] || continue
+        wt_path="${line#worktree }"
+        resolved="$(ait_canon_path "$wt_path")" || continue
+        [[ "$resolved" == "$target" ]] && return 0
+    done <<< "$listing"
+
+    return 1
+}
+
+# abort_data_branch_setup <project_dir> <branch_existed> <needs_migration> <reason>
+# Bail out of task-data-branch setup without touching the user's data. Called
+# from the migration copy, the copy verification, and the data-branch commit
+# check — the places that would otherwise leave a half-populated worktree
+# behind (t1631).
+#
+# The teardown matters because the "already configured" early return at the top
+# of setup_data_branch keys on .aitask-data/.git alone: a worktree left here
+# would make every later `ait setup` report success without ever finishing the
+# job. Reaching any call site means THIS run created the worktree (the early
+# return fires otherwise) and Step 5 has not run, so it holds nothing unique.
+abort_data_branch_setup() {
+    local project_dir="$1" branch_existed="$2" needs_migration="$3" reason="$4"
+
+    warn "$reason"
+    if [[ "$needs_migration" == true ]]; then
+        warn "Nothing was removed from the current branch — your task and plan files are untouched."
+    else
+        warn "No symlinks were created — re-run 'ait setup' to retry."
+    fi
+
+    if ait_data_worktree_is_registered "$project_dir"; then
+        local rm_err=""
+        if ! rm_err="$(cd "$project_dir" && git worktree remove --force "$AIT_DATA_DIR_NAME" 2>&1 >/dev/null)"; then
+            rm -rf "${project_dir:?}/$AIT_DATA_DIR_NAME"
+            git -C "$project_dir" worktree prune 2>/dev/null || true
+        fi
+        if [[ -e "$project_dir/$AIT_DATA_DIR_NAME" ]]; then
+            warn "Could not remove the partial '$AIT_DATA_DIR_NAME' worktree${rm_err:+ (git said: $rm_err)}. Remove it by hand, or the next 'ait setup' will report it as already configured and skip this step."
+        fi
+    else
+        warn "Left '$AIT_DATA_DIR_NAME' in place: it is not a worktree registered with this repository, or that could not be determined."
+        warn "  The next 'ait setup' will treat it as already configured and skip this step — remove it by hand first if it is not wanted."
+    fi
+
+    if [[ "$branch_existed" == false ]]; then
+        info "  The 'aitask-data' branch was created and is left in place for that retry."
+    fi
+}
+
+# --- Commit setup_data_branch's own changes on the current branch (t1963) ---
+# Commits exactly what Step 9 owns -- .gitignore (when <with_gitignore> is
+# true) and the aitasks/ + aiplans/ removals Step 5 staged (when
+# <with_removals> is true) -- and nothing else that happens to be staged in
+# this shared checkout.
+#
+# A pathspec commit cannot do it: `git commit -- aitasks/...` has --only
+# semantics and reads the worktree, where aitasks/ is by now the symlink into
+# the data worktree, so the removals would not land. Instead a private index
+# is seeded from HEAD, given just these entries, and committed; the shared
+# index keeps any foreign staged work, still staged. Setup is assumed to be the
+# only committer while it runs, so there is no concurrent-commit coordination.
+#
+# Returns 0 committed (or nothing to commit), 1 nothing was committed, 2 the
+# commit LANDED but re-syncing the shared index's .gitignore entry failed.
+_ait_commit_data_branch_switch() {
+    local project_dir="$1" msg="$2" with_gitignore="$3" with_removals="$4"
+    local tmp_dir rc=0
+    tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/ait_setup_index.XXXXXX")" || return 1
+    (
+        cd "$project_dir" || exit 1
+        # Inside a fresh directory: git rejects an existing zero-byte index file.
+        local idx="$tmp_dir/index"
+        if git rev-parse --verify -q HEAD >/dev/null; then
+            GIT_INDEX_FILE="$idx" git read-tree HEAD || exit 1
+        else
+            GIT_INDEX_FILE="$idx" git read-tree --empty || exit 1
+        fi
+        if [[ "$with_removals" == true ]]; then
+            git diff --cached --name-only -z --diff-filter=D -- aitasks aiplans \
+                | GIT_INDEX_FILE="$idx" git update-index -z --force-remove --stdin || exit 1
+        fi
+        if [[ "$with_gitignore" == true ]]; then
+            GIT_INDEX_FILE="$idx" git add -- .gitignore || exit 1
+        fi
+        GIT_INDEX_FILE="$idx" git diff --cached --quiet && exit 0
+        GIT_INDEX_FILE="$idx" git commit -m "$msg" || exit 1
+        # Committed. The shared index's removals already match the new HEAD;
+        # its .gitignore entry still holds the old blob and would read as a
+        # staged revert until re-synced.
+        if [[ "$with_gitignore" == true ]]; then
+            git reset -q -- .gitignore || exit 2
+        fi
+    ) || rc=$?
+    rm -rf "$tmp_dir"
+    return "$rc"
+}
+
+# --- Task data branch setup (aitask-data orphan branch + worktree + symlinks) ---
+setup_data_branch() {
+    local project_dir="$SCRIPT_DIR/.."
+
+    # Only setup if we have a git repo
+    if ! git -C "$project_dir" rev-parse --is-inside-work-tree &>/dev/null; then
+        return
+    fi
+
+    # Already configured — worktree exists
+    if [[ -d "$project_dir/.aitask-data/.git" || -f "$project_dir/.aitask-data/.git" ]]; then
+        success "Task data branch already configured (.aitask-data/ worktree exists)"
+        # The repair route for an install whose upstream never resolved, e.g. a
+        # --single-branch clone set up before t2127. Network-free, idempotent.
+        ait_report_data_branch_upstream "$project_dir"
+        return
+    fi
+
+    # --- Refuse inside a linked worktree ---
+    # $project_dir is "$SCRIPT_DIR/.." — the checkout `ait` was invoked from, not
+    # a caller-chosen directory. Task worktrees carry .aitask-scripts/ (tracked
+    # on main), so `./ait setup` inside an UNLINKED aiwork/<task> lands here with
+    # $project_dir set to that worktree. Step 1 below would then create and push
+    # the aitask-data orphan branch, and Step 2 would either fail (the primary
+    # holds the branch) or — with an uninitialized primary — SUCCEED, putting the
+    # repo's only task data inside a throwaway worktree that is removed when the
+    # task lands. Same hazard aitask_init_data.sh Check 3b guards; same
+    # classifier, so the two cannot drift (t1627).
+    #
+    # Placement is load-bearing on both sides: AFTER the already-configured
+    # return (a linked worktree given the layout by --link-worktree has a
+    # .aitask-data symlink and must keep short-circuiting there), and BEFORE
+    # Step 1 (which creates and pushes a branch).
+    local wt_class_rc=0
+    ait_linked_worktree_roots "$project_dir" || wt_class_rc=$?
+    if [[ "$wt_class_rc" -eq 0 || "$wt_class_rc" -eq 2 ]]; then
+        local init_data_self="$SCRIPT_DIR/aitask_init_data.sh"
+        if [[ "$wt_class_rc" -eq 2 ]]; then
+            # Inside a repository, but the topology did not resolve. Refuse
+            # rather than fall through: falling through leaves the unsafe
+            # branch-and-worktree route reachable in exactly the situation where
+            # we cannot tell whether it is safe.
+            warn "Cannot determine whether '$project_dir' is a linked git worktree — its worktree topology did not resolve."
+            warn "Skipping task data branch setup rather than guessing: initializing from a linked worktree can put the repo's only task data inside it."
+            info "  Run 'ait setup' from the primary checkout, or give an existing worktree the layout with:"
+            info "      \"$init_data_self\" --link-worktree <dir>"
+            return
+        fi
+        warn "'$AIT_WT_TOPLEVEL' is a linked git worktree of '$AIT_WT_MAIN_ROOT' — the aitask-data branch belongs to the primary checkout, not here."
+        warn "Skipping task data branch setup. The rest of 'ait setup' continues normally."
+        if [[ -d "$AIT_WT_MAIN_ROOT/$AIT_DATA_DIR_NAME/.git" \
+              || -f "$AIT_WT_MAIN_ROOT/$AIT_DATA_DIR_NAME/.git" ]]; then
+            info "  To give this worktree the task-data layout, run:"
+            info "      \"$init_data_self\" --link-worktree \"$AIT_WT_TOPLEVEL\""
+        else
+            info "  The primary has no $AIT_DATA_DIR_NAME worktree yet. Run 'ait setup' in '$AIT_WT_MAIN_ROOT' first, then:"
+            info "      \"$init_data_self\" --link-worktree \"$AIT_WT_TOPLEVEL\""
+        fi
+        return
+    fi
+
+    # Detect migration scenario: aitasks/ exists as a real directory (not symlink)
+    local needs_migration=false
+    if [[ -d "$project_dir/aitasks" && ! -L "$project_dir/aitasks" ]]; then
+        needs_migration=true
+    fi
+
+    local has_remote=false
+    if git -C "$project_dir" remote get-url origin &>/dev/null; then
+        has_remote=true
+    fi
+
+    if [[ "$needs_migration" == true ]]; then
+        info "Detected existing task data on main branch."
+        info "Setting up a separate 'aitask-data' branch will:"
+        info "  - Move task/plan files to an independent branch"
+        info "  - Create symlinks so all paths remain unchanged"
+        info "  - Enable independent sync of task data across PCs"
+    else
+        info "Setting up separate task data branch..."
+        info "This creates an 'aitask-data' orphan branch with a permanent"
+        info "worktree at .aitask-data/ and symlinks for seamless access."
+    fi
+
+    if [[ -t 0 ]]; then
+        printf "  Use a separate branch for task data? [Y/n] "
+        read -r answer
+    else
+        info "(non-interactive: auto-accepting default)"
+        answer="Y"
+    fi
+
+    case "${answer:-Y}" in
+        [Yy]*|"")
+            ;;
+        *)
+            warn "Skipped task data branch setup."
+            info "You can set this up later by re-running: ait setup"
+            return
+            ;;
+    esac
+
+    # --- Step 1: Get or create aitask-data branch ---
+    local branch_exists=false
+    local remote_state="absent"   # absent | present | unknown
+
+    # Check remote first (if available)
+    if [[ "$has_remote" == true ]]; then
+        # Exact ref match (t1631). The old probe was
+        # `ls-remote --heads origin aitask-data | grep -q aitask-data`:
+        # ls-remote matches a pattern against the TAIL of a ref and the grep was
+        # unanchored, so a remote carrying only `refs/heads/backup/aitask-data`
+        # answered "found". --exit-code additionally separates "definitively
+        # absent" (2) from "the probe itself failed" (anything else), which the
+        # old `2>/dev/null` collapsed together.
+        local ls_err="" ls_rc=0
+        ls_err="$(git -C "$project_dir" ls-remote --exit-code --heads origin refs/heads/aitask-data 2>&1 >/dev/null)" || ls_rc=$?
+        case "$ls_rc" in
+            0) remote_state="present" ;;
+            2) remote_state="absent"  ;;
+            *) remote_state="unknown"
+               warn "Could not check the remote for an aitask-data branch. git said: ${ls_err:-<no output>}" ;;
+        esac
+    fi
+
+    if [[ "$remote_state" == "present" ]]; then
+        info "Found aitask-data branch on remote — fetching..."
+        # Report git's own error rather than discarding it, and do not claim the
+        # branch was found when the fetch that materializes it failed (t1631).
+        # The old `|| true` plus an unconditional `branch_exists=true` sent
+        # Step 2 into git's "invalid reference: aitask-data". The explicit
+        # refspec is what makes a --single-branch clone get a tracking ref (t2127).
+        if ait_fetch_data_branch "$project_dir"; then
+            branch_exists=true
+        else
+            warn "Could not fetch the aitask-data branch from remote. git said: ${AIT_DATA_FETCH_ERR:-<no output>}"
+        fi
+    fi
+
+    # Check local
+    if [[ "$branch_exists" == false ]] && git -C "$project_dir" show-ref --verify refs/heads/aitask-data &>/dev/null; then
+        branch_exists=true
+        if [[ "$remote_state" == "present" ]]; then
+            info "  Using the local aitask-data branch instead. Re-run 'ait setup' once the fetch above works to reconcile it with the remote."
+        fi
+    fi
+
+    # The remote definitively HAS the branch, we could not get it, and there is
+    # no local copy. The creation block below would then mint a SECOND,
+    # unrelated aitask-data — and on the migration path move the user's task
+    # data into it. Refuse instead; returning here is before Steps 3 and 5, so
+    # nothing is copied and nothing is deleted (t1631).
+    #
+    # Scoped to "present" on purpose: an unreachable remote is "unknown", and
+    # refusing there would break `ait setup` for anyone working offline. The
+    # residual is that a first setup performed offline against a remote that
+    # does carry aitask-data still creates a divergent branch.
+    if [[ "$branch_exists" == false && "$remote_state" == "present" ]]; then
+        warn "The remote has an aitask-data branch, it could not be fetched, and there is no local copy."
+        warn "Skipping task data branch setup rather than creating a second, unrelated aitask-data branch."
+        info "  Task and plan files stay on the current branch (legacy layout). Re-run 'ait setup' once the fetch above succeeds."
+        return
+    fi
+
+    # Create if not found
+    if [[ "$branch_exists" == false ]]; then
+        info "Creating aitask-data orphan branch..."
+        local empty_tree_hash commit_hash
+        empty_tree_hash=$(git -C "$project_dir" mktree < /dev/null)
+        commit_hash=$(echo "ait: Initialize aitask-data branch" | git -C "$project_dir" commit-tree "$empty_tree_hash")
+        git -C "$project_dir" update-ref refs/heads/aitask-data "$commit_hash"
+
+        if [[ "$has_remote" == true ]]; then
+            # Report git's own error rather than discarding it (t1627).
+            local push_err=""
+            if ! push_err="$(git -C "$project_dir" push -u origin aitask-data 2>&1 >/dev/null)"; then
+                warn "Could not push aitask-data branch to remote. git said: ${push_err:-<no output>}"
+            elif ! git -C "$project_dir" show-ref --verify -q refs/remotes/origin/aitask-data \
+                    && ! ait_fetch_data_branch "$project_dir"; then
+                # Without a mapping (--single-branch) the push created no
+                # tracking ref, so @{u} has nothing to resolve to (t2127). A
+                # plain clone's push already made one: no fetch there.
+                warn "Pushed aitask-data but could not fetch it back, so 'ait sync' has no upstream yet. git said: ${AIT_DATA_FETCH_ERR:-<no output>}"
+            fi
+        fi
+    fi
+
+    # --- Step 2: Create worktree ---
+    info "Creating .aitask-data/ worktree..."
+    # Surface git's own error. The old text named `git worktree add .aitask-data
+    # aitask-data` as the remedy — the command that had just failed — and
+    # `2>/dev/null` threw away the only explanation of why (t1627, mirroring the
+    # same fix in aitask_init_data.sh at t1624).
+    local wt_add_err=""
+    if ! wt_add_err="$(ait_ensure_local_data_branch "$project_dir" 2>&1 >/dev/null \
+            && cd "$project_dir" && git worktree add .aitask-data aitask-data 2>&1 >/dev/null)"; then
+        warn "Failed to create the .aitask-data worktree in '$project_dir'. git said: ${wt_add_err:-<no output>}"
+        # `return`, not `die`. This whole step is optional — answering 'n' at the
+        # prompt above reaches the identical state — and dying here would abort
+        # the ~20 remaining setup steps (venv, shims, code agents) over a feature
+        # the user can live without. The return also skips Steps 3-9 in one jump,
+        # so nothing is ever populated into a `.aitask-data/` that is not a
+        # worktree; setup simply continues in the legacy on-main layout (which
+        # commit_framework_data_files already early-returns on), and a later
+        # `ait setup` retries this step from scratch.
+        warn "Continuing without a separate task data branch: task and plan files stay on the current branch (legacy layout). Re-run 'ait setup' once the problem above is fixed."
+        # branch_exists is never set true by the creation block above, so it is
+        # still false exactly when this run created the branch itself.
+        if [[ "$branch_exists" == false ]]; then
+            info "  The 'aitask-data' branch was created and is left in place for that retry."
+        fi
+        return
+    fi
+    ait_report_data_branch_upstream "$project_dir"
+
+    # --- Step 3: Populate data ---
+    if [[ "$needs_migration" == true ]]; then
+        info "Migrating task data to aitask-data branch..."
+        mkdir -p "$project_dir/.aitask-data/aitasks" "$project_dir/.aitask-data/aiplans"
+        # Copy all existing data (preserving structure, including drafts).
+        #
+        # cp's status is checked and a failure aborts the migration: Step 5
+        # below deletes these very files from main, and a part-way copy
+        # (permissions, a full disk, an unreadable file) is otherwise
+        # indistinguishable from a complete one at the point of that delete —
+        # the old `2>/dev/null || true` threw away the only evidence (t1631).
+        local cp_err=""
+        if ! cp_err="$(cp -a "$project_dir/aitasks/." "$project_dir/.aitask-data/aitasks/" 2>&1 >/dev/null)"; then
+            abort_data_branch_setup "$project_dir" "$branch_exists" "$needs_migration" \
+                "Failed to copy aitasks/ into the data worktree. cp said: ${cp_err:-<no output>}"
+            return
+        fi
+        if [[ -d "$project_dir/aiplans" ]]; then
+            if ! cp_err="$(cp -a "$project_dir/aiplans/." "$project_dir/.aitask-data/aiplans/" 2>&1 >/dev/null)"; then
+                abort_data_branch_setup "$project_dir" "$branch_exists" "$needs_migration" \
+                    "Failed to copy aiplans/ into the data worktree. cp said: ${cp_err:-<no output>}"
+                return
+            fi
+        fi
+    else
+        info "Creating task data directory structure..."
+        mkdir -p "$project_dir/.aitask-data/aitasks/metadata"
+        mkdir -p "$project_dir/.aitask-data/aitasks/archived"
+        mkdir -p "$project_dir/.aitask-data/aiplans/archived"
+
+        populate_data_branch_seed_metadata \
+            "$project_dir/seed" \
+            "$project_dir/.aitask-data/aitasks/metadata" \
+            "$project_dir/.aitask-scripts/gates_reference.yaml"
+    fi
+
+    # The data worktree's own .gitignore rules (t2197). They are what keeps
+    # per-user and per-PC files out of Step 4's blanket `git add .` — on
+    # migration, the userconfig.yaml, *.local.json and chatlink/applink secrets
+    # cp has just copied in — so a rule that is not in effect stops setup HERE,
+    # before Step 4, through abort_data_branch_setup: it leaves the legacy
+    # layout, which the next `ait setup` retries from scratch. Warning and
+    # carrying on would commit and push exactly those files.
+    #
+    # The file must be a regular, non-symlink file. An existing aitask-data
+    # branch decides what it is, and git stores symlinks — but git does not
+    # follow a symlinked .gitignore in the working tree, so its rules take no
+    # effect however well they are written or read back through the link (and
+    # a link to a FIFO blocked the old `>>`). t2191's refuse_nonregular_gitignores
+    # cannot cover this file: on a fresh setup .aitask-data/ does not exist yet
+    # when main() runs it. Nothing is rewritten to "fix" a link: replacing it
+    # with a regular file would silently change the branch's tracked .gitignore
+    # in Step 4's commit.
+    #
+    # The rules go through the per-rule writer, from the table's groups
+    # (_ait_gitignore_group): checked writes, a read-back, and no unchecked `>>`
+    # under main()'s errexit (as t2185/t2188 for the main .gitignore). Each rule
+    # counts as present only as a whole line (LF or CRLF); the old guards for
+    # *.local.json and profiles/local/ matched any line containing the text,
+    # their own comment line included.
+    local data_gitignore="$project_dir/$AIT_DATA_DIR_NAME/.gitignore" gi_group gi_rc gi_state
+    gi_state=""
+    if [[ -L "$data_gitignore" ]]; then
+        gi_state="is a symlink — git does not follow a symlinked .gitignore, so its rules would not keep private files out of the data branch commit"
+    elif [[ -e "$data_gitignore" && ! -f "$data_gitignore" ]]; then
+        gi_state="is not a regular file"
+    fi
+    if [[ -n "$gi_state" ]]; then
+        abort_data_branch_setup "$project_dir" "$branch_exists" "$needs_migration" \
+            "$AIT_DATA_DIR_NAME/.gitignore $gi_state (it comes from the existing aitask-data branch). Stopping before the data branch commit. Fix: replace .gitignore on the aitask-data branch with a regular file ('git show aitask-data:.gitignore' shows what it is now), then re-run 'ait setup'."
+        return
+    fi
+    for gi_group in drafts data_userconfig data_local_json data_local_profiles \
+                    data_chatlink data_applink; do
+        _ait_gitignore_group "$gi_group"
+        gi_rc=0
+        _ait_add_gitignore_rules "$data_gitignore" "$_ait_gi_comment" \
+            "${_ait_gi_rules[@]}" || gi_rc=$?
+        if [[ "$gi_rc" -eq 2 ]]; then
+            gi_state="the write failed — left unchanged"
+            if [[ -n "$_ait_gitignore_partial" ]]; then
+                gi_state="the write stopped part-way"
+            fi
+            abort_data_branch_setup "$project_dir" "$branch_exists" "$needs_migration" \
+                "Could not add ${_ait_gi_rules[*]} to $AIT_DATA_DIR_NAME/.gitignore ($gi_state). Stopping before the data branch commit, which would otherwise commit them: $_ait_gi_what."
+            return
+        fi
+    done
+
+    # --- Step 4: Commit and push on data branch ---
+    #
+    # The local commit is REQUIRED, not best-effort. Copy equality is not
+    # durability: Step 5 below removes the tracked originals from the current
+    # branch, and if the commit failed the copied data exists only as staged
+    # files in a worktree this run created. The push stays advisory — once the
+    # local commit lands the data is durable, remote or not (t1631).
+    local data_commit_rc=0
+    (
+        # `|| exit 1` is load-bearing, not decoration: this subshell is the left
+        # operand of `|| data_commit_rc=$?` below, which suppresses errexit
+        # inside it. Without the guard a failed cd would leave `git add .` and
+        # `git commit` running against the project root, and the subshell would
+        # still report success — handing Step 5 a green light to delete.
+        cd "$project_dir/$AIT_DATA_DIR_NAME" || exit 1
+        git add . || exit 1
+        if ! git diff --cached --quiet 2>/dev/null; then
+            if [[ "$needs_migration" == true ]]; then
+                git commit -m "ait: Migrate task data from main branch" || exit 1
+            else
+                git commit -m "ait: Initialize task data structure" || exit 1
+            fi
+            if [[ "$has_remote" == true ]]; then
+                # Report git's own error rather than discarding it (t1627).
+                data_push_err=""
+                if ! data_push_err="$(git push 2>&1 >/dev/null)"; then
+                    warn "Could not push data branch to remote. git said: ${data_push_err:-<no output>}"
+                fi
+            fi
+        fi
+    ) || data_commit_rc=$?
+
+    if [[ "$data_commit_rc" -ne 0 ]]; then
+        # Both paths abort, and both abort HERE — before Step 6. On the
+        # migration path that is what keeps Step 5 from deleting originals whose
+        # copy is not committed. On the fresh path there is nothing to delete,
+        # but "warn and continue" is still not available: Step 6 would lay
+        # symlinks over a worktree whose seeded contents are uncommitted, and
+        # the "already configured" early return at the top of this function
+        # keys on .aitask-data/.git alone — so `ait setup` could never retry the
+        # failed initialization, and ait_ensure_data_symlinks is called from
+        # nowhere else in setup. Tearing the worktree down leaves the plain
+        # legacy layout, which a later `ait setup` retries from scratch.
+        abort_data_branch_setup "$project_dir" "$branch_exists" "$needs_migration" \
+            "Could not commit the task data on the aitask-data branch (git exited $data_commit_rc)."
+        return
+    fi
+
+    # --- Step 5: Clean up main (migration only) ---
+    if [[ "$needs_migration" == true ]]; then
+        # Last guard before an irreversible delete. cp reporting success and the
+        # commit landing are the primary ones; this compares the trees outright,
+        # because from setup's point of view the removal below cannot be undone.
+        # Fails closed: diff exits 1 on differences and 2 on trouble (e.g. a file
+        # it cannot read), and both mean "do not delete" (t1631).
+        local diff_out="" verify_ok=true
+        if ! diff_out="$(diff -r -q "$project_dir/aitasks" "$project_dir/.aitask-data/aitasks" 2>&1)"; then
+            verify_ok=false
+        elif [[ -d "$project_dir/aiplans" ]] \
+             && ! diff_out="$(diff -r -q "$project_dir/aiplans" "$project_dir/.aitask-data/aiplans" 2>&1)"; then
+            verify_ok=false
+        fi
+        if [[ "$verify_ok" == false ]]; then
+            abort_data_branch_setup "$project_dir" "$branch_exists" "$needs_migration" \
+                "Copy verification failed — refusing to remove the originals from the current branch. diff said: ${diff_out:-<no output>}"
+            return
+        fi
+
+        info "Removing task data from main branch..."
+        (
+            cd "$project_dir" || exit 1
+            git rm -r --quiet aitasks/ 2>/dev/null || true
+            git rm -r --quiet aiplans/ 2>/dev/null || true
+            # Remove any remaining untracked files/dirs
+            rm -rf aitasks/ aiplans/
+        )
+    fi
+
+    # --- Step 6: Create symlinks ---
+    ait_ensure_data_symlinks "$project_dir"
+
+    # --- Step 7: Update .gitignore on main ---
+    local gitignore="$project_dir/.gitignore"
+    local gitignore_changed=false
+
+    # Migration: rewrite legacy data entries to the root-anchored form.
+    # Trailing-slash patterns (`aitasks/`, `.aitask-data/`) match directories
+    # only and miss the symlinks the data layout creates (t699, t1711); bare
+    # names match the symlinks but at ANY depth, so a nested `docs/aitasks/` is
+    # silently ignored too (t2184). `/aitasks` matches the root entry only, as a
+    # directory or a symlink. Older repos may have either legacy form committed.
+    # See _ait_rewrite_data_gitignore_lines.
+    local rw_rc=0
+    _ait_rewrite_data_gitignore_lines "$gitignore" || rw_rc=$?
+    case "$rw_rc" in
+        0) gitignore_changed=true
+           _ait_report_unhidden_nested_data_paths "$project_dir" ;;
+        1) ;;
+        *) warn "Could not rewrite legacy data entries in .gitignore (left unchanged) — 'ait setup' retries it" ;;
+    esac
+
+    # Both writes below are checked and never fatal: an unchecked `>>` hung on a
+    # FIFO and aborted setup under errexit on a read-only file or a directory
+    # (t2185). A rule or block that cannot be written is reported and never
+    # claimed as written; the rest of the data-branch setup carries on.
+    local blk_rc
+
+    # The task-data rules go through the per-rule writer, from the table's
+    # `data` group: each anchored rule is checked on its own (LF or CRLF), so a
+    # .gitignore that kept `/.aitask-data` but lost `/aitasks` gets exactly
+    # `/aitasks` back, and one that lost only `/.aitask-data` does not have the
+    # link rules duplicated (t2188). The block has no `!` re-includes, so adding
+    # only the missing rules cannot reorder anything. After the rewrite above, a
+    # legacy line has become its anchored form and counts as present; on a
+    # failed rewrite the missing anchored rules are added anyway, which ignores
+    # the root entries whatever the legacy lines still say. The failure warning
+    # offers re-running setup, and that holds: in branch mode the re-run repair
+    # (setup_data_gitignore_symlink_safe) adds missing data rules on every run.
+    blk_rc=0
+    _ait_gitignore_group data
+    _ait_add_gitignore_rules "$gitignore" "$_ait_gi_comment" "${_ait_gi_rules[@]}" || blk_rc=$?
+    case "$blk_rc" in
+        0) gitignore_changed=true ;;
+        1) ;;
+        *) _ait_warn_gitignore_rules_failed "$_ait_gi_what" "${_ait_gi_rules[@]}" ;;
+    esac
+
+    # Install per-profile rendered-skill-closure ignore patterns so a consumer's
+    # `git status` stays clean of on-demand rendered closures
+    # (.claude/skills/<skill>-<profile>-/ etc.). Mirrors the canonical block in
+    # this repo's own .gitignore, minus .gemini (no longer a required agent
+    # root). The `!` negations re-include the committed headless prerenders so
+    # they stay tracked for Claude Code Web where `ait setup` has not run; they
+    # MUST come after the broad `*-/` patterns. Keep this list in sync with the
+    # repo .gitignore until t777_29 unifies both via
+    # aitask_regen_gitignore_prerender.sh.
+    local skill_block=(
+        "# Per-profile rendered skill variants (on-demand, not committed)"
+        "# Convention: rendered dirs end with a trailing hyphen; authoring"
+        "# dirs never do. See https://www.aitasks.io/docs/concepts/skill-templating/"
+        ".claude/skills/*-/"
+        ".agents/skills/*-/"
+        ".opencode/skills/*-/"
+        ""
+        "# Pre-rendered headless variants, committed so the skill works where"
+        "# 'ait setup' has not run (e.g. Claude Code Web). Negations win only"
+        "# when they follow the broad patterns above."
+        "!.claude/skills/aitask-pickrem-remote-/"
+        "!.agents/skills/aitask-pickrem-remote-codex-/"
+        "!.opencode/skills/aitask-pickrem-remote-/"
+        "!.claude/skills/aitask-pickweb-remote-/"
+        "!.agents/skills/aitask-pickweb-remote-codex-/"
+        "!.opencode/skills/aitask-pickweb-remote-/"
+        "!.claude/skills/task-workflow-remote-/"
+        "!.agents/skills/task-workflow-remote-codex-/"
+        "!.opencode/skills/task-workflow-remote-/"
+    )
+    blk_rc=0
+    _ait_ensure_gitignore_block "$gitignore" _ait_gitignore_has_skill_block \
+        "${skill_block[@]}" || blk_rc=$?
+    case "$blk_rc" in
+        0) gitignore_changed=true ;;
+        1) ;;
+        *) _ait_warn_gitignore_block_failed "rendered-skill" \
+               "Rendered per-profile skill directories" "${skill_block[@]}" ;;
+    esac
+
+    # --- Step 8: (retired) ---
+    # CLAUDE.md is intentionally NOT written here: it is regenerated on every
+    # `ait setup` from setup_code_agents, beside update_agentsmd (t1612). This
+    # function early-returns in four places before this point -- most of all when
+    # .aitask-data/.git already exists, i.e. on every re-run -- so a call here
+    # could never refresh the file. Do not re-add one.
+
+    # --- Step 9: Commit on main ---
+    # Path-scoped through a private index (_ait_commit_data_branch_switch,
+    # t1963): only .gitignore and, on migration, the removals Step 5 staged --
+    # never whatever else is staged in this shared checkout. A .gitignore that
+    # was dirty before setup is left on disk, uncommitted, as every other
+    # .gitignore helper does (t1959). CLAUDE.md is not this step's to commit:
+    # commit_framework_files owns it and honours the same baseline (t1612).
+    local commit_gitignore=false commit_rc=0 commit_msg
+    if [[ "$gitignore_changed" == true ]]; then
+        if _ait_gitignore_predates_setup; then
+            info "  .gitignore may hold uncommitted changes from before setup — data-branch rules added but not committed."
+        else
+            commit_gitignore=true
+        fi
+    fi
+    if [[ "$needs_migration" == true ]]; then
+        commit_msg="ait: Migrate task data to aitask-data branch"
+    else
+        commit_msg="ait: Configure task data branch with worktree and symlinks"
+    fi
+    _ait_commit_data_branch_switch "$project_dir" "$commit_msg" \
+        "$commit_gitignore" "$needs_migration" || commit_rc=$?
+    case "$commit_rc" in
+        0) ;;
+        2)
+            warn "Committed '$commit_msg', but the git index could not be updated afterwards — .gitignore may show as a staged revert."
+            info "  Once the index lock clears, reconcile it with: git reset -q -- .gitignore"
+            ;;
+        *)
+            # The task data is already committed on the data branch, so this
+            # is not worth aborting the rest of setup over.
+            warn "Could not commit the task data branch switch on the current branch (exit $commit_rc)."
+            if [[ "$needs_migration" == true ]]; then
+                info "  The aitasks/ and aiplans/ removals are left staged; the .gitignore rules are on disk. Commit them by hand."
+            else
+                info "  The .gitignore rules are on disk, uncommitted. Commit them by hand."
+            fi
+            ;;
+    esac
+
+    success "Task data branch configured successfully"
+    info "  Worktree: .aitask-data/"
+    info "  Symlinks: aitasks/ → .aitask-data/aitasks/, aiplans/ → .aitask-data/aiplans/"
+    if [[ "$needs_migration" == true ]]; then
+        info "  Migration: task/plan data moved from main to aitask-data branch"
+    fi
+}
+
+# --- Metadata files THIS setup run wrote (t1677) ------------------------------
+#
+# aitasks/metadata/* has no derivable task id, so `ait sync` refuses to attribute
+# it and nothing else committed the populate-missing / backfill writes below —
+# an ownerless dirty config became a permanent rebase deferral. `ait setup` is an
+# explicit user action, so it owns what it wrote.
+#
+# Deliberately NOT a "commit everything dirty under aitasks/metadata/" sweep:
+# that would commit whatever a CONCURRENT session was mid-editing, publishing
+# content this run never wrote. Each ensure_* appends only on its real write
+# path.
+#
+# PER-INVOCATION SIGNAL — reset once per run. Every ensure_* below early-exits in
+# the common case, which is exactly the shape that made a stale AIT_LABELS_ADDED
+# a real bug in t1662: a leaked entry would commit an earlier phase's file under
+# a later one.
+# Split by admission, not one list: --allow-new is a PER-PATH permission ("this
+# run created the file"), so a path this run merely EDITED must never ride in an
+# --allow-new batch. ensure_project_config_defaults' backfill pass writes an
+# already-existing project_config.yaml; under a single flag an untracked local
+# copy of it would be published to the data branch rather than refused, which is
+# exactly the fail-closed contract the helper exists to keep (t1677 review).
+AIT_SETUP_METADATA_NEW=()
+AIT_SETUP_METADATA_EXISTING=()
+
+# _note_metadata_write <repo-relative path> [new]
+# Pass the literal `new` ONLY when this invocation brought the file into
+# existence. The default records a pre-existing file, so a call site added later
+# without the argument fails closed (refused) rather than open (published).
+_note_metadata_write() {
+    if [[ "${2:-}" == "new" ]]; then
+        AIT_SETUP_METADATA_NEW+=("$1")
+    else
+        AIT_SETUP_METADATA_EXISTING+=("$1")
+    fi
+}
+
+# Commit what this run wrote. Best-effort: a failed metadata commit must never
+# abort setup, but it must never be silent either — an uncommitted file is a
+# standing state, so the warning names the command that clears it.
+# _flush_metadata_batch <allow_new:0|1> <path>... — one helper call, reporting a
+# failure with the remedy that MATCHES its own admission. Single-sourced so the
+# advertised command cannot drift from the one that ran.
+_flush_metadata_batch() {
+    local allow_new="$1"; shift
+    # Built in step: the command that RUNS and the command the warning SHOWS
+    # take the flag from the same branch, so the advice cannot drift from the
+    # invocation. `shown` carries the repo-relative spelling a user can paste.
+    local -a argv=( "$SCRIPT_DIR/aitask_metadata_commit.sh" )
+    local -a shown=( "./.aitask-scripts/aitask_metadata_commit.sh" )
+    if (( allow_new )); then
+        argv+=( --allow-new )
+        shown+=( --allow-new )
+    fi
+    argv+=( "$@" )
+    shown+=( "$@" )
+
+    local rc=0
+    "${argv[@]}" >/dev/null 2>&1 || rc=$?
+    if [[ $rc -eq 1 ]]; then
+        warn "Config file(s) written but NOT committed. Clear them with: ${shown[*]}"
+    fi
+    return 0
+}
+
+commit_setup_metadata_writes() {
+    # `${arr[@]+...}` guard: bash 3.2 errors on ${#arr[@]} for an EMPTY array
+    # under `set -u`, and the common case here is exactly that.
+    local -a created=( ${AIT_SETUP_METADATA_NEW[@]+"${AIT_SETUP_METADATA_NEW[@]}"} )
+    local -a updated=( ${AIT_SETUP_METADATA_EXISTING[@]+"${AIT_SETUP_METADATA_EXISTING[@]}"} )
+
+    # Two calls, never one — see AIT_SETUP_METADATA_NEW. Files this run created
+    # need --allow-new (they are untracked by construction); files it merely
+    # edited must be refused if they are untracked local content.
+    if (( ${#created[@]} )); then
+        _flush_metadata_batch 1 "${created[@]}"
+    fi
+    if (( ${#updated[@]} )); then
+        _flush_metadata_batch 0 "${updated[@]}"
+    fi
+    return 0
+}
+
+ensure_project_config_defaults() {
+    local project_dir="$SCRIPT_DIR/.."
+    local seed_config="$project_dir/seed/project_config.yaml"
+    local target_config="$project_dir/aitasks/metadata/project_config.yaml"
+    local default_domain="aitasks.io"
+
+    # If target is missing, try to create it from seed. install.sh installs
+    # project_config.yaml into aitasks/metadata/ directly (and deletes seed/
+    # afterwards), so in normal flow target exists here. The seed fallback
+    # still matters for in-tree dev runs where seed/ is preserved.
+    if [[ ! -f "$target_config" ]]; then
+        if [[ ! -f "$seed_config" ]]; then
+            warn "project_config.yaml is missing from aitasks/metadata/ and no seed template is available."
+            warn "tmux default_session and git_tui setup will be skipped."
+            warn "Re-run 'ait setup' to populate the project config from the seed."
+            return
+        fi
+        mkdir -p "$(dirname "$target_config")"
+        cp "$seed_config" "$target_config"
+        _note_metadata_write "aitasks/metadata/project_config.yaml" new
+        success "Created project_config.yaml"
+        return
+    fi
+
+    # Target exists — backfill codeagent_coauthor_domain if missing
+    if grep -Eq '^[[:space:]]*codeagent_coauthor_domain:[[:space:]]*' "$target_config"; then
+        return
+    fi
+
+    local tmp_file
+    tmp_file="$(mktemp)"
+    awk -v domain="$default_domain" '
+        BEGIN { inserted = 0 }
+        /^[[:space:]]*verify_build:[[:space:]]*$/ && inserted == 0 {
+            print "codeagent_coauthor_domain: " domain
+            print ""
+            inserted = 1
+        }
+        { print }
+        END {
+            if (inserted == 0) {
+                print ""
+                print "codeagent_coauthor_domain: " domain
+            }
+        }
+    ' "$target_config" > "$tmp_file"
+    cat "$tmp_file" > "$target_config" && rm "$tmp_file"
+    # Deliberately NOT `new`: this branch edits a file that already existed. If
+    # it is untracked local content the helper must refuse it, not publish it.
+    _note_metadata_write "aitasks/metadata/project_config.yaml"
+    success "Updated project_config.yaml with codeagent_coauthor_domain"
+}
+
+# --- Chatlink gateway config (populate-missing, t1120_2) ---
+ensure_chatlink_config() {
+    local project_dir="$SCRIPT_DIR/.."
+    local seed_config="$project_dir/seed/chatlink_config.yaml"
+    local target_config="$project_dir/aitasks/metadata/chatlink_config.yaml"
+
+    # install.sh installs chatlink_config.yaml into aitasks/metadata/ directly
+    # (and deletes seed/ afterwards), so in normal flow target exists here.
+    # The seed fallback still matters for in-tree dev runs where seed/ is
+    # preserved, and for pre-t1120 installs re-running 'ait setup'.
+    if [[ -f "$target_config" ]]; then
+        return
+    fi
+    if [[ ! -f "$seed_config" ]]; then
+        warn "chatlink_config.yaml is missing from aitasks/metadata/ and no seed template is available."
+        warn "Re-run 'ait setup' after upgrading to populate the chatlink config from the seed."
+        return
+    fi
+    mkdir -p "$(dirname "$target_config")"
+    cp "$seed_config" "$target_config"
+    _note_metadata_write "aitasks/metadata/chatlink_config.yaml" new
+    success "Created chatlink_config.yaml"
+}
+
+# --- AgentCrew runner config (populate-missing, t1196) ---
+# SOURCE-TREE / CLEAN-CLONE ONLY. install.sh deletes seed/ after its installers
+# run, so on a tarball-installed repo this is a no-op by construction — those
+# repos get the file from install_seed_crew_runner_config() on every
+# `ait upgrade` (aitask_upgrade.sh runs install.sh --force). This pass exists for
+# repos whose data branch was initialized before crew_runner_config.yaml joined
+# the clean-init set, where re-running `ait setup` repairs it.
+#
+# Silent when neither file is present, unlike ensure_chatlink_config: the
+# chatlink daemon refuses to start without its config, whereas the runner has
+# working built-in defaults — warning on every seedless setup run would be pure
+# noise.
+ensure_crew_runner_config() {
+    local project_dir="$SCRIPT_DIR/.."
+    local seed_config="$project_dir/seed/crew_runner_config.yaml"
+    local target_config="$project_dir/aitasks/metadata/crew_runner_config.yaml"
+
+    # Every early exit is an explicit `return 0`. A bare `return` after a failed
+    # test propagates status 1, and this runs at top level in main() under
+    # `set -euo pipefail` — the seedless (tarball) path is the COMMON case, so a
+    # bare return would abort the whole setup run for exactly the repos this
+    # helper is a deliberate no-op for. Same class of hazard as t1193.
+    [[ -f "$target_config" ]] && return 0
+    [[ -f "$seed_config" ]] || return 0
+
+    mkdir -p "$(dirname "$target_config")"
+    cp "$seed_config" "$target_config"
+    _note_metadata_write "aitasks/metadata/crew_runner_config.yaml" new
+    success "Created crew_runner_config.yaml"
+    return 0
+}
+
+# --- Data-branch metadata population (extracted from setup_data_branch, t1194) ---
+# Populates a freshly created data-branch metadata dir. Extracted so the
+# seed->metadata mapping is callable (and testable) on its own: together with
+# ensure_agent_config_seeds() it is the source-tree counterpart of install.sh's
+# install_seed_* family, and tests/test_seed_manifest_drift.sh derives this side
+# of the manifest by calling both directly.
+#
+# The gate registry is copied BEFORE the seed-dir guard on purpose: it is
+# canonical under .aitask-scripts/ and ships downstream even when seed/ is
+# absent (t1147). Folding it below the guard would silently drop gates.yaml on
+# every seedless run.
+populate_data_branch_seed_metadata() {
+    local seed_dir="$1" dest_dir="$2" gates_reference="$3"
+
+    if [[ -f "$gates_reference" ]]; then
+        cp "$gates_reference" "$dest_dir/gates.yaml" 2>/dev/null || true
+    fi
+
+    [[ -d "$seed_dir" ]] || return 0
+
+    cp "$seed_dir/task_types.txt" "$dest_dir/" 2>/dev/null || true
+    cp "$seed_dir/project_config.yaml" "$dest_dir/" 2>/dev/null || true
+    cp "$seed_dir/chatlink_config.yaml" "$dest_dir/" 2>/dev/null || true
+    cp "$seed_dir/crew_runner_config.yaml" "$dest_dir/" 2>/dev/null || true
+    cp "$seed_dir/doc_update_guide.md" "$dest_dir/" 2>/dev/null || true
+    cp "$seed_dir/code_areas.yaml" "$dest_dir/" 2>/dev/null || true
+    cp "$seed_dir/codeagent_config.json" "$dest_dir/" 2>/dev/null || true
+    cp "$seed_dir"/models_*.json "$dest_dir/" 2>/dev/null || true
+    cp "$seed_dir/"*_instructions.seed.md "$dest_dir/" 2>/dev/null || true
+    if [[ -d "$seed_dir/profiles" ]]; then
+        mkdir -p "$dest_dir/profiles"
+        cp "$seed_dir/profiles/"*.yaml "$dest_dir/profiles/" 2>/dev/null || true
+    fi
+    return 0
+}
+
+# --- Agent config seeds (populate-missing, t1185) ---
+# install.sh installs these into aitasks/metadata/ directly (and deletes seed/
+# afterwards), so in the normal tarball flow the targets already exist. This
+# populate-missing pass matters for (a) source-tree / clean-clone runs where
+# seed/ survives but aitasks/metadata/ was never populated, and (b) repos whose
+# data branch was initialized before these seeds joined the clean-init set —
+# re-running `ait setup` repairs them.
+#
+# Without it, setup_codex_cli/setup_opencode find no seed and silently skip
+# their merge, leaving .codex/config.toml without the
+# default_mode_request_user_input feature that t1171 depends on.
+#
+# Existing files are never overwritten — user customizations win.
+ensure_agent_config_seeds() {
+    local project_dir="$SCRIPT_DIR/.."
+    local seed_dir="$project_dir/seed"
+    local dest_dir="$project_dir/aitasks/metadata"
+
+    [[ -d "$seed_dir" ]] || return 0
+
+    # "<seed filename>:<metadata filename>" — the dest name differs for the
+    # Claude settings seed; install.sh:582-583 applies the same rename.
+    local pairs=(
+        "codex_config.seed.toml:codex_config.seed.toml"
+        "codex_rules.default.rules:codex_rules.default.rules"
+        "opencode_config.seed.json:opencode_config.seed.json"
+        "claude_settings.local.json:claude_settings.seed.json"
+        "claude_settings.hooks.json:claude_settings.hooks.json"
+    )
+
+    # Only create the destination when it is genuinely absent. A dangling
+    # aitasks/ symlink (data branch not yet materialized) makes `mkdir -p` fail,
+    # which under `set -e` would abort the whole setup run. The normal sequence
+    # calls this after setup_data_branch, so the dir exists by then — degrade to
+    # a warning rather than taking setup down if that ever stops holding.
+    if [[ ! -d "$dest_dir" ]] && ! mkdir -p "$dest_dir" 2>/dev/null; then
+        warn "Cannot populate agent config seeds — $dest_dir is unavailable"
+        return 0
+    fi
+
+    local pair src_name dest_name copied=0
+    for pair in "${pairs[@]}"; do
+        src_name="${pair%%:*}"
+        dest_name="${pair##*:}"
+        [[ -f "$seed_dir/$src_name" ]] || continue
+        [[ -f "$dest_dir/$dest_name" ]] && continue
+        cp "$seed_dir/$src_name" "$dest_dir/$dest_name"
+        _note_metadata_write "aitasks/metadata/$dest_name" new
+        info "  Populated aitasks/metadata/$dest_name from seed"
+        copied=$((copied + 1))
+    done
+
+    if [[ $copied -gt 0 ]]; then
+        success "Populated $copied missing agent config seed(s)"
+    fi
+    return 0
+}
+
+# True when .gitignore was already dirty (edited, or deleted — staged or not)
+# at snapshot_pre_setup_dirty, so no setup commit may carry it (t1959). Shared
+# by _ait_commit_gitignore_rule and setup_data_branch's Step 9 (t1963).
+# An unverified main baseline counts as "may predate": its emptiness is
+# unknown, not clean (t1747_4).
+_ait_gitignore_predates_setup() {
+    [[ "${AIT_SETUP_BASELINE_UNVERIFIED:-0}" == "1" ]] && return 0
+    [[ -n "$(printf '%s\n' .gitignore | _ait_intersect "$AIT_SETUP_DIRTY_BASELINE")" ]]
+}
+
+# --- Commit a rule a .gitignore helper just appended (t1959) ---
+# Every .gitignore helper below commits through here. Path-scoped: a bare
+# `git commit` would carry whatever another session staged in this shared
+# checkout. And never over a pre-setup change: when .gitignore was already
+# dirty at snapshot_pre_setup_dirty (edited, or deleted — staged or not),
+# committing it would put the user's uncommitted change into a setup commit,
+# so the rule stays on disk (effective, uncommitted) and commit_framework_files
+# reports the file as left alone. An unarmed or empty baseline (direct calls,
+# a fresh install) commits.
+_ait_commit_gitignore_rule() {
+    local project_dir="$1" msg="$2"
+    git -C "$project_dir" rev-parse --is-inside-work-tree &>/dev/null || return 0
+    if _ait_gitignore_predates_setup; then
+        info "  .gitignore may hold uncommitted changes from before setup — rule added but not committed."
+        return 0
+    fi
+    (cd "$project_dir" && git add -- .gitignore && git commit -m "$msg" -- .gitignore 2>/dev/null) || true
+}
+
+# --- Draft directory and gitignore setup ---
+# Every .gitignore helper below writes through _ait_setup_gitignore_group (the
+# checked, never-fatal writer and the shared rule table, t2178) and commits
+# through _ait_commit_gitignore_rule.
+setup_draft_directory() {
+    mkdir -p "$SCRIPT_DIR/../aitasks/new"
+    _ait_setup_gitignore_group drafts \
+        "Draft directory already in .gitignore" "draft tasks are local-only" || return 0
+    _ait_commit_gitignore_rule "$SCRIPT_DIR/.." "ait: Add aitasks/new/ to .gitignore (draft tasks)"
+    success "Draft directory configured (aitasks/new/ in .gitignore)"
+}
+
+# --- Python cache artifact gitignore rule ---
+setup_python_cache_gitignore() {
+    _ait_setup_gitignore_group pycache \
+        "Python cache rule already in .gitignore" "Python cache artifacts" || return 0
+    _ait_commit_gitignore_rule "$SCRIPT_DIR/.." "ait: Add __pycache__/ to .gitignore (Python cache artifacts)"
+    success "Python cache rule added to .gitignore"
+}
+
+# --- Gate sidecar-log gitignore rule (t635_1) ---
+# Per-task gate verifier output lives under .aitask-gates/<task-id>/. The in-body
+# "Gate Runs" summary is what gets committed; the raw logs are local-only.
+setup_gate_logs_gitignore() {
+    _ait_setup_gitignore_group gates \
+        "Gate sidecar-log rule already in .gitignore" "gate sidecar logs" || return 0
+    _ait_commit_gitignore_rule "$SCRIPT_DIR/.." "ait: Add .aitask-gates/ to .gitignore (gate sidecar logs)"
+    success "Gate sidecar-log rule added to .gitignore"
+}
+
+# --- Per-user framework root (t1852_1) ---
+# $AITASKS_HOME/engine/ is where install_engine_binary() (M1.5) lands the
+# ait-testmap binary. Only the engine root is created here; an existing
+# directory is left with whatever mode it has.
+setup_aitasks_home() {
+    if [[ -d "$AITASKS_HOME/engine" ]]; then
+        success "AITASKS_HOME:$AITASKS_HOME (engine root present)"
+        return
+    fi
+    info "Creating per-user framework root $AITASKS_HOME/engine ..."
+    # The mode is meant for engine/ alone; a parent $AITASKS_HOME created on the
+    # way gets the umask default, like any other user directory.
+    # shellcheck disable=SC2174
+    mkdir -p -m 0755 "$AITASKS_HOME/engine"
+    success "AITASKS_HOME:$AITASKS_HOME"
+}
+
+# --- Legacy per-user root hint (t1852_6) ---
+# report_home_legacy — when the legacy per-user root still holds tenants, print
+# its HOME_LEGACY: line (taken verbatim from `ait engine home`, the one owner of
+# that listing) and how to migrate. Setup migrates by default
+# (migrate_home_legacy), so from setup this shows only after a refusal, a
+# rollback or an opt-out; install.sh, which never migrates, shows it too.
+# Silent when there is nothing to report.
+report_home_legacy() {
+    local out line
+    out="$(bash "$SCRIPT_DIR/aitask_engine.sh" home 2>/dev/null)" || return 0
+    line="$(printf '%s\n' "$out" | grep '^HOME_LEGACY:' | grep -v '^HOME_LEGACY:none$' | grep -v '|(empty)$')" || return 0
+    [[ -n "$line" ]] || return 0
+    # printf, not info's echo -e: tenant names are %q-escaped and may hold backslashes.
+    printf '%b%s\n' "${BLUE}[ait]${NC}   " "$line"
+    info "    'ait engine home' shows what blocks it; 'ait setup' (or 'ait engine home --migrate') moves these into $AITASKS_HOME and leaves a symlink behind"
+    return 0
+}
+
+# --- Monitor status server restart after an upgrade (t2246) ---
+# report_monitor_server_restart — the shared monitor status server keeps
+# running the code it started with, so after install.sh replaced this tree's
+# files every server STARTED FROM THIS TREE (any tmux server, any version) is
+# stopped with a verified SIGTERM; its clients reconnect and respawn one from the
+# new files. Owner-scoped on purpose: install-flow tests run with a scratch
+# HOME but the real XDG_RUNTIME_DIR, and other trees' servers run unchanged
+# files. status_restart.py is stdlib-only, so any python3 will do. Never fatal;
+# AIT_MONITOR_RESTART=0 opts out. Prints MONITOR_SERVER:<line> for each server
+# it stopped or failed to stop, nothing otherwise.
+report_monitor_server_restart() {
+    [[ "${AIT_MONITOR_RESTART:-1}" == "0" ]] && return 0
+    local helper="$SCRIPT_DIR/monitor/status_restart.py"
+    local owner="$SCRIPT_DIR/monitor/status_server.py"
+    [[ -f "$helper" && -f "$owner" ]] || return 0
+    local py="${VENV_DIR:-}/bin/python"
+    [[ -n "${VENV_DIR:-}" && -x "$py" ]] || py="$(resolve_python)"
+    if [[ -z "$py" ]]; then
+        echo "MONITOR_SERVER:skipped:no_python"
+        return 0
+    fi
+    local out line rc=0 failed=false
+    out="$("$py" "$helper" retire --all-keys --all-versions --owner-path "$owner" 2>/dev/null)" || rc=$?
+    while IFS= read -r line; do
+        case "$line" in
+            RETIRED:*) printf 'MONITOR_SERVER:%s\n' "$line" ;;
+            RETIRE_FAILED:*) printf 'MONITOR_SERVER:%s\n' "$line"; failed=true ;;
+        esac
+    done <<<"$out"
+    # The helper exits 0, or 1 when it printed a RETIRE_FAILED line. Anything
+    # else (a broken interpreter, a crash) means nothing was checked — say so
+    # rather than reading the silence as "no server to restart".
+    if [[ "$rc" -ne 0 && "$failed" != true ]]; then
+        echo "MONITOR_SERVER:failed:helper_exit_$rc ($py)"
+        failed=true
+    fi
+    if [[ "$failed" == true ]]; then
+        echo "MONITOR_SERVER:hint: a status server did not stop; 'ait monitor --server-status' lists it — end that pid by hand, open monitors respawn a fresh one"
+    fi
+    return 0
+}
+
+# --- Python venv dependency drift hint (t2133) ---
+# report_venv_dep_drift — read-only check of the existing venvs against the pip
+# specs above. Setup repairs drift itself (pip install + verify_venv_specs);
+# install.sh / `ait upgrade` never touch the venvs, so this is how an
+# upgraded-only machine learns that a raised floor (e.g. rich>=14.3.3) needs
+# `ait setup`. A venv that does not exist is silent; an inspection that failed
+# is reported as such, never as clean. Installs and removes nothing.
+report_venv_dep_drift() {
+    local dir py specs_label
+    local -a specs
+    for dir in "$VENV_DIR" "$PYPY_VENV_DIR"; do
+        py="$dir/bin/python"
+        [[ -x "$py" ]] || continue
+        if [[ "$dir" == "$VENV_DIR" ]]; then
+            specs=("${AIT_PIP_SPECS_COMMON[@]}" "${AIT_PIP_SPECS_CPYTHON_EXTRA[@]}")
+        else
+            specs=("${AIT_PIP_SPECS_COMMON[@]}")
+        fi
+        verify_venv_specs "$py" "${specs[@]}"
+        if [[ "$specs_check_ok" != true ]]; then
+            warn "Could not check Python dependency versions in $dir (interpreter or version check failed)."
+        elif [[ ${#bad_specs[@]} -gt 0 ]]; then
+            printf -v specs_label '%s; ' "${bad_specs[@]}"
+            warn "Python venv $dir has dependencies outside the required range: ${specs_label%; }"
+        else
+            continue
+        fi
+        info "    'ait upgrade' does not update Python dependencies — run 'ait setup' to repair them."
+    done
+    return 0
+}
+
+# --- Legacy per-user root migration (t1939) ---
+# migrate_home_legacy [--no-home-migration] — run `ait engine home --migrate`
+# (the one owner of the move) and branch on its exit class.
+#
+# The verb writes STRAIGHT to setup's stdout/stderr, never into a $( ) buffer:
+# its HOME_FAILED / HOME_STRANDED / HOME_RESTORE lines are the only record of a
+# blocked rollback (on a signal it exits 128+signo even then), and a buffer
+# dies with setup when a TERM/HUP reaches the whole process group. Setup itself
+# outlives such a signal through HANDLER traps (never '': an ignored signal is
+# inherited by the verb, which could then not trap it), waits for the verb's
+# own recovery, then reports. Opt-outs: the flag, or AIT_HOME_MIGRATE=0.
+# Returns the class to the caller:
+#   0          migrated, nothing to migrate, or opted out
+#   1          refused or rolled back — the legacy root is as it was; continue
+#   2          rollback blocked — HOME_STRANDED/HOME_RESTORE printed; caller stops
+#   128+signo  interrupted (the verb's, or setup's own) — caller stops
+migrate_home_legacy() {
+    if [[ "${1:-}" == "--no-home-migration" ]]; then
+        info "Per-user root migration skipped (--no-home-migration)"
+        return 0
+    fi
+    if [[ "${AIT_HOME_MIGRATE:-1}" == "0" ]]; then
+        info "Per-user root migration skipped (AIT_HOME_MIGRATE=0)"
+        return 0
+    fi
+    # The lock-free report says whether there is anything to do; only an
+    # explicit HOME_NEXT:none (no legacy root, already migrated) stays silent.
+    local next
+    next="$(bash "$SCRIPT_DIR/aitask_engine.sh" home 2>/dev/null </dev/null | grep '^HOME_NEXT:' | head -n1)" || next=""
+    [[ "$next" == HOME_NEXT:none\|* ]] && return 0
+
+    info "Migrating the per-user root into $AITASKS_HOME ('ait engine home --migrate'):"
+    local rc=0 sig=""
+    trap 'sig=INT' INT
+    trap 'sig=TERM' TERM
+    trap 'sig=HUP' HUP
+    bash "$SCRIPT_DIR/aitask_engine.sh" home --migrate </dev/null || rc=$?
+    trap - INT TERM HUP
+    # Setup was signalled but the verb finished on its own: still stop.
+    if [[ -n "$sig" ]] && (( rc < 128 )); then
+        case "$sig" in INT) rc=130 ;; TERM) rc=143 ;; HUP) rc=129 ;; esac
+    fi
+    case "$rc" in
+        0)
+            success "Per-user root migration done: the legacy root now links to $AITASKS_HOME"
+            return 0 ;;
+        1)
+            warn "Per-user root not migrated (see the HOME_ lines above) — nothing was changed; setup continues"
+            return 1 ;;
+        2)
+            warn "Per-user root migration FAILED and its rollback was blocked."
+            warn "Run the HOME_RESTORE steps above in order, then re-run 'ait setup'."
+            return 2 ;;
+        *)
+            if (( rc >= 128 )); then
+                warn "Per-user root migration interrupted (exit $rc). Read the HOME_ lines above: any HOME_RESTORE steps must be run in order before re-running 'ait setup'."
+                return "$rc"
+            fi
+            warn "Per-user root migration did not run (exit $rc); setup continues"
+            return 1 ;;
+    esac
+}
+
+# --- Test map engine install (t1852_5) ---
+# install_engine_binary [--local-engine <path>] [--engine-from-source]
+#                       [--no-testmap] [--force-engine]
+# Installs the ait-testmap engine for exactly this framework VERSION into
+# $AITASKS_HOME/engine/v<V>/ait-testmap. Reached by `ait setup` and — through
+# install.sh, which sources this file — by `ait upgrade`. Source order:
+#   --local-engine (final when given) > the exact-version release asset >
+#   --engine-from-source > an ENGINE_MISSING warning.
+# AIT_TESTMAP_FETCH=0 switches the release tier off (install.sh sets it for a
+# --local-tarball install); with no other source that is TESTMAP_BINARY:skipped.
+# AIT_ENGINE_RELEASE_URL overrides the release base URL (mirrors, file:// tests).
+# Never fatal: every outcome is a TESTMAP_BINARY: line and the function returns
+# 0, so nothing else in setup depends on the engine. The staging, checksum,
+# lock and publication mechanics live in lib/engine_install.sh.
+install_engine_binary() {
+    local local_engine="" from_source=0 no_testmap=0 force=0 fetch=1
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --local-engine)
+                if [[ $# -lt 2 || -z "$2" ]]; then
+                    echo "TESTMAP_BINARY:usage|--local-engine needs a path"
+                    return 0
+                fi
+                local_engine="$2"; shift 2 ;;
+            --engine-from-source) from_source=1; shift ;;
+            --no-testmap)         no_testmap=1; shift ;;
+            --force-engine)       force=1; shift ;;
+            *)
+                echo "TESTMAP_BINARY:usage|unknown option $1"
+                return 0 ;;
+        esac
+    done
+
+    if [[ "$no_testmap" == 1 ]]; then
+        if [[ -n "$local_engine" || "$from_source" == 1 || "$force" == 1 ]]; then
+            echo "TESTMAP_BINARY:usage|--no-testmap cannot be combined with another engine flag"
+            return 0
+        fi
+        echo "TESTMAP_BINARY:skipped"
+        info "Test map engine install skipped (--no-testmap)."
+        return 0
+    fi
+    [[ "${AIT_TESTMAP_FETCH:-1}" == 0 ]] && fetch=0
+    if [[ "$fetch" == 0 && -z "$local_engine" && "$from_source" == 0 ]]; then
+        echo "TESTMAP_BINARY:skipped"
+        info "Test map engine fetch skipped (AIT_TESTMAP_FETCH=0); run 'ait setup' online, or pass --local-engine <path>."
+        return 0
+    fi
+
+    # shellcheck source=lib/engine_install.sh
+    if ! source "$SETUP_LIB_DIR/engine_install.sh"; then
+        echo "TESTMAP_BINARY:lib-missing|$SETUP_LIB_DIR/engine_install.sh"
+        return 0
+    fi
+    # shellcheck source=lib/platform_detect.sh
+    if ! source "$SETUP_LIB_DIR/platform_detect.sh"; then
+        echo "TESTMAP_BINARY:lib-missing|$SETUP_LIB_DIR/platform_detect.sh"
+        return 0
+    fi
+
+    local v=""
+    if ! v="$(engine_read_framework_version "$VERSION_FILE")"; then
+        echo "TESTMAP_BINARY:version-invalid|$VERSION_FILE"
+        return 0
+    fi
+    case "$AITASKS_HOME" in
+        *'|'*|*$'\n'*|*$'\r'*)
+            echo "TESTMAP_BINARY:path-unsafe|AITASKS_HOME"
+            return 0 ;;
+    esac
+    local slot bin
+    slot="$(aitasks_engine_dir "$v")"
+    bin="$slot/ait-testmap"
+
+    # Fast path only — the authoritative .dev re-check runs under the slot lock.
+    if [[ "$force" != 1 && -e "$slot/.dev" ]]; then
+        engine_publish_report 4 "$bin" ""
+        return 0
+    fi
+
+    local staging rc=0
+    if ! staging="$(engine_staging_dir)"; then
+        echo "TESTMAP_BINARY:staging-failed|$AITASKS_HOME/engine"
+        rc=1
+    else
+        _install_engine_tiers "$staging" "$v" "$slot" "$local_engine" "$from_source" "$force" "$fetch" || rc=$?
+        engine_slot_unlock
+        rm -rf -- "$staging" 2>/dev/null || warn "Could not remove the staging dir $staging"
+    fi
+
+    # 0 installed/present, 4 kept-dev: nothing more to say.
+    if [[ "$rc" -ne 0 && "$rc" -ne 4 ]]; then
+        if [[ -f "$bin" ]] && engine_self_check "$bin" "$v" >/dev/null; then
+            info "The existing engine at $bin was left in place."
+        else
+            echo "ENGINE_MISSING:$bin|run 'ait setup --local-engine <path>' or 'ait setup --engine-from-source'"
+            warn "No ait-testmap engine is installed for v$v. 'ait testmap' will refuse until one is; nothing else depends on it."
+        fi
+    fi
+    return 0
+}
+
+# _install_engine_tiers <staging> <V> <slot> <local path> <from_source> <force> <fetch>
+# The source tiers of install_engine_binary, in order. Prints the protocol lines.
+# 0 installed or present · 1 nothing installed · 4 kept-dev · 5 publish failed.
+_install_engine_tiers() {
+    local staging="$1" v="$2" slot="$3" local_engine="$4" from_source="$5" force="$6" fetch="$7"
+    local bin="$slot/ait-testmap" found="" hex="" prc=0
+
+    # Tier 1 — an explicit local binary is final: no fallback to another source.
+    if [[ -n "$local_engine" ]]; then
+        if [[ ! -f "$local_engine" ]]; then
+            echo "TESTMAP_BINARY:local-missing"
+            warn "--local-engine: no such file: $local_engine"
+            return 1
+        fi
+        if ! cp "$local_engine" "$staging/ait-testmap" 2>/dev/null ||
+           ! engine_stage_exec "$staging/ait-testmap"; then
+            echo "TESTMAP_BINARY:stage-failed|local"
+            return 1
+        fi
+        if ! found="$(engine_self_check "$staging/ait-testmap" "$v")"; then
+            echo "TESTMAP_BINARY:self-check-failed|local|$found"
+            warn "--local-engine reports version '$found'; this framework needs exactly '$v'."
+            return 1
+        fi
+        engine_publish_locked marked "$staging/ait-testmap" "$slot" "$force" || prc=$?
+        engine_publish_report "$prc" "$bin" local
+        case "$prc" in 0) return 0 ;; 4) return 4 ;; *) return 5 ;; esac
+    fi
+
+    # An intact, verified release install needs no network at all.
+    if [[ "$force" != 1 && -f "$bin" && -f "$slot/ait-testmap.sha256" ]] &&
+       hex="$(engine_sum_lookup "$slot/ait-testmap.sha256" ait-testmap)" &&
+       engine_file_matches "$bin" "$hex" &&
+       engine_self_check "$bin" "$v" >/dev/null; then
+        echo "TESTMAP_BINARY:present|$bin"
+        return 0
+    fi
+
+    # Tier 2 — the exact-version release asset, checksum-verified.
+    if [[ "$fetch" == 1 ]]; then
+        local suffix="" base asset sums
+        if suffix="$(platform_asset_suffix 2>/dev/null)"; then
+            base="${AIT_ENGINE_RELEASE_URL:-https://github.com/$REPO/releases/download/v$v}"
+            asset="ait-testmap_${v}_${suffix}"
+            sums="ait-testmap_${v}_SHA256SUMS.txt"
+            info "Fetching test map engine $asset ..."
+            if ! engine_fetch "$base/$sums" "$staging/$sums"; then
+                echo "TESTMAP_BINARY:fetch-failed|$base/$sums"
+            elif ! engine_fetch "$base/$asset" "$staging/$asset"; then
+                echo "TESTMAP_BINARY:fetch-failed|$base/$asset"
+            elif ! hex="$(engine_sum_lookup "$staging/$sums" "$asset")" ||
+                 ! engine_file_matches "$staging/$asset" "$hex"; then
+                echo "TESTMAP_BINARY:checksum-mismatch|$asset"
+                warn "$asset does not match $sums — refused; nothing was installed."
+            elif ! engine_stage_exec "$staging/$asset"; then
+                echo "TESTMAP_BINARY:stage-failed|release"
+            elif ! found="$(engine_self_check "$staging/$asset" "$v")"; then
+                echo "TESTMAP_BINARY:self-check-failed|release|$found"
+            else
+                local sidecar="$staging/ait-testmap.sha256"
+                { printf '%s  ait-testmap\n' "$hex" > "$sidecar"; } 2>/dev/null || sidecar=""
+                engine_publish_locked release "$staging/$asset" "$slot" "$force" "$sidecar" || prc=$?
+                engine_publish_report "$prc" "$bin" release
+                case "$prc" in 0) return 0 ;; 4) return 4 ;; *) return 5 ;; esac
+            fi
+        else
+            echo "TESTMAP_BINARY:platform-unsupported|$(uname -s)|$(uname -m)"
+            info "No prebuilt engine for this platform; build one with --engine-from-source or supply --local-engine <path>."
+        fi
+    fi
+
+    # Tier 3 — build from the Go source (a framework checkout only).
+    if [[ "$from_source" == 1 ]]; then
+        local root build out built
+        root="$(cd "$SETUP_LIB_DIR/../.." && pwd)"
+        build="$root/goengines/build.sh"
+        if [[ ! -f "$build" ]]; then
+            echo "TESTMAP_BINARY:no-source|$build"
+            info "The Go source ships only in the aitasks framework repository: build there with 'goengines/build.sh host --version $v', then re-run with --local-engine <path>."
+            return 1
+        fi
+        info "Building the test map engine from source ..."
+        if ! out="$(bash "$build" --version "$v" --out "$staging/src" host)"; then
+            echo "TESTMAP_BINARY:build-failed|$build"
+            return 1
+        fi
+        built="$(printf '%s\n' "$out" | sed -n 's/^BUILT://p')"
+        if [[ -z "$built" || "$built" == *$'\n'* || ! -f "$built" ]] ||
+           ! engine_stage_exec "$built"; then
+            echo "TESTMAP_BINARY:build-failed|$build"
+            return 1
+        fi
+        if ! found="$(engine_self_check "$built" "$v")"; then
+            echo "TESTMAP_BINARY:self-check-failed|source|$found"
+            return 1
+        fi
+        engine_publish_locked marked "$built" "$slot" "$force" || prc=$?
+        engine_publish_report "$prc" "$bin" source
+        case "$prc" in 0) return 0 ;; 4) return 4 ;; *) return 5 ;; esac
+    fi
+    return 1
+}
+
+# report_testmap_state — TESTMAP:<state> for this project, after the install.
+# Setup reports; it never onboards. The engine probe is the shim's own handshake
+# (so it honours AIT_TESTMAP_BIN / AIT_ENGINE exactly as `ait testmap` would);
+# "registry present" is aitestmap/config.yaml, the same rule `ait test` uses.
+report_testmap_state() {
+    local project_dir="$SCRIPT_DIR/.." err=""
+    if ! err="$(
+        # shellcheck source=aitask_testmap.sh
+        source "$SETUP_LIB_DIR/../aitask_testmap.sh" --source-only 2>/dev/null || exit 3
+        rc=0
+        testmap_resolve_engine 2>/dev/null || rc=$?
+        if [[ "$rc" -ne 0 ]]; then
+            printf '%s\n' "$TESTMAP_ENGINE_ERROR"
+            exit "$rc"
+        fi
+    )"; then
+        echo "TESTMAP:engine-missing"
+        [[ -n "$err" ]] && info "  $err"
+        return 0
+    fi
+    # M6.1 (t1857) named extension: an unfinished aitestmap/onboard.yaml ledger
+    # reports TESTMAP:bootstrapping|<next phase> — insert its branch between the
+    # absent and onboarded arms below.
+    if [[ ! -f "$project_dir/aitestmap/config.yaml" ]]; then
+        echo "TESTMAP:absent|run /aitask-testmap-onboard"
+        info "No test map in this project yet: run /aitask-testmap-onboard to enable change-aware test selection."
+    else
+        echo "TESTMAP:onboarded"
+    fi
+    return 0
+}
+
+# --- Task relations activation (t1981_3) ---
+# aidocs/framework/task_relations.md D5 "Activation is visible". Background
+# analysis spends tokens (headless Claude print mode bills at a higher rate),
+# so it is OFF until answered: an absent `relations.enabled` means "never
+# asked", which is the only state in which the interactive question fires. Batch
+# (non-tty) setup never asks and leaves the key absent. Both helpers need the
+# venv (PyYAML), so they run after setup_python_venv.
+_relations_config_state() {
+    local py
+    py="$(resolve_python 2>/dev/null)" || py=""
+    [[ -n "$py" ]] || return 1
+    "$py" "$SCRIPT_DIR/lib/relations_config.py" state "$SCRIPT_DIR/.." 2>/dev/null
+}
+
+ask_relations_activation() {
+    [[ -t 0 ]] || return 0
+    local state py answer value out rc=0
+    state="$(_relations_config_state)" || return 0
+    [[ "$state" == *"RELATIONS_KEY:absent"* ]] || return 0
+    py="$(resolve_python 2>/dev/null)" || py=""
+    [[ -n "$py" ]] || return 0
+    info "Task relations: background analysis records how tasks relate (shown at pick time and before review)."
+    info "  It runs headless Claude print mode, which bills at a higher per-token rate, capped per host per day."
+    printf "  Enable background task-relations analysis? [y/N] "
+    answer=""
+    read -r answer || answer=""
+    case "${answer:-N}" in
+        [Yy]*) value=true ;;
+        *)     value=false ;;
+    esac
+    out="$("$py" "$SCRIPT_DIR/lib/relations_config.py" set-enabled "$SCRIPT_DIR/.." "$value" 2>&1)" || rc=$?
+    if [[ $rc -ne 0 ]]; then
+        # A "yes" that cannot resolve project.name leaves the key absent, so
+        # the question is asked again once the name is set.
+        warn "Task relations not enabled: ${out#*:}"
+        info "  Set project.name, then run: ait relations enable"
+        return 0
+    fi
+    _flush_metadata_batch 0 "aitasks/metadata/project_config.yaml"
+    return 0
+}
+
+report_relations_state() {
+    local state cap agent
+    state="$(_relations_config_state)" || state=""
+    if [[ "$state" == *"RELATIONS_KEY:true"* ]]; then
+        cap="$(printf '%s\n' "$state" | sed -n 's/^RELATIONS_CAP://p')"
+        agent="$(cd "$SCRIPT_DIR/.." && "$SCRIPT_DIR/aitask_codeagent.sh" resolve relations 2>/dev/null \
+            | sed -n 's/^AGENT_STRING://p')" || agent=""
+        echo "RELATIONS:enabled(${agent:-unresolved}, cap ${cap:-40}/day)"
+        info "Background task-relations analysis is on (headless Claude print mode bills at a higher per-token rate). Disable with: ait relations disable"
+    else
+        echo "RELATIONS:disabled"
+        info "Background task-relations analysis is off. Enable with: ait relations enable (headless Claude print mode bills at a higher per-token rate; capped per host per day)."
+    fi
+    return 0
+}
+
+# --- Test map scratch gitignore rule (t1852_5) ---
+# .aitask-testmap/ holds per-checkout runs, the cost ledger and onboarding
+# scratch; it must never be committed.
+setup_testmap_gitignore() {
+    _ait_setup_gitignore_group testmap \
+        "Test map scratch rule already in .gitignore" "test map runs and ledger" || return 0
+    _ait_commit_gitignore_rule "$SCRIPT_DIR/.." "ait: Add .aitask-testmap/ to .gitignore (test map scratch)"
+    success "Test map scratch rule added to .gitignore"
+}
+
+# --- Worktree-directory gitignore rules (t1616) ---
+# The framework creates two worktree trees inside the project: task worktrees at
+# aiwork/<task_name> (task-workflow Step 7) and AgentCrew worktrees at
+# .aitask-crews/crew-<id> (aitask_crew_init.sh). Both are local, per-branch
+# checkouts that must never be committed — and an unignored worktree is exposed
+# to a broad `git add -A` in another concurrent session.
+#
+# The two rules are guarded independently (_ait_add_gitignore_rules guards each
+# rule on its own) so a project that already carries one (this repo carried
+# .aitask-crews/ by hand for a long time) gains only the other.
+setup_worktree_dirs_gitignore() {
+    _ait_setup_gitignore_group worktrees \
+        "Worktree directory rules already in .gitignore" "framework worktree directories" || return 0
+    local added="$_ait_gitignore_added"
+    _ait_commit_gitignore_rule "$SCRIPT_DIR/.." "ait: Add worktree directories to .gitignore"
+    success "Worktree directory rules added to .gitignore ($added)"
+}
+
+# --- Root-anchored, symlink-safe data-name gitignore rules (t699, t1711, t2184) ---
+# In branch mode .aitask-data, aitasks and aiplans are symlinks in every linked
+# worktree (ait_link_worktree_data) and live at the repository root. Setup has
+# written two legacy forms for them, each wrong in its own way:
+#   `<name>/`  a trailing slash matches directories only, so `.aitask-data/`
+#              leaves the worktree dirty (`?? .aitask-data`), `git worktree
+#              remove` refuses, and the task cannot archive (t699, t1711);
+#   `<name>`   a bare name matches the symlinks but at ANY depth, so every
+#              nested `docs/aitasks/` or `fixtures/aiplans/` is silently
+#              ignored as well (t2184).
+# Rewrite each exact legacy line to `/<name>`: the leading slash anchors it to
+# the directory holding the .gitignore (the root, or each linked worktree's
+# root), and with no trailing slash it still matches a symlink. The names come
+# from data_symlinks.sh, the one definition ait_link_worktree_data reads.
+#
+# Whole-file, exact-line scope, like the original trailing-slash rewrite: the
+# block's header comment is user-editable, so it is no boundary, and a bare
+# data-name line anywhere in the root .gitignore has the same defect.
+#
+# Prints nothing on stdout. Exit status is a three-way contract that callers
+# MUST branch on (never collapse 1 and 2):
+#   0  rewrote the file
+#   1  nothing to do (no .gitignore, or no legacy line) — file untouched
+#   2  could not inspect or rewrite (unreadable or not a regular file, not
+#      writable, render or rename failure) — the original file is left in
+#      place, unmodified, with its mode intact
+
+# Renderer for ait_atomic_render: <gitignore> <space-separated legacy names>.
+# Whole-line match, names passed as data (no regex built from them): both
+# `<name>/` and `<name>` become `/<name>`. A CRLF line keeps its CR: git strips
+# a trailing CR before matching, so CRLF `.aitask-data/` is still
+# directory-only and needs the rewrite, and the rewritten line keeps the file's
+# own line ending. Other lines pass through byte for byte.
+_ait_render_data_gitignore() {
+    awk -v names="$2" '
+        BEGIN {
+            n = split(names, a, " ")
+            for (i = 1; i <= n; i++) { want[a[i]] = "/" a[i]; want[a[i] "/"] = "/" a[i] }
+        }
+        {
+            line = $0; cr = ""
+            if (sub(/\r$/, "", line)) cr = "\r"
+            if (line in want) { print want[line] cr; next }
+            print
+        }
+    ' "$1" || return 1
+}
+
+_ait_rewrite_data_gitignore_lines() {
+    local gitignore="$1" name
+    local legacy=()
+    [[ -e "$gitignore" || -L "$gitignore" ]] || return 1
+    # Open only a regular file (or a symlink to one): a FIFO blocks grep's open
+    # until a writer appears (t2185, as _ait_add_gitignore_rules, t2178).
+    [[ -f "$gitignore" ]] || return 2
+    for name in "$AIT_DATA_DIR_NAME" "${AIT_DATA_LINKS[@]}"; do
+        # Both legacy forms, LF and CRLF: a CRLF line carries its CR into grep's line.
+        if grep -qxF -e "$name/" -e "$name/"$'\r' -e "$name" -e "$name"$'\r' \
+                -- "$gitignore" 2>/dev/null; then
+            legacy+=("$name")
+        else
+            # grep 1 = no such line; 2 = unreadable / a directory, not "absent".
+            [[ $? -eq 1 ]] || return 2
+        fi
+    done
+    [[ ${#legacy[@]} -gt 0 ]] || return 1
+    # A read-only .gitignore is the user saying "do not touch": the rename below
+    # would replace it anyway, so refuse explicitly (as the session-hook install
+    # does for settings.json).
+    [[ -w "$gitignore" ]] || return 2
+    # shellcheck source=lib/atomic_write.sh
+    source "$SETUP_LIB_DIR/atomic_write.sh"
+    # Stages beside the resolved file with the file's current mode, renames it
+    # in, and discards the temp on failure. A hand-rolled mktemp+mv would land
+    # the file 0600 — stripping other users' read access in a shared checkout —
+    # and would replace a symlinked .gitignore instead of writing through it.
+    ait_atomic_render "$gitignore" _ait_render_data_gitignore \
+        "$gitignore" "${legacy[*]}" || return 2
+    return 0
+}
+
+# _ait_nested_data_entries — the filter stage of
+# _ait_report_unhidden_nested_data_paths. Reads NUL-separated paths on stdin.
+# For each path whose data name is a NON-root component, prints the path's
+# prefix through the FIRST such component (with a trailing `/` when that
+# component is a directory) as one line, printf %q-encoded: the encoding is
+# injective and never contains a raw newline, so the caller can dedupe with a
+# plain `sort -u` and print the lines as they are. Consecutive repeats (every
+# file under one directory) are skipped here; sort -u removes the rest.
+_ait_nested_data_entries() {
+    local path rest comp prefix entry name prev="" candidate is_data last
+    while IFS= read -r -d '' path; do
+        # Cheap prefilter: only a path with a data name as a non-root component
+        # is walked below (a root entry has no nested component at all).
+        candidate=0
+        for name in "$AIT_DATA_DIR_NAME" "${AIT_DATA_LINKS[@]}"; do
+            [[ "$path" == */"$name"/* || "$path" == */"$name" ]] && { candidate=1; break; }
+        done
+        [[ "$candidate" -eq 1 ]] || continue
+        prefix="${path%%/*}"
+        rest="${path#*/}"
+        while :; do
+            comp="${rest%%/*}"
+            last=0
+            [[ "$comp" == "$rest" ]] && last=1
+            prefix="$prefix/$comp"
+            is_data=0
+            for name in "$AIT_DATA_DIR_NAME" "${AIT_DATA_LINKS[@]}"; do
+                [[ "$comp" == "$name" ]] && { is_data=1; break; }
+            done
+            if [[ "$is_data" -eq 1 ]]; then
+                entry="$prefix"
+                [[ "$last" -eq 1 ]] || entry="$prefix/"
+                if [[ "$entry" != "$prev" ]]; then
+                    printf '%q\n' "$entry"
+                    prev="$entry"
+                fi
+                break
+            fi
+            [[ "$last" -eq 0 ]] || break
+            rest="${rest#*/}"
+        done
+    done
+    return 0
+}
+
+# _ait_report_unhidden_nested_data_paths <project_dir> — run after a successful
+# rewrite. Lists, via info, the untracked (not ignored) paths that sit under a
+# NESTED directory carrying a data name (`docs/aitasks/`, never the root
+# `aitasks`), at most 10 plus a remainder count, so they are seen before a
+# broad `git add` sweeps them in. Advisory and read-only: it never fails, and
+# prints nothing outside a git work tree, when any stage of the scan fails, or
+# when there is nothing to list.
+#
+# The wording claims no provenance. The scan runs after the rewrite only, so it
+# cannot tell a path the old bare rules hid from one that was untracked all
+# along — a mixed `.aitask-data/` + `/aitasks` file rewrites with rc 0 while
+# `docs/aitasks/` was visible before it (t2184).
+#
+# Files, not `--directory`: a wholly-untracked `docs/` would collapse to one
+# entry and hide the nested component. Paths are read raw and NUL-separated
+# (`-z`): without it git C-quotes any path holding `"`, `\` or a control
+# character — core.quotePath=false does not stop that — so one directory would
+# split into `docs/aitasks/` and `"docs/aitasks/`.
+_ait_report_unhidden_nested_data_paths() {
+    local project_dir="$1" listing label line total=0 nshown=0
+    # One pipeline, every stage's status read from PIPESTATUS (not pipefail: the
+    # helper must not depend on the caller's shell options). A git that fails
+    # after printing some paths leaves nothing to show, so a partial scan is
+    # never presented as the list. sort -u under LC_ALL=C: byte order, and no
+    # locale collation that could fold two different entries into one.
+    listing="$(
+        git -C "$project_dir" ls-files -z -o --exclude-standard 2>/dev/null \
+            | _ait_nested_data_entries | LC_ALL=C sort -u
+        _ait_scan_status=("${PIPESTATUS[@]}")
+        for _ait_scan_rc in "${_ait_scan_status[@]}"; do
+            [[ "$_ait_scan_rc" -eq 0 ]] || exit 1
+        done
+        exit 0
+    )" || return 0
+    [[ -n "$listing" ]] || return 0
+    while IFS= read -r line; do total=$((total + 1)); done <<< "$listing"
+    label="$(printf '%s/' "${AIT_DATA_LINKS[@]}" "$AIT_DATA_DIR_NAME")"
+    label="${label%/}"
+    info "  After anchoring the data entries in .gitignore, these paths under nested ${label} directories show as untracked — review them before a broad 'git add':"
+    # printf, not info: info is `echo -e`, which would read the backslashes of
+    # a %q-encoded entry as escapes.
+    while IFS= read -r line; do
+        [[ "$nshown" -lt 10 ]] || break
+        printf '    %s\n' "$line"
+        nshown=$((nshown + 1))
+    done <<< "$listing"
+    if [[ "$total" -gt 10 ]]; then
+        printf '    … and %d more\n' "$((total - 10))"
+    fi
+    return 0
+}
+
+# Re-run repair for existing installs: setup_data_branch's own Step 7 rewrite
+# sits behind its "already configured" early return, so on every later
+# `ait setup` only this reaches the file.
+#
+# Two halves, in this order. The rewrite turns legacy data lines into their
+# root-anchored form. Then, in BRANCH mode only, every anchored data rule still
+# missing is added through the per-rule writer (the table's `data` group) — a
+# hand edit that dropped `/aitasks` otherwise left the root symlink untracked
+# for good (t2188). Rewrite first, so a legacy `aitasks/` becomes `/aitasks`
+# instead of gaining a duplicate beside it. Never in legacy mode: there
+# aitasks/ is tracked task data, and ignoring it would hide every new task file.
+#
+# It deliberately commits nothing. main() calls it LAST, immediately before
+# commit_framework_files, which commits .gitignore minus the pre-setup dirty
+# baseline. The other .gitignore helpers commit their own rule (through
+# _ait_commit_gitignore_rule, which honours the same baseline), so running this
+# ahead of one of them would let that helper's commit carry the repair under
+# the helper's message.
+#
+# install.sh main() calls it too, for existing installs only — `ait upgrade`
+# never runs setup — after its snapshot_pre_install_dirty and immediately
+# before commit_installed_files, under the same baseline contract.
+setup_data_gitignore_symlink_safe() {
+    local project_dir="$SCRIPT_DIR/.."
+    local rc=0 add_rc=1 anchored
+    anchored="$(printf '/%s, ' "$AIT_DATA_DIR_NAME" "${AIT_DATA_LINKS[@]}")"
+    anchored="${anchored%, }"
+    _ait_rewrite_data_gitignore_lines "$project_dir/.gitignore" || rc=$?
+    # add_rc stays 1 ("nothing added") in legacy mode, where nothing is tried.
+    # Branch mode is the predicate setup_data_branch's "already configured"
+    # check and task_utils' data-worktree resolver use: .aitask-data/.git.
+    if [[ -d "$project_dir/$AIT_DATA_DIR_NAME/.git" || -f "$project_dir/$AIT_DATA_DIR_NAME/.git" ]]; then
+        add_rc=0
+        _ait_gitignore_group data
+        _ait_add_gitignore_rules "$project_dir/.gitignore" \
+            "$_ait_gi_comment" "${_ait_gi_rules[@]}" || add_rc=$?
+    fi
+    case "$rc" in
+        0) success "Rewrote legacy data entries in .gitignore to the root-anchored form ($anchored)"
+           _ait_report_unhidden_nested_data_paths "$project_dir" ;;
+        # "already" only when no anchored rule was missing either (add_rc 1,
+        # which legacy mode always reports): beside an "Added" line or a failed
+        # add it would claim a state the file is not in.
+        1) [[ "$add_rc" -ne 1 ]] || success "Data entries in .gitignore already symlink-safe and root-anchored" ;;
+        *) warn "Could not rewrite legacy data entries in .gitignore — left unchanged."
+           warn "  A trailing-slash entry leaves linked task worktrees showing '?? $AIT_DATA_DIR_NAME' (worktree cleanup then keeps them); a bare one also ignores every nested directory of that name."
+           warn "  Fix by hand: change '$AIT_DATA_DIR_NAME/' or '$AIT_DATA_DIR_NAME' to '/$AIT_DATA_DIR_NAME' (likewise aitasks and aiplans), or re-run 'ait setup'." ;;
+    esac
+    # Reported after the rewrite line; nothing in between touches the writer's
+    # _ait_gitignore_added / _ait_gitignore_partial state.
+    case "$add_rc" in
+        0) success "Added $_ait_gitignore_added to .gitignore (missing task-data rules)" ;;
+        1) ;;
+        *) _ait_warn_gitignore_rules_failed "$_ait_gi_what" "${_ait_gi_rules[@]}" ;;
+    esac
+    return 0
+}
+
+# --- Shadow rejection-store gitignore rule (t1427_1) ---
+# Concerns the user rejected in the monitor/minimonitor picker live under
+# .aitask-shadow/<task-id>/. They are per-task, local-only working state the
+# shadow agent reads back as prompt context, and are pruned when the task is
+# archived — nothing here belongs in git.
+setup_shadow_store_gitignore() {
+    _ait_setup_gitignore_group shadow \
+        "Shadow rejection-store rule already in .gitignore" "shadow concern-rejection store" || return 0
+    _ait_commit_gitignore_rule "$SCRIPT_DIR/.." "ait: Add .aitask-shadow/ to .gitignore (shadow rejection store)"
+    success "Shadow rejection-store rule added to .gitignore"
+}
+
+# --- Scratchpad notes-store gitignore rule (t2073_1) ---
+# The scratchpad pane's notes live under .aitask-scratchpad/<task-id>/. They are
+# per-task, local-only working state, pruned when the task is archived —
+# nothing here belongs in git.
+setup_scratchpad_gitignore() {
+    _ait_setup_gitignore_group scratchpad \
+        "Scratchpad notes rule already in .gitignore" "scratchpad notes store" || return 0
+    _ait_commit_gitignore_rule "$SCRIPT_DIR/.." "ait: Add .aitask-scratchpad/ to .gitignore (scratchpad notes)"
+    success "Scratchpad notes rule added to .gitignore"
+}
+
+# --- Sitrep store gitignore rule (t2175_1) ---
+# The sitrep todo store lives under .aitask-sitrep/. It is per-repo, local-only
+# working state -- written only by aitask_sitrep_todo.sh, which keeps its own
+# backups -- and nothing here belongs in git.
+setup_sitrep_store_gitignore() {
+    _ait_setup_gitignore_group sitrep \
+        "Sitrep store rule already in .gitignore" "sitrep todo store" || return 0
+    _ait_commit_gitignore_rule "$SCRIPT_DIR/.." "ait: Add .aitask-sitrep/ to .gitignore (sitrep todo store)"
+    success "Sitrep store rule added to .gitignore"
+}
+
+# --- Discovery-cache gitignore rule (t2173_1) ---
+# Trail discovery keeps an on-disk, content-keyed cache under
+# .aitask-cache/trail_discovery/. It is per-checkout, revalidated by content on
+# every read and safe to delete — nothing here belongs in git.
+#
+# The rule reaches a project by two routes, because `ait upgrade` never runs
+# setup: setup_cache_gitignore (ait setup) writes and commits it, and
+# upgrade_cache_gitignore (install.sh, existing installs) only writes it —
+# install.sh's commit_installed_files then commits .gitignore under the
+# pre-upgrade dirty baseline, the same contract as
+# setup_data_gitignore_symlink_safe. upgrade_store_gitignore_rules (below) is
+# the same upgrade route for the older setup-only rules (t2177).
+#
+# Every setup .gitignore helper writes through _ait_add_gitignore_rules, by way
+# of _ait_setup_gitignore_group, and both routes take their comment and rule
+# strings from the one group table, _ait_gitignore_group (t2178).
+# setup_data_branch Step 7 writes its task-data rules through the per-rule
+# writer too (the `data` group, t2188), but its rendered-skill block through
+# _ait_ensure_gitignore_block (below the per-rule writer): that block's guard
+# is per block, and its `!` re-includes must stay after its broad patterns.
+
+# _ait_add_gitignore_rules <gitignore> <comment> <rule>...
+#   -> 0 added, 1 every rule already present, 2 could not inspect or write
+#      (including an existing path that is not a regular file).
+# Each rule is guarded on its own: only the missing ones are written, under one
+# "# <comment>" line, and their names are left in _ait_gitignore_added.
+# Callers run it as `|| rc=$?`, which suspends errexit inside it, so every
+# fallible step is checked here, and the write is read back before it counts.
+# `2>/dev/null` comes FIRST on each write: a failed redirection is reported
+# before any later redirection applies, and the wrapper's warning says it.
+# The write is several write()s, so one that fails after the first leaves bytes
+# behind: on rc 2, _ait_gitignore_partial is "yes" unless the file provably did
+# not change (_ait_gitignore_note_partial), and the warning says which.
+# The writes are chained with `&&`, never newlines: a group's status is its LAST
+# command's, so a failed separator or comment would be lost behind a later
+# write that succeeded. The separator is also what ends a last line with no
+# newline, so the comment would be glued onto the user's rule (`keep-me# ...`)
+# while the rule read-back below still passed (t2188, as
+# _ait_ensure_gitignore_block, t2185).
+# A rule counts as present in its LF or CRLF form: git strips a trailing CR
+# before matching, so a CRLF `aiwork/` already ignores aiwork/ (t2188).
+_ait_gitignore_added=""
+_ait_gitignore_partial=""
+_ait_add_gitignore_rules() {
+    local gitignore="$1" comment="$2" rc rule before
+    shift 2
+    local missing=()
+    _ait_gitignore_added=""
+    _ait_gitignore_partial=""
+    if [[ -e "$gitignore" || -L "$gitignore" ]]; then
+        # Open only a regular file (or a symlink to one): opening a FIFO blocks
+        # until a peer appears and a device can be read forever (t2178). Any
+        # other existing path is the same "cannot inspect" as an unreadable one.
+        [[ -f "$gitignore" ]] || return 2
+        for rule in "$@"; do
+            rc=0
+            grep -qxF -e "$rule" -e "$rule"$'\r' -- "$gitignore" 2>/dev/null || rc=$?
+            case "$rc" in
+                0) ;;
+                1) missing+=("$rule") ;;
+                *) return 2 ;;
+            esac
+        done
+        [[ ${#missing[@]} -gt 0 ]] || return 1
+        before="$(wc -c < "$gitignore" 2>/dev/null)" || before=""
+        if ! {
+            echo "" && echo "# $comment" && printf '%s\n' "${missing[@]}"
+        } 2>/dev/null >> "$gitignore"; then
+            _ait_gitignore_note_partial "$gitignore" "$before"
+            return 2
+        fi
+    else
+        missing=("$@")
+        before="absent"
+        if ! {
+            echo "# $comment" && printf '%s\n' "${missing[@]}"
+        } 2>/dev/null > "$gitignore"; then
+            _ait_gitignore_note_partial "$gitignore" "$before"
+            return 2
+        fi
+    fi
+    for rule in "${missing[@]}"; do
+        if ! grep -qxF -e "$rule" -e "$rule"$'\r' -- "$gitignore" 2>/dev/null; then
+            _ait_gitignore_note_partial "$gitignore" "$before"
+            return 2
+        fi
+    done
+    _ait_gitignore_added="${missing[*]}"
+    return 0
+}
+
+# _ait_gitignore_note_partial <gitignore> <before> — after a failed write, set
+# _ait_gitignore_partial to "yes" unless the file provably did not change.
+# <before> is its byte count before an append, "absent" before a create, or
+# empty when that count could not be read (then nothing is provable).
+_ait_gitignore_note_partial() {
+    local gitignore="$1" before="${2//[[:space:]]/}" after=""
+    _ait_gitignore_partial="yes"
+    if [[ "$before" == absent ]]; then
+        [[ -e "$gitignore" || -L "$gitignore" ]] || _ait_gitignore_partial=""
+    elif [[ "$before" =~ ^[0-9]+$ ]]; then
+        after="$(wc -c < "$gitignore" 2>/dev/null)" || after=""
+        after="${after//[[:space:]]/}"
+        [[ "$after" != "$before" ]] || _ait_gitignore_partial=""
+    fi
+    return 0
+}
+
+# _ait_warn_gitignore_rules_failed <what> <rule>... — the shared rc-2 report.
+# Reads _ait_gitignore_partial, so it runs straight after the failed write.
+_ait_warn_gitignore_rules_failed() {
+    local what="$1"
+    shift
+    local lines="'$1'" noun="line" rule
+    for rule in "${@:2}"; do lines="$lines '$rule'"; noun="lines"; done
+    if [[ -n "$_ait_gitignore_partial" ]]; then
+        warn "Could not add $* to .gitignore — the write stopped part-way, so it may now end in an incomplete entry."
+        warn "  $what will show as untracked in 'git status'."
+        warn "  Fix by hand: delete any incomplete line at the end of .gitignore, then add the $noun $lines, or re-run 'ait setup'."
+    else
+        warn "Could not add $* to .gitignore — left unchanged."
+        warn "  $what will show as untracked in 'git status'."
+        warn "  Fix by hand: add the $noun $lines to .gitignore, or re-run 'ait setup'."
+    fi
+}
+
+# --- setup_data_branch Step 7's whole-block writer (t2185) ---
+# Step 7 writes its rendered-skill block to the main .gitignore behind ONE
+# guard: the block is present when `.claude/skills/*-/` appears anywhere. The
+# per-rule writer above does not fit it: it would add each missing rule on its
+# own, and an appended broad `*-/` pattern that lands after an existing `!`
+# re-include silently cancels it — the negations only win when they follow.
+# (Step 7's task-data rules have no negations; they use the per-rule writer,
+# so a lost link rule is restored on its own, t2188.)
+
+# Step 7's block guard: grep's status, 0 present, 1 absent, 2 unreadable.
+_ait_gitignore_has_skill_block() {
+    grep -qF -e ".claude/skills/*-/" -- "$1" 2>/dev/null
+}
+
+# _ait_ensure_gitignore_block <gitignore> <guard> <line>...
+#   -> 0 appended, 1 already present, 2 could not inspect or write (an existing
+#      path that is not a regular file, an unreadable file, a failed or
+#      unverified append); on 2, _ait_gitignore_partial says whether bytes
+#      landed (see _ait_gitignore_note_partial).
+# <guard> <gitignore> is the block's own presence test; it runs again after the
+# append as the read-back, so the block counts as written only once its guard
+# finds it. Appends a blank line and then the lines — the bytes the old Step 7
+# echo blocks wrote, including when the file did not exist. Callers run it as
+# `|| rc=$?`, which suspends errexit inside it, so every fallible step is
+# checked here.
+_ait_ensure_gitignore_block() {
+    local gitignore="$1" guard="$2" rc=0 before
+    shift 2
+    _ait_gitignore_partial=""
+    if [[ -e "$gitignore" || -L "$gitignore" ]]; then
+        # Open only a regular file (or a symlink to one): a FIFO blocks the
+        # open until a peer appears, and a dangling symlink would have its
+        # target created. Anything else is "cannot inspect".
+        [[ -f "$gitignore" ]] || return 2
+        "$guard" "$gitignore" || rc=$?
+        case "$rc" in
+            0) return 1 ;;
+            1) ;;
+            *) return 2 ;;
+        esac
+        before="$(wc -c < "$gitignore" 2>/dev/null)" || before=""
+    else
+        before="absent"
+    fi
+    # `&&`, not a newline: a group's status is its LAST command's, so a failed
+    # separator would be lost if the block then wrote. That blank line is also
+    # what ends a last line with no newline, so the block would be glued onto
+    # the user's rule (`keep-me# ...`) while the read-back below still found it.
+    if ! {
+        echo "" && printf '%s\n' "$@"
+    } 2>/dev/null >> "$gitignore"; then
+        _ait_gitignore_note_partial "$gitignore" "$before"
+        return 2
+    fi
+    rc=0
+    "$guard" "$gitignore" || rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+        _ait_gitignore_note_partial "$gitignore" "$before"
+        return 2
+    fi
+    return 0
+}
+
+# _ait_warn_gitignore_block_failed <label> <what> <line>... — the rc-2 report
+# for _ait_ensure_gitignore_block. Reads _ait_gitignore_partial, so it runs
+# straight after the failed write. It never offers re-running setup: Step 7 is
+# behind setup_data_branch's "already configured" return, so once the data
+# worktree exists nothing writes these blocks again. Instead it prints the
+# block's rules (no comments or blank lines) in order, one per line, as the
+# hand fix — through printf, so each line can be copied as it stands.
+_ait_warn_gitignore_block_failed() {
+    local label="$1" what="$2" line
+    shift 2
+    if [[ -n "$_ait_gitignore_partial" ]]; then
+        warn "Could not add the $label entries to .gitignore — the write stopped part-way, so it may now end in an incomplete entry."
+        warn "  $what will show as untracked in 'git status'."
+        warn "  'ait setup' does not retry this step. Fix by hand: delete any incomplete line at the end of .gitignore, then add these lines to .gitignore, in this order:"
+    else
+        warn "Could not add the $label entries to .gitignore — left unchanged."
+        warn "  $what will show as untracked in 'git status'."
+        warn "  'ait setup' does not retry this step. Fix by hand: add these lines to .gitignore, in this order:"
+    fi
+    for line in "$@"; do
+        [[ -z "$line" || "$line" == "#"* ]] && continue
+        printf '    %s\n' "$line"
+    done
+    return 0
+}
+
+# --- .gitignore rule groups: the one table setup and upgrade read (t2178) ---
+# _ait_gitignore_group <group> sets, for one group:
+#   _ait_gi_comment  the "# ..." line written above the rules
+#   _ait_gi_rules    the rules (array), each guarded on its own
+#   _ait_gi_what     what a failed write leaves showing as untracked
+#   _ait_gi_label    the group's name in upgrade's "Added ... (<label>)" line
+# Both routes write a group from here, which is what keeps setup's and
+# upgrade's .gitignore byte-identical (tests/test_setup_git.sh 27h; 27k pins the
+# strings themselves). An unknown group is a framework bug: die rather than
+# reuse the previous lookup's values.
+_ait_gi_comment="" _ait_gi_what="" _ait_gi_label=""
+_ait_gi_rules=()
+_ait_gitignore_group() {
+    case "$1" in
+        drafts)
+            _ait_gi_comment="Draft tasks (local, not committed)"
+            _ait_gi_rules=("aitasks/new/")
+            _ait_gi_what="Draft tasks"
+            _ait_gi_label="draft tasks" ;;
+        pycache)
+            _ait_gi_comment="Python cache artifacts (generated by aitasks Python TUIs)"
+            _ait_gi_rules=("__pycache__/")
+            _ait_gi_what="Python cache directories"
+            _ait_gi_label="Python cache artifacts" ;;
+        gates)
+            _ait_gi_comment="Gate sidecar logs (per-task verifier output; in-body summary is committed)"
+            _ait_gi_rules=(".aitask-gates/")
+            _ait_gi_what="Gate sidecar logs"
+            _ait_gi_label="gate sidecar logs" ;;
+        testmap)
+            _ait_gi_comment="Test map runs, ledger and onboarding scratch (per-checkout)"
+            _ait_gi_rules=(".aitask-testmap/")
+            _ait_gi_what="Test map runs"
+            _ait_gi_label="test map scratch" ;;
+        shadow)
+            _ait_gi_comment="Shadow concern-rejection store (per-task, local-only; pruned at archive)"
+            _ait_gi_rules=(".aitask-shadow/")
+            _ait_gi_what="The shadow rejection store"
+            _ait_gi_label="shadow rejection store" ;;
+        scratchpad)
+            _ait_gi_comment="Scratchpad notes (per-task, local-only; pruned at archive)"
+            _ait_gi_rules=(".aitask-scratchpad/")
+            _ait_gi_what="Scratchpad notes"
+            _ait_gi_label="scratchpad notes" ;;
+        sitrep)
+            _ait_gi_comment="Sitrep todo store (per-repo, local-only; not rebuildable)"
+            _ait_gi_rules=(".aitask-sitrep/")
+            _ait_gi_what="The sitrep todo store"
+            _ait_gi_label="sitrep store" ;;
+        cache)
+            _ait_gi_comment="Discovery caches (per-checkout, content-keyed, safe to delete)"
+            _ait_gi_rules=(".aitask-cache/")
+            _ait_gi_what="The discovery cache"
+            _ait_gi_label="discovery caches" ;;
+        worktrees)
+            _ait_gi_comment="Framework worktrees (local, per-task and per-crew branches)"
+            _ait_gi_rules=("aiwork/" ".aitask-crews/")
+            _ait_gi_what="Task and crew worktrees"
+            _ait_gi_label="framework worktree directories" ;;
+        data)
+            # Branch mode only: setup_data_branch Step 7 and the re-run repair
+            # (setup_data_gitignore_symlink_safe) write it, never the upgrade
+            # store loop — in legacy mode aitasks/ is tracked task data (t2188).
+            # Root-anchored (t2184); the names come from data_symlinks.sh, the
+            # one definition the rewriter and ait_link_worktree_data read.
+            local link
+            _ait_gi_comment="Task data (lives on aitask-data branch, accessed via symlinks)"
+            _ait_gi_rules=("/$AIT_DATA_DIR_NAME")
+            for link in "${AIT_DATA_LINKS[@]}"; do _ait_gi_rules+=("/$link"); done
+            _ait_gi_what="The root task-data entries"
+            _ait_gi_label="task data" ;;
+        # The data worktree's own .gitignore ($AIT_DATA_DIR_NAME/.gitignore),
+        # with `drafts` above: written only by setup_data_branch Step 3, never
+        # to the main .gitignore and never by the upgrade loop (t2197).
+        data_userconfig)
+            _ait_gi_comment="Per-user config (local, not shared)"
+            _ait_gi_rules=("aitasks/metadata/userconfig.yaml")
+            _ait_gi_what="per-user config (userconfig.yaml)"
+            _ait_gi_label="per-user config" ;;
+        data_local_json)
+            _ait_gi_comment="Per-user overrides (*.local.json files, not shared)"
+            _ait_gi_rules=("aitasks/metadata/*.local.json")
+            _ait_gi_what="per-user override files (*.local.json)"
+            _ait_gi_label="per-user overrides" ;;
+        data_local_profiles)
+            _ait_gi_comment="Per-user execution profiles (local, not shared)"
+            _ait_gi_rules=("aitasks/metadata/profiles/local/")
+            _ait_gi_what="per-user execution profiles"
+            _ait_gi_label="per-user profiles" ;;
+        data_chatlink)
+            _ait_gi_comment="chatlink runtime state (per-PC: bot token + relay spools)"
+            _ait_gi_rules=("aitasks/metadata/chatlink_sessions/")
+            _ait_gi_what="chatlink runtime state (bot token, relay spools)"
+            _ait_gi_label="chatlink runtime state" ;;
+        data_applink)
+            _ait_gi_comment="applink runtime state (per-PC: TLS cert/key + active bearer sessions)"
+            _ait_gi_rules=("aitasks/metadata/applink_sessions/")
+            _ait_gi_what="applink runtime state (TLS cert/key, bearer sessions)"
+            _ait_gi_label="applink runtime state" ;;
+        *) die "unknown .gitignore rule group: $1" ;;
+    esac
+}
+
+# _ait_setup_gitignore_group <group> <already-line> <added-note>
+#   -> 0 rules were written (the caller commits and reports them),
+#      1 nothing was written: already present (reported with <already-line>)
+#        or not writable (warned via _ait_warn_gitignore_rules_failed).
+# The setup route for one table group. Never fatal: every setup helper runs it
+# as `|| return 0`, so `ait setup` carries on past a .gitignore it cannot write.
+_ait_setup_gitignore_group() {
+    local already="$2" note="$3" rc=0
+    _ait_gitignore_group "$1"
+    _ait_add_gitignore_rules "$SCRIPT_DIR/../.gitignore" \
+        "$_ait_gi_comment" "${_ait_gi_rules[@]}" || rc=$?
+    case "$rc" in
+        0) info "Added $_ait_gitignore_added to .gitignore ($note)"; return 0 ;;
+        1) success "$already" ;;
+        *) _ait_warn_gitignore_rules_failed "$_ait_gi_what" "${_ait_gi_rules[@]}" ;;
+    esac
+    return 1
+}
+
+setup_cache_gitignore() {
+    _ait_setup_gitignore_group cache \
+        "Discovery-cache rule already in .gitignore" "discovery caches" || return 0
+    _ait_commit_gitignore_rule "$SCRIPT_DIR/.." "ait: Add .aitask-cache/ to .gitignore (discovery caches)"
+    success "Discovery-cache rule added to .gitignore"
+}
+
+# Upgrade-path variant: writes the rule, commits nothing (see above). It MUST
+# run after install.sh's snapshot_pre_install_dirty and before
+# commit_installed_files. Never fatal, like setup_data_gitignore_symlink_safe.
+upgrade_cache_gitignore() {
+    local rc=0
+    _ait_gitignore_group cache
+    _ait_add_gitignore_rules "$SCRIPT_DIR/../.gitignore" \
+        "$_ait_gi_comment" "${_ait_gi_rules[@]}" || rc=$?
+    case "$rc" in
+        0) success "Added .aitask-cache/ to .gitignore (discovery caches)" ;;
+        1) success "Discovery-cache rule already in .gitignore" ;;
+        *) _ait_warn_gitignore_rules_failed "$_ait_gi_what" "${_ait_gi_rules[@]}" ;;
+    esac
+    return 0
+}
+
+# _ait_upgrade_gitignore_rules <label> <what> <comment> <rule>... — one
+# write-only, never-fatal upgrade step; <label> names the group in the success
+# line, <what> the store the failure warning says will show as untracked.
+_ait_upgrade_gitignore_rules() {
+    local label="$1" what="$2" comment="$3" rc=0
+    shift 3
+    _ait_add_gitignore_rules "$SCRIPT_DIR/../.gitignore" "$comment" "$@" || rc=$?
+    case "$rc" in
+        0) success "Added $_ait_gitignore_added to .gitignore ($label)" ;;
+        1) success "$* already in .gitignore" ;;
+        *) _ait_warn_gitignore_rules_failed "$what" "$@" ;;
+    esac
+    return 0
+}
+
+# --- Setup-only store and worktree rules on the upgrade path (t2177) ---
+# setup_gate_logs_gitignore, setup_testmap_gitignore,
+# setup_shadow_store_gitignore, setup_scratchpad_gitignore,
+# setup_sitrep_store_gitignore and setup_worktree_dirs_gitignore run only from
+# `ait setup`, so an upgraded-only project never ignored their directories.
+# This writes the same table groups (_ait_gitignore_group) in setup's order
+# (tests/test_setup_git.sh pins the result byte-identical to setup's), and
+# commits nothing — the same install.sh contract and position as
+# upgrade_cache_gitignore. __pycache__/ is left out: install.sh's scoped
+# .aitask-scripts/.gitignore covers the framework's caches.
+upgrade_store_gitignore_rules() {
+    local group
+    for group in gates testmap shadow scratchpad sitrep worktrees; do
+        _ait_gitignore_group "$group"
+        _ait_upgrade_gitignore_rules "$_ait_gi_label" "$_ait_gi_what" \
+            "$_ait_gi_comment" "${_ait_gi_rules[@]}"
+    done
+    return 0
+}
+
+# --- Version check ---
+check_latest_version() {
+    local local_version=""
+    if [[ -f "$VERSION_FILE" ]]; then
+        local_version="$(cat "$VERSION_FILE")"
+    else
+        return
+    fi
+
+    # Resolve via the shared helper (REST API with a git-tag fallback). Keep the
+    # silent-degrade contract: any failure or empty result returns with no notice.
+    local latest_version=""
+    latest_version="$(github_resolve_latest_version "$REPO" 2>/dev/null)" || return
+
+    if [[ -z "$latest_version" ]]; then
+        return
+    fi
+
+    if [[ "$local_version" != "$latest_version" ]]; then
+        echo ""
+        info "Update available: $local_version → $latest_version"
+        info "Run: ait upgrade latest"
+    fi
+}
+
+# --- Merge Claude Code settings (union of permissions.allow) ---
+merge_claude_settings() {
+    local seed_file="$1"
+    local dest_file="$2"
+    local merged=""
+
+    if command -v jq &>/dev/null; then
+        merged="$(jq -s '
+            .[0] as $existing |
+            .[1] as $seed |
+            $existing * {
+                permissions: {
+                    allow: (
+                        ($existing.permissions.allow // []) +
+                        (($seed.permissions.allow // []) - ($existing.permissions.allow // []))
+                    )
+                }
+            }
+        ' "$dest_file" "$seed_file")"
+    elif command -v python3 &>/dev/null; then
+        merged="$(python3 -c "
+import json, sys
+with open(sys.argv[1]) as f:
+    existing = json.load(f)
+with open(sys.argv[2]) as f:
+    seed = json.load(f)
+existing_allow = existing.get('permissions', {}).get('allow', [])
+seed_allow = seed.get('permissions', {}).get('allow', [])
+seen = set(existing_allow)
+merged = list(existing_allow)
+for entry in seed_allow:
+    if entry not in seen:
+        merged.append(entry)
+        seen.add(entry)
+existing.setdefault('permissions', {})['allow'] = merged
+print(json.dumps(existing, indent=2))
+" "$dest_file" "$seed_file")"
+    else
+        warn "Neither jq nor python3 found. Cannot merge settings automatically."
+        warn "Please manually merge $seed_file into $dest_file"
+        return
+    fi
+
+    if [[ -n "$merged" ]]; then
+        echo "$merged" > "$dest_file"
+        info "  Merged aitask permissions into .claude/settings.local.json"
+    else
+        warn "  Merge produced empty output — existing settings unchanged"
+    fi
+}
+
+# --- Merge the aitasks SessionStart hook into an existing .claude/settings.json ---
+# Merges ONLY hooks.SessionStart, deduping by (matcher, command). Every other
+# key -- other hook events, permissions, env, anything the user added -- is
+# preserved verbatim. The merge itself lives in lib/claude_hooks_merge.py, which
+# is also what lib/claude_hook_status.sh asks "is it installed?" -- one identity
+# rule for both. python3-only: the merge is a nested structural edit that jq
+# would express far less readably, and python3 is a hard framework dependency.
+#
+# Returns non-zero on every failure branch (no python, unparseable settings,
+# empty output), leaving the file unchanged: `ait setup --hooks-only` must not
+# report a repair that did not happen.
+merge_claude_hooks() {
+    local seed_file="$1"
+    local dest_file="$2"
+
+    local python_cmd=""
+    if [[ -x "$VENV_DIR/bin/python" ]]; then
+        python_cmd="$VENV_DIR/bin/python"
+    elif command -v python3 &>/dev/null; then
+        python_cmd="python3"
+    else
+        warn "python3 not found. Cannot merge Claude Code session hook automatically."
+        warn "Please manually merge $seed_file into $dest_file"
+        return 1
+    fi
+
+    local merged=""
+    merged="$("$python_cmd" "$SETUP_LIB_DIR/claude_hooks_merge.py" merge "$dest_file" "$seed_file")" || {
+        warn "  Session hook merge failed — existing .claude/settings.json unchanged"
+        return 1
+    }
+
+    if [[ -n "$merged" ]]; then
+        # A read-only settings.json is the user saying "do not touch": the
+        # atomic rename below would replace it anyway, so refuse explicitly.
+        if [[ ! -w "$dest_file" ]]; then
+            warn "  .claude/settings.json is not writable — session hook not installed"
+            return 1
+        fi
+        # Stage a complete replacement beside the file and rename it in: a plain
+        # `> "$dest_file"` truncates first, so a failed write (disk full, file
+        # size limit) would leave the user's settings cut short.
+        # shellcheck source=lib/atomic_write.sh
+        source "$SETUP_LIB_DIR/atomic_write.sh"
+        if ! ait_atomic_write_text "$dest_file" "$merged"; then
+            warn "  Could not write .claude/settings.json — left unchanged, session hook not installed"
+            return 1
+        fi
+        info "  Merged aitasks session hook into .claude/settings.json"
+    else
+        warn "  Merge produced empty output — existing settings unchanged"
+        return 1
+    fi
+}
+
+# --- Claude Code SessionStart hook (own consent prompt) ---
+# DELIBERATELY NOT part of setup_claude_code(): that function early-returns when
+# the permissions seed is absent and is gated behind the "Install these Claude
+# Code permissions?" prompt. The hook and the permission allowlist are different
+# consents -- a user who declines permissions, or a project with no permissions
+# seed, must still be OFFERED the hook.
+#
+# The answer is not persisted: a decline is re-asked on the next `ait setup`,
+# matching every other setup prompt (no new config field, no new drift surface).
+#
+# Returns 0 installed (created, merged, or already present), 1 failed, 2
+# declined -- `ait setup --hooks-only` reports on it; the full setup ignores it.
+# `--yes` (only passed by --hooks-only, from its own flag) is an explicit
+# acceptance: no prompt, terminal or not.
+# An already-installed hook is not re-offered (there is nothing to consent to),
+# and a malformed settings.json is reported rather than prompted about.
+setup_claude_hooks() {
+    local assume_yes=0
+    [[ "${1:-}" == "--yes" ]] && assume_yes=1
+    local project_dir="$SCRIPT_DIR/.."
+    local seed_file="$project_dir/aitasks/metadata/claude_settings.hooks.json"
+    local dest_dir="$project_dir/.claude"
+    local dest_file="$dest_dir/settings.json"
+
+    if [[ ! -f "$seed_file" ]]; then
+        return 0
+    fi
+
+    # shellcheck source=lib/claude_hook_status.sh
+    source "$SETUP_LIB_DIR/claude_hook_status.sh"
+    case "$(claude_session_hook_status "$project_dir")" in
+        INSTALLED)
+            info "Claude Code session hook already installed"
+            return 0
+            ;;
+        INVALID)
+            warn "$(claude_session_hook_invalid_hint)"
+            return 1
+            ;;
+    esac
+
+    echo ""
+    info "aitasks can install a Claude Code SessionStart hook:"
+    info "  .aitask-scripts/aitask_session_hook.sh"
+    info "It runs when a Claude Code session starts in this project and records the"
+    info "session id, so an agent you freeze can later be restored instead of"
+    info "re-started. It writes nothing to the session and always exits 0."
+    echo ""
+
+    local answer
+    if [[ "$assume_yes" == "1" ]]; then
+        info "(accepted via --yes)"
+        answer="Y"
+    elif [[ -t 0 ]]; then
+        printf "  Install the session hook? [Y/n] "
+        read -r answer
+    else
+        info "(non-interactive: auto-accepting default)"
+        answer="Y"
+    fi
+    case "${answer:-Y}" in
+        [Yy]*|"") ;;
+        *)
+            info "Skipped Claude Code session hook."
+            return 2
+            ;;
+    esac
+
+    mkdir -p "$dest_dir" || return 1
+
+    if [[ ! -f "$dest_file" ]]; then
+        if ! cp "$seed_file" "$dest_file"; then
+            warn "  Could not create .claude/settings.json — session hook not installed"
+            return 1
+        fi
+        info "  Created .claude/settings.json with the aitasks session hook"
+    else
+        info "  Existing .claude/settings.json found — merging session hook..."
+        merge_claude_hooks "$seed_file" "$dest_file" || return 1
+    fi
+    return 0
+}
+
+# --- `ait setup --hooks-only`: repair just the Claude Code session hook ---
+# A project that was only ever upgraded never got the hook (install.sh stages
+# the seed; only setup merges it). This path installs it without re-running the
+# whole setup. Order matters: nothing that needs consent runs before we know
+# there is work to do, and nothing is written before consent and runtime are
+# established.
+#   exit 0 installed / already installed / declined
+#   exit 1 cannot or did not install (no seed, invalid settings, no runtime,
+#          merge failure, or the re-check disagrees)
+#   exit 2 consent unavailable (no terminal and no --yes)
+setup_hooks_only() {
+    local assume_yes="$1"
+    local project_dir="$SCRIPT_DIR/.."
+
+    # shellcheck source=lib/claude_hook_status.sh
+    source "$SETUP_LIB_DIR/claude_hook_status.sh"
+
+    local status
+    status="$(claude_session_hook_status "$project_dir")"
+    case "$status" in
+        INSTALLED)
+            success "Claude Code session hook already installed — nothing to do."
+            return 0
+            ;;
+        NO_SEED)
+            warn "No hook seed at aitasks/metadata/claude_settings.hooks.json — $(claude_session_hook_seed_repair "$project_dir")."
+            return 1
+            ;;
+        INVALID)
+            warn "$(claude_session_hook_invalid_hint)"
+            return 1
+            ;;
+    esac
+
+    # MISSING / UNKNOWN from here on. A hook copied onto a machine that cannot
+    # run it records nothing, so the runtime is established before any write.
+    if ! claude_session_hook_runtime_ok; then
+        warn "The session hook cannot record sessions on this machine yet: $(claude_session_hook_repair)."
+        return 1
+    fi
+
+    # Consent is never implied on this path: setup_claude_hooks auto-accepts
+    # without a terminal (the full-setup behaviour), so reach it
+    # non-interactively only with an explicit --yes -- which it then honours
+    # with a terminal too.
+    if [[ ! -t 0 && "$assume_yes" != "1" ]]; then
+        warn "ait setup --hooks-only needs an interactive answer to install an executable hook; re-run in a terminal or pass --yes to accept explicitly."
+        return 2
+    fi
+
+    snapshot_pre_setup_dirty
+
+    local rc=0
+    if [[ "$assume_yes" == "1" ]]; then
+        setup_claude_hooks --yes || rc=$?
+    else
+        setup_claude_hooks || rc=$?
+    fi
+    case "$rc" in
+        0) ;;
+        2)
+            info "Session hook not installed."
+            return 0
+            ;;
+        *)
+            warn "Session hook installation failed — see above."
+            return 1
+            ;;
+    esac
+
+    # Verify by re-reading the file, not by the success line above.
+    status="$(claude_session_hook_status "$project_dir")"
+    if [[ "$status" != "INSTALLED" ]]; then
+        warn "Session hook installation could not be verified (status: $status)."
+        return 1
+    fi
+
+    commit_framework_files
+    success "Claude Code session hook installed. Claude Code agents started from now on can be restored after a freeze."
+    return 0
+}
+
+# --- Claude Code setup (settings, permissions) ---
+setup_claude_code() {
+    local project_dir="$SCRIPT_DIR/.."
+    local seed_file="$project_dir/aitasks/metadata/claude_settings.seed.json"
+    local dest_dir="$project_dir/.claude"
+    local dest_file="$dest_dir/settings.local.json"
+
+    if [[ ! -f "$seed_file" ]]; then
+        return
+    fi
+
+    echo ""
+    info "The following Claude Code permissions are recommended for aitask skills:"
+    info "These allow aitask skills to run without manual approval each time."
+    echo ""
+    # Use `sed -E` (ERE): BSD/macOS sed does not support the `\?` quantifier in
+    # BRE, so `s/",\?$//` would leave the trailing `",` un-stripped there.
+    grep '"Bash(' "$seed_file" | sed 's/^[[:space:]]*/  /' | sed -E 's/",?$//' | sed 's/^  "/  /'
+    echo ""
+
+    if [[ -t 0 ]]; then
+        printf "  Install these Claude Code permissions? [Y/n] "
+        read -r answer
+    else
+        info "(non-interactive: auto-accepting default)"
+        answer="Y"
+    fi
+    case "${answer:-Y}" in
+        [Yy]*|"") ;;
+        *)
+            info "Skipped Claude Code permission settings."
+            return
+            ;;
+    esac
+
+    mkdir -p "$dest_dir"
+
+    if [[ ! -f "$dest_file" ]]; then
+        cp "$seed_file" "$dest_file"
+        info "  Created .claude/settings.local.json with aitask permissions"
+    else
+        info "  Existing .claude/settings.local.json found — merging permissions..."
+        merge_claude_settings "$seed_file" "$dest_file"
+    fi
+}
+
+# --- Merge Codex CLI config.toml (add aitask-specific settings) ---
+merge_codex_settings() {
+    local seed_file="$1"
+    local dest_file="$2"
+
+    # Prefer venv Python, fall back to system python3
+    local python_cmd=""
+    if [[ -x "$VENV_DIR/bin/python" ]]; then
+        python_cmd="$VENV_DIR/bin/python"
+    elif command -v python3 &>/dev/null; then
+        python_cmd="python3"
+    else
+        warn "python3 not found. Cannot merge Codex settings automatically."
+        warn "Please manually merge $seed_file into $dest_file"
+        return
+    fi
+
+    local merged=""
+    merged="$("$python_cmd" -c "
+import sys
+
+try:
+    import tomllib
+except ImportError:
+    try:
+        import tomli as tomllib
+    except ImportError:
+        print('ERROR: No TOML parser available (need Python 3.11+ or tomli)', file=sys.stderr)
+        sys.exit(1)
+
+with open(sys.argv[1], 'rb') as f:
+    existing = tomllib.load(f)
+with open(sys.argv[2], 'rb') as f:
+    seed = tomllib.load(f)
+
+def deep_merge(base, overlay):
+    result = dict(base)
+    for key, value in overlay.items():
+        if key not in result:
+            result[key] = value
+        elif isinstance(result[key], dict) and isinstance(value, dict):
+            result[key] = deep_merge(result[key], value)
+        elif isinstance(result[key], list) and isinstance(value, list):
+            existing_strs = [str(item) for item in result[key]]
+            for item in value:
+                if str(item) not in existing_strs:
+                    result[key].append(item)
+    return result
+
+# t1944 retirement rule (one-shot). The t1797 seed wrote [tui] animations =
+# false, but animations is Codex's master switch: off, the Working timer stops
+# ticking and a working pane reads idle. A [tui] with animations = false and
+# neither whimsy nor effects is the pre-t1944 shape, so drop the key; the merge
+# below then adds the starfield-only keys, so this never matches again and a
+# value re-added afterwards is kept. animations = true is never touched, and
+# nothing is retired unless this merge installs a marker (seed whimsy or
+# effects) and the seed itself no longer carries the t1797 value.
+tui = existing.get('tui')
+seed_tui = seed.get('tui') if isinstance(seed.get('tui'), dict) else {}
+if (isinstance(tui, dict) and tui.get('animations') is False
+        and 'whimsy' not in tui and 'effects' not in tui
+        and ('whimsy' in seed_tui or 'effects' in seed_tui)
+        and seed_tui.get('animations') is not False):
+    del tui['animations']
+    print('[ait]   Removed [tui] animations = false (seeded by t1797; it stops the '
+          'Codex Working timer). To keep it deliberately, re-add it to '
+          '.codex/config.toml or set it in ~/.codex/config.toml.', file=sys.stderr)
+
+# t1944: tui.whimsy and tui.effects.starfield are two spellings of ONE Codex
+# preference (0.160 aliases whimsy to effects.starfield, and the canonical key
+# wins when both are set). If the project already states it in either spelling,
+# the seed supplies that same value for the missing spelling, never its own
+# false, so an explicit opt-in is not silently overridden by the other key.
+if isinstance(tui, dict) and isinstance(seed_tui, dict) and seed_tui:
+    effects = tui.get('effects') if isinstance(tui.get('effects'), dict) else {}
+    if 'starfield' in effects:
+        stated = effects['starfield']
+    else:
+        stated = tui.get('whimsy')
+    if stated is not None:
+        seed_tui = dict(seed_tui)
+        if 'whimsy' in seed_tui:
+            seed_tui['whimsy'] = stated
+        if isinstance(seed_tui.get('effects'), dict) and 'starfield' in seed_tui['effects']:
+            seed_tui['effects'] = dict(seed_tui['effects'], starfield=stated)
+        seed = dict(seed, tui=seed_tui)
+
+merged = deep_merge(existing, seed)
+
+def toml_serialize(d, prefix=''):
+    lines = []
+    tables = []
+    array_tables = []
+    for k, v in d.items():
+        full_key = f'{prefix}.{k}' if prefix else k
+        if isinstance(v, dict):
+            tables.append((full_key, v))
+        elif isinstance(v, list) and v and isinstance(v[0], dict):
+            array_tables.append((full_key, v))
+        elif isinstance(v, bool):
+            lines.append(f'{k} = {str(v).lower()}')
+        elif isinstance(v, str):
+            lines.append(f'{k} = \"{v}\"')
+        elif isinstance(v, (int, float)):
+            lines.append(f'{k} = {v}')
+        elif isinstance(v, list):
+            items = ', '.join(f'\"{i}\"' if isinstance(i, str) else str(i) for i in v)
+            lines.append(f'{k} = [{items}]')
+    for line in lines:
+        print(line)
+    for full_key, table in tables:
+        print(f'\n[{full_key}]')
+        toml_serialize(table, full_key)
+    for full_key, entries in array_tables:
+        for entry in entries:
+            print(f'\n[[{full_key}]]')
+            toml_serialize(entry, full_key)
+toml_serialize(merged)
+" "$dest_file" "$seed_file")"
+
+    if [[ -n "$merged" ]]; then
+        echo "$merged" > "$dest_file"
+        info "  Merged aitask settings into .codex/config.toml"
+    else
+        warn "  Merge produced empty output — existing config unchanged"
+    fi
+}
+
+# --- Merge Codex CLI rules/default.rules (add missing aitask helper rules) ---
+codex_rule_helper_name() {
+    local line="$1"
+    case "$line" in
+        *'prefix_rule('*'./.aitask-scripts/aitask_'*'.sh'*)
+            line="${line#*./.aitask-scripts/}"
+            line="${line%%.sh*}.sh"
+            printf '%s\n' "$line"
+            ;;
+    esac
+}
+
+codex_rules_has_helper() {
+    local rules_file="$1"
+    local helper="$2"
+    [[ -f "$rules_file" ]] || return 1
+    grep -qF "pattern = [\"./.aitask-scripts/${helper}\"]" "$rules_file"
+}
+
+merge_codex_rules() {
+    local seed_file="$1"
+    local dest_file="$2"
+
+    if [[ ! -f "$seed_file" ]]; then
+        return
+    fi
+
+    if [[ ! -f "$dest_file" ]]; then
+        cp "$seed_file" "$dest_file"
+        info "  Created .codex/rules/default.rules from seed"
+        return
+    fi
+
+    local tmp
+    tmp=$(mktemp "${TMPDIR:-/tmp}/aitask_codex_rules_XXXXXX")
+    cp "$dest_file" "$tmp"
+
+    local added=0
+    local line helper
+    while IFS= read -r line; do
+        helper="$(codex_rule_helper_name "$line" || true)"
+        [[ -n "$helper" ]] || continue
+        if ! codex_rules_has_helper "$tmp" "$helper"; then
+            if [[ -s "$tmp" ]]; then
+                printf '\n' >> "$tmp"
+            fi
+            printf '%s\n' "$line" >> "$tmp"
+            added=$((added + 1))
+        fi
+    done < "$seed_file"
+
+    if (( added > 0 )); then
+        mv "$tmp" "$dest_file"
+        info "  Merged $added aitask rule(s) into .codex/rules/default.rules"
+    else
+        rm -f "$tmp"
+        info "  .codex/rules/default.rules already contains aitask rules"
+    fi
+}
+
+# --- Codex CLI setup (skills + config + instructions) ---
+setup_codex_cli() {
+    local project_dir="$SCRIPT_DIR/.."
+    local staging_skills="$project_dir/aitasks/metadata/codex_skills"
+    local dest_skills="$project_dir/.agents/skills"
+    local dest_codex="$project_dir/.codex"
+
+    if [[ ! -d "$staging_skills" ]]; then
+        info "No Codex CLI staging files found — skipping"
+        info "  Re-run 'ait setup' to restore Codex CLI support files"
+        return
+    fi
+
+    local count=0
+    if [[ -d "$staging_skills" ]]; then
+        count=$(find "$staging_skills" -name "SKILL.md" -type f 2>/dev/null | wc -l | tr -d ' ')
+    fi
+
+    echo ""
+    info "Found $count Codex CLI skill wrappers ready for installation."
+    info "This also installs a SessionStart hook (.aitask-scripts/aitask_session_hook.sh)"
+    info "into .codex/config.toml, which records the session id so a frozen agent can"
+    info "be restored. Note: the codex TUI fires it at a session's first turn (codex"
+    info "0.163.0 measured); older codex fires it under \`codex exec\` only."
+    echo ""
+
+    if [[ -t 0 ]]; then
+        printf "  Install Codex CLI skills and config? [Y/n] "
+        read -r answer
+    else
+        info "(non-interactive: auto-accepting default)"
+        answer="Y"
+    fi
+    case "${answer:-Y}" in
+        [Yy]*|"") ;;
+        *)
+            info "Skipped Codex CLI skill installation."
+            return
+            ;;
+    esac
+
+    # 1. Copy skill wrappers
+    mkdir -p "$dest_skills"
+    local installed=0
+    for skill_dir in "$staging_skills"/aitask-*/; do
+        [[ -d "$skill_dir" ]] || continue
+        local skill_name
+        skill_name="$(basename "$skill_dir")"
+        mkdir -p "$dest_skills/$skill_name"
+        cp "$skill_dir/SKILL.md" "$dest_skills/$skill_name/SKILL.md"
+        installed=$((installed + 1))
+    done
+    # Copy shared helper docs (codex)
+    for doc in codex_tool_mapping.md; do
+        if [[ -f "$staging_skills/$doc" ]]; then
+            cp "$staging_skills/$doc" "$dest_skills/$doc"
+        fi
+    done
+    success "  Installed $installed unified skill wrappers to .agents/skills/"
+
+    # 2. Assemble and insert instructions (Layer 1 + Layer 2, with markers)
+    local content
+    content="$(assemble_aitasks_instructions "$project_dir" "codex")" || true
+    if [[ -n "$content" ]]; then
+        mkdir -p "$dest_codex"
+        local dest_instructions="$dest_codex/instructions.md"
+        insert_aitasks_instructions "$dest_instructions" "$content"
+        info "  Installed .codex/instructions.md (with aitasks markers)"
+    fi
+
+    # 3. Merge config.toml seed
+    local seed_config="$project_dir/aitasks/metadata/codex_config.seed.toml"
+    if [[ -f "$seed_config" ]]; then
+        mkdir -p "$dest_codex"
+        local dest_config="$dest_codex/config.toml"
+        if [[ ! -f "$dest_config" ]]; then
+            cp "$seed_config" "$dest_config"
+            info "  Created .codex/config.toml from seed"
+        else
+            info "  Existing .codex/config.toml found — merging aitask settings..."
+            merge_codex_settings "$seed_config" "$dest_config"
+        fi
+    fi
+
+    # 4. Merge rules/default.rules seed
+    local seed_rules="$project_dir/aitasks/metadata/codex_rules.default.rules"
+    if [[ -f "$seed_rules" ]]; then
+        mkdir -p "$dest_codex/rules"
+        merge_codex_rules "$seed_rules" "$dest_codex/rules/default.rules"
+    fi
+}
+
+# --- Merge OpenCode opencode.json (add aitask-specific settings) ---
+merge_opencode_settings() {
+    local seed_file="$1"
+    local dest_file="$2"
+
+    # Prefer venv Python, fall back to system python3
+    local python_cmd=""
+    if [[ -x "$VENV_DIR/bin/python" ]]; then
+        python_cmd="$VENV_DIR/bin/python"
+    elif command -v python3 &>/dev/null; then
+        python_cmd="python3"
+    else
+        warn "python3 not found. Cannot merge OpenCode settings automatically."
+        warn "Please manually merge $seed_file into $dest_file"
+        return
+    fi
+
+    local merged=""
+    merged="$("$python_cmd" -c "
+import json, sys
+
+with open(sys.argv[1]) as f:
+    existing = json.load(f)
+with open(sys.argv[2]) as f:
+    seed = json.load(f)
+
+def deep_merge(base, overlay):
+    result = dict(base)
+    for key, value in overlay.items():
+        if key not in result:
+            result[key] = value
+        elif isinstance(result[key], dict) and isinstance(value, dict):
+            result[key] = deep_merge(result[key], value)
+        elif isinstance(result[key], list) and isinstance(value, list):
+            existing_items = [str(item) for item in result[key]]
+            for item in value:
+                if str(item) not in existing_items:
+                    result[key].append(item)
+    return result
+
+merged = deep_merge(existing, seed)
+print(json.dumps(merged, indent=2))
+" "$dest_file" "$seed_file")"
+
+    if [[ -n "$merged" ]]; then
+        echo "$merged" > "$dest_file"
+        info "  Merged aitask settings into opencode.json"
+    else
+        warn "  Merge produced empty output — existing config unchanged"
+    fi
+}
+
+# --- OpenCode setup (skills + config + instructions) ---
+setup_opencode() {
+    local project_dir="$SCRIPT_DIR/.."
+    local staging_skills="$project_dir/aitasks/metadata/opencode_skills"
+    local staging_commands="$project_dir/aitasks/metadata/opencode_commands"
+    local dest_skills="$project_dir/.opencode/skills"
+    local dest_commands="$project_dir/.opencode/commands"
+    local dest_opencode="$project_dir/.opencode"
+
+    if [[ ! -d "$staging_skills" && ! -d "$staging_commands" ]]; then
+        info "No OpenCode staging files found — skipping"
+        info "  Re-run 'ait setup' to restore OpenCode support files"
+        return
+    fi
+
+    local count
+    count=$(find "$staging_skills" -name "SKILL.md" -type f 2>/dev/null | wc -l | tr -d ' ')
+
+    echo ""
+    info "Found $count OpenCode skill wrappers ready for installation."
+    echo ""
+
+    if [[ -t 0 ]]; then
+        printf "  Install OpenCode skills and config? [Y/n] "
+        read -r answer
+    else
+        info "(non-interactive: auto-accepting default)"
+        answer="Y"
+    fi
+    case "${answer:-Y}" in
+        [Yy]*|"") ;;
+        *)
+            info "Skipped OpenCode skill installation."
+            return
+            ;;
+    esac
+
+    # 1. Copy skill wrappers and helper docs
+    if [[ -d "$staging_skills" ]]; then
+        mkdir -p "$dest_skills"
+        local installed=0
+        for skill_dir in "$staging_skills"/aitask-*/; do
+            [[ -d "$skill_dir" ]] || continue
+            local skill_name
+            skill_name="$(basename "$skill_dir")"
+            mkdir -p "$dest_skills/$skill_name"
+            cp "$skill_dir/SKILL.md" "$dest_skills/$skill_name/SKILL.md"
+            installed=$((installed + 1))
+        done
+
+        if [[ -f "$staging_skills/opencode_tool_mapping.md" ]]; then
+            cp "$staging_skills/opencode_tool_mapping.md" "$dest_skills/opencode_tool_mapping.md"
+        fi
+        if [[ -f "$staging_skills/opencode_planmode_prereqs.md" ]]; then
+            cp "$staging_skills/opencode_planmode_prereqs.md" "$dest_skills/opencode_planmode_prereqs.md"
+        fi
+
+        success "  Installed $installed OpenCode skill wrappers to .opencode/skills/"
+    fi
+
+    # 1b. Copy command wrappers
+    if [[ -d "$staging_commands" ]]; then
+        mkdir -p "$dest_commands"
+        cp -r "$staging_commands/." "$dest_commands/"
+        success "  Installed OpenCode command wrappers to .opencode/commands/"
+    fi
+
+    # 2. Assemble and insert instructions (Layer 1 + Layer 2, with markers)
+    local content
+    content="$(assemble_aitasks_instructions "$project_dir" "opencode")" || true
+    if [[ -n "$content" ]]; then
+        mkdir -p "$dest_opencode"
+        local dest_instructions="$dest_opencode/instructions.md"
+        insert_aitasks_instructions "$dest_instructions" "$content"
+        info "  Installed .opencode/instructions.md (with aitasks markers)"
+    fi
+
+    # 3. Merge opencode.json permission seed
+    local seed_config="$project_dir/aitasks/metadata/opencode_config.seed.json"
+    if [[ -f "$seed_config" ]]; then
+        local dest_config="$project_dir/opencode.json"
+        if [[ ! -f "$dest_config" ]]; then
+            cp "$seed_config" "$dest_config"
+            info "  Created opencode.json from seed"
+        else
+            info "  Existing opencode.json found — merging aitask settings..."
+            merge_opencode_settings "$seed_config" "$dest_config"
+        fi
+    fi
+}
+
+# --- Set up all code agent integrations ---
+setup_code_agents() {
+    local project_dir="$SCRIPT_DIR/.."
+
+    # Claude Code settings are always installed (core framework infrastructure)
+    setup_claude_code
+
+    # The SessionStart hook carries its OWN consent prompt (it is executable
+    # code that runs at every session start, not a permission grant), so it is
+    # called unconditionally here rather than folded into setup_claude_code --
+    # which early-returns without the permissions seed and is gated behind the
+    # permissions prompt. Non-fatal here: its failures are already reported,
+    # and a hook problem must never abort the rest of the setup.
+    setup_claude_hooks || true
+
+    # AGENTS.md is a cross-agent convention (codex reads it at repo root;
+    # other agents may too). Install unconditionally so it is in place
+    # whether or not specific agent CLIs are available.
+    update_agentsmd "$project_dir"
+
+    # CLAUDE.md gets the same unconditional lifecycle as AGENTS.md, but it is
+    # project-OWNED mixed content: update_claudemd_git_section's
+    # CLAUDEMD_HAND_MAINTAINED_SENTINEL guard (t1607) skips a markerless file
+    # that already documents the conventions by hand. Living here rather than in
+    # setup_data_branch Step 8 is what makes that guard -- and the refresh --
+    # reachable on re-runs and in legacy mode (t1612).
+    update_claudemd_git_section "$project_dir"
+
+    # Other agents: only set up if their CLI is installed
+    if _is_agent_installed codex; then
+        echo ""
+        setup_codex_cli
+    fi
+
+    if _is_agent_installed opencode; then
+        echo ""
+        setup_opencode
+    fi
+
+    # Runs after every agent's wrappers are (re)installed: the install loops are
+    # additive and never remove a wrapper the framework retired upstream. The
+    # helper decides ownership by content hash, so anything the user modified or
+    # authored at a retired path is preserved and reported, never deleted.
+    prune_retired_skills "$project_dir"
+}
+
+# --- Prune retired skill surfaces (see install.sh prune_retired_skills) ---
+# Kept deliberately small and non-fatal: a prune failure must never abort
+# `ait setup`, whose job is to repair an installation.
+prune_retired_skills() {
+    _prune_retired "$1" "retired_skills_manifest.txt" "skill" "Retired-skill"
+}
+
+# --- Prune retired framework scripts (see install.sh prune_retired_scripts) ---
+# Covers projects `ait upgrade` skips as "Already up to date" but which still
+# carry a file the framework deleted or moved out of .aitask-scripts/ — e.g. a
+# stale board/task_yaml.py shadowing lib/task_yaml.py. main() calls it after
+# snapshot_pre_setup_dirty and before commit_framework_files, so the deletion
+# is committed as setup's own change, never mistaken for pre-existing dirt.
+prune_retired_scripts() {
+    _prune_retired "$1" "retired_scripts_manifest.txt" "script" "Retired-script"
+}
+
+# _prune_retired <project_dir> <manifest> <noun> <failure-prefix>
+_prune_retired() {
+    local project_dir="$1" manifest="$2" noun="$3" fail_prefix="$4"
+    local helper="$SCRIPT_DIR/aitask_prune_retired_skills.sh"
+    [[ -f "$helper" ]] || return 0
+
+    local out pruned kept
+    if ! out="$(bash "$helper" --dir "$project_dir" \
+            --manifest "$SCRIPT_DIR/$manifest" --label "$noun")"; then
+        warn "$fail_prefix prune failed — nothing was removed."
+        return 0
+    fi
+
+    pruned="$(printf '%s\n' "$out" | grep -c '^PRUNED:')" || pruned=0
+    kept="$(printf '%s\n' "$out" | grep -c '^KEPT:')" || kept=0
+
+    if [[ "$pruned" -gt 0 ]]; then
+        echo ""
+        info "Removed $pruned retired $noun path(s):"
+        printf '%s\n' "$out" | grep '^PRUNED:' | sed 's/^PRUNED:/    /'
+    fi
+    if [[ "$kept" -gt 0 ]]; then
+        info "Kept $kept retired path(s) — see the warning above for cleanup."
+    fi
+}
+
+# --- Review guides setup ---
+setup_review_guides() {
+    local project_dir="$SCRIPT_DIR/.."
+    local seed_dir="$project_dir/seed/reviewguides"
+    local dest_dir="$project_dir/aireviewguides"
+
+    # If no seed directory, check if review guides already installed
+    if [[ ! -d "$seed_dir" ]]; then
+        if [[ -d "$dest_dir" ]]; then
+            local count
+            count=$(find "$dest_dir" -name "*.md" -type f 2>/dev/null | wc -l)
+            if [[ $count -gt 0 ]]; then
+                success "Review guides already installed ($count guides in aireviewguides/)"
+            else
+                warn "No seed/reviewguides/ directory found — skipping review guide setup"
+                info "Review guides can be added manually to aireviewguides/"
+            fi
+        else
+            warn "No seed/reviewguides/ directory found — skipping review guide setup"
+            info "Review guides can be added manually to aireviewguides/"
+        fi
+        return
+    fi
+
+    # Count available seed modes (recursive scan for tree structure)
+    local seed_files=()
+    while IFS= read -r -d '' f; do
+        seed_files+=("$f")
+    done < <(find "$seed_dir" -name "*.md" -type f -print0 2>/dev/null)
+
+    if [[ ${#seed_files[@]} -eq 0 ]]; then
+        warn "No review guide files found in seed/reviewguides/"
+        return
+    fi
+
+    info "Found ${#seed_files[@]} review guide templates available for installation."
+
+    if [[ -t 0 ]]; then
+        printf "  Install review guides? [Y/n] "
+        read -r answer
+        case "${answer:-Y}" in
+            [Yy]*|"") ;;
+            *)
+                info "Skipped review guide installation."
+                return 0
+                ;;
+        esac
+    else
+        info "(non-interactive: auto-accepting default)"
+    fi
+
+    # Build display list: extract name and description from YAML frontmatter
+    local display_lines=()
+    local file_map=()  # parallel array: display_line -> filepath
+
+    # Add "Install all" option first
+    display_lines+=(">>> Install all ${#seed_files[@]} review guides")
+    file_map+=("ALL")
+
+    for f in "${seed_files[@]}"; do
+        local rel_path name desc
+        rel_path="${f#$seed_dir/}"
+        name=""
+        desc=""
+        local in_yaml=false
+        while IFS= read -r line; do
+            if [[ "$line" == "---" ]]; then
+                if [[ "$in_yaml" == true ]]; then
+                    break
+                else
+                    in_yaml=true
+                    continue
+                fi
+            fi
+            if [[ "$in_yaml" == true ]]; then
+                if [[ "$line" =~ ^name:[[:space:]]*(.*) ]]; then
+                    name="${BASH_REMATCH[1]}"
+                elif [[ "$line" =~ ^description:[[:space:]]*(.*) ]]; then
+                    desc="${BASH_REMATCH[1]}"
+                fi
+            fi
+        done < "$f"
+
+        # Fallback if frontmatter missing
+        [[ -z "$name" ]] && name="$rel_path"
+        [[ -z "$desc" ]] && desc="(no description)"
+
+        # Check if already installed (using relative path)
+        local marker=""
+        if [[ -f "$dest_dir/$rel_path" ]]; then
+            marker=" [installed]"
+        fi
+
+        # Show category prefix for modes in subdirectories
+        local category_prefix=""
+        if [[ "$rel_path" == */* ]]; then
+            category_prefix="[$(dirname "$rel_path")] "
+        fi
+
+        display_lines+=("${category_prefix}${name} — $desc$marker")
+        file_map+=("$f")
+    done
+
+    # Add "Skip" option at the end
+    display_lines+=(">>> Skip review guide installation")
+    file_map+=("SKIP")
+
+    # Create destination directory
+    mkdir -p "$dest_dir"
+
+    local selected_indices=()
+
+    if [[ -t 0 ]]; then
+        # Interactive: use fzf multi-select
+        local fzf_input=""
+        for line in "${display_lines[@]}"; do
+            fzf_input+="$line"$'\n'
+        done
+        # Remove trailing newline
+        fzf_input="${fzf_input%$'\n'}"
+
+        local selected
+        selected=$(echo "$fzf_input" | fzf --multi \
+            --prompt="Review guides (Tab to select, Enter to confirm): " \
+            --header="Select review guides to install" \
+            --height=15 --no-info) || true
+
+        if [[ -z "$selected" ]] || echo "$selected" | grep -q "^>>> Skip review guide installation"; then
+            info "No review guides selected — skipping"
+            return
+        fi
+
+        # Check if "Install all" was selected
+        if echo "$selected" | grep -q "^>>> Install all"; then
+            # Select all files
+            selected_indices=("${!seed_files[@]}")
+        else
+            # Map selected display lines back to file indices
+            while IFS= read -r sel_line; do
+                for i in "${!display_lines[@]}"; do
+                    if [[ "${display_lines[$i]}" == "$sel_line" && "${file_map[$i]}" != "ALL" && "${file_map[$i]}" != "SKIP" ]]; then
+                        selected_indices+=("$((i - 1))")  # -1 because file_map[0] is "ALL"
+                        break
+                    fi
+                done
+            done <<< "$selected"
+        fi
+    else
+        # Non-interactive: install all
+        info "(non-interactive: installing all review guides)"
+        selected_indices=("${!seed_files[@]}")
+    fi
+
+    # Copy selected files (preserving subdirectory structure)
+    local installed=0
+    local skipped=0
+    for idx in "${selected_indices[@]}"; do
+        local src="${seed_files[$idx]}"
+        local rel_path="${src#$seed_dir/}"
+        local dest="$dest_dir/$rel_path"
+        mkdir -p "$(dirname "$dest")"
+        if [[ -f "$dest" ]]; then
+            info "  Skipping existing: $rel_path"
+            skipped=$((skipped + 1))
+        else
+            cp "$src" "$dest"
+            info "  Installed: $rel_path"
+            installed=$((installed + 1))
+        fi
+    done
+
+    # Copy .reviewguidesignore if present in seed and not already installed
+    if [[ -f "$seed_dir/.reviewguidesignore" && ! -f "$dest_dir/.reviewguidesignore" ]]; then
+        cp "$seed_dir/.reviewguidesignore" "$dest_dir/.reviewguidesignore"
+        info "  Installed filter file: .reviewguidesignore"
+    fi
+
+    if [[ $installed -gt 0 ]]; then
+        success "Installed $installed review guide(s)"
+    fi
+    if [[ $skipped -gt 0 ]]; then
+        info "Skipped $skipped existing guide(s) (preserved user customizations)"
+    fi
+    if [[ $installed -eq 0 && $skipped -eq 0 ]]; then
+        info "No review guides were installed"
+    fi
+}
+
+# --- Contribution check CI/CD setup ---
+# Creates the 'contribution' label on the remote and installs the platform-specific
+# CI/CD workflow that triggers aitask_contribution_check.sh on new contribution issues.
+
+_create_contribution_label() {
+    local platform="$1"
+
+    case "$platform" in
+        github)
+            if command -v gh &>/dev/null && gh auth status &>/dev/null 2>&1; then
+                if gh label list --limit 200 --json name -q '.[].name' 2>/dev/null | grep -qxF "contribution"; then
+                    success "Label 'contribution' already exists on GitHub"
+                else
+                    if gh label create "contribution" --color "0e8a16" --description "External contribution via aitask-contribute" 2>/dev/null; then
+                        success "Created 'contribution' label on GitHub"
+                    else
+                        warn "Could not create 'contribution' label — create it manually in GitHub Settings > Labels"
+                    fi
+                fi
+            else
+                warn "gh CLI not authenticated — create 'contribution' label manually in GitHub Settings > Labels"
+            fi
+            ;;
+        gitlab)
+            if command -v glab &>/dev/null && glab auth status &>/dev/null 2>&1; then
+                if glab label create "contribution" --color "#0e8a16" --description "External contribution via aitask-contribute" 2>/dev/null; then
+                    success "Created 'contribution' label on GitLab"
+                else
+                    # Label may already exist; glab returns error on duplicate
+                    info "Label 'contribution' may already exist on GitLab (or creation failed)"
+                fi
+            else
+                warn "glab CLI not authenticated — create 'contribution' label manually in GitLab > Labels"
+            fi
+            ;;
+        bitbucket)
+            info "Bitbucket Cloud has no issue tracker (removed 2026-08-20) — no label creation needed"
+            ;;
+        "")
+            warn "No git remote detected — cannot create 'contribution' label automatically"
+            info "Create it manually after configuring your remote."
+            ;;
+    esac
+}
+
+# sha256 of every PREVIOUSLY shipped GitHub workflow template, oldest first
+# (git log -- seed/ci/github/contribution-check.yml, then the file's current
+# home .aitask-scripts/ci_templates/github/). An installed workflow that matches
+# one of these is an unmodified older template, so `ait setup` may refresh it;
+# anything else is a local customization and is never overwritten.
+# When you edit the template, append the OUTGOING version's hash here —
+# tests/test_setup_contribution_workflow.sh fails until you do.
+_CONTRIBUTION_WORKFLOW_SHIPPED_SHA256=(
+    77832b69e479f1f8451b3fade4b1df1ba98ab95cf4a341d6d2150b456faa89d3  # 39c812ef2 (t355_4)
+    efc623833421955cc7b29205b6e7f7a52f14f619b6b0196fae36fd22437ad7a4  # e98f58128 (t381)
+    d45bc66162937391370be7dad11caee776a78157c48e47c77ee67d2192a60e19  # 197f7b8fd (t381)
+    dd0241966d18c04f22885f4a9c0e727b08711451edfdf9abb706216d0bd6d98a  # 5b853d0ee (t387)
+)
+
+# _contribution_workflow_lf <file> <out> — copy <file> to <out> with every
+# CRLF line ending turned into LF (and a missing final newline supplied). A
+# lone CR elsewhere is kept: only line endings are normalised, never content.
+_contribution_workflow_lf() {
+    awk '{ sub(/\r$/, ""); print }' "$1" > "$2"
+}
+
+# _contribution_workflow_state <installed_file> <template_file>
+# Prints one word: current (the template, up to line endings), stale (an
+# unmodified previously shipped template, up to line endings) or customized
+# (anything else, including a file that could not be read or hashed — failing
+# to compare never licenses an overwrite). Line endings are ignored because a
+# Windows checkout with core.autocrlf=true holds a git-clean CRLF copy.
+_contribution_workflow_state() {
+    local installed="$1" template="$2"
+    local tmp_inst tmp_tmpl
+    tmp_inst=$(mktemp) || { echo "customized"; return; }
+    tmp_tmpl=$(mktemp) || { rm -f "$tmp_inst"; echo "customized"; return; }
+    if ! _contribution_workflow_lf "$installed" "$tmp_inst" ||
+       ! _contribution_workflow_lf "$template" "$tmp_tmpl"; then
+        rm -f "$tmp_inst" "$tmp_tmpl"
+        echo "customized"
+        return
+    fi
+    if cmp -s "$tmp_inst" "$tmp_tmpl"; then
+        rm -f "$tmp_inst" "$tmp_tmpl"
+        echo "current"
+        return
+    fi
+    local hex="" known
+    if [[ -f "$SCRIPT_DIR/lib/artifact_utils.sh" ]]; then
+        # shellcheck source=lib/artifact_utils.sh
+        source "$SCRIPT_DIR/lib/artifact_utils.sh"
+        hex=$(artifact_sha256 "$tmp_inst" 2>/dev/null) || hex=""
+        hex="${hex#sha256:}"
+    fi
+    rm -f "$tmp_inst" "$tmp_tmpl"
+    if [[ -n "$hex" ]]; then
+        for known in "${_CONTRIBUTION_WORKFLOW_SHIPPED_SHA256[@]}"; do
+            if [[ "$hex" == "$known" ]]; then
+                echo "stale"
+                return
+            fi
+        done
+    fi
+    echo "customized"
+}
+
+# _gitlab_ci_strip_comment <line>
+# Prints <line> without its comment. A comment starts at a '#' that begins a
+# word (line start, or after whitespace) outside '...' and "..." quotes: the
+# rule both YAML and sh use, so it serves the job's YAML lines and the lines of
+# its script block alike. A quoted '#' and a backslash-escaped one are kept.
+# When a quote is still open at the end of the line, the quote reading was
+# wrong (a YAML plain scalar such as don't) or the string continues on the
+# next line, so the line is cut at the first word-initial '#' instead.
+_gitlab_ci_strip_comment() {
+    local s="$1" out="" c prev=" " q="" i
+    for ((i = 0; i < ${#s}; i++)); do
+        c="${s:i:1}"
+        if [[ -n "$q" ]]; then
+            if [[ "$q" == '"' && "$c" == "\\" ]]; then
+                out+="$c${s:i+1:1}"; i=$((i + 1)); prev=x; continue
+            fi
+            [[ "$c" == "$q" ]] && q=""
+        else
+            case "$c" in
+                "'" | '"') q="$c" ;;
+                "\\") out+="$c${s:i+1:1}"; i=$((i + 1)); prev=x; continue ;;
+                '#') [[ "$prev" == [[:space:]] ]] && break ;;
+            esac
+        fi
+        out+="$c"
+        prev="$c"
+    done
+    if [[ -n "$q" ]]; then
+        out="" prev=" "
+        for ((i = 0; i < ${#s}; i++)); do
+            c="${s:i:1}"
+            [[ "$c" == '#' && "$prev" == [[:space:]] ]] && break
+            out+="$c"
+            prev="$c"
+        done
+    fi
+    printf '%s\n' "$out"
+}
+
+# _gitlab_contribution_job_stale_effects <ci_file>
+# A .gitlab-ci.yml whose contribution-check job was copied from a template
+# shipped before t2241 still runs that job's broken scheduled scan, because
+# setup never edits an existing CI configuration. Prints one line per effect
+# of the outdated scan found in the job (nothing when the job is current, is
+# absent or the file cannot be read). Only the top-level contribution-check job
+# is read — from its key up to the next top-level key — so the same strings in
+# another job never match. The key is recognised in every ordinary spelling
+# YAML reads as the same key: bare, single- or double-quoted, and with spaces
+# before the colon. Comments are dropped before the markers are searched
+# (_gitlab_ci_strip_comment): outside the script they are YAML comments and
+# inside its literal block they are shell comments, so a marker in one — a
+# note, a commented-out old job — runs nothing. Read-only.
+_gitlab_contribution_job_stale_effects() {
+    local ci_file="$1" line body="" in_job=0
+    local re_key="^(contribution-check[[:space:]]*:([[:space:]]|\$)|'contribution-check'[[:space:]]*:|\"contribution-check\"[[:space:]]*:)"
+    local re_top='^[^[:space:]#]'
+    [[ -f "$ci_file" && -r "$ci_file" ]] || return 0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%$'\r'}"
+        if [[ "$line" =~ $re_key ]]; then
+            in_job=1
+        elif [[ "$in_job" == 1 && "$line" =~ $re_top ]]; then
+            in_job=0
+        fi
+        [[ "$in_job" == 1 ]] && body+="$(_gitlab_ci_strip_comment "$line")"$'\n'
+    done < "$ci_file"
+    [[ -n "$body" ]] || return 0
+    if grep -qF 'labels=contribution&updated_after' <<<"$body"; then
+        echo "its scheduled scan only lists issues labeled 'contribution', so it misses contributions from non-members (GitLab silently drops the labels they set)"
+    fi
+    if grep -qF "date -u -d '6 hours ago'" <<<"$body"; then
+        echo "it computes the 6-hour cutoff with GNU/BSD date options that BusyBox date on alpine:latest rejects"
+    fi
+    return 0
+}
+
+_install_contribution_ci_workflow() {
+    local platform="$1"
+    local project_dir="$2"
+    local ci_template_dir="$3"
+
+    local src_file=""
+    local dest_file=""
+    local dest_dir=""
+
+    case "$platform" in
+        github)
+            src_file="$ci_template_dir/github/contribution-check.yml"
+            dest_dir="$project_dir/.github/workflows"
+            dest_file="$dest_dir/contribution-check.yml"
+            ;;
+        gitlab)
+            src_file="$ci_template_dir/gitlab/contribution-check-job.yml"
+            dest_file="$project_dir/.gitlab-ci.yml"
+            ;;
+        bitbucket)
+            # Bitbucket Cloud removed its native issue tracker and its API on
+            # 2026-08-20, so there is nothing for a pipeline to check. An
+            # existing configuration is never edited, but a pipeline installed
+            # earlier still runs and reports success while checking nothing —
+            # say so.
+            info "Bitbucket Cloud has no issue tracker (removed 2026-08-20) — no contribution-check pipeline is installed."
+            if [[ -f "$project_dir/bitbucket-pipelines.yml" ]] &&
+               grep -qF "aitask_contribution_check.sh" "$project_dir/bitbucket-pipelines.yml" 2>/dev/null; then
+                warn "bitbucket-pipelines.yml still runs the contribution check. Its 'contribution-check' custom pipeline can no longer work (the job reports success while checking nothing) — remove it and its schedule by hand."
+            fi
+            return
+            ;;
+        "")
+            info "No git remote detected — skipping CI/CD workflow installation"
+            info "Run 'ait setup' again after configuring your remote."
+            return
+            ;;
+    esac
+
+    if [[ ! -f "$src_file" ]]; then
+        warn "CI template not found: $src_file"
+        return
+    fi
+
+    # Idempotency: an installed GitHub workflow is left alone unless it is an
+    # unmodified older template, which is refreshed to the current one.
+    local refresh=0 snapshot=""
+    if [[ "$platform" == "github" && -f "$dest_file" ]]; then
+        case "$(_contribution_workflow_state "$dest_file" "$src_file")" in
+            current)
+                success "GitHub Actions contribution check workflow already installed (up to date)"
+                return
+                ;;
+            stale)
+                info "Installed contribution check workflow is an older shipped template."
+                refresh=1
+                # Snapshot what was classified: the prompt below can stay open
+                # for a long time, and the file must not change under it.
+                snapshot=$(mktemp) && cp "$dest_file" "$snapshot" || {
+                    rm -f "$snapshot"
+                    warn "Could not snapshot .github/workflows/contribution-check.yml — left it unchanged."
+                    return
+                }
+                ;;
+            *)
+                warn "Left .github/workflows/contribution-check.yml unchanged: it differs from every shipped template (local changes). The current template also runs on issues.opened, so contribution issues from authors without push access are checked — merge it from .aitask-scripts/ci_templates/github/contribution-check.yml."
+                return
+                ;;
+        esac
+    fi
+    if [[ "$platform" != "github" && -f "$dest_file" ]]; then
+        if grep -q "contribution-check" "$dest_file" 2>/dev/null; then
+            # A job copied before t2241 is present but broken: report it as
+            # such instead of as a success, and still leave the file alone.
+            local stale_effects=""
+            if [[ "$platform" == gitlab ]]; then
+                stale_effects=$(_gitlab_contribution_job_stale_effects "$dest_file" | paste -sd ';' - | sed 's/;/; /g')
+            fi
+            if [[ -n "$stale_effects" ]]; then
+                warn "The contribution-check job in .gitlab-ci.yml predates the current template: ${stale_effects}. Setup does not edit an existing CI configuration — re-copy the job from .aitask-scripts/ci_templates/gitlab/contribution-check-job.yml (see Manual Setup in website/content/docs/workflows/contribute-and-manage/contribution-flow.md)."
+                return
+            fi
+            success "Contribution check job already present in $(basename "$dest_file")"
+            return
+        fi
+        # An existing CI configuration is never edited. Appending the template
+        # would add a job whose stage the project may not declare — and it
+        # would still look like a success.
+        if [[ -s "$dest_file" ]]; then
+            local stage_note=""
+            [[ "$platform" == gitlab ]] && stage_note=" (its job uses stage: test — make sure that stage is in your stages: list)"
+            warn "Left $(basename "$dest_file") unchanged: setup does not edit an existing CI configuration. To enable the contribution check, merge .aitask-scripts/ci_templates/$platform/$(basename "$src_file") into it by hand${stage_note}."
+            return
+        fi
+    fi
+
+    if ! _contribution_ci_confirm "$refresh"; then
+        [[ -n "$snapshot" ]] && rm -f "$snapshot"
+        info "Skipped contribution check workflow installation."
+        return
+    fi
+
+    case "$platform" in
+        github)
+            mkdir -p "$dest_dir"
+            if [[ "$refresh" == 1 ]]; then
+                # Stage beside the file (lib/atomic_write.sh: same directory,
+                # same mode, temp removed on any failure), then re-validate
+                # after the prompt: an edit made while it was open turns the
+                # file into a customization, which is never overwritten.
+                # shellcheck source=lib/atomic_write.sh
+                source "$SETUP_LIB_DIR/atomic_write.sh"
+                local resolved staged
+                if ! resolved=$(ait_atomic_resolve "$dest_file") ||
+                   ! staged=$(ait_atomic_tmp "$resolved"); then
+                    rm -f "$snapshot"
+                    warn "Could not stage the updated workflow — left .github/workflows/contribution-check.yml unchanged."
+                    return
+                fi
+                if ! cp "$src_file" "$staged"; then
+                    ait_atomic_discard "$staged"
+                    rm -f "$snapshot"
+                    warn "Could not stage the updated workflow — left .github/workflows/contribution-check.yml unchanged."
+                    return
+                fi
+                if ! cmp -s "$dest_file" "$snapshot"; then
+                    ait_atomic_discard "$staged"
+                    rm -f "$snapshot"
+                    warn "Left .github/workflows/contribution-check.yml unchanged: it changed while the update prompt was open. Re-run 'ait setup' to re-check it."
+                    return
+                fi
+                rm -f "$snapshot"
+                if ! ait_atomic_commit "$staged" "$resolved"; then
+                    warn "Could not replace .github/workflows/contribution-check.yml — left it unchanged."
+                    return
+                fi
+                success "Updated contribution check workflow — commit .github/workflows/contribution-check.yml"
+            else
+                if [[ -e "$dest_file" ]]; then
+                    warn "Left .github/workflows/contribution-check.yml unchanged: it appeared while the install prompt was open. Re-run 'ait setup' to re-check it."
+                    return
+                fi
+                cp "$src_file" "$dest_file"
+                success "Installed contribution check workflow: .github/workflows/contribution-check.yml"
+            fi
+            ;;
+        gitlab)
+            local cfg_name
+            cfg_name=$(basename "$dest_file")
+            # Only an absent or empty file is written (see above); re-check
+            # after the prompt in case one appeared meanwhile.
+            if [[ -s "$dest_file" ]]; then
+                warn "Left $cfg_name unchanged: it gained content while the install prompt was open. Re-run 'ait setup' to re-check it."
+                return
+            fi
+            {
+                echo "# $cfg_name — auto-generated by ait setup"
+                echo ""
+                cat "$src_file"
+            } > "$dest_file"
+            success "Created .gitlab-ci.yml with contribution check job"
+            ;;
+    esac
+}
+
+# _contribution_ci_confirm <refresh 0|1> — returns 0 to go ahead. Asks [Y/n]
+# on a terminal and auto-accepts otherwise. Kept separate so the window
+# between the question and the write can be exercised by tests.
+_contribution_ci_confirm() {
+    local answer
+    if [[ -t 0 ]]; then
+        if [[ "$1" == 1 ]]; then
+            printf "  Update contribution check CI/CD workflow to the current template? [Y/n] "
+        else
+            printf "  Install contribution check CI/CD workflow? [Y/n] "
+        fi
+        read -r answer
+        case "${answer:-Y}" in
+            [Yy]*) return 0 ;;
+            *) return 1 ;;
+        esac
+    fi
+    info "(non-interactive: auto-accepting contribution check workflow)"
+    return 0
+}
+
+setup_contribution_check() {
+    local project_dir="$SCRIPT_DIR/.."
+    # The templates live under .aitask-scripts/, not seed/: install.sh deletes
+    # seed/ after every install and upgrade, so a template kept there would
+    # never reach an installed project.
+    local ci_template_dir="$SCRIPT_DIR/ci_templates"
+    local platform
+    platform=$(_detect_git_platform)
+
+    if [[ ! -d "$ci_template_dir" ]]; then
+        warn "Contribution check CI templates not found at .aitask-scripts/ci_templates (incomplete framework install) — skipping the 'contribution' label and CI workflow."
+        return
+    fi
+
+    info "Contribution overlap check CI/CD integration"
+
+    _create_contribution_label "$platform"
+    _install_contribution_ci_workflow "$platform" "$project_dir" "$ci_template_dir"
+}
+
+# --- Pre-setup dirty-state baseline ---
+# Setup cannot tell "I wrote this file" from "the developer has uncommitted
+# work here" by inspecting the working tree at commit time. It can tell by
+# looking twice: snapshot the dirty framework-path set BEFORE setup writes
+# anything, then commit only (changed-at-commit-time − baseline). Files in
+# the baseline are left alone and reported, never committed — if setup
+# rewrites a file that was already dirty, that file's update goes
+# uncommitted rather than sweeping the developer's edit.
+AIT_SETUP_DIRTY_BASELINE=""
+AIT_SETUP_DATA_DIRTY_BASELINE=""
+AIT_SETUP_BASELINE_ARMED=0
+# ARMED means "a snapshot ran"; UNVERIFIED means "it ran but could not read the
+# dirty state", so its empty baseline is unknown rather than clean and the
+# matching committer refuses. One flag per baseline, each read only by that
+# baseline's committer (t1747_4). Keep these separate from ARMED.
+AIT_SETUP_BASELINE_UNVERIFIED=0
+AIT_SETUP_DATA_BASELINE_UNVERIFIED=0
+
+# Print the framework pathspecs that exist in <project_dir>, one per line.
+# With <include_absent>=1, print every pathspec whether or not it exists: the
+# dirty-baseline snapshot needs that, because a tracked framework file the user
+# deleted (staged or not) is absent on disk yet is exactly a pre-existing
+# change — filtered out here, setup would recreate it and commit over the
+# deletion (t1959). git accepts an unmatched pathspec in the read-only queries
+# the snapshot runs; `git add` (commit_framework_files) does not, so the
+# default stays existence-filtered.
+# NOTE: The base list is duplicated in install.sh _install_framework_paths()
+# (used by its snapshot_pre_install_dirty and commit_installed_files). If you
+# change one, change the other — tests/test_install_upgrade_dirty_baseline.sh
+# pins the two. install.sh runs stand-alone via curl|bash and snapshots before
+# extraction, so it cannot source a shared helper.
+_ait_framework_paths() {
+    local project_dir="$1" include_absent="${2:-0}"
+    local p
+    local check_paths=(
+        ".aitask-scripts/"
+        "aitasks/metadata/"
+        "aireviewguides/"
+        "ait"
+        ".claude/skills/"
+        ".claude/settings.json"
+        ".agents/"
+        ".codex/"
+        ".opencode/"
+        ".gitignore"
+        ".github/workflows/"
+        "CLAUDE.md"
+        "AGENTS.md"
+        "opencode.json"
+    )
+    for p in "${check_paths[@]}"; do
+        [[ "$include_absent" == "1" || -e "$project_dir/$p" ]] && printf '%s\n' "$p"
+    done
+    # install.sh may not exist in tarball installs; CI files may have been
+    # installed by setup_contribution_check.
+    for p in "install.sh" ".gitlab-ci.yml" "bitbucket-pipelines.yml"; do
+        [[ "$include_absent" == "1" || -f "$project_dir/$p" ]] && printf '%s\n' "$p"
+    done
+    return 0
+}
+
+# Print the data-branch framework pathspecs that exist in <data_dir>, one per
+# line. Framework-owned config dirs only — never task or plan content.
+# <include_absent>=1 prints them whether or not they exist, for the same
+# deletion-aware snapshot reason as _ait_framework_paths.
+_ait_data_framework_paths() {
+    local data_dir="$1" include_absent="${2:-0}"
+    local p
+    for p in "aitasks/metadata/" "aireviewguides/"; do
+        [[ "$include_absent" == "1" || -e "$data_dir/$p" ]] && printf '%s\n' "$p"
+    done
+    return 0
+}
+
+# Emit the filtered untracked + modified + staged set under <paths...> in
+# <workdir>, one file per line, deduplicated. <extra_exclude_re> is an ERE of
+# paths to additionally exclude (empty = none). The staged term
+# (`diff --cached`) is load-bearing: a framework file whose edit was fully
+# staged before setup runs is invisible to both `ls-files --others` (tracked
+# in the index) and `ls-files --modified` (worktree matches index) — without
+# it the baseline would miss the file and the commit would sweep the user's
+# staged hunk. --no-renames: with rename detection a staged rename lists only
+# its destination, and the source — gone from the index, so invisible to
+# `ls-files --modified` too — would miss the baseline; a setup step that
+# recreates it would then commit it, turning the user's pending rename into an
+# addition. Mirrored by _install_list_changes in install.sh.
+# Returns 0 when the list is verified; 2 when any probe failed, with stdout
+# empty — an unreadable worktree is not a clean one (t1747_4).
+_ait_list_framework_changes() {
+    local workdir="$1" extra_exclude_re="$2"
+    shift 2
+    local cache_artifacts_re='(^|/)__pycache__/|\.py[co]$|\.pyd$'
+    local exclude_re="$cache_artifacts_re"
+    [[ -n "$extra_exclude_re" ]] && exclude_re="$cache_artifacts_re|$extra_exclude_re"
+    local untracked modified staged probe_rc=0
+    untracked="$(git -C "$workdir" ls-files --others --exclude-standard \
+        -- "$@" 2>/dev/null)" || probe_rc=1
+    modified="$(git -C "$workdir" ls-files --modified -- "$@" 2>/dev/null)" || probe_rc=1
+    staged="$(git -C "$workdir" diff --cached --name-only --no-renames \
+        -- "$@" 2>/dev/null)" || probe_rc=1
+    # A partial list is not a smaller dirty set: print nothing on failure.
+    (( probe_rc == 0 )) || return 2
+    printf '%s\n%s\n%s\n' "$untracked" "$modified" "$staged" \
+        | sed '/^$/d' | sort -u | grep -Ev "$exclude_re" || true
+}
+
+# Is .aitask-scripts/VERSION in <dir>'s index? 0 = tracked, 1 = genuinely
+# untracked (bootstrap), 2 = unverified. `--error-unmatch` exits 1 for an
+# untracked path and 128 for a git error, so the two are separable (t1747_4).
+_ait_framework_version_tracked() {
+    local rc=0
+    git -C "$1" ls-files --error-unmatch -- .aitask-scripts/VERSION >/dev/null 2>&1 || rc=$?
+    case $rc in 0) return 0 ;; 1) return 1 ;; *) return 2 ;; esac
+}
+
+# Refuse a framework commit whose pre-setup dirty state could not be read:
+# setup's own files left uncommitted are recoverable by hand, someone else's
+# work committed under a setup message is not (t1747_4). The recovery is a
+# path-scoped manual commit, not a re-run: a re-run's snapshot would find the
+# files this run left dirty and leave them alone as pre-existing changes, and
+# a commit without paths would sweep anything else already staged (t2120).
+_ait_refuse_unverified_commit() {
+    local what="$1" recovery="$2"
+    warn "Could not read the uncommitted state of $what — framework files were NOT committed."
+    warn "Committing without it could sweep someone else's uncommitted work into the setup commit."
+    info "Once git works again, review 'git status' and commit only the framework files you reviewed, naming each path: $recovery — a commit without paths also commits anything else already staged."
+}
+
+# Print stdin lines NOT present in the newline-joined set $1 (exact match).
+_ait_subtract() {
+    if [[ -z "$1" ]]; then cat; return 0; fi
+    grep -Fxv -f <(printf '%s\n' "$1") || true
+}
+
+# Print stdin lines present in the newline-joined set $1 (exact match).
+_ait_intersect() {
+    if [[ -z "$1" ]]; then cat >/dev/null; return 0; fi
+    grep -Fx -f <(printf '%s\n' "$1") || true
+}
+
+# Regex excluding data-branch paths from the main worktree's change list when
+# branch mode is active (they are committed by commit_framework_data_files).
+_ait_data_branch_exclude_re() {
+    local project_dir="$1"
+    if [[ -d "$project_dir/.aitask-data/.git" || -f "$project_dir/.aitask-data/.git" ]]; then
+        printf '%s' '^(aitasks|aiplans)/'
+    fi
+    return 0
+}
+
+# Snapshot the pre-setup dirty framework-path state. MUST run from main()
+# after refuse_nonregular_gitignores (its untracked-file walk reads .gitignore,
+# and a FIFO there blocks git, t2191), after ensure_git_repo, and before any
+# setup step writes a framework file —
+# commit_framework_files/commit_framework_data_files subtract this baseline
+# so foreign in-progress work is never swept into a framework commit.
+#
+# Each baseline is gated on its own committer's eligibility, never on the
+# other's: a snapshot skipped in a state its committer acts in would leave that
+# committer working against an empty baseline (t1972).
+#   - Data: the .aitask-data worktree is present — the only guard
+#     commit_framework_data_files has. Independent of the main repo's state.
+#   - Main: a work tree with .aitask-scripts/VERSION in the index. No HEAD is
+#     required — commit_framework_files reads the index, so a repository with
+#     no first commit and a staged VERSION is not a bootstrap.
+#
+# Bootstrap trade-off: when the framework is not yet git-tracked (fresh
+# install — sentinel: .aitask-scripts/VERSION not in the index, same signal as
+# install.sh commit_installed_files), the main baseline stays empty and
+# commit_framework_files commits ALL framework-path files. "VERSION not
+# tracked" does not prove there is no foreign work under those paths (partial
+# installs, hand-copied files); it only means no baseline COULD separate
+# installer output from anything else. The non-interactive commit path
+# announces this blast radius explicitly.
+#
+# Unverified: a failed git probe yields no list, and an empty baseline would
+# read as "nothing was dirty" — the commit-all sweep. Instead it sets that
+# baseline's UNVERIFIED flag and its committer refuses (t1747_4). The data and
+# main flags are independent, like the baselines themselves.
+snapshot_pre_setup_dirty() {
+    local project_dir="$SCRIPT_DIR/.."
+    local data_dir="$project_dir/.aitask-data"
+    local p
+    AIT_SETUP_BASELINE_ARMED=1
+    AIT_SETUP_BASELINE_UNVERIFIED=0
+    AIT_SETUP_DATA_BASELINE_UNVERIFIED=0
+    AIT_SETUP_DIRTY_BASELINE=""
+    AIT_SETUP_DATA_DIRTY_BASELINE=""
+
+    # Data-worktree baseline — only if the worktree already exists at snapshot
+    # time. On a first-ever data-branch setup it does not, and an empty data
+    # baseline correctly means "commit all" there too. include_absent=1: a
+    # deleted data framework dir is a pre-existing change. A present .git that
+    # git cannot read is an unverified baseline, not a missing one.
+    if [[ -d "$data_dir/.git" || -f "$data_dir/.git" ]]; then
+        if ! git -C "$data_dir" rev-parse --is-inside-work-tree &>/dev/null; then
+            AIT_SETUP_DATA_BASELINE_UNVERIFIED=1
+        else
+            local data_paths=() data_rc=0
+            while IFS= read -r p; do data_paths+=("$p"); done < <(_ait_data_framework_paths "$data_dir" 1)
+            # unverified: flag the data baseline; commit_framework_data_files refuses.
+            AIT_SETUP_DATA_DIRTY_BASELINE="$(_ait_list_framework_changes "$data_dir" "" \
+                "${data_paths[@]}")" || data_rc=$?
+            (( data_rc == 0 )) || AIT_SETUP_DATA_BASELINE_UNVERIFIED=1
+        fi
+    fi
+
+    # A failed rev-parse is unverified whether or not $project_dir/.git exists:
+    # ensure_git_repo accepts an install in a subdirectory of an ancestor repo,
+    # which has no local .git. With truly no repository the flag is inert —
+    # every committer bails on its own repo check before reading it.
+    if ! git -C "$project_dir" rev-parse --is-inside-work-tree &>/dev/null; then
+        AIT_SETUP_BASELINE_UNVERIFIED=1
+        return 0
+    fi
+
+    # Bootstrap: framework not yet tracked → empty main baseline (commit-all).
+    local vrc=0
+    # unverified: flag the main baseline; commit_framework_files refuses.
+    _ait_framework_version_tracked "$project_dir" || vrc=$?
+    case $vrc in
+        0) ;;
+        1) return 0 ;;
+        *) AIT_SETUP_BASELINE_UNVERIFIED=1; return 0 ;;
+    esac
+
+    # include_absent=1: a deleted tracked framework file is a pre-existing change.
+    local fw_paths=() main_rc=0
+    while IFS= read -r p; do fw_paths+=("$p"); done < <(_ait_framework_paths "$project_dir" 1)
+    if [[ ${#fw_paths[@]} -gt 0 ]]; then
+        # unverified: flag the main baseline; commit_framework_files refuses.
+        AIT_SETUP_DIRTY_BASELINE="$(_ait_list_framework_changes "$project_dir" \
+            "$(_ait_data_branch_exclude_re "$project_dir")" "${fw_paths[@]}")" || main_rc=$?
+        (( main_rc == 0 )) || AIT_SETUP_BASELINE_UNVERIFIED=1
+    fi
+    return 0
+}
+
+# --- Commit all framework files to git ---
+# Runs at the END of setup, after all steps have created their files.
+# This ensures review modes, .gitignore, and other late-stage files are included.
+#
+# CONTRACT: production callers MUST run snapshot_pre_setup_dirty() first
+# (main() does, before any framework file is written). Unarmed
+# (AIT_SETUP_BASELINE_ARMED=0) means "empty baseline" — the legacy commit-all
+# sweep behavior — acceptable ONLY for direct test invocation.
+commit_framework_files() {
+    local project_dir="$SCRIPT_DIR/.."
+
+    # Bail if not in a git repo
+    if ! git -C "$project_dir" rev-parse --is-inside-work-tree &>/dev/null; then
+        return
+    fi
+
+    if [[ "${AIT_SETUP_BASELINE_ARMED:-0}" != "1" ]]; then
+        warn "commit_framework_files: baseline not armed — committing without pre-setup dirty protection" >&2
+    fi
+    if [[ "${AIT_SETUP_BASELINE_UNVERIFIED:-0}" == "1" ]]; then
+        _ait_refuse_unverified_commit "the framework paths" "'git add -- <path>...' / 'git commit -- <path>...'"
+        return
+    fi
+
+    local paths_to_add=() p
+    while IFS= read -r p; do paths_to_add+=("$p"); done < <(_ait_framework_paths "$project_dir")
+
+    if [[ ${#paths_to_add[@]} -eq 0 ]]; then
+        return
+    fi
+
+    # Check for untracked, modified, or staged framework files.
+    # Exclude interpreter cache artifacts even if local ignore rules are
+    # incomplete. In branch mode (`aitasks/`, `aiplans/` are symlinks into a
+    # `.aitask-data` worktree), additionally exclude those paths — they are
+    # committed by commit_framework_data_files(). In legacy mode, leave them in.
+    local data_branch_re all_changes list_rc=0
+    data_branch_re="$(_ait_data_branch_exclude_re "$project_dir")"
+    # unverified: refuse — an empty list would report a false "already committed".
+    all_changes="$(_ait_list_framework_changes "$project_dir" "$data_branch_re" \
+        "${paths_to_add[@]}")" || list_rc=$?
+    if (( list_rc != 0 )); then
+        _ait_refuse_unverified_commit "the framework paths" "'git add -- <path>...' / 'git commit -- <path>...'"
+        return
+    fi
+
+    # Baseline diff: commit only files that were NOT already dirty before
+    # setup ran; report the rest and leave them alone (never sweep foreign
+    # in-progress work into the framework commit).
+    local changed_files=() excluded_files=() changed_file
+    while IFS= read -r changed_file; do
+        [[ -n "$changed_file" ]] || continue
+        changed_files+=("$changed_file")
+    done < <(printf '%s\n' "$all_changes" | _ait_subtract "$AIT_SETUP_DIRTY_BASELINE")
+    while IFS= read -r changed_file; do
+        [[ -n "$changed_file" ]] || continue
+        excluded_files+=("$changed_file")
+    done < <(printf '%s\n' "$all_changes" | _ait_intersect "$AIT_SETUP_DIRTY_BASELINE")
+
+    local _i
+    if [[ ${#excluded_files[@]} -gt 0 ]]; then
+        echo ""
+        warn "Pre-existing uncommitted changes under framework paths — left alone (not committed by setup):"
+        for ((_i=0; _i<${#excluded_files[@]} && _i<20; _i++)); do
+            printf '    %s\n' "${excluded_files[_i]}"
+        done
+        if [[ ${#excluded_files[@]} -gt 20 ]]; then
+            info "    ... and $((${#excluded_files[@]} - 20)) more"
+        fi
+        info "Review and commit them yourself when ready."
+    fi
+
+    if [[ ${#changed_files[@]} -eq 0 ]]; then
+        success "All framework files already committed to git"
+        return
+    fi
+
+    local total_count
+    total_count="${#changed_files[@]}"
+    echo ""
+    info "────────────────────────────────────────────────────"
+    info "READY TO COMMIT $total_count FRAMEWORK FILES"
+    info "────────────────────────────────────────────────────"
+    # Iterate via bash array indexing — avoids `printf | head` SIGPIPE which,
+    # under `set -o pipefail` + `set -e`, kills the script mid-list when the
+    # array is longer than the head limit.
+    local _i
+    for ((_i=0; _i<total_count && _i<20; _i++)); do
+        printf '  %s\n' "${changed_files[_i]}"
+    done
+    if [[ $total_count -gt 20 ]]; then
+        info "  ... and $((total_count - 20)) more files"
+    fi
+
+    if [[ -t 0 ]]; then
+        printf "  Commit framework files to git? [Y/n] "
+        read -r answer
+    else
+        info "(non-interactive: auto-accepting default)"
+        local vrc=0
+        # unverified: warn as for bootstrap — this is a display; the commit
+        # itself was gated by the verified snapshot.
+        _ait_framework_version_tracked "$project_dir" || vrc=$?
+        if (( vrc == 2 )); then
+            warn "Could not verify whether the framework is already tracked in git."
+        fi
+        if (( vrc != 0 )); then
+            warn "First-time framework tracking: committing ALL $total_count listed framework-path files automatically."
+            warn "If that is not desired, rerun 'ait setup' interactively or commit the intended files manually first."
+        fi
+        answer="Y"
+    fi
+    case "${answer:-Y}" in
+        [Yy]*|"")
+            local add_output commit_output
+            if ! add_output=$(cd "$project_dir" && git add -- "${changed_files[@]}" 2>&1); then
+                warn "git add failed:"
+                printf '%s\n' "$add_output" | awk '{print "    " $0}'
+                warn "Framework files NOT committed. Review 'git status' and commit only the framework files you reviewed, naming each path: 'git add -- <path>...' / 'git commit -- <path>...'."
+                return
+            fi
+            # Path-scoped diff guard and commit: a bare `git commit` would
+            # sweep a foreign pre-staged index; a global `--cached --quiet`
+            # reads "dirty" when only a foreign file is staged and would
+            # drive a spurious commit attempt.
+            if ! (cd "$project_dir" && git diff --cached --quiet -- "${changed_files[@]}" 2>/dev/null); then
+                if ! commit_output=$(cd "$project_dir" && git commit -m "ait: Add aitask framework" -- "${changed_files[@]}" 2>&1); then
+                    warn "git commit failed:"
+                    printf '%s\n' "$commit_output" | awk '{print "    " $0}'
+                    warn "Framework files staged but NOT committed. Commit them yourself naming each path — 'git commit -- <path>...'; a commit without paths also commits anything else already staged."
+                    return
+                fi
+            fi
+
+            # Post-commit verification: anything still untracked under the
+            # framework paths indicates a gitignore rule, pathspec quirk, or
+            # a new file produced between the list and the commit. Apply the
+            # same data-branch filter — those files are committed separately
+            # by commit_framework_data_files() in branch mode — and subtract
+            # the baseline: a pre-existing dirty file is deliberately left
+            # behind, not a commit failure.
+            local cache_artifacts_re='(^|/)__pycache__/|\.py[co]$|\.pyd$'
+            local post_exclude_re="$cache_artifacts_re"
+            [[ -n "$data_branch_re" ]] && post_exclude_re="$cache_artifacts_re|$data_branch_re"
+            local still_untracked
+            still_untracked="$(cd "$project_dir" && git ls-files --others --exclude-standard \
+                "${paths_to_add[@]}" 2>/dev/null | { grep -Ev "$post_exclude_re" || true; } \
+                | _ait_subtract "$AIT_SETUP_DIRTY_BASELINE")" || true
+            if [[ -n "$still_untracked" ]]; then
+                warn "Some framework files remain untracked after commit:"
+                # awk reads all stdin — no SIGPIPE even if list is huge.
+                printf '%s\n' "$still_untracked" | awk 'NR<=20 {print "    " $0}'
+                warn "Run 'git status' to investigate, then commit only the listed files you intend, naming each path: 'git add -- <path>...' / 'git commit -- <path>...'."
+            else
+                success "Framework files committed to git"
+            fi
+            ;;
+        *)
+            warn "Skipped committing framework files. These files remain UNTRACKED:"
+            for ((_i=0; _i<total_count && _i<10; _i++)); do
+                printf '    %s\n' "${changed_files[_i]}"
+            done
+            if [[ $total_count -gt 10 ]]; then
+                info "    ... and $((total_count - 10)) more"
+            fi
+            info "You can commit them later, naming each path: 'git add -- <path>...' / 'git commit -- <path>...'."
+            ;;
+    esac
+}
+
+# --- Commit data-branch framework files (branch-mode only) ---
+# Setup-time analogue of install.sh's commit_installed_data_files().
+# In branch mode, framework metadata living on the aitask-data branch
+# (aitasks/metadata/, optionally aireviewguides/) gets written through
+# symlinks during setup but never reaches the data worktree's index unless
+# we commit it here. Keeps `ait setup` and `ait upgrade` symmetric.
+#
+# CONTRACT: production callers MUST run snapshot_pre_setup_dirty() first
+# (main() does, before any framework file is written). Unarmed
+# (AIT_SETUP_BASELINE_ARMED=0) means "empty baseline" — the legacy commit-all
+# sweep behavior — acceptable ONLY for direct test invocation.
+commit_framework_data_files() {
+    local project_dir="$SCRIPT_DIR/.."
+    local data_dir="$project_dir/.aitask-data"
+
+    # Legacy mode (no separate data worktree) — nothing to do.
+    if [[ ! -d "$data_dir/.git" && ! -f "$data_dir/.git" ]]; then
+        return
+    fi
+
+    if ! git -C "$data_dir" rev-parse --is-inside-work-tree &>/dev/null; then
+        return
+    fi
+
+    if [[ "${AIT_SETUP_BASELINE_ARMED:-0}" != "1" ]]; then
+        warn "commit_framework_data_files: baseline not armed — committing without pre-setup dirty protection" >&2
+    fi
+    if [[ "${AIT_SETUP_DATA_BASELINE_UNVERIFIED:-0}" == "1" ]]; then
+        _ait_refuse_unverified_commit "the aitask-data framework paths" "'./ait git add -- <path>...' / './ait git commit -- <path>...'"
+        return
+    fi
+
+    # Framework-owned config dirs that may live on the data branch. Never
+    # commit task or plan content here — those are user data.
+    local data_paths=() p
+    while IFS= read -r p; do data_paths+=("$p"); done < <(_ait_data_framework_paths "$data_dir")
+
+    if [[ ${#data_paths[@]} -eq 0 ]]; then
+        return
+    fi
+
+    local all_changes list_rc=0
+    # unverified: refuse — an empty list would report a false "already committed".
+    all_changes="$(_ait_list_framework_changes "$data_dir" "" "${data_paths[@]}")" || list_rc=$?
+    if (( list_rc != 0 )); then
+        _ait_refuse_unverified_commit "the aitask-data framework paths" "'./ait git add -- <path>...' / './ait git commit -- <path>...'"
+        return
+    fi
+
+    # Baseline diff: commit only files that were NOT already dirty before
+    # setup ran (concurrent sessions routinely have in-progress work in the
+    # data worktree — never sweep it into the framework-data commit).
+    local changed_files=() excluded_files=() changed_file
+    while IFS= read -r changed_file; do
+        [[ -n "$changed_file" ]] || continue
+        changed_files+=("$changed_file")
+    done < <(printf '%s\n' "$all_changes" | _ait_subtract "$AIT_SETUP_DATA_DIRTY_BASELINE")
+    while IFS= read -r changed_file; do
+        [[ -n "$changed_file" ]] || continue
+        excluded_files+=("$changed_file")
+    done < <(printf '%s\n' "$all_changes" | _ait_intersect "$AIT_SETUP_DATA_DIRTY_BASELINE")
+
+    local _i
+    if [[ ${#excluded_files[@]} -gt 0 ]]; then
+        echo ""
+        warn "Pre-existing uncommitted changes on the aitask-data branch — left alone (not committed by setup):"
+        for ((_i=0; _i<${#excluded_files[@]} && _i<20; _i++)); do
+            printf '    %s\n' "${excluded_files[_i]}"
+        done
+        if [[ ${#excluded_files[@]} -gt 20 ]]; then
+            info "    ... and $((${#excluded_files[@]} - 20)) more"
+        fi
+        info "Review and commit them yourself when ready (via './ait git')."
+    fi
+
+    if [[ ${#changed_files[@]} -eq 0 ]]; then
+        success "Framework data files already committed to aitask-data branch"
+        return
+    fi
+
+    local total_count=${#changed_files[@]}
+    echo ""
+    info "────────────────────────────────────────────────────"
+    info "READY TO COMMIT $total_count FRAMEWORK DATA FILES (aitask-data branch)"
+    info "────────────────────────────────────────────────────"
+    local _i
+    for ((_i=0; _i<total_count && _i<20; _i++)); do
+        printf '  %s\n' "${changed_files[_i]}"
+    done
+    if [[ $total_count -gt 20 ]]; then
+        info "  ... and $((total_count - 20)) more files"
+    fi
+
+    if [[ -t 0 ]]; then
+        printf "  Commit framework data files to aitask-data branch? [Y/n] "
+        read -r answer
+    else
+        info "(non-interactive: auto-accepting default)"
+        answer="Y"
+    fi
+    case "${answer:-Y}" in
+        [Yy]*|"")
+            local add_output commit_output
+            if ! add_output=$(git -C "$data_dir" add -- "${changed_files[@]}" 2>&1); then
+                warn "git add failed (data branch):"
+                printf '%s\n' "$add_output" | awk '{print "    " $0}'
+                warn "Framework data files NOT committed."
+                return
+            fi
+            # Path-scoped diff guard and commit — a bare `git commit` would
+            # sweep a foreign pre-staged index in the data worktree.
+            if ! git -C "$data_dir" diff --cached --quiet -- "${changed_files[@]}" 2>/dev/null; then
+                if ! commit_output=$(git -C "$data_dir" \
+                    commit -m "ait: Add aitask framework data" -- "${changed_files[@]}" 2>&1); then
+                    warn "git commit failed (data branch):"
+                    printf '%s\n' "$commit_output" | awk '{print "    " $0}'
+                    warn "Framework data files staged but NOT committed."
+                    return
+                fi
+            fi
+            success "Framework data files committed to aitask-data branch"
+            ;;
+        *)
+            warn "Skipped committing framework data files. These remain UNTRACKED on aitask-data:"
+            for ((_i=0; _i<total_count && _i<10; _i++)); do
+                printf '    %s\n' "${changed_files[_i]}"
+            done
+            if [[ $total_count -gt 10 ]]; then
+                info "    ... and $((total_count - 10)) more"
+            fi
+            info "You can commit them later, naming each path: './ait git add -- <path>...' / './ait git commit -- <path>...'."
+            ;;
+    esac
+}
+
+# --- Git TUI detection and configuration ---
+# Uses `cat > file` instead of `mv tmpf file` so we write THROUGH symlinks
+# to the actual file content, rather than replacing the path's inode (which
+# can break symlinks or behave inconsistently across filesystems/mv variants).
+_set_git_tui_config() {
+    local config_file="$1" value="$2"
+    local tmpf
+    tmpf=$(mktemp)
+
+    if grep -qE '^[[:space:]]*git_tui:' "$config_file"; then
+        # Update existing git_tui line
+        sed "s/^\([[:space:]]*\)git_tui:.*/\1git_tui: $value/" "$config_file" > "$tmpf" \
+            && cat "$tmpf" > "$config_file" && rm "$tmpf"
+    else
+        # Append tmux section with git_tui
+        {
+            cat "$config_file"
+            printf '\ntmux:\n  git_tui: %s\n' "$value"
+        } > "$tmpf" && cat "$tmpf" > "$config_file" && rm "$tmpf"
+    fi
+}
+
+_install_lazygit_from_github() {
+    local version arch
+    version=$(curl -s "https://api.github.com/repos/jesseduffield/lazygit/releases/latest" \
+        | grep '"tag_name"' | head -1 | sed -E 's/.*"v([^"]+)".*/\1/')
+    if [[ -z "$version" ]]; then
+        warn "Could not determine latest lazygit version."
+        return 1
+    fi
+    case "$(uname -m)" in
+        x86_64)  arch="x86_64" ;;
+        aarch64) arch="arm64" ;;
+        armv*)   arch="armv6" ;;
+        *)       warn "Unsupported architecture: $(uname -m)"; return 1 ;;
+    esac
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    curl -Lo "$tmpdir/lazygit.tar.gz" \
+        "https://github.com/jesseduffield/lazygit/releases/latest/download/lazygit_${version}_Linux_${arch}.tar.gz"
+    tar xf "$tmpdir/lazygit.tar.gz" -C "$tmpdir" lazygit
+    sudo install "$tmpdir/lazygit" /usr/local/bin/lazygit
+    rm -rf "$tmpdir"
+}
+
+_install_lazygit() {
+    info "Installing lazygit..."
+    case "$OS" in
+        arch)
+            sudo pacman -S --needed --noconfirm lazygit ;;
+        debian)
+            _install_lazygit_from_github ;;
+        fedora)
+            sudo dnf install -y lazygit ;;
+        macos)
+            brew install lazygit ;;
+        *)
+            warn "Unsupported OS ($OS) for automatic lazygit installation."
+            info "Install manually: https://github.com/jesseduffield/lazygit#installation"
+            return 1 ;;
+    esac
+}
+
+setup_git_tui() {
+    local project_dir="$SCRIPT_DIR/.."
+    local config_file="$project_dir/aitasks/metadata/project_config.yaml"
+
+    if [[ ! -f "$config_file" ]]; then
+        info "No project_config.yaml found — skipping git TUI setup."
+        return
+    fi
+
+    # Check if already configured (non-empty value)
+    local current
+    current=$(grep -E '^[[:space:]]*git_tui:' "$config_file" 2>/dev/null | sed 's/.*git_tui:[[:space:]]*//' || true)
+    if [[ -n "$current" ]]; then
+        success "Git TUI already configured: $current"
+        return
+    fi
+
+    info "Configuring git management TUI..."
+
+    local detected=()
+    for tool in lazygit gitui tig; do
+        if command -v "$tool" &>/dev/null; then
+            detected+=("$tool")
+        fi
+    done
+
+    local selected=""
+
+    if [[ ${#detected[@]} -eq 0 ]]; then
+        info "No git management TUI detected (lazygit, gitui, tig)."
+        if [[ -t 0 ]]; then
+            printf "  Install lazygit? [Y/n] "
+            read -r answer
+        else
+            info "(non-interactive: skipping git TUI installation)"
+            return
+        fi
+        if [[ "${answer,,}" != "n" ]]; then
+            _install_lazygit
+            if command -v lazygit &>/dev/null; then
+                selected="lazygit"
+            else
+                warn "lazygit installation may have failed. Skipping git TUI config."
+                return
+            fi
+        else
+            info "Skipping git TUI configuration."
+            return
+        fi
+    elif [[ ${#detected[@]} -eq 1 ]]; then
+        selected="${detected[0]}"
+        info "Detected git TUI: $selected"
+    else
+        info "Multiple git TUIs detected: ${detected[*]}"
+        if [[ -t 0 ]]; then
+            local i=1
+            for tool in "${detected[@]}"; do
+                printf "  %d) %s\n" "$i" "$tool"
+                ((i++))
+            done
+            printf "  Select git TUI [1]: "
+            read -r choice_num
+            choice_num="${choice_num:-1}"
+            if [[ "$choice_num" =~ ^[0-9]+$ ]] && (( choice_num >= 1 && choice_num <= ${#detected[@]} )); then
+                selected="${detected[$((choice_num - 1))]}"
+            else
+                selected="${detected[0]}"
+            fi
+        else
+            # Non-interactive: prefer first detected (lazygit > gitui > tig)
+            selected="${detected[0]}"
+            info "(non-interactive: auto-selecting $selected)"
+        fi
+    fi
+
+    if [[ -n "$selected" ]]; then
+        _set_git_tui_config "$config_file" "$selected"
+        # Verify the write actually took effect — guards against silent
+        # symlink/mv/sed failures reported on some setups.
+        local after_write
+        after_write=$(grep -E '^[[:space:]]*git_tui:' "$config_file" 2>/dev/null | sed 's/.*git_tui:[[:space:]]*//' || true)
+        if [[ "$after_write" != "$selected" ]]; then
+            warn "Git TUI config write failed — expected '$selected' but got '$after_write'"
+            warn "Config file: $(readlink -f "$config_file" 2>/dev/null || echo "$config_file")"
+        else
+            success "Git TUI configured: $selected"
+        fi
+    fi
+}
+
+# --- Tmux default_session detection and configuration ---
+# Read and write through lib/tmux_bootstrap.sh — the reader `ait ide`, the TUI
+# switcher and frozen-agent restore resolve with — so setup's "configured?"
+# answer and what it writes are exactly what those paths will read (t1811). It
+# runs in an isolated `bash -c`: sourcing the lib here would pull in
+# terminal_compat.sh and redefine this script's [ait]-prefixed
+# info/warn/success/die for the rest of setup.
+_setup_tmux_bootstrap_call() {
+    bash -c 'source "$1" || exit 3; shift; "$@"' _ "$SCRIPT_DIR/lib/tmux_bootstrap.sh" "$@"
+}
+
+# _set_tmux_default_session_config <config_file> <name>
+#
+# Sets tmux.default_session to <name> only if the result reads back as <name>:
+# the edit is rendered into a scratch project and read there first, so a name no
+# YAML spelling carries (or a control character) leaves the real file untouched
+# and returns 1.
+_set_tmux_default_session_config() {
+    local config_file="$1" value="$2"
+    local literal tmproot readback rc=0
+    if ! literal=$(_setup_tmux_bootstrap_call _tmux_bootstrap_yaml_session_literal "$value"); then
+        warn "tmux session name '$value' cannot be written as a YAML value"
+        return 1
+    fi
+    tmproot=$(mktemp -d)
+    mkdir -p "$tmproot/aitasks/metadata"
+    if ! _setup_tmux_bootstrap_call _tmux_bootstrap_render_default_session "$config_file" "$literal" \
+            > "$tmproot/aitasks/metadata/project_config.yaml"; then
+        rm -rf "$tmproot"
+        warn "Could not render tmux default_session into $config_file"
+        return 1
+    fi
+    readback=$(_setup_tmux_bootstrap_call _tmux_bootstrap_default_session_raw "$tmproot" 2>/dev/null) || rc=$?
+    if [[ $rc -ne 0 || "$readback" != "$value" ]]; then
+        rm -rf "$tmproot"
+        warn "tmux session name '$value' would not read back as written; leaving project_config.yaml unchanged"
+        return 1
+    fi
+    cat "$tmproot/aitasks/metadata/project_config.yaml" > "$config_file"
+    rm -rf "$tmproot"
+}
+
+setup_tmux_default_session() {
+    local project_dir="$SCRIPT_DIR/.."
+    local config_file="$project_dir/aitasks/metadata/project_config.yaml"
+
+    if [[ ! -f "$config_file" ]]; then
+        info "No project_config.yaml found — skipping tmux default_session setup."
+        return
+    fi
+
+    # Skip if already configured. rc 2 means a value is set that the resolvers
+    # cannot read — the reader has already reported it on stderr. Leave it alone:
+    # rewriting a shape we do not parse could corrupt it (e.g. duplicate the
+    # `tmux:` block after a flow mapping). Any other failure reads as "not
+    # configured", so setup prompts — the fail-safe, idempotent direction.
+    local current rc=0
+    current=$(_setup_tmux_bootstrap_call _tmux_bootstrap_default_session_raw "$project_dir") || rc=$?
+    if [[ $rc -eq 2 ]]; then
+        warn "tmux default_session is set but not readable — leaving it untouched; edit $config_file by hand"
+        return
+    fi
+    if [[ $rc -eq 0 && -n "$current" ]]; then
+        success "tmux default_session already configured: $current"
+        return
+    fi
+
+    info "Configuring default tmux session name..."
+
+    local default_name="aitasks"
+    local session_name
+    if [[ -t 0 ]]; then
+        printf "  tmux session name [%s]: " "$default_name"
+        read -r session_name
+        session_name="${session_name:-$default_name}"
+    else
+        session_name="$default_name"
+        info "(non-interactive: using default '$session_name')"
+    fi
+
+    # tmux session names cannot contain . or :
+    if ! _setup_tmux_bootstrap_call _tmux_bootstrap_session_name_ok "$session_name"; then
+        warn "Session name contains invalid chars (. or :); falling back to '$default_name'"
+        session_name="$default_name"
+    fi
+
+    if ! _set_tmux_default_session_config "$config_file" "$session_name"; then
+        if [[ "$session_name" == "$default_name" ]]; then
+            warn "tmux default_session write failed"
+            return
+        fi
+        warn "Falling back to '$default_name'"
+        session_name="$default_name"
+        _set_tmux_default_session_config "$config_file" "$session_name" || {
+            warn "tmux default_session write failed"
+            return
+        }
+    fi
+
+    # Verify the write took effect, through the same reader the resolvers use
+    local after_write rc_after=0
+    after_write=$(_setup_tmux_bootstrap_call _tmux_bootstrap_default_session_raw "$project_dir" 2>/dev/null) || rc_after=$?
+    if [[ $rc_after -ne 0 || "$after_write" != "$session_name" ]]; then
+        warn "tmux default_session write failed — expected '$session_name' but got '$after_write'"
+    else
+        success "tmux default_session configured: $session_name"
+    fi
+}
+
+# --- Optional starter ~/.tmux.conf (opt-in, never overwrites) ---
+setup_starter_tmux_conf() {
+    # Primary path: populated by install.sh's install_seed_tmux_conf().
+    # Fallback: source-tree checkouts where seed/ is preserved.
+    local template="$SCRIPT_DIR/templates/tmux.conf"
+    if [[ ! -f "$template" ]]; then
+        template="$SCRIPT_DIR/../seed/tmux.conf"
+    fi
+
+    if [[ ! -f "$template" ]]; then
+        return
+    fi
+
+    if [[ -f "$HOME/.tmux.conf" ]]; then
+        info "tmux config already present at ~/.tmux.conf — leaving untouched."
+        return
+    fi
+    if [[ -f "$HOME/.config/tmux/tmux.conf" ]]; then
+        info "tmux config already present at ~/.config/tmux/tmux.conf — leaving untouched."
+        return
+    fi
+
+    local target=""
+    if [[ -d "$HOME/.config/tmux" ]]; then
+        target="$HOME/.config/tmux/tmux.conf"
+    else
+        target="$HOME/.tmux.conf"
+    fi
+
+    if [[ ! -t 0 ]]; then
+        return
+    fi
+
+    info "No tmux config detected at $target."
+    printf "  Install aitasks-recommended starter tmux.conf? Enables: mouse on, right-click menu, top status bar, sensible defaults. [y/N] "
+    local answer=""
+    read -r answer
+    case "${answer:-N}" in
+        [Yy]*) ;;
+        *) info "Skipped starter tmux.conf."; return ;;
+    esac
+
+    mkdir -p "$(dirname "$target")"
+    cp "$template" "$target"
+    success "Installed starter tmux.conf at $target"
+}
+
+# --- Per-user config (userconfig.yaml) ---
+setup_userconfig() {
+    local project_dir
+    project_dir="$(pwd)"
+
+    # Determine where aitasks/metadata lives
+    local metadata_dir
+    if [[ -d "$project_dir/.aitask-data/aitasks/metadata" ]]; then
+        metadata_dir="$project_dir/.aitask-data/aitasks/metadata"
+    elif [[ -d "$project_dir/aitasks/metadata" ]]; then
+        metadata_dir="$project_dir/aitasks/metadata"
+    else
+        warn "No aitasks/metadata directory found — skipping userconfig setup"
+        return
+    fi
+
+    local config_file="$metadata_dir/userconfig.yaml"
+
+    if [[ -f "$config_file" ]]; then
+        local existing_email
+        existing_email=$(grep '^email:' "$config_file" 2>/dev/null | sed 's/^email: *//')
+        success "Per-user config already exists (email: ${existing_email:-<not set>})"
+        return
+    fi
+
+    info "Setting up per-user config (userconfig.yaml)..."
+    info "This file is gitignored and stores your local identity."
+
+    # Try to get a default from git config
+    local default_email
+    default_email=$(git config user.email 2>/dev/null || echo "")
+
+    local email=""
+    if [[ -t 0 ]]; then
+        if [[ -n "$default_email" ]]; then
+            printf "  Your email [%s]: " "$default_email"
+        else
+            printf "  Your email: "
+        fi
+        read -r email
+        email="${email:-$default_email}"
+    else
+        # Non-interactive: use git config email if available
+        email="$default_email"
+        if [[ -n "$email" ]]; then
+            info "(non-interactive: using git config email: $email)"
+        else
+            info "(non-interactive: no email available, skipping userconfig)"
+            return
+        fi
+    fi
+
+    if [[ -z "$email" ]]; then
+        info "No email provided — skipping userconfig creation."
+        info "You can create it manually later: aitasks/metadata/userconfig.yaml"
+        return
+    fi
+
+    {
+        echo "# Local user configuration (gitignored, not shared)"
+        echo "email: $email"
+        echo "# TUI shortcut label mnemonic case: upper => E(X)port, preserve => E(x)port"
+        echo "shortcut_label_case: preserve"
+    } > "$config_file"
+
+    success "Created userconfig.yaml (email: $email)"
+}
+
+# --- Usage ---
+# Source: website/content/docs/commands/setup-install.md — "ait setup" section,
+# guided-setup step 7 (the three opt-in dependency tiers and their
+# remember-after-first-opt-in behavior). The setup-vs-upgrade verb split
+# ("reinstall / repair" vs "move to a newer version") is from CLAUDE.md,
+# "CLI Conventions".
+usage() {
+    cat << 'EOF'
+Usage: ait setup [OPTIONS]
+
+Install dependencies and configure the aitask framework in this project.
+Safe to re-run: setup reinstalls, repairs, and populates whatever is missing,
+preserving existing configuration. To move to a newer framework version, use
+'ait upgrade' instead.
+
+Options:
+  --with-pypy   Also install the opt-in PyPy venv that speeds up 'ait board'
+  --with-chat   Also install the opt-in chat SDK tier (discord.py, slack-bolt,
+                slack-sdk) used by 'ait chatlink'
+  --with-dev    Also install the opt-in dev/test tier (pytest, pytest-xdist),
+                which gives the Python test suite a parallel lane
+  --hooks-only  Only install / repair the Claude Code session hook, needed to
+                restore Claude Code agents frozen later; skips every other step
+  --local-engine <path>
+                Install this ait-testmap binary as the test map engine (it must
+                report exactly this framework's version) instead of downloading
+  --engine-from-source
+                If no release engine can be fetched, build one with
+                goengines/build.sh (aitasks framework checkout only; needs Go)
+  --force-engine
+                Replace an engine slot marked as a custom build (.dev)
+  --no-testmap  Skip the test map engine install entirely
+  --no-home-migration
+                Leave the legacy per-user root ~/.aitask in place
+                (also: AIT_HOME_MIGRATE=0)
+  --yes        With --hooks-only: accept the hook without a prompt, for
+                non-interactive use
+  -h, --help    Show this help message
+
+Each opt-in tier is remembered after the first opt-in: later plain 'ait setup'
+runs revalidate and repair it without re-passing the flag.
+
+The test map engine is installed to $AITASKS_HOME/engine/v<VERSION>/ (default
+~/.aitasks). AIT_TESTMAP_FETCH=0 skips the download; an explicit
+--local-engine or --engine-from-source still installs.
+
+At the end, setup moves an older per-user root (~/.aitask: venv, python, bin,
+...) into $AITASKS_HOME and leaves ~/.aitask behind as a symlink to it, so
+every existing path keeps working. A refusal changes nothing and is reported.
+
+Examples:
+  ait setup                            # Install / repair dependencies and config
+  ait setup --with-dev                 # ... plus the pytest test tier
+  ait setup --with-pypy --with-chat    # ... plus the PyPy and chat tiers
+  ait setup --local-engine ./ait-testmap   # install a locally built engine
+  ait setup --hooks-only               # Only install the Claude Code session hook
+EOF
+}
+
+# --- Main ---
+main() {
+    INSTALL_PYPY=0
+    INSTALL_CHAT=0
+    INSTALL_DEV=0
+    local hooks_only=0 assume_yes=0 no_home_migration=0
+    local args=()
+    # Test map engine flags, passed through to install_engine_binary.
+    local engine_args=() no_testmap=0 other_engine_flag=0 engine_path=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --with-pypy) INSTALL_PYPY=1; shift ;;
+            --with-chat) INSTALL_CHAT=1; shift ;;
+            --with-dev)  INSTALL_DEV=1; shift ;;
+            --hooks-only) hooks_only=1; shift ;;
+            --yes)       assume_yes=1; shift ;;
+            --no-home-migration) no_home_migration=1; shift ;;
+            --local-engine)
+                [[ $# -ge 2 && -n "$2" ]] || die "--local-engine requires a path argument"
+                # `ait` has already cd'ed to the project root: a relative path
+                # means the directory the user typed the command in.
+                engine_path="$2"
+                [[ "$engine_path" == /* ]] || engine_path="${AIT_INVOCATION_PWD:-$PWD}/$engine_path"
+                [[ -f "$engine_path" ]] || die "--local-engine: no such file: $2"
+                engine_args+=(--local-engine "$engine_path")
+                other_engine_flag=1
+                shift 2 ;;
+            --engine-from-source) engine_args+=(--engine-from-source); other_engine_flag=1; shift ;;
+            --force-engine)       engine_args+=(--force-engine); other_engine_flag=1; shift ;;
+            --no-testmap)         engine_args+=(--no-testmap); no_testmap=1; shift ;;
+            # Must exit before any setup step runs: falling through to the
+            # catch-all below made 'ait setup --help' run the full guided
+            # install — the very side effects the user was asking about.
+            -h|--help)   usage; exit 0 ;;
+            --) shift; args+=("$@"); break ;;
+            *)  args+=("$1"); shift ;;
+        esac
+    done
+    set -- "${args[@]}"
+
+    if [[ "$assume_yes" == "1" && "$hooks_only" != "1" ]]; then
+        die "--yes is only meaningful with --hooks-only"
+    fi
+    if [[ "$no_testmap" == "1" && "$other_engine_flag" == "1" ]]; then
+        die "--no-testmap cannot be combined with --local-engine, --engine-from-source or --force-engine"
+    fi
+    if [[ "$hooks_only" == "1" && ${#engine_args[@]} -gt 0 ]]; then
+        die "--hooks-only cannot be combined with the test map engine flags"
+    fi
+    if [[ "$hooks_only" == "1" ]]; then
+        local rc=0
+        setup_hooks_only "$assume_yes" || rc=$?
+        exit "$rc"
+    fi
+
+    echo ""
+    info "aitask framework setup"
+    echo ""
+
+    # Before the first side effect and the first git command: git blocks on a
+    # FIFO .gitignore, and snapshot_pre_setup_dirty below is a git walk (t2191).
+    refuse_nonregular_gitignores
+
+    detect_os
+    info "Detected OS: $OS"
+    echo ""
+
+    install_cli_tools "$OS"
+    echo ""
+
+    check_bash_version
+    echo ""
+
+    ensure_git_repo
+    echo ""
+
+    # Snapshot pre-existing dirty framework paths BEFORE any setup step
+    # writes a framework file — commit_framework_files and
+    # commit_framework_data_files subtract this baseline so foreign
+    # in-progress work is never swept into a framework commit.
+    snapshot_pre_setup_dirty
+
+    setup_data_branch
+    echo ""
+
+    setup_draft_directory
+    echo ""
+
+    setup_python_cache_gitignore
+    echo ""
+
+    setup_gate_logs_gitignore
+    echo ""
+
+    setup_testmap_gitignore
+    echo ""
+
+    setup_shadow_store_gitignore
+    echo ""
+
+    setup_scratchpad_gitignore
+    echo ""
+
+    setup_sitrep_store_gitignore
+    echo ""
+
+    setup_cache_gitignore
+    echo ""
+
+    setup_worktree_dirs_gitignore
+    echo ""
+
+    setup_id_counter
+    echo ""
+
+    setup_lock_branch
+    echo ""
+
+    ensure_project_config_defaults
+    echo ""
+
+    ensure_chatlink_config
+    echo ""
+
+    ensure_crew_runner_config
+    echo ""
+
+    ensure_agent_config_seeds
+    echo ""
+
+    # Own everything the four ensure_* passes above actually wrote — and nothing
+    # else. A no-op when they all early-exited, which is the common case.
+    commit_setup_metadata_writes
+
+    setup_git_tui
+    echo ""
+
+    setup_tmux_default_session
+    echo ""
+
+    setup_starter_tmux_conf
+    echo ""
+
+    setup_userconfig
+    echo ""
+
+    setup_python_venv
+    echo ""
+
+    # After the venv: the registry read needs PyYAML.
+    setup_artifact_fetch_exclusion
+    echo ""
+
+    # Revalidate/repair an existing PyPy venv on every `ait setup` (the
+    # `-d "$PYPY_VENV_DIR"` clause). The fresh-install TTY prompt only fires when
+    # no venv exists — prompt_install_pypy_if_tty returns 1 if the dir exists, so
+    # it is not reached when the dir clause is already true (no double prompt).
+    if [[ "$INSTALL_PYPY" == "1" ]] || [[ -d "$PYPY_VENV_DIR" ]] || prompt_install_pypy_if_tty; then
+        setup_pypy_venv
+        echo ""
+    fi
+
+    # Opt-in chat SDK tier: install on --with-chat; revalidate/repair on every
+    # setup once previously installed (mirrors the PyPy revalidation clause).
+    if [[ "$INSTALL_CHAT" == "1" ]] || chat_deps_present; then
+        setup_chat_deps
+        echo ""
+    fi
+
+    # Opt-in dev/test tier: install on --with-dev; revalidate/repair on every
+    # setup once the opt-in marker exists (mirrors the chat clause, but keyed on
+    # a persisted marker rather than an import probe — see AIT_DEV_TIER_MARKER).
+    if [[ "$INSTALL_DEV" == "1" ]] || dev_deps_present; then
+        setup_dev_deps
+        echo ""
+    fi
+
+    setup_aitasks_home
+    echo ""
+
+    install_global_shim
+    echo ""
+
+    install_engine_binary ${engine_args[@]+"${engine_args[@]}"}
+    report_testmap_state
+    ask_relations_activation
+    report_relations_state
+    echo ""
+
+    setup_code_agents
+    echo ""
+
+    setup_review_guides
+    echo ""
+
+    setup_contribution_check
+    echo ""
+
+    prune_retired_scripts "$SCRIPT_DIR/.."
+
+    # MUST stay the last step before commit_framework_files: it leaves its
+    # .gitignore rewrite for that commit, and an earlier .gitignore helper's own
+    # commit would otherwise carry it under that helper's message (t1711, t1959).
+    setup_data_gitignore_symlink_safe
+    echo ""
+
+    commit_framework_files
+    echo ""
+
+    commit_framework_data_files
+    echo ""
+
+    # Last, after every tenant writer (venv, python, uv, bin, pypy, dev tier) and
+    # every setup commit: setup never recreates a tenant it just moved, a fresh
+    # install also ends in the new layout, and a blocked rollback stops here
+    # with nothing left uncommitted (t1939).
+    local home_rc=0
+    if [[ "$no_home_migration" == "1" ]]; then
+        migrate_home_legacy --no-home-migration || home_rc=$?
+    else
+        migrate_home_legacy || home_rc=$?
+    fi
+    if (( home_rc >= 2 )); then
+        warn "Setup stopped before completion (per-user root migration, exit $home_rc)."
+        exit "$home_rc"
+    fi
+    echo ""
+
+    check_latest_version
+
+    echo ""
+    success "Setup complete!"
+    echo ""
+    info "Summary:"
+    info "  Bash: $BASH_VERSION ($(command -v bash))"
+    info "  Python venv: $VENV_DIR"
+    info "  AITASKS_HOME:$AITASKS_HOME"
+    report_home_legacy
+    if [[ -x "$VENV_DIR/bin/python" ]]; then
+        info "  Python: $("$VENV_DIR/bin/python" -c 'import sys; print("{}.{}.{}".format(*sys.version_info[:3]))' 2>/dev/null || echo unknown)"
+    fi
+    if [[ -d "$PYPY_VENV_DIR" ]]; then
+        info "  PyPy venv: $PYPY_VENV_DIR"
+    fi
+    info "  Global shim: $SHIM_DIR/ait"
+    if [[ -f "$VERSION_FILE" ]]; then
+        info "  Version: $(cat "$VERSION_FILE")"
+    fi
+    echo ""
+}
+
+# Allow sourcing for testing without running main
+[[ "${1:-}" == "--source-only" ]] && return 0 2>/dev/null || true
+
+main "$@"

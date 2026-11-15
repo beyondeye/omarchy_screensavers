@@ -1,0 +1,6067 @@
+"""Brainstorm TUI: interactive design space exploration with Textual."""
+
+from __future__ import annotations
+
+# Allow importing sibling packages (brainstorm, agentcrew, lib)
+import os
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lib"))
+
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+from tui_switcher import TuiSwitcherMixin
+from shortcuts_mixin import ShortcutsMixin
+from keybinding_registry import resolve_key
+from textual.app import (
+    App,
+    ComposeResult,
+)
+from textual.binding import Binding
+from textual.containers import (
+    Container,
+    Horizontal,
+    VerticalScroll,
+)
+from textual.screen import ModalScreen
+from textual.widgets import (
+    Button,
+    Checkbox,
+    ContentSwitcher,
+    Footer,
+    Header,
+    Input,
+    Label,
+    RadioButton,
+    RadioSet,
+    Static,
+    Tabs,
+    TabbedContent,
+    TabPane,
+    TextArea,
+)
+from textual import (
+    on,
+    work,
+)
+from brainstorm.brainstorm_dag import (
+    UMBRELLA_SUBGRAPH,
+    _node_module,
+    _read_graph_state,
+    delete_node_cascade,
+    get_active_dimensions,
+    get_head,
+    is_ancestor_subgraph,
+    is_root_node,
+    list_nodes,
+    list_subgraphs,
+    node_descendants_closure,
+    read_node,
+    read_proposal,
+    set_head,
+)
+from brainstorm.brainstorm_schemas import (
+    DIMENSION_PREFIXES,
+    PREFIX_TO_LABEL,
+    extract_dimensions,
+    group_dimensions_by_prefix,
+)
+from brainstorm.brainstorm_sections import (
+    best_section_for_dimension,
+    get_sections_for_dimension,
+    parse_sections,
+)
+from brainstorm.brainstorm_dag_display import (
+    DAGDisplay,
+    MODULE_STATUS_STYLES,
+    UNKNOWN_STATUS_STYLE,
+)
+from brainstorm.brainstorm_status import module_status_rows
+from brainstorm.polling_indicator import PollingIndicator
+from brainstorm.nav_mixin import RowNavMixin
+from brainstorm.brainstorm_session import (
+    _module_deferred_map,
+    _read_browse_view,
+    _write_browse_view,
+    _write_module_deferred,
+    archive_session,
+    crew_worktree,
+    finalize_session,
+    GROUPS_FILE,
+    load_session,
+    ModuleDecomposePartialFailure,
+    PrunePartialFailure,
+    rank_dimensions,
+    record_operation,
+    run_module_decompose_from_sections,
+    run_prune_operation,
+    save_session,
+    session_exists,
+)
+from brainstorm.brainstorm_crew import (
+    register_comparator,
+    register_explorer,
+    register_module_decomposer,
+    register_module_merger,
+    register_module_syncer,
+    register_synthesizer,
+)
+from agent_command_screen import AgentCommandScreen, resolve_skill_profile
+from agent_launch_utils import (
+    TmuxLaunchConfig,
+    find_terminal,
+    is_tmux_available,
+    launch_in_tmux,
+    maybe_spawn_minimonitor,
+    resolve_agent_string,
+    resolve_dry_run_command,
+    spawn_in_terminal,
+)
+from codebrowser.agent_utils import resolve_agent_binary
+from guarded_dismiss import GuardedModalScreen
+from launch_modes import DEFAULT_LAUNCH_MODE, VALID_LAUNCH_MODES
+from agentcrew.agentcrew_utils import (
+    crew_git_timeout,
+    git_cmd,
+    list_agent_files,
+    format_elapsed,
+    read_yaml,
+)
+from agentcrew.agentcrew_log_utils import list_agent_logs
+from agentcrew.agentcrew_runner_control import (
+    get_runner_info,
+    hard_kill_agent,
+    send_agent_command,
+    start_runner,
+    stop_runner,
+)
+from agentcrew.agentcrew_process_stats import (
+    get_all_agent_processes,
+    get_runner_process_info,
+    sync_stale_processes,
+)
+from agentcrew.agentcrew_utils import update_yaml_field
+
+# t1048: re-exports — preserve the external import surface (tests import these
+# names from brainstorm_app). Do not remove.
+from brainstorm.styles import APP_CSS  # noqa: F401
+from brainstorm.constants import (  # noqa: F401
+    AGENT_STATUS_COLORS,
+    AIT_PATH,
+    BROWSE_DEFAULT_VIEW,
+    BROWSE_PANE_TO_VIEW,
+    BROWSE_VIEWS,
+    BROWSE_VIEW_TO_PANE,
+    NODE_HUB_COMPARE,
+    NODE_HUB_OPERATIONS,
+    NodeHubResult,
+    RUNNER_STATE_DISPLAY,
+    STATUS_COLORS,
+    _DESIGN_OPS,
+    _MODULE_OPS,
+    _MULTI_NODE_OPS,
+    _MULTI_NODE_REASON,
+    _NODE_SELECT_OPS,
+    _NODE_SELECT_STEP_OPS,
+    _OPERATION_HELP,
+    _OP_LABELS,
+    _ROOT_DELETE_REASON,
+    _SESSION_OPS,
+    _SINGLE_NODE_OPS,
+    _SINGLE_NODE_REASON,
+    _SUBGRAPH_SELECT_OPS,
+    _TERMINAL_AGENT_STATES,
+    _WIZARD_OP_TO_AGENT_TYPE,
+    _WIZARD_STEPS,
+    _WIZARD_STEPS_BY_ID,
+    _WizardStep,
+)
+from brainstorm.utils import (  # noqa: F401
+    NodeSelection,
+    _STALE_CREW_BRANCH_RE,
+    _brainstorm_launch_mode_default,
+    _export_filename,
+    _filter_labels,
+    _format_progress_bar,
+    _next_checkbox_index,
+    _nodes_for_subgraph,
+    _open_node_detail_visible,
+    _parse_dimension_label,
+    _parse_prune_label,
+    _parse_section_label,
+    _read_groups,
+    _sections_intersection,
+    _validate_export_dir,
+    _write_node_exports,
+    active_step_ids,
+    browse_toggle_view,
+    compare_matrix_rows,
+    derive_runner_state,
+    detect_stale_crew_branch,
+    format_node_id_summary,
+    format_status_strip,
+    next_step_id,
+    op_states_for_selection,
+    prev_step_id,
+    step_position,
+)
+from brainstorm.widgets import (  # noqa: F401
+    AgentStatusRow,
+    CycleField,
+    DimensionRow,
+    FuzzyCheckList,
+    GroupRow,
+    NodeDetailPanel,
+    NodeRow,
+    OperationRow,
+    ProcessRow,
+    ProposalPreviewPane,
+    StatusLogRow,
+    _NumberedProposal,
+    _PreviewMinimap,
+    render_node_detail_widgets,
+)
+from brainstorm.modals import (  # noqa: F401
+    AgentModeEditModal,
+    CleanupAgentModal,
+    CompareMatrixModal,
+    DeleteNodeModal,
+    DeleteSessionModal,
+    ExportNodeDetailModal,
+    ImportProposalFilePicker,
+    InitFailureModal,
+    InitSessionModal,
+    LogDetailModal,
+    ModulePreviewScreen,
+    NodeActionSelectModal,
+    NodeDetailModal,
+    NodeHub,
+    OperationDetailScreen,
+    OperationHelpModal,
+    _MarkdownOnlyDirectoryTree,
+)
+
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+# Repo root that owns this .aitask-scripts/ — the cwd for the Discuss agent
+# launch (t1823_4). AIT_PATH is <root>/ait.
+_REPO_ROOT = Path(AIT_PATH).parent
+
+
+
+
+# Runner-state → (label, color) for the Running tab header and the always-on
+# runtime strip (t983_9). Single source of truth so the tab and the strip never
+# drift; the derivation below is pure so it is unit-tested without a live App
+# (tests/test_brainstorm_header_strip.py).
+
+
+
+
+
+
+# Agent states a Running-tab row can be cleaned up / retried from (t983_9 / t535).
+
+# Ops that get a source-node-select step. module_decompose picks a source node
+# too, but — unlike the ops above — must NOT trigger the section_select step
+# (which stays gated on the narrower _NODE_SELECT_OPS).
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# Flat op_key -> (label, brief description) map built from both op lists.
+# Used by _mount_op_context_header to remind the user which operation the
+# wizard is configuring on Step 2 onwards.
+
+
+# Help text condensed from the agent prompt templates in
+# .aitask-scripts/brainstorm/templates/*.md (one prompt per design op) and
+# from the session lifecycle status machine in brainstorm_session.py.
+# When those sources change, update the per-entry source comments below
+# AND the corresponding "summary"/"reads_from_parent"/"produces" fields.
+# Surfaced inline on Step 2+ (one-line header via _mount_op_context_header)
+# and via the op-help shortcut on every wizard step (OperationHelpModal).
+
+
+# ---------------------------------------------------------------------------
+# Modal Screens
+# ---------------------------------------------------------------------------
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# Node Hub dismiss protocol (t983_5). The Hub dismisses with None (closed) or a
+# NodeHubResult carrying one of the NODE_HUB_* action verbs. Adding a launch
+# surface = add a verb here + a branch in BrainstormApp._on_node_hub_result.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ---------------------------------------------------------------------------
+# Wizard step model (pure, App-independent — see tests/test_brainstorm_wizard_steps.py)
+#
+# The Actions-tab wizard is an ordered table of steps; which steps are *active*
+# for a given flow is decided by per-step predicates over a small context dict
+# (`{"op": <op>, "node_has_sections": <bool>}`). Back/Next/Esc navigation and
+# the "Step X of Y" indicator are derived from the active list, so adding an
+# optional step is "add one row + predicate" — no integer renumbering. A future
+# module subgraph-selector slots in as one more row (see commented entry).
+# ---------------------------------------------------------------------------
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ---------------------------------------------------------------------------
+# Node selection model (t983_2)
+#
+# Pure, headless model backing the Browse-tab selection (parent t983 IA
+# redesign). Like the wizard step model above, it reads/writes only its own
+# state — no Textual import, no session-file I/O — so it is exhaustively
+# unit-testable without a running App (see tests/test_brainstorm_node_selection.py).
+# Wired into the Browse UI by t983_3; since t1003 it is the sole Browse cursor
+# (the legacy single-selection focused-node field was retired).
+# ---------------------------------------------------------------------------
+
+
+
+
+# ---------------------------------------------------------------------------
+# Browse view-state helper (t983_3)
+#
+# Pure, headless model for the Browse tab's graph⇄list toggle (parent t983 IA
+# redesign). Mirrors the wizard step / NodeSelection models: no Textual import,
+# no session-file I/O — the App owns the ContentSwitcher and persistence
+# (brainstorm_session._read_browse_view / _write_browse_view). Graph is the
+# default; the toggle persists per session.
+# ---------------------------------------------------------------------------
+
+# Map a logical view to the id of the ContentSwitcher child that renders it.
+
+
+
+
+# ---------------------------------------------------------------------------
+# Operations-dialog op-relevance model (t983_4)
+#
+# Pure, headless decision for which node operations are enabled for the current
+# selection, greyed by *cardinality* (t983_2 NodeSelection). Mirrors the wizard
+# step / NodeSelection / browse-view models: no Textual import, no session I/O.
+# The App wrapper (_node_action_op_states) gathers node_ctx via session reads
+# and calls this; the Operations dialog (NodeActionSelectModal) renders the
+# result via the existing op_states + OperationRow disabled-with-reason path.
+# ---------------------------------------------------------------------------
+
+# Ops acting on ONE node — greyed when more than one node is selected.
+# Module ops are single-node too, but ALSO carry their own subgraph
+# preconditions (computed into node_ctx by the wrapper from the primary node).
+# Ops needing 2+ nodes — greyed when fewer than two are selected.
+
+
+
+
+
+
+
+
+
+# ---------------------------------------------------------------------------
+# Dashboard Widgets
+# ---------------------------------------------------------------------------
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ---------------------------------------------------------------------------
+# Main App
+# ---------------------------------------------------------------------------
+
+
+class ActionsWizardScreen(RowNavMixin, GuardedModalScreen):
+    """Contextual multi-step design-op wizard, re-hosted out of the former
+    Actions tab into a modal overlay (t983_11).
+
+    Pushed by ``BrainstormApp._on_node_action_result`` on ``A``/Enter, seeded
+    from the contextual Browse selection. Launching an op dismisses with a
+    result dict ``{op, config, subgraph}`` that ``BrainstormApp._execute_design_op``
+    runs in a worker; cancel/Esc dismisses with ``None``. The disk-readers
+    (``_node_*``) and the op executor stay on ``BrainstormApp`` and are reached
+    via ``self.app``.
+    """
+
+    BINDINGS = [
+        Binding("escape", "close", "Close", show=False),
+        Binding("H", "op_help", "Op help", show=False),
+        # t1047: the preview toggles are now plain single keys, shown in the
+        # footer. They are context-scoped via ``check_action`` to the preview
+        # config step AND to when the proposal/minimap is focused — so the
+        # focused Mandate TextArea still receives ``w``/``l`` as text (you Tab to
+        # the proposal to toggle). This replaces the t1018_1 ``alt+`` chords,
+        # which existed only to dodge that TextArea-swallowing problem.
+        Binding("w", "cycle_preview_ratio", "Preview width", show=True),
+        Binding("l", "toggle_preview_numbered", "Line numbers", show=True),
+    ]
+
+    # Shortcut-resolution scope (mirrors BrainstormApp) so resolve_key works for
+    # the help-key hint rendered in the wizard (t983_11).
+    _shortcuts_scope = "brainstorm"
+
+    def __init__(self, *, op_key: str, node_id: str = "", marked=None) -> None:
+        super().__init__()
+        self._seed_op = op_key
+        self._seed_node = node_id
+        self._seed_marked = list(marked or [])
+        # Wizard UI state (owned by the screen; moved from BrainstormApp.__init__).
+        self._wizard_step: int = 0
+        self._wizard_total_steps: int = 1
+        self._wizard_step_id: str = ""
+        self._wizard_op: str = ""
+        self._wizard_has_sections: bool = False
+        self._wizard_config: dict = {}
+        self._wizard_subgraph_count: int = 1
+        self._wizard_subgraph: str = UMBRELLA_SUBGRAPH
+        self._wizard_fast_track: bool = False
+        self._cmp_section_checks: dict = {}
+        self._cmp_dim_checks: dict = {}
+        # Prune-dimensions config state (t1983). ``_prune_mode`` /
+        # ``_prune_applied_n`` are the last *applied* values: the change
+        # handlers compare against them, so the Changed events Textual posts
+        # while mounting restored values are no-ops.
+        self._prune_source: str = ""
+        self._prune_dims: dict = {}
+        self._prune_ranked: list[str] = []
+        self._prune_mode: str = "top_n"
+        self._prune_applied_n: int = 0
+        self._prune_initial_kept: set[str] = set()
+
+    def compose(self) -> ComposeResult:
+        with Container(id="actions_wizard_dialog"):
+            yield VerticalScroll(id="actions_content")
+            yield Footer()
+
+    def on_mount(self) -> None:
+        """Reproduce the per-op seeding/routing formerly in _on_node_action_result."""
+        op_key = self._seed_op
+        node_id = self._seed_node
+        if op_key == "fast_track":
+            self._wizard_op = "module_decompose"
+            self._set_total_steps()
+            self._wizard_fast_track = True
+            self._wizard_subgraph = _node_module(self.app.session_path, node_id)
+            self._wizard_config = {"pre_seeded_node": True}
+            self._actions_show_config()
+        elif op_key in ("module_decompose", "module_merge", "module_sync"):
+            self._wizard_op = op_key
+            self._set_total_steps()
+            self._wizard_subgraph = _node_module(self.app.session_path, node_id)
+            self._wizard_config = {"pre_seeded_node": True}
+            self._actions_show_config()
+        elif op_key == "prune_dimensions":
+            # Single-node op on the contextual node; no section-select step.
+            self._wizard_op = op_key
+            self._set_total_steps()
+            self._wizard_subgraph = _node_module(self.app.session_path, node_id)
+            self._wizard_config = {
+                "_selected_node": node_id, "pre_seeded_node": True,
+            }
+            self._actions_show_config()
+        elif op_key in ("compare", "synthesize"):
+            self._wizard_op = op_key
+            self._set_total_steps()
+            self._wizard_config = {}
+            self._actions_show_config()
+            marked = sorted(self._seed_marked)
+            if len(marked) >= 2:
+                self.call_after_refresh(
+                    lambda op=op_key, m=marked: (
+                        self._preseed_multi_node_checklist(op, m)
+                    )
+                )
+        else:
+            # explore: seed the contextual node and skip the node-select step.
+            self._wizard_op = op_key
+            self._set_total_steps()
+            self._wizard_config = {
+                "_selected_node": node_id, "pre_seeded_node": True,
+            }
+            self._actions_advance_from_node_select(node_id)
+
+    def action_close(self) -> None:
+        self.dismiss(None)
+
+    def action_op_help(self) -> None:
+        from textual.actions import SkipAction
+        if self._wizard_step < 1:
+            raise SkipAction
+        if self._wizard_step_id == "op_select":
+            focused = self.focused
+            if not isinstance(focused, OperationRow):
+                raise SkipAction
+            op_key = focused.op_key
+        else:
+            op_key = self._wizard_op
+        if not op_key or op_key not in _OPERATION_HELP:
+            raise SkipAction
+        self.app.push_screen(OperationHelpModal(op_key))
+
+    def on_key(self, event) -> None:
+        """Wizard navigation (relocated from BrainstormApp.on_key, t983_11).
+
+        A ModalScreen consumes keys, so the wizard nav that used to live in the
+        App's on_key (gated on tab_actions) now runs here unconditionally."""
+        if self._wizard_step < 1:
+            return
+        # Esc: step back, or close the wizard on the first step.
+        if event.key == "escape":
+            if self._wizard_step > 1:
+                prev = prev_step_id(self._wizard_ctx(), self._wizard_step_id)
+                if prev is not None:
+                    self._render_wizard_step(prev)
+            else:
+                self.dismiss(None)
+            event.prevent_default()
+            event.stop()
+            return
+        # t945 preview focus ring (Tab/Shift+Tab on the explore config step).
+        if event.key in ("tab", "shift+tab"):
+            if self._cycle_preview_focus(forward=event.key == "tab"):
+                event.prevent_default()
+                event.stop()
+                return
+        # Enter on op-select: choose operation (design-ops-only; t983_8).
+        if event.key == "enter" and self._wizard_step_id == "op_select":
+            focused = self.focused
+            if isinstance(focused, OperationRow) and not focused.op_disabled:
+                self._wizard_op = focused.op_key
+                self._set_total_steps()
+                self._actions_show_step2()
+                event.prevent_default()
+                event.stop()
+                return
+        # Enter on subgraph-select: choose subgraph and advance
+        if event.key == "enter" and self._wizard_step_id == "subgraph_select":
+            focused = self.focused
+            if isinstance(focused, OperationRow) and not focused.op_disabled:
+                self._wizard_subgraph = focused.op_key
+                nxt = next_step_id(self._wizard_ctx(), "subgraph_select")
+                if nxt is not None:
+                    self._render_wizard_step(nxt)
+                event.prevent_default()
+                event.stop()
+                return
+        # Enter on node-select: select node and advance
+        if event.key == "enter" and self._wizard_step_id == "node_select":
+            focused = self.focused
+            if isinstance(focused, OperationRow) and not focused.op_disabled:
+                if self._wizard_op in _NODE_SELECT_STEP_OPS:
+                    self._wizard_config["_selected_node"] = focused.op_key
+                    self._actions_advance_from_node_select(focused.op_key)
+                    event.prevent_default()
+                    event.stop()
+                    return
+        # Compare/Synthesize config step: Tab cycles whole control groups
+        if (
+            event.key in ("tab", "shift+tab")
+            and self._wizard_step_id == "config"
+            and self._wizard_op in ("compare", "synthesize", "prune_dimensions")
+        ):
+            if self._cycle_wizard_groups(-1 if event.key == "shift+tab" else 1):
+                event.prevent_default()
+                event.stop()
+                return
+        # Compare config step: up/down within the section-checkbox group
+        if (
+            event.key in ("up", "down")
+            and self._wizard_step_id == "config"
+            and self._wizard_op == "compare"
+            and isinstance(self.focused, Checkbox)
+            and "chk_section" in self.focused.classes
+        ):
+            if self._navigate_rows(
+                1 if event.key == "down" else -1,
+                "cmp_sections_box", (Checkbox,),
+            ):
+                event.prevent_default()
+                event.stop()
+                return
+        # Section-select step: up/down navigate the section checkboxes (t1047).
+        # They are direct children of #actions_content; reuse the shared helper.
+        if (
+            event.key in ("up", "down")
+            and self._wizard_step_id == "section_select"
+            and isinstance(self.focused, Checkbox)
+            and "chk_section" in self.focused.classes
+        ):
+            if self._navigate_rows(
+                1 if event.key == "down" else -1,
+                "actions_content", (Checkbox,),
+            ):
+                event.prevent_default()
+                event.stop()
+                return
+        # Up/down: navigate OperationRow widgets in the row-select steps
+        if event.key in ("up", "down") and self._wizard_step_id in (
+            "op_select", "subgraph_select", "node_select",
+        ):
+            direction = 1 if event.key == "down" else -1
+            if self._navigate_rows(direction, "actions_content", (OperationRow,)):
+                event.prevent_default()
+                event.stop()
+                return
+        # Up/down: cycle focus among focusable widgets on the confirm step
+        if event.key in ("up", "down") and self._wizard_step_id == "confirm":
+            if self._cycle_confirm_focus(1 if event.key == "down" else -1):
+                event.prevent_default()
+                event.stop()
+                return
+
+    @on(Button.Pressed, ".btn_actions_launch")
+    def _on_actions_launch(self) -> None:
+        """Launch the configured op: collect launch-mode, then dismiss with a
+        result dict the App executes. Session ops left the wizard (t983_8)."""
+        try:
+            field = self.query_one("#launch-mode-field", CycleField)
+            self._wizard_config["launch_mode"] = field.current_value
+        except Exception:
+            self._wizard_config["launch_mode"] = DEFAULT_LAUNCH_MODE
+        self.dismiss({
+            "op": self._wizard_op,
+            "config": dict(self._wizard_config),
+            "subgraph": self._wizard_subgraph,
+        })
+
+    def on_operation_row_activated(self, event: OperationRow.Activated) -> None:
+        """Mouse-click activation on a wizard OperationRow (design-ops-only)."""
+        row = event.row
+        if self._wizard_step_id == "op_select":
+            self._wizard_op = row.op_key
+            self._set_total_steps()
+            self._actions_show_step2()
+        elif self._wizard_step_id == "subgraph_select":
+            self._wizard_subgraph = row.op_key
+            nxt = next_step_id(self._wizard_ctx(), "subgraph_select")
+            if nxt is not None:
+                self._render_wizard_step(nxt)
+        elif (
+            self._wizard_step_id == "node_select"
+            and self._wizard_op in _NODE_SELECT_STEP_OPS
+        ):
+            self._wizard_config["_selected_node"] = row.op_key
+            container = self.query_one("#actions_content", VerticalScroll)
+            for op_row in container.query(OperationRow):
+                op_row.selected = (op_row.op_key == row.op_key)
+            try:
+                self.query_one(".btn_actions_next", Button).disabled = False
+            except Exception:
+                pass
+
+    def on_descendant_focus(self, event) -> None:
+        """Track wizard node selection: focusing an OperationRow on the
+        node-select step seeds _selected_node and enables Next (moved from
+        BrainstormApp.on_descendant_focus, t983_11)."""
+        # Focus moving into/out of the preview pane flips the preview-toggle
+        # check_action verdict — refresh so the footer shows/hides w/l (t1047).
+        self.refresh_bindings()
+        if (
+            isinstance(event.widget, OperationRow)
+            and self._wizard_step_id == "node_select"
+            and self._wizard_op in _NODE_SELECT_STEP_OPS
+        ):
+            self._wizard_config["_selected_node"] = event.widget.op_key
+            container = self.query_one("#actions_content", VerticalScroll)
+            for row in container.query(OperationRow):
+                row.selected = (row.op_key == event.widget.op_key)
+            try:
+                self.query_one(".btn_actions_next", Button).disabled = False
+            except Exception:
+                pass
+
+    # _navigate_rows / _focus_within now live on RowNavMixin (t1047); the
+    # tab-bar boundary is the inherited default (None → stop at top).
+
+    def _cycle_confirm_focus(self, direction: int) -> bool:
+        """Cycle focus among focusable descendants of the confirm step container.
+
+        direction: +1 down, -1 up. Returns True if focus moved.
+        """
+        try:
+            container = self.query_one("#actions_content", VerticalScroll)
+        except Exception:
+            return False
+
+        focusable = [
+            w for w in container.query("*")
+            if getattr(w, "can_focus", False) and not getattr(w, "disabled", False)
+        ]
+        if not focusable:
+            return False
+
+        current = self.focused
+        if current in focusable:
+            idx = focusable.index(current)
+            new_idx = (idx + direction) % len(focusable)
+        else:
+            new_idx = 0 if direction == 1 else len(focusable) - 1
+
+        focusable[new_idx].focus()
+        try:
+            focusable[new_idx].scroll_visible()
+        except Exception:
+            pass
+        return True
+
+    def _cycle_wizard_groups(self, direction: int) -> bool:
+        """Tab/Shift+Tab cycle focus between whole control groups on the
+        Compare/Synthesize config step.
+
+        Each group exposes one "entry widget" (the filter box of a
+        FuzzyCheckList, the first section checkbox, the merge-rules TextArea,
+        or the Next button) plus a "membership" widget used to detect which
+        group currently holds focus. Returns True if handled.
+        """
+        try:
+            container = self.query_one("#actions_content", VerticalScroll)
+        except Exception:
+            return False
+
+        def _fcl_group(fcl_id):
+            try:
+                fcl = container.query_one(f"#{fcl_id}", FuzzyCheckList)
+                return (fcl.query_one(Input), fcl)
+            except Exception:
+                return None
+
+        # (entry_widget, membership_widget) pairs, in Tab order.
+        groups: list[tuple] = []
+        if self._wizard_op == "synthesize":
+            node_grp = _fcl_group("syn_nodes")
+            if node_grp:
+                groups.append(node_grp)
+            try:
+                ta = container.query_one(TextArea)
+                groups.append((ta, ta))
+            except Exception:
+                pass
+        elif self._wizard_op == "prune_dimensions":
+            for sel in (".rs_prune_mode", "#prune_top_n"):
+                try:
+                    w = container.query_one(sel)
+                    groups.append((w, w))
+                except Exception:
+                    pass
+            dim_grp = _fcl_group("prune_dims")
+            if dim_grp:
+                groups.append(dim_grp)
+        elif self._wizard_op == "compare":
+            node_grp = _fcl_group("cmp_nodes")
+            if node_grp:
+                groups.append(node_grp)
+            dim_grp = _fcl_group("cmp_dims")
+            if dim_grp:
+                groups.append(dim_grp)
+            try:
+                box = container.query_one("#cmp_sections_box", Container)
+                secs = list(box.query("Checkbox.chk_section"))
+                if secs:
+                    groups.append((secs[0], box))
+            except Exception:
+                pass
+        try:
+            btn = container.query_one(".btn_actions_next", Button)
+            groups.append((btn, btn))
+        except Exception:
+            pass
+
+        if not groups:
+            return False
+
+        current = None
+        for i, (_entry, member) in enumerate(groups):
+            if self._focus_within(member):
+                current = i
+                break
+
+        if current is None:
+            new_idx = 0 if direction == 1 else len(groups) - 1
+        else:
+            new_idx = (current + direction) % len(groups)
+
+        entry = groups[new_idx][0]
+        entry.focus()
+        try:
+            entry.scroll_visible()
+        except Exception:
+            pass
+        return True
+
+    def _actions_show_step1(self) -> None:
+        """Render Step 1: operation selection list."""
+        self._wizard_op = ""
+        self._wizard_config = {}
+        self._wizard_has_sections = False
+        self._cmp_section_checks = {}
+        # Refresh the cached subgraph count for the selector predicate (one
+        # disk read per wizard entry; _wizard_ctx then stays I/O-free).
+        self._wizard_subgraph_count = len(list_subgraphs(self.app.session_path))
+        self._wizard_subgraph = UMBRELLA_SUBGRAPH
+        self._enter_wizard_step("op_select")
+
+        container = self.query_one("#actions_content", VerticalScroll)
+        container.remove_children()
+
+        if self.app.read_only:
+            container.mount(Label("[italic]Session is read-only. No operations available.[/]"))
+            return
+
+        container.mount(Label("Step 1 \u2014 Select Operation  (\u2191\u2193 Navigate  Enter Select  ? Help)", classes="actions_step_indicator"))
+
+        status = self.app.session_data.get("status", "")
+
+        # Design operations. Session-lifecycle ops moved to the dedicated
+        # Session tab (t983_8) — the wizard op list is design-ops-only now.
+        container.mount(Label("Design Operations", classes="actions_section_title"))
+        design_disabled = status not in ("init", "active")
+        for op_key, label, desc in _DESIGN_OPS:
+            container.mount(OperationRow(op_key, label, desc, disabled=design_disabled))
+
+        # Recent operations history
+        self._mount_recent_ops(container)
+
+        # Focus first enabled operation after widgets are rendered
+        self.call_after_refresh(self._focus_first_operation)
+
+    def _focus_first_operation(self) -> None:
+        """Focus the first enabled OperationRow in the actions tab."""
+        try:
+            # Scope to the actions container — the Session tab also hosts
+            # OperationRows (t983_8), so an app-wide query could grab those.
+            rows = self.query_one("#actions_content", VerticalScroll).query(OperationRow)
+            for row in rows:
+                if not row.op_disabled:
+                    row.focus()
+                    break
+        except Exception:
+            pass
+
+    def _focus_operation_row(self, op_key: str) -> None:
+        """Focus the OperationRow matching ``op_key`` (fallback: first enabled).
+
+        Used to pre-highlight a default choice (e.g. HEAD on the decompose
+        source-node step); focusing the row drives ``on_descendant_focus`` to
+        seed ``_selected_node`` and enable Next.
+        """
+        try:
+            rows = list(self.query("OperationRow"))
+            for row in rows:
+                if row.op_key == op_key and not row.op_disabled:
+                    row.focus()
+                    return
+            for row in rows:
+                if not row.op_disabled:
+                    row.focus()
+                    return
+        except Exception:
+            pass
+
+    def _mount_op_context_header(self, container: VerticalScroll) -> None:
+        """Mount a one-line dim header showing op name + brief desc.
+
+        Called from step 2 onwards so the user remembers which operation
+        they're configuring. Full description stays in OperationHelpModal,
+        reachable via the op-help shortcut.
+        """
+        info = _OP_LABELS.get(self._wizard_op)
+        if not info:
+            return
+        label_text, desc = info
+        help_key = resolve_key(self._shortcuts_scope, "op_help", "H") or "H"
+        container.mount(
+            Label(
+                f"[dim]{label_text} — {desc}  ({help_key} for details)[/dim]",
+                classes="actions_op_context",
+            )
+        )
+
+    def _mount_recent_ops(self, container: VerticalScroll) -> None:
+        """Append recent operation history from br_groups.yaml."""
+        groups_path = self.app.session_path / GROUPS_FILE
+        if not groups_path.is_file():
+            return
+        try:
+            groups_data = read_yaml(str(groups_path))
+        except Exception:
+            return
+        groups = groups_data.get("groups", {}) if groups_data else {}
+        if not groups:
+            return
+        container.mount(Label("Recent Operations", classes="actions_section_title"))
+        for name in list(groups.keys())[-5:]:
+            info = groups[name] if isinstance(groups[name], dict) else {}
+            op = info.get("operation", "?")
+            gstatus = info.get("status", "?")
+            created = info.get("created_at", "")
+            container.mount(Label(f"  [dim]{name}[/]  {op}  [{gstatus}]  {created}"))
+
+    def _set_total_steps(self) -> None:
+        """Reset per-op wizard flags when an operation is chosen.
+
+        The step count is now derived from the active step set (see
+        ``step_position``), so this only resets the section cache that the
+        predicates read. Kept as a named hook because op-select call-sites
+        invoke it right after setting ``_wizard_op``.
+        """
+        self._wizard_has_sections = False
+        self._cmp_section_checks = {}
+        self._wizard_subgraph = UMBRELLA_SUBGRAPH
+        # Clear the fast-track preset arm whenever a new op is selected; the
+        # fast-track branch re-arms it after calling this. Keeps the preset's
+        # link-to-task pre-check from bleeding into a later normal decompose.
+        self._wizard_fast_track = False
+
+    def _wizard_ctx(self) -> dict:
+        """Context dict consumed by the pure step resolver (no I/O)."""
+        return {
+            "op": self._wizard_op,
+            "node_has_sections": self._wizard_has_sections,
+            "subgraph_count": self._wizard_subgraph_count,
+            # Set by the contextual launch path (t983_6) to drop the node_select
+            # step when the node/marked-set is already known.
+            "pre_seeded_node": bool(self._wizard_config.get("pre_seeded_node")),
+        }
+
+    def _enter_wizard_step(self, step_id: str) -> None:
+        """Mark the current wizard step and derive its 'Step X of Y' numbers."""
+        self._wizard_step_id = step_id
+        self._wizard_step, self._wizard_total_steps = step_position(
+            self._wizard_ctx(), step_id
+        )
+
+    def _render_wizard_step(self, step_id: str) -> None:
+        """Render the wizard step with id ``step_id`` (back/next dispatch target)."""
+        renderers = {
+            "op_select": self._actions_show_step1,
+            "subgraph_select": self._actions_show_subgraph_select,
+            "node_select": self._actions_show_node_select,
+            "section_select": self._actions_show_section_select,
+            "config": self._actions_show_config,
+            "confirm": self._actions_show_confirm,
+        }
+        renderer = renderers.get(step_id)
+        if renderer is not None:
+            renderer()
+
+    def _actions_show_step2(self) -> None:
+        """Render the step after op-select (resolver-driven).
+
+        Routes to subgraph-select (multi-subgraph node-select ops), node-select
+        (single-subgraph node-select ops), or config (compare/synthesize),
+        whichever the active step set says comes next after op_select.
+        """
+        nxt = next_step_id(self._wizard_ctx(), "op_select")
+        if nxt is not None:
+            self._render_wizard_step(nxt)
+
+    def _actions_show_subgraph_select(self) -> None:
+        """Optional step: choose which module subgraph the op runs inside.
+
+        Only rendered for subgraph-scoped ops in a 2+ subgraph session (see the
+        ``subgraph_select`` predicate). Defaults the highlighted choice to the
+        most-recently-touched subgraph. Mirrors op-select: Enter/click advances
+        immediately (no Next button).
+        """
+        self._enter_wizard_step("subgraph_select")
+
+        container = self.query_one("#actions_content", VerticalScroll)
+        container.remove_children()
+
+        container.mount(
+            Label(
+                f"Step {self._wizard_step} of {self._wizard_total_steps} "
+                "— Select Subgraph  (↑↓ Navigate  Enter Select  Esc: Back)",
+                classes="actions_step_indicator",
+            )
+        )
+        self._mount_op_context_header(container)
+
+        subgraphs = list_subgraphs(self.app.session_path)
+        # Default selection = most-recently-touched subgraph (first in the list).
+        if self._wizard_op == "module_merge":
+            self._wizard_subgraph = next(
+                (m for m in subgraphs if m != UMBRELLA_SUBGRAPH),
+                UMBRELLA_SUBGRAPH,
+            )
+        else:
+            self._wizard_subgraph = subgraphs[0] if subgraphs else UMBRELLA_SUBGRAPH
+        for module in subgraphs:
+            head = get_head(self.app.session_path, module=module)
+            head_str = head or "(empty)"
+            disabled = self._wizard_op == "module_merge" and module == UMBRELLA_SUBGRAPH
+            container.mount(
+                OperationRow(module, module, f"HEAD: {head_str}", disabled=disabled)
+            )
+        self.call_after_refresh(self._focus_first_operation)
+
+    def _actions_show_node_select(self) -> None:
+        """Step 2: dedicated node selection for explore."""
+        self._wizard_config = {}
+        self._enter_wizard_step("node_select")
+
+        container = self.query_one("#actions_content", VerticalScroll)
+        container.remove_children()
+
+        total = self._wizard_total_steps
+        desc_map = {
+            "explore": "Select Base Node",
+            "module_decompose": "Select Source Node",
+            "prune_dimensions": "Select Source Node",
+        }
+        desc = desc_map.get(self._wizard_op, "Select Node")
+        container.mount(
+            Label(
+                f"Step {self._wizard_step} of {total} \u2014 {desc}  (Esc: Back)",
+                classes="actions_step_indicator",
+            )
+        )
+        self._mount_op_context_header(container)
+        container.mount(
+            Label("[dim]  \u2191\u2193 Navigate  Enter Select  |  Click node + Next[/dim]")
+        )
+
+        # Scope candidates + HEAD to the selected subgraph (default _umbrella
+        # \u2192 every node, identical to pre-module behaviour).
+        subgraph = self._wizard_subgraph
+        nodes = _nodes_for_subgraph(
+            self.app.session_path, list_nodes(self.app.session_path), subgraph
+        )
+        head = get_head(self.app.session_path, module=subgraph)
+
+        if not nodes:
+            container.mount(
+                Label("[bold yellow]No nodes available.[/] Initialize the session first.")
+            )
+            return
+
+        for nid in nodes:
+            node_data = read_node(self.app.session_path, nid)
+            desc = node_data.get("description", "")
+
+            lbl_parts = [nid]
+            if nid == head:
+                lbl_parts.append("[green]HEAD[/]")
+            lbl = " ".join(lbl_parts)
+
+            container.mount(OperationRow(nid, lbl, desc))
+
+        container.mount(
+            Button("Next \u25b6", variant="primary", classes="btn_actions_next", disabled=True)
+        )
+        # module_decompose defaults its source node to HEAD so the user can
+        # advance immediately; explore requires an explicit pick.
+        # Focusing the HEAD row makes on_descendant_focus seed _selected_node
+        # and enable Next (the same path explore uses for its first row).
+        if self._wizard_op in ("module_decompose", "prune_dimensions") and head in nodes:
+            self.call_after_refresh(lambda: self._focus_operation_row(head))
+        else:
+            self.call_after_refresh(self._focus_first_operation)
+
+    def _actions_advance_from_node_select(self, node: str) -> bool:
+        """Advance the wizard out of the node-select step for ``node``.
+
+        Canonical logic shared by the Next button, keyboard Enter, and the
+        NodeActionSelectModal callback. Returns False (after notifying) when
+        the operation cannot proceed; True once the next step is rendered.
+        """
+        if not node:
+            self.notify("Select a node first", severity="warning")
+            return False
+        # Cache section presence into the ctx source BEFORE transitioning so the
+        # step resolver sees it (else section_select would be skipped). This disk
+        # read happens once here, never inside a per-render predicate. Only the
+        # node-select ops have a section_select step; module_decompose reuses the
+        # node-select UI but skips straight to config.
+        if self._wizard_op in _NODE_SELECT_OPS:
+            self._wizard_has_sections = self.app._node_has_sections(node)
+            if self._wizard_has_sections:
+                self._actions_show_section_select()
+                return True
+        self._actions_show_config()
+        return True
+
+    def _actions_show_section_select(self) -> None:
+        """Optional step (post node-select): pick sections to target."""
+        node = self._wizard_config.get("_selected_node", "")
+        secs = self.app._node_sections(node)
+
+        # Mark sections present so the resolver counts this step, then derive
+        # the indicator numbers from the active set.
+        self._wizard_has_sections = True
+        self._enter_wizard_step("section_select")
+
+        container = self.query_one("#actions_content", VerticalScroll)
+        container.remove_children()
+
+        total = self._wizard_total_steps
+        container.mount(
+            Label(
+                f"Step {self._wizard_step} of {total} \u2014 Select Sections for {node}  (Esc: Back)",
+                classes="actions_step_indicator",
+            )
+        )
+        self._mount_op_context_header(container)
+        container.mount(
+            Label("[dim]Leave all unchecked to target the whole document.[/]")
+        )
+        for s in secs:
+            dims = f" [dim][{', '.join(s.dimensions)}][/]" if s.dimensions else ""
+            container.mount(Checkbox(f"{s.name}{dims}", classes="chk_section"))
+        container.mount(
+            Button("Next \u25b6", variant="primary", classes="btn_actions_next")
+        )
+
+    def _actions_show_config(self) -> None:
+        """Render config step: operation-specific configuration form."""
+        op = self._wizard_op
+        self._enter_wizard_step("config")
+
+        container = self.query_one("#actions_content", VerticalScroll)
+        container.remove_children()
+
+        total = self._wizard_total_steps
+        step = self._wizard_step
+        container.mount(
+            Label(
+                f"Step {step} of {total} \u2014 Configure: {op.title()}  (Esc: Back)",
+                classes="actions_step_indicator",
+            )
+        )
+        self._mount_op_context_header(container)
+
+        if op in ("compare", "synthesize", "prune_dimensions"):
+            container.mount(Label(
+                "[dim]  ↑↓ Navigate  Space Toggle  "
+                "Tab Switch group  Type to filter[/]"))
+        elif op in ("explore", "module_decompose"):
+            # Preview ops: the proposal toggles (w/l) are shown in the footer
+            # contextually via check_action; this line covers the non-binding
+            # navigation keys only (t1047).
+            container.mount(Label(
+                "[dim]  Tab Focus proposal  ↑↓ Navigate[/]"))
+
+        if op == "explore":
+            self._config_explore_no_node(container)
+        elif op == "compare":
+            self._config_compare(container)
+        elif op == "synthesize":
+            self._config_synthesize(container)
+        elif op == "prune_dimensions":
+            self._config_prune_dimensions(container)
+        elif op == "module_decompose":
+            self._config_module_decompose(container)
+        elif op == "module_merge":
+            self._config_module_merge(container)
+        elif op == "module_sync":
+            self._config_module_sync(container)
+
+    def _preseed_multi_node_checklist(self, op_key: str, marked: list[str]) -> None:
+        """Pre-check the compare/synthesize source-node FuzzyCheckList from the
+        contextual marked set (t983_6).
+
+        Called after ``_actions_show_config`` has mounted the config form for a
+        contextually-launched compare/synthesize op. Checks the rows for the
+        marked nodes; the user can still adjust the selection. For compare, the
+        section/dimension lists derive from the *checked* nodes and were
+        refreshed (empty) by ``_config_compare`` before these boxes were
+        checked, so re-run those refreshes here.
+        """
+        fcl_id = "cmp_nodes" if op_key == "compare" else "syn_nodes"
+        try:
+            fcl = self.query_one(f"#{fcl_id}", FuzzyCheckList)
+        except Exception:
+            return
+        wanted = set(marked)
+        for cb in fcl.query("Checkbox.chk_node"):
+            cb.value = str(cb.label) in wanted
+        if op_key == "compare":
+            self._refresh_compare_sections()
+            self._refresh_compare_dimensions()
+
+    def _focus_fcl_filter(self, fcl_id: str) -> None:
+        """Focus the filter Input of a FuzzyCheckList by widget id."""
+        try:
+            fcl = self.query_one(f"#{fcl_id}", FuzzyCheckList)
+            fcl.query_one(Input).focus()
+        except Exception:
+            pass
+
+    def action_cycle_preview_ratio(self) -> None:
+        """Cycle the config-step preview split: balanced → proposal → input."""
+        from textual.actions import SkipAction
+        panes = self.query(ProposalPreviewPane)
+        splits = self.query(".config_preview_split")
+        if not panes or not splits:
+            raise SkipAction()
+        pane = panes.first()
+        lefts = splits.first().query(".config_preview_left")
+        if not lefts:
+            raise SkipAction()
+        left = lefts.first()
+        # Capture the current top line BEFORE the width reflow, then restore it.
+        pane.on_ratio_change()
+        self._preview_ratio = (getattr(self, "_preview_ratio", 0) + 1) % 3
+        self._apply_preview_ratio(left, pane, self._preview_ratio)
+
+    def action_toggle_preview_numbered(self) -> None:
+        """Toggle the config-step proposal preview between Markdown and the
+        numbered source-line view (t954)."""
+        from textual.actions import SkipAction
+        panes = self.query(ProposalPreviewPane)
+        if not panes:
+            raise SkipAction()
+        panes.first().toggle_numbered()
+
+    def on_section_minimap_section_selected(self, event) -> None:
+        """Route a preview-pane minimap selection to the pane (t1047).
+
+        The config-step preview lives inside this ModalScreen, so the minimap's
+        ``SectionSelected`` message bubbles here, not to the App. (The former
+        BrainstormApp handler was dead code once the wizard became a modal.) The
+        ``preview_proposal_minimap`` class guard mirrors the old App handler.
+        """
+        ctrl = getattr(event, "control", None)
+        if ctrl is None or not ctrl.has_class("preview_proposal_minimap"):
+            return
+        panes = self.query(ProposalPreviewPane)
+        if not panes:
+            return
+        panes.first().scroll_to_section(event.section_name)
+        event.stop()
+
+    def _focus_within_preview(self) -> bool:
+        """True when focus is inside the config-step proposal preview pane."""
+        panes = self.query(ProposalPreviewPane)
+        return bool(panes) and self._focus_within(panes.first())
+
+    def check_action(self, action: str, parameters) -> bool | None:
+        """Context-scope the preview toggles (t1047).
+
+        ``w`` (width) / ``l`` (line numbers) apply only on the explore /
+        module_decompose preview config step AND only while the proposal or
+        minimap is focused. The footer therefore advertises them exactly then,
+        and a focused Mandate ``TextArea`` keeps ``w``/``l`` as typed text
+        (returning False leaves the key unbound at the screen, so it reaches the
+        input). Other actions are unaffected.
+        """
+        if action in ("toggle_preview_numbered", "cycle_preview_ratio"):
+            on_preview_step = (
+                self._wizard_step_id == "config"
+                and self._wizard_op in ("explore", "module_decompose")
+            )
+            return on_preview_step and self._focus_within_preview()
+        return True
+
+    def _cycle_preview_focus(self, forward: bool = True) -> bool:
+        """Tab / Shift+Tab on the config-with-preview step → step the focus ring.
+
+        Cycles editboxes → minimap → proposal pane → wrap, so the proposal
+        markdown is reachable (and scrollable) by Tab alongside the inputs and
+        the minimap. Returns True when focus was moved (caller stops the event);
+        False when there is no preview pane (default Tab traversal runs).
+        """
+        ring = self._preview_focus_ring()
+        if not ring:
+            return False
+        focused = self.screen.focused
+        cur = -1
+        for i, member in enumerate(ring):
+            if focused is member or (
+                focused is not None and focused in member.walk_children()
+            ):
+                cur = i
+                break
+        if cur == -1:
+            target = ring[0]
+        else:
+            target = ring[(cur + (1 if forward else -1)) % len(ring)]
+        minimaps = list(self.query(".preview_proposal_minimap"))
+        if minimaps and target is minimaps[0]:
+            target.focus_first_row()
+        else:
+            target.focus()
+        return True
+
+    def _config_explore_no_node(self, container: VerticalScroll) -> None:
+        """Explore config (node already selected): mandate, parallel count.
+
+        Lays out input-left / proposal-preview-right via the shared
+        :meth:`_mount_config_with_preview` helper (t945_1) so the selected base
+        node's proposal is visible beside the Exploration Mandate input.
+        """
+        node_id = self._wizard_config.get("_selected_node", "?")
+        try:
+            proposal = read_proposal(self.app.session_path, node_id)
+        except Exception:
+            proposal = "*No proposal found.*"
+
+        def left_builder(left: VerticalScroll) -> None:
+            left.mount(Label(f"[bold]Base Node:[/] {node_id}"))
+            left.mount(Label("[bold]Exploration Mandate[/]"))
+            left.mount(TextArea(""))
+            left.mount(CycleField("Parallel explorers", ["1", "2", "3", "4"], initial="2"))
+            left.mount(Button("Next \u25b6", variant="primary", classes="btn_actions_next"))
+
+        self._mount_config_with_preview(container, left_builder, proposal)
+
+    def _config_compare(self, container: VerticalScroll) -> None:
+        """Compare config: multi-node checkboxes + dimension checkboxes + sections."""
+        nodes = list_nodes(self.app.session_path)
+
+        container.mount(Label("[bold]Select Nodes to Compare (2+)[/]"))
+        container.mount(FuzzyCheckList(
+            nodes, item_class="chk_node",
+            placeholder="Type to filter nodes\u2026", id="cmp_nodes"))
+
+        container.mount(Label("[bold]Dimensions[/]"))
+        # Mounted empty; _refresh_compare_dimensions populates it scoped to the
+        # checked nodes (grouped, descriptive, active-default) once nodes are
+        # selected. Keeping the FuzzyCheckList present preserves its filter
+        # Input + the cmp_dims Tab-nav group even before any node is checked.
+        container.mount(FuzzyCheckList(
+            [], item_class="chk_dim",
+            placeholder="Type to filter dimensions\u2026", id="cmp_dims"))
+
+        container.mount(Label("[bold]Target Sections (optional)[/]", id="cmp_sections_label"))
+        container.mount(Container(id="cmp_sections_box"))
+
+        container.mount(Button("Next \u25b6", variant="primary", classes="btn_actions_next"))
+
+        self._cmp_section_checks = {}
+        self._cmp_dim_checks = {}
+        self.call_after_refresh(self._refresh_compare_sections)
+        self.call_after_refresh(self._refresh_compare_dimensions)
+        self.call_after_refresh(lambda: self._focus_fcl_filter("cmp_nodes"))
+
+    def _refresh_compare_sections(self) -> None:
+        """(Re)mount compare section checkboxes based on currently checked nodes."""
+        try:
+            box = self.query_one("#cmp_sections_box", Container)
+        except Exception:
+            return
+
+        for cb in box.query("Checkbox.chk_section"):
+            self._cmp_section_checks[_parse_section_label(str(cb.label))] = bool(cb.value)
+        box.remove_children()
+
+        checked: list[str] = []
+        for cb in self.query("Checkbox.chk_node"):
+            if cb.value:
+                checked.append(str(cb.label))
+
+        if len(checked) < 1:
+            box.mount(Label("[dim]Select nodes to see comparable sections.[/]"))
+            return
+
+        per_node: dict[str, list[str]] = {
+            nid: [s.name for s in self.app._node_sections(nid)] for nid in checked
+        }
+        inter = _sections_intersection(per_node)
+
+        if not inter:
+            box.mount(Label("[dim]No sections are present in all selected nodes.[/]"))
+            return
+
+        for name in inter:
+            value = self._cmp_section_checks.get(name, False)
+            box.mount(Checkbox(name, value=value, classes="chk_section"))
+
+    def _refresh_compare_dimensions(self) -> None:
+        """(Re)mount compare dimension checkboxes scoped to the checked nodes.
+
+        Mirrors ``_refresh_compare_sections``: preserves prior toggles across
+        node-selection changes, scopes the dimension list to the union of the
+        checked nodes' dimensions (grouped by prefix under subheaders),
+        default-checks the session's ``active_dimensions`` (falling back to
+        all-checked when none), and labels each row ``"<full_key> — <value>"``
+        so the dimension's meaning is visible.
+        """
+        try:
+            fcl = self.query_one("#cmp_dims", FuzzyCheckList)
+        except Exception:
+            return
+
+        # Preserve current toggles across node-selection changes.
+        for cb in fcl.query("Checkbox.chk_dim"):
+            self._cmp_dim_checks[_parse_dimension_label(str(cb.label))] = bool(cb.value)
+
+        checked_nodes = [
+            str(cb.label) for cb in self.query("Checkbox.chk_node") if cb.value
+        ]
+        if not checked_nodes:
+            fcl.set_grouped_items([])
+            return
+
+        grouped = self._dimension_entries_for_nodes(checked_nodes)
+        active = set(get_active_dimensions(self.app.session_path))
+        groups: list[tuple[str, list[tuple[str, bool]]]] = []
+        for _prefix, label, entries in grouped:
+            rows: list[tuple[str, bool]] = []
+            for _suffix, value, full_key in entries:
+                v = str(value)
+                trunc = v if len(v) <= 60 else v[:57] + "…"
+                if full_key in self._cmp_dim_checks:
+                    checked = self._cmp_dim_checks[full_key]
+                elif active:
+                    checked = full_key in active
+                else:
+                    checked = True  # fallback = old default_checked=True
+                rows.append((f"{full_key} — {trunc}", checked))
+            groups.append((label, rows))
+        fcl.set_grouped_items(groups)
+
+    def _config_synthesize(self, container: VerticalScroll) -> None:
+        """Synthesize config: multi-node checkboxes + merge rules."""
+        nodes = list_nodes(self.app.session_path)
+
+        container.mount(Label("[bold]Select Source Nodes (2+)[/]"))
+        container.mount(FuzzyCheckList(
+            nodes, item_class="chk_node",
+            placeholder="Type to filter nodes\u2026", id="syn_nodes"))
+
+        container.mount(Label("[bold]Merge Rules[/]"))
+        container.mount(TextArea(""))
+        container.mount(Button("Next \u25b6", variant="primary", classes="btn_actions_next"))
+        self.call_after_refresh(lambda: self._focus_fcl_filter("syn_nodes"))
+
+    def _config_prune_dimensions(self, container: VerticalScroll) -> None:
+        """Prune config: mode + N + one flat checklist of the source node's
+        dimensions in ranked order (t1983).
+
+        The checked set is the dimensions the new child node keeps. "Keep top N
+        overall" checks the first N of one importance ranking (no per-kind
+        quota); "Keep selected" leaves the checks to the user. Returning here
+        from the confirm step (Back) restores the collected mode, N and exact
+        checked set for the same source node; any other entry starts from the
+        defaults.
+        """
+        cfg = self._wizard_config
+        node_id = cfg.get("_selected_node") or get_head(
+            self.app.session_path, module=self._wizard_subgraph
+        ) or ""
+        try:
+            dims = extract_dimensions(read_node(self.app.session_path, node_id))
+        except Exception:
+            dims = {}
+        try:
+            proposal = read_proposal(self.app.session_path, node_id)
+        except Exception:
+            proposal = ""
+        ranked = rank_dimensions(
+            dims, proposal, get_active_dimensions(self.app.session_path)
+        )
+        self._prune_source = node_id
+        self._prune_dims = dims
+        self._prune_ranked = ranked
+
+        default_n = max(1, min(40, len(ranked) - 1))
+        restored = (
+            cfg.get("source_node") == node_id
+            and isinstance(cfg.get("kept"), list)
+        )
+        if restored:
+            self._prune_mode = cfg.get("mode") or "top_n"
+            self._prune_applied_n = int(cfg.get("top_n") or default_n)
+            self._prune_initial_kept = set(cfg["kept"]) & set(dims)
+        else:
+            self._prune_mode = "top_n"
+            self._prune_applied_n = default_n
+            self._prune_initial_kept = set(ranked[:default_n])
+
+        container.mount(Label(f"[bold]Source Node:[/] {node_id or '(none)'}"))
+        container.mount(Label("[bold]Prune mode[/]"))
+        container.mount(RadioSet(
+            RadioButton(
+                "Keep top N overall", value=self._prune_mode == "top_n"
+            ),
+            RadioButton(
+                "Keep selected", value=self._prune_mode == "selected"
+            ),
+            classes="rs_prune_mode",
+        ))
+        container.mount(Label(
+            "[bold]N[/] [dim](top-N mode: changing N re-checks the first N "
+            "rows; you can still adjust the checks)[/]"
+        ))
+        container.mount(Input(
+            value=str(self._prune_applied_n), type="integer", id="prune_top_n",
+        ))
+        container.mount(Label("", id="prune_counts"))
+        container.mount(Label("[bold]Dimensions to keep[/]"))
+        container.mount(FuzzyCheckList(
+            [], item_class="chk_prune_dim",
+            placeholder="Type to filter dimensions\u2026", id="prune_dims"))
+        container.mount(Button("Next \u25b6", variant="primary", classes="btn_actions_next"))
+        self._prune_update_counts()
+        self.call_after_refresh(self._fill_prune_list)
+
+    def _fill_prune_list(self) -> None:
+        """Mount the prune checklist: one flat group in ranked order, checked
+        from the stored initial set (restored or default), never recomputed."""
+        try:
+            fcl = self.query_one("#prune_dims", FuzzyCheckList)
+        except Exception:
+            return
+        rows: list[tuple[str, bool]] = []
+        for i, key in enumerate(self._prune_ranked, start=1):
+            v = str(self._prune_dims.get(key, ""))
+            trunc = v if len(v) <= 60 else v[:57] + "…"
+            rows.append((f"{i}. {key} — {trunc}", key in self._prune_initial_kept))
+        fcl.set_grouped_items(
+            [("Dimensions — ranked by importance", rows)] if rows else []
+        )
+        self._prune_update_counts()
+
+    def _prune_checked_keys(self) -> set[str] | None:
+        """Checked keys from the mounted checklist, or None before it exists."""
+        cbs = list(self.query("Checkbox.chk_prune_dim"))
+        if not cbs:
+            return None
+        return {_parse_prune_label(str(cb.label)) for cb in cbs if cb.value}
+
+    def _prune_read_n(self) -> int | None:
+        """The N field as an int >= 1, or None when empty/invalid."""
+        try:
+            n = int(self.query_one("#prune_top_n", Input).value.strip())
+        except Exception:
+            return None
+        return n if n >= 1 else None
+
+    def _prune_check_top_n(self, n: int) -> None:
+        keep = set(self._prune_ranked[:n])
+        for cb in self.query("Checkbox.chk_prune_dim"):
+            cb.value = _parse_prune_label(str(cb.label)) in keep
+        # Programmatic checks bypass the filter's matched-OR-checked rule;
+        # re-apply it so a newly kept row is never hidden under a filter.
+        try:
+            self.query_one("#prune_dims", FuzzyCheckList).refresh_visibility()
+        except Exception:
+            pass
+        self._prune_update_counts()
+
+    def _prune_update_counts(self) -> None:
+        try:
+            label = self.query_one("#prune_counts", Label)
+        except Exception:
+            return
+        checked = self._prune_checked_keys()
+        if checked is None:
+            checked = self._prune_initial_kept
+        total = len(self._prune_ranked)
+        kept = len(checked)
+        label.update(
+            f"Keeping {kept} of {total} dimensions ({total - kept} dropped)"
+        )
+
+    @on(Input.Changed, "#prune_top_n")
+    def _on_prune_n_changed(self, event: Input.Changed) -> None:
+        if self._wizard_op != "prune_dimensions" or self._prune_mode != "top_n":
+            return
+        n = self._prune_read_n()
+        if n is None or n == self._prune_applied_n:
+            return
+        self._prune_applied_n = n
+        self._prune_check_top_n(n)
+
+    @on(RadioSet.Changed, ".rs_prune_mode")
+    def _on_prune_mode_changed(self, event: RadioSet.Changed) -> None:
+        if self._wizard_op != "prune_dimensions":
+            return
+        mode = "top_n" if event.radio_set.pressed_index == 0 else "selected"
+        if mode == self._prune_mode:
+            return
+        self._prune_mode = mode
+        if mode == "top_n":
+            n = self._prune_read_n() or self._prune_applied_n
+            self._prune_applied_n = n
+            self._prune_check_top_n(n)
+
+    @on(Checkbox.Changed, ".chk_prune_dim")
+    def _on_prune_dim_changed(self, event: Checkbox.Changed) -> None:
+        self._prune_update_counts()
+
+    def _config_module_decompose(self, container: VerticalScroll) -> None:
+        """Module decompose config: module list + extraction options.
+
+        When entered via the "Fast-track this module" preset
+        (``_wizard_fast_track``, t756_6 UC-3), the link-to-task checkbox is
+        pre-armed so naming one module + confirm creates the subgraph root and
+        the linked aitask in a single pass. The op, config-collection, confirm,
+        and execute paths are otherwise identical to the multi-module flow.
+
+        Lays out input-left / proposal-preview-right via the shared
+        :meth:`_mount_config_with_preview` helper (t945_1) so the chosen source
+        node's proposal is visible beside the Decomposition Plan input.
+        """
+        fast_track = getattr(self, "_wizard_fast_track", False)
+        # Source node: the user's pick on the source-node step, else subgraph
+        # HEAD (express entry paths skip node-select).
+        node_id = self._wizard_config.get("_selected_node") or get_head(
+            self.app.session_path, module=self._wizard_subgraph
+        )
+        try:
+            proposal = (
+                read_proposal(self.app.session_path, node_id)
+                if node_id else "*No proposal found.*"
+            )
+        except Exception:
+            proposal = "*No proposal found.*"
+
+        def left_builder(left: VerticalScroll) -> None:
+            if fast_track:
+                left.mount(Label(
+                    "[dim]Fast-track: name one module — a linked aitask is "
+                    "created in one pass.[/]"
+                ))
+            left.mount(Label(f"[bold]Source Subgraph:[/] {self._wizard_subgraph}"))
+            left.mount(Label(f"[bold]Source Node:[/] {node_id or '(none)'}"))
+            left.mount(Label("[bold]Decompose mode[/]"))
+            left.mount(RadioSet(
+                RadioButton("Manual — I type the names", value=True),
+                RadioButton("Agent-proposed — infer from the Plan"),
+                RadioButton("From section markers"),
+                classes="rs_decompose_mode",
+            ))
+            left.mount(Label("[bold]Modules (used by Manual / From-sections)[/]"))
+            left.mount(TextArea("", classes="ta_module_decompose_modules"))
+            link_chk = Checkbox("Create linked child tasks", classes="chk_link_to_task")
+            link_chk.value = bool(fast_track)
+            left.mount(link_chk)
+            left.mount(Label("[bold]Decomposition Plan (optional)[/]"))
+            left.mount(TextArea("", classes="ta_module_decompose_plan"))
+            review_chk = Checkbox(
+                "Review before apply", classes="chk_review_before_apply"
+            )
+            review_chk.value = True
+            left.mount(review_chk)
+            left.mount(Button("Next \u25b6", variant="primary", classes="btn_actions_next"))
+
+        self._mount_config_with_preview(container, left_builder, proposal)
+
+    def _config_module_merge(self, container: VerticalScroll) -> None:
+        """Module merge config: ancestor destination + merge-up rules."""
+        source = self._wizard_subgraph
+        ancestors = self.app._ancestor_subgraphs(source)
+        source_head = get_head(self.app.session_path, module=source)
+        container.mount(Label(f"[bold]Source Subgraph:[/] {source}"))
+        container.mount(Label(f"[bold]Source HEAD:[/] {source_head or '(none)'}"))
+        if not ancestors:
+            container.mount(
+                Label("[bold yellow]No ancestor destination is available for this source.[/]")
+            )
+        else:
+            container.mount(
+                CycleField(
+                    "Destination subgraph",
+                    ancestors,
+                    initial=ancestors[0],
+                    id="cf_module_merge_destination",
+                )
+            )
+        container.mount(Label("[bold]Merge-Up Rules[/]"))
+        container.mount(TextArea("", classes="ta_module_merge_rules"))
+        container.mount(
+            Button(
+                "Next \u25b6",
+                variant="primary",
+                classes="btn_actions_next",
+                disabled=not bool(ancestors),
+            )
+        )
+
+    def _config_module_sync(self, container: VerticalScroll) -> None:
+        """Module sync config: requires a linked task; surface scan horizon."""
+        module = self._wizard_subgraph
+        gs = _read_graph_state(self.app.session_path)
+        tasks = gs.get("module_tasks")
+        tasks = tasks if isinstance(tasks, dict) else {}
+        linked = tasks.get(module)
+        synced = gs.get("last_synced_at")
+        synced = synced if isinstance(synced, dict) else {}
+        last = synced.get(module) or "(never)"
+        source_head = get_head(self.app.session_path, module=module)
+        container.mount(Label(f"[bold]Module Subgraph:[/] {module}"))
+        container.mount(Label(f"[bold]Source HEAD:[/] {source_head or '(none)'}"))
+        if not linked:
+            container.mount(
+                Label(
+                    "[bold yellow]This module has no linked task (module_tasks). "
+                    "Sync requires one \u2014 use Patch for free-form context.[/]"
+                )
+            )
+        else:
+            container.mount(Label(f"[bold]Linked Task:[/] t{linked}"))
+            container.mount(Label(f"[bold]Last Synced:[/] {last}"))
+            container.mount(Label("[bold]Sync Instructions (optional)[/]"))
+            container.mount(TextArea("", classes="ta_module_sync_instructions"))
+        container.mount(
+            Button(
+                "Next \u25b6",
+                variant="primary",
+                classes="btn_actions_next",
+                disabled=not bool(linked) or not bool(source_head),
+            )
+        )
+
+    def _actions_collect_config(self) -> bool:
+        """Collect and validate config from config step widgets. Returns True if valid."""
+        op = self._wizard_op
+        # Preserve _selected_node from node selection step
+        selected_node = self._wizard_config.get("_selected_node")
+        # Preserve target_sections already chosen in the section-select step
+        prior_target_sections = self._wizard_config.get("target_sections")
+        config: dict = {}
+        if selected_node:
+            config["_selected_node"] = selected_node
+        if prior_target_sections is not None:
+            config["target_sections"] = prior_target_sections
+        container = self.query_one("#actions_content", VerticalScroll)
+
+        if op == "explore":
+            config["base_node"] = selected_node or ""
+            if not config["base_node"]:
+                self.notify("Select a base node first", severity="warning")
+                return False
+            config["mandate"] = container.query_one(TextArea).text.strip()
+            if not config["mandate"]:
+                self.notify("Mandate cannot be empty", severity="warning")
+                return False
+            config["parallel"] = int(container.query_one(CycleField).current_value)
+
+        elif op == "compare":
+            node_cbs = container.query("Checkbox.chk_node")
+            selected = [cb.label for cb in node_cbs if cb.value]
+            if len(selected) < 2:
+                self.notify("Select at least 2 nodes", severity="warning")
+                return False
+            config["nodes"] = [str(lbl) for lbl in selected]
+            dim_cbs = container.query("Checkbox.chk_dim")
+            config["dimensions"] = [
+                _parse_dimension_label(str(cb.label))
+                for cb in dim_cbs if cb.value
+            ]
+            try:
+                box = self.query_one("#cmp_sections_box", Container)
+                sec_cbs = box.query("Checkbox.chk_section")
+                sel_secs = [str(cb.label) for cb in sec_cbs if cb.value]
+                config["target_sections"] = sel_secs or None
+            except Exception:
+                config["target_sections"] = None
+
+        elif op == "synthesize":
+            node_cbs = container.query("Checkbox.chk_node")
+            selected = [cb.label for cb in node_cbs if cb.value]
+            if len(selected) < 2:
+                self.notify("Select at least 2 source nodes", severity="warning")
+                return False
+            config["nodes"] = [str(lbl) for lbl in selected]
+            config["merge_rules"] = container.query_one(TextArea).text.strip()
+            if not config["merge_rules"]:
+                self.notify("Merge rules cannot be empty", severity="warning")
+                return False
+
+        elif op == "prune_dimensions":
+            source = selected_node or self._prune_source
+            if not source:
+                self.notify("Select a source node first", severity="warning")
+                return False
+            checked = self._prune_checked_keys() or set()
+            ranked = list(self._prune_ranked)
+            kept = [k for k in ranked if k in checked]
+            dropped = [k for k in ranked if k not in checked]
+            if not kept:
+                self.notify("Keep at least one dimension", severity="warning")
+                return False
+            if not dropped:
+                self.notify(
+                    "Nothing to prune — uncheck at least one dimension",
+                    severity="warning",
+                )
+                return False
+            n = self._prune_read_n()
+            if self._prune_mode == "top_n" and n is None:
+                self.notify("N must be a whole number of at least 1", severity="warning")
+                return False
+            config["source_node"] = source
+            config["mode"] = self._prune_mode
+            config["top_n"] = n or self._prune_applied_n
+            config["kept"] = kept
+            config["dropped"] = dropped
+            config["total"] = len(ranked)
+
+        elif op == "module_decompose":
+            config["subgraph"] = self._wizard_subgraph
+            # Use the node chosen on the source-node step, falling back to the
+            # subgraph HEAD (express entry paths skip node-select).
+            config["source_node"] = selected_node or get_head(
+                self.app.session_path, module=self._wizard_subgraph
+            )
+            if not config["source_node"]:
+                self.notify("Selected subgraph has no HEAD", severity="warning")
+                return False
+            # Decompose mode: 0=Manual, 1=Agent-proposed (infer), 2=From sections.
+            mode = container.query_one(
+                ".rs_decompose_mode", RadioSet
+            ).pressed_index
+            module_text = container.query_one(
+                ".ta_module_decompose_modules", TextArea
+            ).text
+            modules = [
+                m.strip()
+                for m in re.split(r"[,\n]+", module_text)
+                if m.strip()
+            ]
+            instructions = container.query_one(
+                ".ta_module_decompose_plan", TextArea
+            ).text.strip()
+            if mode == 1:
+                # Infer: the agent proposes the module set; names field is
+                # ignored, but a Decomposition Plan is required to infer from.
+                if not instructions:
+                    self.notify(
+                        "Agent-proposed mode needs a Decomposition Plan "
+                        "to infer from",
+                        severity="warning",
+                    )
+                    return False
+                modules = []
+            else:
+                if not modules:
+                    self.notify("Enter at least one module name", severity="warning")
+                    return False
+                if len(set(modules)) != len(modules):
+                    self.notify("Module names must be unique", severity="warning")
+                    return False
+            config["modules"] = modules
+            config["from_sections"] = (mode == 2)
+            config["link_to_task"] = bool(
+                container.query_one(".chk_link_to_task", Checkbox).value
+            )
+            config["instructions"] = instructions
+            try:
+                config["review_before_apply"] = bool(
+                    container.query_one(".chk_review_before_apply", Checkbox).value
+                )
+            except Exception:
+                config["review_before_apply"] = True
+
+        elif op == "module_merge":
+            config["source_subgraph"] = self._wizard_subgraph
+            try:
+                dest = container.query_one(
+                    "#cf_module_merge_destination", CycleField
+                ).current_value
+            except Exception:
+                dest = ""
+            if not dest:
+                self.notify("No ancestor destination available", severity="warning")
+                return False
+            if not is_ancestor_subgraph(self.app.session_path, self._wizard_subgraph, dest):
+                self.notify("Destination is not an ancestor", severity="warning")
+                return False
+            config["destination_subgraph"] = dest
+            config["merge_rules"] = container.query_one(
+                ".ta_module_merge_rules", TextArea
+            ).text.strip()
+            if not config["merge_rules"]:
+                self.notify("Merge-up rules cannot be empty", severity="warning")
+                return False
+
+        elif op == "module_sync":
+            module = self._wizard_subgraph
+            config["subgraph"] = module
+            gs = _read_graph_state(self.app.session_path)
+            tasks = gs.get("module_tasks")
+            tasks = tasks if isinstance(tasks, dict) else {}
+            if not tasks.get(module):
+                self.notify(
+                    "Module has no linked task — sync requires one",
+                    severity="warning",
+                )
+                return False
+            try:
+                config["instructions"] = container.query_one(
+                    ".ta_module_sync_instructions", TextArea
+                ).text.strip()
+            except Exception:
+                config["instructions"] = ""
+
+        self._wizard_config = config
+        return True
+
+    def _collect_target_sections(self) -> None:
+        """Collect checked section names from the section-select step into wizard config."""
+        container = self.query_one("#actions_content", VerticalScroll)
+        names: list[str] = []
+        for cb in container.query("Checkbox.chk_section"):
+            if cb.value:
+                names.append(_parse_section_label(str(cb.label)))
+        self._wizard_config["target_sections"] = names or None
+
+    def _actions_show_confirm(self) -> None:
+        """Render final confirm step: summary + launch/confirm button."""
+        self._enter_wizard_step("confirm")
+        total = self._wizard_total_steps
+        step = self._wizard_step
+
+        container = self.query_one("#actions_content", VerticalScroll)
+        container.remove_children()
+        container.mount(Label(f"Step {step} of {total} \u2014 Confirm  (Esc: Back)", classes="actions_step_indicator"))
+        self._mount_op_context_header(container)
+
+        summary_lines = self._build_summary()
+        container.mount(Static("\n".join(summary_lines), classes="actions_summary"))
+
+        # Session ops left the wizard (t983_8) — the confirm step is design-ops
+        # only, so the launch-mode field shows for every op that launches an
+        # agent. prune_dimensions runs no agent (t1983), so it has none.
+        launches_agent = self._wizard_op != "prune_dimensions"
+        default_mode = _brainstorm_launch_mode_default(self._wizard_op)
+        if launches_agent:
+            container.mount(
+                CycleField(
+                    "Launch mode",
+                    sorted(VALID_LAUNCH_MODES),
+                    initial=default_mode,
+                    id="launch-mode-field",
+                )
+            )
+        if launches_agent and not is_tmux_available():
+            container.mount(
+                Static(
+                    "[dim]tmux not installed — interactive will fall back "
+                    "to a standalone terminal (no monitor integration)[/]",
+                    classes="actions_hint",
+                )
+            )
+
+        container.mount(
+            Horizontal(
+                Button("Launch", variant="primary", classes="btn_actions_launch"),
+                Button("Back", variant="default", classes="btn_actions_back"),
+                classes="actions_buttons",
+            )
+        )
+        self.call_after_refresh(self._focus_confirm_start)
+
+    def _focus_confirm_start(self) -> None:
+        """Move focus to the first focusable widget on the confirm screen."""
+        try:
+            container = self.query_one("#actions_content", VerticalScroll)
+        except Exception:
+            return
+        for w in container.query("*"):
+            if getattr(w, "can_focus", False) and not getattr(w, "disabled", False):
+                w.focus()
+                return
+
+    def _build_summary(self) -> list[str]:
+        """Build summary lines for step 3 display."""
+        op = self._wizard_op
+        cfg = self._wizard_config
+        lines = [f"[bold]Operation:[/] {op.title()}", ""]
+
+        if op == "explore":
+            lines.append(f"[bold]Base Node:[/] {cfg['base_node']}")
+            lines.append(f"[bold]Parallel Explorers:[/] {cfg['parallel']}")
+            lines.append("[bold]Mandate:[/]")
+            lines.append(cfg["mandate"])
+        elif op == "compare":
+            lines.append(f"[bold]Nodes:[/] {', '.join(cfg['nodes'])}")
+            dims_str = ", ".join(cfg["dimensions"]) if cfg["dimensions"] else "(all)"
+            lines.append(f"[bold]Dimensions:[/] {dims_str}")
+        elif op == "synthesize":
+            lines.append(f"[bold]Source Nodes:[/] {', '.join(cfg['nodes'])}")
+            lines.append("[bold]Merge Rules:[/]")
+            lines.append(cfg["merge_rules"])
+        elif op == "prune_dimensions":
+            kept, dropped = cfg["kept"], cfg["dropped"]
+            total = cfg.get("total", len(kept) + len(dropped))
+            lines.append(f"[bold]Source Node:[/] {cfg['source_node']}")
+            mode_txt = (
+                f"Keep top {cfg['top_n']} overall"
+                if cfg["mode"] == "top_n" else "Keep selected"
+            )
+            lines.append(f"[bold]Mode:[/] {mode_txt}")
+            lines.append(
+                f"[bold]Keeping:[/] {len(kept)} of {total} dimensions "
+                f"({len(dropped)} dropped)"
+            )
+            # Informational only — there is no per-kind quota; the counts make
+            # a kind that drops to zero visible before launch.
+            per_kind = []
+            for prefix in DIMENSION_PREFIXES:
+                k = sum(1 for d in kept if d.startswith(prefix))
+                t = k + sum(1 for d in dropped if d.startswith(prefix))
+                if t:
+                    count = f"{k}/{t}" if k else f"[yellow]{k}/{t}[/]"
+                    per_kind.append(f"{PREFIX_TO_LABEL[prefix]} {count}")
+            if per_kind:
+                lines.append(f"[bold]Per kind:[/] {', '.join(per_kind)}")
+            lines.append(f"[bold]Kept:[/] {', '.join(kept)}")
+            lines.append(f"[bold]Dropped ({len(dropped)}):[/] {', '.join(dropped)}")
+            lines.append(
+                "[dim]Section markers lose the dropped tags; proposal prose "
+                "is kept.[/]"
+            )
+        elif op == "module_decompose":
+            lines.append(f"[bold]Source Subgraph:[/] {cfg['subgraph']}")
+            lines.append(f"[bold]Source HEAD:[/] {cfg['source_node']}")
+            lines.append(f"[bold]Modules:[/] {', '.join(cfg['modules'])}")
+            lines.append(
+                f"[bold]From Sections:[/] {str(cfg['from_sections']).lower()}"
+            )
+            lines.append(
+                f"[bold]Link To Task:[/] {str(cfg['link_to_task']).lower()}"
+            )
+            if cfg.get("instructions"):
+                lines.append("[bold]Decomposition Plan:[/]")
+                lines.append(cfg["instructions"])
+        elif op == "module_merge":
+            lines.append(f"[bold]Source Subgraph:[/] {cfg['source_subgraph']}")
+            lines.append(
+                f"[bold]Destination Subgraph:[/] {cfg['destination_subgraph']}"
+            )
+            lines.append("[bold]Merge-Up Rules:[/]")
+            lines.append(cfg["merge_rules"])
+        elif op == "module_sync":
+            module = cfg["subgraph"]
+            gs = _read_graph_state(self.app.session_path)
+            tasks = gs.get("module_tasks")
+            tasks = tasks if isinstance(tasks, dict) else {}
+            synced = gs.get("last_synced_at")
+            synced = synced if isinstance(synced, dict) else {}
+            lines.append(f"[bold]Module Subgraph:[/] {module}")
+            lines.append(f"[bold]Linked Task:[/] t{tasks.get(module, '?')}")
+            lines.append(f"[bold]Last Synced:[/] {synced.get(module) or '(never)'}")
+            if cfg.get("instructions"):
+                lines.append("[bold]Sync Instructions:[/]")
+                lines.append(cfg["instructions"])
+        # Session ops left the wizard (t983_8); their confirmation now lives in
+        # the Session tab (_session_op_summary).
+
+        ts = cfg.get("target_sections")
+        if ts:
+            lines.append(f"[bold]Sections:[/] {', '.join(ts)}")
+
+        if op != "prune_dimensions":
+            default_mode = _brainstorm_launch_mode_default(op)
+            lines.append(f"[bold]Launch mode:[/] {default_mode} (editable below)")
+
+        return lines
+
+    @on(Checkbox.Changed, ".chk_node")
+    def _on_cmp_node_changed(self, event: Checkbox.Changed) -> None:
+        """Re-render compare section + dimension checkboxes on node-selection change."""
+        if self._wizard_op != "compare":
+            return
+        self._refresh_compare_sections()
+        self._refresh_compare_dimensions()
+
+    @on(Button.Pressed, ".btn_actions_back")
+    def _on_actions_back(self) -> None:
+        """Handle Back button (confirm step) — go to the previous active step."""
+        prev = prev_step_id(self._wizard_ctx(), self._wizard_step_id)
+        if prev is not None:
+            self._render_wizard_step(prev)
+
+    @on(Button.Pressed, ".btn_actions_next")
+    def _on_actions_next(self) -> None:
+        """Handle Next button — dispatch by the current step id."""
+        if self._wizard_step_id == "node_select":
+            # Guarded advance (section/config routing).
+            self._actions_advance_from_node_select(
+                self._wizard_config.get("_selected_node", "")
+            )
+        elif self._wizard_step_id == "section_select":
+            # Collect sections, then go to config.
+            self._collect_target_sections()
+            self._actions_show_config()
+        elif self._wizard_step_id == "config":
+            if self._actions_collect_config():
+                self._actions_show_confirm()
+
+
+    def _mount_config_with_preview(self, container, left_builder, proposal_text):
+        """Lay out a config step as input-left / proposal-preview-right.
+
+        *left_builder* receives the left ``VerticalScroll`` and mounts the op's
+        own widgets into it verbatim, so the existing ``_actions_collect_config``
+        collectors keep resolving them via the recursive ``#actions_content``
+        query. The right :class:`ProposalPreviewPane` shows *proposal_text* with
+        a navigable minimap. The pane adds no input widgets, so explore's
+        single-match ``query_one(TextArea)`` / ``query_one(CycleField)`` stay
+        unambiguous.
+        """
+        left = VerticalScroll(classes="config_preview_left")
+        pane = ProposalPreviewPane(
+            proposal_text=proposal_text, classes="config_preview_pane"
+        )
+        split = Horizontal(left, pane, classes="config_preview_split")
+        container.mount(split)
+        self._preview_ratio = 0
+
+        def _fill() -> None:
+            left_builder(left)
+
+        # Defer the left-side nested mounts until the split has settled (mirrors
+        # the call_after_refresh pattern used by the compare/synthesize configs).
+        # The proposal preview populates itself from ProposalPreviewPane.on_mount
+        # — its content widget is guaranteed composed there — so it no longer
+        # races this callback (the headless-only NoMatches fixed in t1050).
+        self.call_after_refresh(_fill)
+
+    def _apply_preview_ratio(self, left, pane, ratio: int) -> None:
+        """Set the width split by swapping the ratio_* class on both panes.
+
+        ratio 0 = balanced (50/50, no class), 1 = proposal-wide, 2 = input-wide.
+        """
+        ratio_classes = {1: "ratio_proposal_wide", 2: "ratio_input_wide"}
+        for w in (left, pane):
+            w.remove_class("ratio_proposal_wide")
+            w.remove_class("ratio_input_wide")
+        cls = ratio_classes.get(ratio)
+        if cls:
+            left.add_class(cls)
+            pane.add_class(cls)
+
+    def _preview_focus_ring(self) -> list:
+        """Ordered Tab focus ring for the config-with-preview step.
+
+        Left input widgets (each editbox/control in DOM order), then the section
+        minimap (only when it is shown), then the scrollable proposal markdown
+        pane. Returns ``[]`` when no preview pane is mounted (other Actions-tab
+        steps fall back to their own / default Tab handling).
+        """
+        panes = self.query(ProposalPreviewPane)
+        splits = self.query(".config_preview_split")
+        if not panes or not splits:
+            return []
+        pane = panes.first()
+        ring: list = []
+
+        def _ancestor_in_ring(w) -> bool:
+            p = w.parent
+            while p is not None:
+                if p in ring:
+                    return True
+                p = p.parent
+            return False
+
+        lefts = splits.first().query(".config_preview_left")
+        if lefts:
+            # Outermost focusable per control group (e.g. the RadioSet, not its
+            # individual RadioButtons), in DOM order.
+            for w in lefts.first().query("*"):
+                if not (w.can_focus and w.display and not w.disabled):
+                    continue
+                if _ancestor_in_ring(w):
+                    continue
+                ring.append(w)
+        minimaps = list(pane.query(".preview_proposal_minimap"))
+        if minimaps and minimaps[0].display:
+            ring.append(minimaps[0])
+        # Append whichever content view is currently shown: the markdown pane by
+        # default, or the numbered source view when toggled (alt+n). The
+        # minimap above is already gated on .display, so numbered mode (which
+        # hides it) drops it from the ring automatically.
+        if getattr(pane, "_numbered", False):
+            numbered = list(pane.query("#preview_proposal_numbered"))
+            if numbered:
+                ring.append(numbered[0])
+        else:
+            contents = list(pane.query("#preview_proposal_content"))
+            if contents:
+                ring.append(contents[0])
+        return ring
+
+    def _dimension_entries_for_nodes(self, node_ids):
+        """Union of the given nodes' dimensions, grouped by prefix.
+
+        Returns ``group_dimensions_by_prefix`` output:
+        ``[(prefix, label, [(suffix, value, full_key)])]``. **Union, not
+        intersection** — a dimension present on only one selected node is still
+        a valid comparison axis, and intersection risks an empty list when
+        nodes carry divergent dimension sets. Scoped to the *selected* nodes,
+        it still shrinks far below the whole-graph key set.
+        """
+        merged: dict[str, str] = {}
+        for nid in node_ids:
+            try:
+                data = read_node(self.app.session_path, nid)
+            except Exception:
+                continue
+            for k, v in extract_dimensions(data).items():
+                merged.setdefault(k, str(v))
+        return group_dimensions_by_prefix(merged)
+
+
+class BrainstormApp(TuiSwitcherMixin, ShortcutsMixin, RowNavMixin, App):
+    """Textual app for interactive brainstorm session orchestration."""
+
+    _shortcuts_scope = "brainstorm"
+
+    TITLE = "ait brainstorm"
+
+    CSS = APP_CSS
+
+    BINDINGS = [
+        *TuiSwitcherMixin.SWITCHER_BINDINGS,
+        *ShortcutsMixin.SHORTCUTS_MIXIN_BINDINGS,
+        Binding("q", "quit", "Quit"),
+        # t983_9: `b` selects the Browse tab without forcing a view (the
+        # persisted graph⇄list choice is kept). `d`/`g` remain view-specific
+        # muscle-memory shortcuts; `v` toggles the view.
+        Binding("b", "tab_browse", "Browse", show=False),
+        Binding("d", "tab_dashboard", "Browse (list)", show=False),
+        Binding("g", "tab_graph", "Browse (graph)", show=False),
+        Binding("v", "browse_toggle_view", "Toggle view", show=False),
+        Binding("space", "browse_mark", "Mark node", show=False),
+        # t983_7: `c` opens the dimension-matrix overlay on the marked set (the
+        # Compare *tab* is gone). NOTE coordinate the final Browse keymap with
+        # t983_9 (running-strip/keybinding deconflict: tabs b/s/r), which
+        # reclaims `r` for "Running".
+        Binding("c", "compare_matrix", "Compare", show=False),
+        # t983_11: `a`/Actions tab removed — `A` (node_action) opens the
+        # Operations dialog, which launches the contextual wizard modal.
+        # `s` opens the Session-lifecycle tab (t983_8); `r` opens the Running
+        # monitor (renamed from Status by t983_9, freed from `s`/`r` churn by
+        # t983_7).
+        Binding("s", "tab_session", "Session", show=False),
+        Binding("r", "tab_running", "Running", show=False),
+        Binding("enter", "open_node_detail", "Open detail"),
+        Binding("A", "node_action", "Node action"),
+        Binding("f", "toggle_deferred", "Defer module"),
+        # t983_11: op_help + preview-pane toggles moved to ActionsWizardScreen
+        # (the wizard is a modal now and owns those bindings).
+        Binding("ctrl+r", "retry_initializer_apply", "Retry initializer apply"),
+        # t1018_2: the undeliverable `ctrl+shift+x`/`ctrl+shift+y` retry-apply
+        # chords were removed; explorer/synthesizer re-ingest is now the
+        # group-scoped `S` action on the Running-tab GroupRow (_retry_group_apply).
+    ]
+
+    # Maps action_name -> required tab id. check_action() hides the binding
+    # from the footer (returns False — Textual removes False bindings from the
+    # footer; None would only dim them) when the active tab does not match, and
+    # keeps it active only on its owning tab.
+    _TAB_SCOPED_ACTIONS: dict[str, str] = {
+        "open_node_detail": "tab_browse",
+        # t1018_1: `ctrl+r` (retry initializer apply) fell through check_action's
+        # default `return True`, leaking a visible footer label on every
+        # tab/screen. Scope it to the (R)unning tab where the initializer agent
+        # lives. (t1018_2 removed the explorer/synthesizer retry-apply chords and
+        # re-homed their logic onto the Running-tab GroupRow `S` action, so only
+        # the initializer entry remains here.)
+        "retry_initializer_apply": "tab_running",
+    }
+
+    def __init__(self, task_num: str):
+        super().__init__()
+        self.current_tui_name = f"brainstorm-{task_num}"
+        self.task_num = task_num
+        self.session_path = crew_worktree(task_num)
+        self.session_data: dict = {}
+        self.read_only: bool = False
+        # _wizard_step / _wizard_total_steps are DERIVED ints (from step_position)
+        # kept for the "Step X of Y" label and the "wizard active" sentinel guards
+        # (_wizard_step > 0). _wizard_step_id is the source of truth for dispatch.
+        self._wizard_step: int = 0
+        self._wizard_total_steps: int = 3
+        self._wizard_step_id: str = ""
+        self._wizard_op: str = ""
+        # Pending Session-tab lifecycle op awaiting inline confirm (t983_8).
+        self._session_confirm_op: str = ""
+        self._wizard_config: dict = {}
+        self._wizard_has_sections: bool = False
+        # Cached subgraph count for the I/O-free _wizard_ctx (set when op-select
+        # renders); gates the optional subgraph-selector step (>= 2 subgraphs).
+        self._wizard_subgraph_count: int = 1
+        # The subgraph chosen in the selector (or _umbrella default). Held in a
+        # dedicated field, NOT _wizard_config, because node-select resets that
+        # dict after the selector runs.
+        self._wizard_subgraph: str = UMBRELLA_SUBGRAPH
+        # Transient "Fast-track this module" preset flag (UC-3, t756_6). When
+        # set, the module_decompose config step pre-arms link-to-task. Reset by
+        # _set_total_steps (the op-select funnel) so it never leaks across ops.
+        self._wizard_fast_track: bool = False
+        self._cmp_section_checks: dict[str, bool] = {}
+        self._expanded_groups: set[str] = set()
+        self._status_refresh_timer = None
+        self._processes_synced: bool = False
+        self._initializer_agent: str | None = None
+        self._initializer_done: bool = False
+        self._initializer_timer = None
+        self._initializer_apply_error: str | None = None
+        self._applying_initializer: bool = False
+        # Explorer auto-apply state. Tracked agent names produce a single
+        # node each via apply_explorer_output; the poll timer fires until
+        # every tracked agent has either applied or been dropped.
+        self._explorer_agents: set[str] = set()
+        self._applying_explorer: set[str] = set()
+        self._explorer_apply_errors: dict[str, str] = {}
+        self._explorer_poll_timer = None
+        # Synthesizer auto-apply state. Tracked agent names produce a
+        # single synthesized node each via apply_synthesizer_output; the poll
+        # timer fires until every tracked agent has either applied or
+        # been dropped.
+        self._synthesizer_agents: set[str] = set()
+        self._applying_synthesizer: set[str] = set()
+        self._synthesizer_apply_errors: dict[str, str] = {}
+        self._synthesizer_poll_timer = None
+        # Comparator completion lifecycle (t1020). A compare op creates no node;
+        # the poll timer fires until every tracked comparator has finalized its
+        # operation status (Waiting → Completed) or been dropped.
+        self._comparator_agents: set[str] = set()
+        self._applying_comparator: set[str] = set()
+        self._comparator_apply_errors: dict[str, str] = {}
+        self._comparator_poll_timer = None
+        self._module_agents: set[str] = set()
+        self._applying_module_agent: set[str] = set()
+        self._module_apply_errors: dict[str, str] = {}
+        self._module_poll_timer = None
+        # Review gate (t929_1): decomposer agents whose proposal is awaiting the
+        # operator's preview decision, and those already accepted (so the poller
+        # applies them on the next tick without re-prompting). ``_module_steer``
+        # carries the ordered Re-run revision notes forward, keyed by group name.
+        self._module_review_pending: set[str] = set()
+        self._module_review_accepted: set[str] = set()
+        self._module_steer: dict[str, list[str]] = {}
+        # Browse selection model (t983_2/t983_3): the sole Browse cursor.
+        # `self._selection.primary` is the focused-node cursor and `space`
+        # toggles marks. The legacy parallel focused-node field was retired in
+        # t1003 — there is now one cursor source of truth.
+        self._selection = NodeSelection()
+        # Remembered for the lifetime of the app; pre-fills the export modal's
+        # directory input so repeated exports default to the previous choice.
+        self._last_export_dir: str | None = None
+        self._update_title_from_task()
+
+    def check_action(self, action: str, parameters) -> bool | None:
+        # Textual 8.2.7 footer semantics (Screen.active_bindings): return
+        # ``False`` to REMOVE a binding from the footer (and disable it),
+        # ``True`` to show it active on its owning surface. Returning ``None``
+        # keeps the binding in the footer rendered DIMMED (-disabled) — which
+        # is a leak for contextual actions (t1039 fixed an earlier ``None``
+        # that left `ctrl+r` greyed-but-visible on every tab). Firing is gated
+        # on truthiness either way, so False vs None is a footer-display choice.
+        #
+        # Hide app-level bindings when a non-modal screen (e.g., pushed
+        # DiffViewerScreen) is active — that screen owns the footer.
+        if (
+            len(self.screen_stack) > 1
+            and not isinstance(self.screen, ModalScreen)
+        ):
+            return False
+        # t983_11: op_help is now an ActionsWizardScreen binding (the wizard is
+        # a modal); the App no longer gates it.
+        if action in ("node_action", "toggle_deferred"):
+            try:
+                tabbed = self.query_one(TabbedContent)
+            except Exception:
+                return False
+            if tabbed.active != "tab_browse":
+                return False
+            if not self._selection.primary:
+                return False
+            return True
+        # t983_11: cycle_preview_ratio / toggle_preview_numbered moved to
+        # ActionsWizardScreen bindings (preview pane lives in the wizard modal).
+        required_tab = self._TAB_SCOPED_ACTIONS.get(action)
+        if required_tab is None:
+            return True
+        try:
+            tabbed = self.query_one(TabbedContent)
+        except Exception:
+            return False
+        if tabbed.active != required_tab:
+            return False
+        if action == "open_node_detail":
+            if not _open_node_detail_visible(
+                tabbed.active or "", isinstance(self.focused, NodeRow)
+            ):
+                return False
+        return True
+
+    def _resolve_task_file_path(self) -> Path | None:
+        """Return the task file path for self.task_num, or None if not found."""
+        tf = self.session_data.get("task_file") if self.session_data else None
+        if tf:
+            p = Path(tf)
+            if p.exists():
+                return p
+        matches = sorted(Path("aitasks").glob(f"t{self.task_num}_*.md"))
+        return matches[0] if matches else None
+
+    def _update_title_from_task(self) -> None:
+        """Set sub_title to include task id and full task name."""
+        path = self._resolve_task_file_path()
+        if path is not None:
+            stem = path.stem
+            prefix = f"t{self.task_num}_"
+            name_part = stem[len(prefix):] if stem.startswith(prefix) else stem
+            self.sub_title = f"t{self.task_num} — {name_part}"
+        else:
+            self.sub_title = f"t{self.task_num}"
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        with Horizontal(id="initializer_row", classes="initializer-row"):
+            yield Static("", id="initializer_apply_banner", classes="initializer-banner")
+            yield PollingIndicator(id="initializer_polling_indicator")
+        # Always-on runtime strip (t983_9): runner state + running-op count,
+        # visible from every tab. Refreshed by _refresh_status_strip.
+        yield Static("", id="runtime_strip", classes="runtime-strip")
+        with TabbedContent(id="brainstorm_tabs"):
+            with TabPane("(B)rowse", id="tab_browse"):
+                with Horizontal(id="browse_split"):
+                    # graph⇄list toggle (t983_3): one ContentSwitcher hosts both
+                    # views; `v` flips `current`. Graph is the default; on_mount
+                    # overrides it from the persisted per-session view.
+                    with ContentSwitcher(
+                        id="browse_switcher", initial="dag_content"
+                    ):
+                        yield VerticalScroll(id="node_list_pane")
+                        yield DAGDisplay(id="dag_content")
+                    # ONE shared detail panel, a persistent sibling of the
+                    # switcher so it survives `v` toggles.
+                    yield VerticalScroll(
+                        Label("Session Status", id="session_status_title"),
+                        Label("Loading...", id="session_status_info"),
+                        Label("Modules", id="module_status_title"),
+                        Label("", id="module_status_info"),
+                        # Explicit textual list of the space-marked nodes (t983_4)
+                        # — complements the per-row ● glyph and shows in both
+                        # list and graph views. Empty when nothing is marked.
+                        Label("", id="browse_marked_info"),
+                        NodeDetailPanel(
+                            self.session_path,
+                            title_id="browse_node_title",
+                            info_id="browse_node_info",
+                            id="browse_node_panel",
+                        ),
+                        id="browse_detail_pane",
+                    )
+            # t983_11: the (A)ctions tab is gone — the design-op wizard is now a
+            # contextual modal (ActionsWizardScreen) launched from the Operations
+            # dialog (`A`) / Node Hub (Enter).
+            # t983_8: session-lifecycle ops (pause/resume/finalize/archive/delete)
+            # get their own tab — they are not node-contextual, so they leave the
+            # Actions wizard. Rendered by _refresh_session_tab.
+            with TabPane("(S)ession", id="tab_session"):
+                yield VerticalScroll(id="session_content")
+            # Runtime monitor, renamed from "Status" (t983_9): `s` belongs to
+            # Session, so this tab keeps `r`. The always-on runtime strip above
+            # the tabs mirrors the runner state + running-op count.
+            with TabPane("(R)unning", id="tab_running"):
+                with Horizontal(id="status_header", classes="status-header"):
+                    yield Label("Running", classes="status_pane_title")
+                    yield PollingIndicator(id="status_polling_indicator")
+                yield VerticalScroll(id="status_content")
+        yield Footer()
+
+    def on_key(self, event) -> None:
+        """Handle Enter on NodeRow, compare keys, wizard nav, and arrow navigation."""
+        if isinstance(self.screen, ModalScreen):
+            return
+        tabbed = self.query_one(TabbedContent)
+
+        # Down from tab bar: focus first row in active tab
+        if event.key == "down":
+            tabs_widget = tabbed.query_one(Tabs)
+            if self.focused is tabs_widget:
+                # Browse tab: focus depends on the current view. Graph view →
+                # focus the DAGDisplay directly (it manages its own layer/column
+                # navigation). List view → focus the first NodeRow.
+                if tabbed.active == "tab_browse":
+                    if self._browse_current_view() == "graph":
+                        try:
+                            dag = self.query_one(DAGDisplay)
+                        except Exception:
+                            dag = None
+                        if dag is not None:
+                            dag.focus()
+                            event.prevent_default()
+                            event.stop()
+                            return
+                    elif self._navigate_rows(1, "node_list_pane", (NodeRow,)):
+                        event.prevent_default()
+                        event.stop()
+                        return
+                tab_to_container = {
+                    "tab_session": ("session_content", (OperationRow,)),
+                    "tab_running": ("status_content", (GroupRow, AgentStatusRow, StatusLogRow)),
+                }
+                mapping = tab_to_container.get(tabbed.active)
+                if mapping:
+                    if self._navigate_rows(1, mapping[0], mapping[1]):
+                        event.prevent_default()
+                        event.stop()
+                        return
+
+        # Up/down on Browse: navigate DimensionRows in the shared detail pane
+        # once focus has moved into it; otherwise, in list view, navigate the
+        # NodeRow list. In graph view with the DAG focused, DAGDisplay's own
+        # up/down bindings drive layer navigation (we don't intercept).
+        if event.key in ("up", "down") and tabbed.active == "tab_browse":
+            direction = 1 if event.key == "down" else -1
+            if isinstance(self.focused, DimensionRow):
+                if self._navigate_rows(direction, "browse_node_info", (DimensionRow,)):
+                    event.prevent_default()
+                    event.stop()
+                    return
+            elif self._browse_current_view() == "list":
+                if self._navigate_rows(direction, "node_list_pane", (NodeRow,)):
+                    event.prevent_default()
+                    event.stop()
+                    return
+
+        # Tab / Shift+Tab on Browse: toggle focus between the active view (node
+        # list or DAG, depending on the switcher) and the shared detail pane's
+        # DimensionRows. Only fires when there is at least one DimensionRow in
+        # #browse_node_info (i.e., a node with dimensions is displayed).
+        if event.key in ("tab", "shift+tab") and tabbed.active == "tab_browse":
+            if self._browse_toggle_pane_focus():
+                event.prevent_default()
+                event.stop()
+                return
+
+        # t983_11: Actions-tab wizard navigation moved to
+        # ActionsWizardScreen.on_key (the wizard is a modal now; App.on_key
+        # early-returns under any ModalScreen).
+
+        # Session tab (t983_8): navigate the lifecycle-op list and dispatch.
+        if tabbed.active == "tab_session":
+            if event.key in ("up", "down"):
+                direction = 1 if event.key == "down" else -1
+                if self._navigate_rows(direction, "session_content", (OperationRow,)):
+                    event.prevent_default()
+                    event.stop()
+                    return
+            if event.key == "enter":
+                focused = self.focused
+                if isinstance(focused, OperationRow) and not focused.op_disabled:
+                    self._dispatch_session_op(focused.op_key)
+                    event.prevent_default()
+                    event.stop()
+                    return
+
+        # Enter key handlers for various focusable rows
+        if event.key == "enter":
+            focused = self.focused
+            if isinstance(focused, GroupRow):
+                self._toggle_group(focused.group_name)
+                event.prevent_default()
+                event.stop()
+                return
+            if isinstance(focused, StatusLogRow):
+                self.push_screen(LogDetailModal(focused.log_info["path"], focused.log_info["name"]))
+                event.prevent_default()
+                event.stop()
+                return
+            # NodeRow Enter is handled by action_open_node_detail (binding) so
+            # the footer hint is surfaced. Falls through here when focus is
+            # something else.
+
+        # b: show task brief — Browse-tab only (t1060). On other tabs `b` falls
+        # through to the `tab_browse` binding so it switches back to Browse
+        # (otherwise the unconditional stop() here swallowed `b` everywhere).
+        if event.key == "b" and tabbed.active == "tab_browse":
+            spec = getattr(self, "session_data", {}).get("initial_spec", "")
+            if spec:
+                self._show_brief_in_detail(spec)
+            else:
+                self.notify("No task brief available", severity="warning")
+            event.prevent_default()
+            event.stop()
+            return
+
+        # w: reset agent in Error state
+        if event.key == "w":
+            focused = self.focused
+            if isinstance(focused, AgentStatusRow):
+                if focused.agent_status != "Error":
+                    self.notify(
+                        f"Can only reset agents in Error state (current: {focused.agent_status})",
+                        severity="warning",
+                    )
+                else:
+                    self._reset_agent(focused)
+                event.prevent_default()
+                event.stop()
+                return
+
+        # R: retry a failed agent — reset to Waiting AND ensure the runner is
+        # live so it actually relaunches (distinct from `w`, which only resets
+        # status and relies on an already-running runner). t983_9 / t535.
+        if event.key == "R":
+            focused = self.focused
+            if isinstance(focused, AgentStatusRow):
+                if focused.agent_status != "Error":
+                    self.notify(
+                        f"Can only retry agents in Error state "
+                        f"(current: {focused.agent_status})",
+                        severity="warning",
+                    )
+                else:
+                    self._retry_agent(focused)
+                event.prevent_default()
+                event.stop()
+                return
+
+        # x: clean up a finished/failed agent's status artifacts (confirm modal).
+        # Works on a terminal-state AgentStatusRow or a dead ProcessRow. t983_9 / t535.
+        if event.key == "x":
+            focused = self.focused
+            name = None
+            if isinstance(focused, AgentStatusRow):
+                if focused.agent_status in _TERMINAL_AGENT_STATES:
+                    name = focused.agent_name
+                else:
+                    self.notify(
+                        f"Can only clean up finished/failed agents "
+                        f"(current: {focused.agent_status})",
+                        severity="warning",
+                    )
+            elif isinstance(focused, ProcessRow):
+                if not focused.proc_data.get("process_alive", False):
+                    name = focused.agent_name
+                else:
+                    self.notify(
+                        "Can only clean up a dead process — stop it first (k/K).",
+                        severity="warning",
+                    )
+            if name:
+                self._confirm_cleanup_agent(name)
+            if isinstance(focused, (AgentStatusRow, ProcessRow)):
+                event.prevent_default()
+                event.stop()
+                return
+
+        # n: re-run a failed operation group from scratch (t1018_2). Opens the
+        # pre-seeded Actions wizard so config is re-collected, then offers to
+        # clean up the old group. (Plain `n`/`i` are used rather than `F`/`S`:
+        # `f`/`s` are App-bound to toggle_deferred/tab_session, and their
+        # shift-pairs would be a muscle-memory hazard. `n`/`i` are unbound in
+        # both cases.)
+        if event.key == "n":
+            focused = self.focused
+            if isinstance(focused, GroupRow):
+                if not focused.has_failed_agent:
+                    self.notify(
+                        "Re-run fresh is for operations with failed agents; "
+                        "this group has none.",
+                        severity="warning",
+                    )
+                else:
+                    self._rerun_group_fresh(focused)
+                event.prevent_default()
+                event.stop()
+                return
+
+        # i: retry only the failed apply step — re-ingest output for the group's
+        # completed agents (t1018_2, re-homed from the removed ctrl+shift+x/y
+        # chords).
+        if event.key == "i":
+            focused = self.focused
+            if isinstance(focused, GroupRow):
+                self._retry_group_apply(focused)
+                event.prevent_default()
+                event.stop()
+                return
+
+        # o: open the focused operation group's OperationDetailScreen (t1020).
+        # The output-access path for node-less ops (e.g. Compare), which have
+        # no created node to press `o` on. `o` is a NodeRow-scoped binding, so
+        # it only reaches here when a GroupRow is focused — no conflict.
+        if event.key == "o":
+            focused = self.focused
+            if isinstance(focused, GroupRow):
+                self._open_group_operation(focused)
+                event.prevent_default()
+                event.stop()
+                return
+
+        # e: edit launch_mode on a Waiting agent
+        if event.key == "e":
+            focused = self.focused
+            if isinstance(focused, AgentStatusRow):
+                if focused.agent_status != "Waiting":
+                    self.notify(
+                        f"Can only edit launch_mode on Waiting agents "
+                        f"(current: {focused.agent_status})",
+                        severity="warning",
+                    )
+                else:
+                    self._edit_agent_mode(focused)
+                event.prevent_default()
+                event.stop()
+                return
+
+        # L: open log viewer for focused agent row
+        if event.key == "L":
+            focused = self.focused
+            if isinstance(focused, AgentStatusRow):
+                crew_dir = crew_worktree(focused.crew_id)
+                log_path = Path(crew_dir) / f"{focused.agent_name}_log.txt"
+                if not log_path.exists():
+                    self.notify(
+                        f"No log yet for {focused.agent_name}",
+                        severity="warning",
+                    )
+                else:
+                    try:
+                        subprocess.Popen(
+                            ["./ait", "crew", "logview", "--path", str(log_path)],
+                            start_new_session=True,  # outlive the brainstorm TUI (esp. outside tmux)
+                        )
+                        self.notify(f"Opening log for {focused.agent_name}")
+                    except OSError as exc:
+                        self.notify(
+                            f"Failed to open log viewer: {exc}",
+                            severity="error",
+                        )
+                event.prevent_default()
+                event.stop()
+                return
+
+        # Process actions on focused ProcessRow
+        if isinstance(self.focused, ProcessRow):
+            proc_row = self.focused
+            if event.key == "p":
+                status = proc_row.proc_data.get("status", "")
+                cmd = "resume" if status == "Paused" else "pause"
+                ok = send_agent_command(proc_row.crew_id, proc_row.agent_name, cmd)
+                self.notify(
+                    f"{'Resumed' if cmd == 'resume' else 'Paused'} {proc_row.agent_name}"
+                    if ok else f"Failed to {cmd} {proc_row.agent_name}",
+                    severity="information" if ok else "error",
+                )
+                self.set_timer(2.0, self._refresh_runtime)
+                event.prevent_default()
+                event.stop()
+                return
+            elif event.key == "k":
+                ok = send_agent_command(proc_row.crew_id, proc_row.agent_name, "kill")
+                self.notify(
+                    f"Kill sent to {proc_row.agent_name}" if ok
+                    else f"Failed to send kill to {proc_row.agent_name}",
+                    severity="information" if ok else "error",
+                )
+                self.set_timer(2.0, self._refresh_runtime)
+                event.prevent_default()
+                event.stop()
+                return
+            elif event.key == "K":
+                result = hard_kill_agent(proc_row.crew_id, proc_row.agent_name)
+                self.notify(
+                    result["message"],
+                    severity="information" if result["success"] else "error",
+                )
+                if result["success"]:
+                    self.set_timer(2.0, self._refresh_runtime)
+                event.prevent_default()
+                event.stop()
+                return
+
+        # Up/down: navigate focusable rows in Status tab
+        if event.key in ("up", "down") and tabbed.active == "tab_running":
+            direction = 1 if event.key == "down" else -1
+            if self._navigate_rows(direction, "status_content", (GroupRow, AgentStatusRow, ProcessRow, StatusLogRow)):
+                event.prevent_default()
+                event.stop()
+                return
+
+    # ------------------------------------------------------------------
+    # Tab switching actions (shown in Footer via BINDINGS)
+    # ------------------------------------------------------------------
+
+    def action_open_node_detail(self) -> None:
+        """Enter on a focused NodeRow → open the Node Hub (t983_5).
+
+        Falls through (SkipAction) when focus is anything else, so the
+        existing on_key handlers for GroupRow/StatusLogRow keep working.
+        """
+        from textual.actions import SkipAction
+        if isinstance(self.screen, ModalScreen):
+            raise SkipAction()
+        focused = self.focused
+        if isinstance(focused, NodeRow):
+            self.push_screen(
+                NodeHub(focused.node_id, self.session_path),
+                self._on_node_hub_result,
+            )
+            return
+        raise SkipAction()
+
+    def _on_node_hub_result(self, result) -> None:
+        """Node Hub dismissed (t983_5): a ``NodeHubResult`` dispatches its
+        action; ``None`` (Escape/Close) is a no-op. New launch verbs add a
+        branch here."""
+        if not isinstance(result, NodeHubResult):
+            return
+        if result.action == NODE_HUB_OPERATIONS:
+            self._open_operations_dialog(result.node_id)
+        elif result.action == NODE_HUB_COMPARE:
+            # Compare the Hub's focal node WITH the marked peers (union, so the
+            # node you were viewing always participates) — t983_7.
+            node_ids = sorted(set(self._selection.marked) | {result.node_id})
+            self._open_compare_matrix(
+                node_ids, anchor=result.node_id
+            )
+
+    def _set_browse_view(self, view: str) -> None:
+        """Switch the Browse ContentSwitcher to ``view`` ("graph"|"list") and
+        persist the choice per session."""
+        try:
+            switcher = self.query_one("#browse_switcher", ContentSwitcher)
+        except Exception:
+            return
+        switcher.current = BROWSE_VIEW_TO_PANE.get(view, "dag_content")
+        try:
+            _write_browse_view(self.session_path, view)
+        except Exception:
+            pass
+
+    def _browse_current_view(self) -> str:
+        """Return the Browse switcher's current logical view ("graph"|"list")."""
+        try:
+            switcher = self.query_one("#browse_switcher", ContentSwitcher)
+        except Exception:
+            return BROWSE_DEFAULT_VIEW
+        return BROWSE_PANE_TO_VIEW.get(switcher.current, BROWSE_DEFAULT_VIEW)
+
+    def _refresh_node_marks(self) -> None:
+        """Reflect ``self._selection.marked`` on BOTH Browse views' glyphs.
+
+        Repaints the list-view NodeRow glyphs (the hard bar for t983_3) and the
+        graph-view DAG node boxes (``dag_node_mark_rendering``, t1004) from the
+        single ``NodeSelection.marked`` source of truth. NodeRows stay mounted
+        inside the switcher even when the graph view is showing, so a mark made
+        in graph view is visible the moment the list view is shown."""
+        marked = self._selection.marked
+        for row in self.query(NodeRow):
+            row.marked = row.node_id in marked
+        # Companion refresh: keep the textual marked-node summary in lock-step
+        # with the per-row glyphs (glyphs + textual summary) — t983_4.
+        self._refresh_marked_summary()
+        # Mirror the marks onto the graph-view DAG node boxes (t1004). The DAG
+        # is always composed in the Browse tab; the guard keeps this safe for
+        # any future caller where it might not be mounted.
+        try:
+            self.query_one(DAGDisplay).set_marked(marked)
+        except Exception:
+            pass
+
+    def _refresh_marked_summary(self) -> None:
+        """Update the Browse ``#browse_marked_info`` label from
+        ``self._selection.marked`` (t983_4).
+
+        The explicit textual list complements the per-row ``●`` glyph and — being
+        in the shared ``#browse_detail_pane`` (a persistent sibling of the
+        ContentSwitcher) — shows in BOTH list and graph views, covering the
+        graph-view glyph gap (``dag_node_mark_rendering``). Empty when nothing is
+        marked."""
+        try:
+            label = self.query_one("#browse_marked_info", Label)
+        except Exception:
+            return
+        ids = sorted(self._selection.marked)
+        label.update(format_node_id_summary(ids, "Marked") if ids else "")
+
+    def _select_tab(self, tab_id: str) -> None:
+        """Activate a TabbedContent pane so the switch is not reverted (t1060).
+
+        Setting ``TabbedContent.active`` alone does not stick when a focusable
+        row in the *current* pane holds focus: Textual re-syncs ``active`` back
+        to the pane owning the focused widget on the next refresh, so the
+        single-key tab switches (`b`/`g`/`d`/`s`/`r`) silently failed once focus
+        moved into content. Handing focus to the tab bar (its boot-time home,
+        from which ``down`` re-enters content) makes the switch durable. We only
+        refocus when the tab actually changes, so toggling the Browse view
+        (`d`/`g`) from within Browse keeps the node cursor.
+        """
+        tabbed = self.query_one(TabbedContent)
+        changed = tabbed.active != tab_id
+        tabbed.active = tab_id
+        if changed:
+            bar = self._nav_tab_bar()
+            if bar is not None:
+                bar.focus()
+
+    def action_tab_browse(self) -> None:
+        """`b`: select the Browse tab, preserving the persisted view (t983_9).
+
+        Unlike `d`/`g`, this does not force list/graph — the per-session view
+        choice is kept (mirrors `s`/`r`, which just select their tab).
+        """
+        if isinstance(self.screen, ModalScreen):
+            return
+        self._select_tab("tab_browse")
+
+    def action_tab_dashboard(self) -> None:
+        """`d`: select Browse and show the list view (muscle memory)."""
+        if isinstance(self.screen, ModalScreen):
+            return
+        self._select_tab("tab_browse")
+        self._set_browse_view("list")
+
+    def action_tab_graph(self) -> None:
+        """`g`: select Browse and show the graph view (muscle memory)."""
+        if isinstance(self.screen, ModalScreen):
+            return
+        self._select_tab("tab_browse")
+        self._set_browse_view("graph")
+
+    def action_browse_toggle_view(self) -> None:
+        """`v`: flip the Browse view graph⇄list and persist it."""
+        if isinstance(self.screen, ModalScreen):
+            return
+        if self.query_one(TabbedContent).active != "tab_browse":
+            return
+        self._set_browse_view(browse_toggle_view(self._browse_current_view()))
+
+    def action_browse_mark(self) -> None:
+        """`space`: toggle the marked state of the primary (cursor) node."""
+        if isinstance(self.screen, ModalScreen):
+            return
+        if self.query_one(TabbedContent).active != "tab_browse":
+            return
+        node_id = self._selection.primary
+        if not node_id:
+            return
+        self._selection.toggle(node_id)
+        self._refresh_node_marks()
+
+    def action_compare_matrix(self) -> None:
+        """`c` on Browse → open the dimension-matrix overlay on the marked set
+        (t983_7). In Browse the marked set IS the selection; the cursor is not
+        auto-included (mark explicitly to compare)."""
+        if isinstance(self.screen, ModalScreen):
+            return
+        if self.query_one(TabbedContent).active != "tab_browse":
+            return
+        self._open_compare_matrix(sorted(self._selection.marked))
+
+    def _open_compare_matrix(
+        self, node_ids: list[str], anchor: str | None = None
+    ) -> None:
+        """Open :class:`CompareMatrixModal` on ``node_ids``, enforcing the 2-4
+        cardinality the dimension matrix needs (t983_7). Shared by Browse ``c``,
+        the Node Hub Compare verb, and the graph ``x``/Enter picker. ``anchor``
+        (the Node Hub's focal node, when set) tailors the too-few message."""
+        n = len(node_ids)
+        if n < 2:
+            if anchor:
+                self.notify(
+                    f"Mark 1–3 more nodes to compare with {anchor}",
+                    severity="warning",
+                )
+            else:
+                self.notify("Mark 2–4 nodes to compare", severity="warning")
+            return
+        if n > 4:
+            self.notify("Compare at most 4 nodes", severity="warning")
+            return
+        self.push_screen(CompareMatrixModal(self.session_path, node_ids))
+
+    def _ancestor_subgraphs(self, source: str) -> list[str]:
+        """Subgraphs that are ancestors of ``source`` (merge destinations).
+
+        Shared by the Operations dialog op-state computation
+        (_node_action_op_states) and the wizard's module-merge config
+        (ActionsWizardScreen._config_module_merge, via self.app)."""
+        return [
+            module for module in list_subgraphs(self.session_path)
+            if module != source
+            and is_ancestor_subgraph(self.session_path, source, module)
+        ]
+
+    def _node_action_op_states(self, node_id: str, cardinality: int) -> dict:
+        """Thin I/O wrapper over the pure :func:`op_states_for_selection`.
+
+        Gathers the primary node's module facts (``node_ctx``) via session reads
+        — the only I/O — and delegates the greying decision to the pure function,
+        which now returns ``{op_key: (disabled, reason)}`` for **every** op in the
+        Operations dialog (single-node, module, and multi-node), greyed by
+        ``cardinality`` (t983_4). Module preconditions are read from the primary
+        node; when ``cardinality > 1`` the module ops are greyed by cardinality
+        regardless, so the primary is the correct single source.
+        """
+        module = _node_module(self.session_path, node_id)
+        is_umbrella = module == UMBRELLA_SUBGRAPH
+        gs = _read_graph_state(self.session_path)
+        tasks = gs.get("module_tasks")
+        has_linked_task = bool(isinstance(tasks, dict) and tasks.get(module))
+        # _ancestor_subgraphs takes a subgraph NAME (matches _config_module_merge,
+        # which passes self._wizard_subgraph). The _umbrella root has none.
+        ancestors = [] if is_umbrella else self._ancestor_subgraphs(module)
+        node_ctx = {
+            "is_umbrella": is_umbrella,
+            "is_root": is_root_node(self.session_path, node_id),
+            "has_ancestor": bool(ancestors),
+            "has_linked_task": has_linked_task,
+        }
+        return op_states_for_selection(node_ctx, cardinality)
+
+    def action_node_action(self) -> None:
+        """Open the Operations dialog for the focused node.
+
+        Bound to `A` on the Browse tab. Holds the keybinding-context guards
+        (modal-active, tab_browse, a focused node) then delegates to the shared
+        `_open_operations_dialog`. The Node Hub's Operations entry (t983_5)
+        reaches the same dialog through that helper.
+        """
+        if isinstance(self.screen, ModalScreen):
+            return
+        tabbed = self.query_one(TabbedContent)
+        if tabbed.active != "tab_browse":
+            return
+        node_id = self._selection.primary
+        if not node_id:
+            self.notify("Focus a node first", severity="warning")
+            return
+        self._open_operations_dialog(node_id)
+
+    def _open_operations_dialog(self, node_id: str) -> None:
+        """Open the contextual Operations dialog (t983_4) for ``node_id``.
+
+        Shared launch path for the `A` keybinding (`action_node_action`) and the
+        Node Hub's Operations entry (`_on_node_hub_result`, t983_5). On pick, the
+        dismiss callback seeds the operation wizard and switches to the Actions
+        tab (or, for delete, opens the cascade-delete confirmation modal).
+        """
+        # Anchor the cursor to node_id so the dialog's single-node target is
+        # unambiguous regardless of event ordering (no-op on the `A` path, where
+        # primary already equals node_id; does not disturb a marked set —
+        # effective() returns the marked set when non-empty).
+        self._selection.set_primary(node_id)
+        if self.read_only:
+            self.notify(
+                "Session is read-only — no operations available.",
+                severity="warning",
+            )
+            return
+        status = self.session_data.get("status", "")
+        if status not in ("init", "active"):
+            self.notify(
+                f"Design operations are unavailable while the session is "
+                f"'{status or 'unknown'}'.",
+                severity="warning",
+            )
+            return
+        if node_id not in list_nodes(self.session_path):
+            # Node was deleted between focus and keypress.
+            self._selection.remove(node_id)
+            self.notify(
+                f"Node '{node_id}' no longer exists.", severity="error"
+            )
+            return
+        cardinality = self._selection.cardinality
+        op_states = self._node_action_op_states(node_id, cardinality)
+        # The effective target set the chosen op will act on (marked set if any,
+        # else the lone primary) — surfaced in the dialog header (t983_4).
+        targets = sorted(self._selection.effective()) or [node_id]
+        self.push_screen(
+            NodeActionSelectModal(node_id, op_states, targets=targets),
+            lambda result, nid=node_id: self._on_node_action_result(
+                nid, result
+            ),
+        )
+
+    def action_toggle_deferred(self) -> None:
+        """Toggle the focused node's module ``deferred`` marker (§4.7, t756_5).
+
+        Bound to `f` on the Dashboard / Graph tabs. The target module is the
+        subgraph of the currently-focused node; the `_umbrella` root has no
+        module to defer. Persists ``module_deferred[module]`` so the marker
+        survives a TUI reload, then refreshes the status view. ``deferred`` is
+        orthogonal to the computed base status (a module can be both).
+        """
+        if isinstance(self.screen, ModalScreen):
+            return
+        tabbed = self.query_one(TabbedContent)
+        if tabbed.active != "tab_browse":
+            return
+        node_id = self._selection.primary
+        if not node_id:
+            self.notify("Focus a node first", severity="warning")
+            return
+        if self.read_only:
+            self.notify(
+                "Session is read-only — cannot change deferral.",
+                severity="warning",
+            )
+            return
+        module = _node_module(self.session_path, node_id)
+        if module == UMBRELLA_SUBGRAPH:
+            self.notify(
+                "The root design has no module to defer.", severity="warning"
+            )
+            return
+        current = bool(_module_deferred_map(self.session_path).get(module, False))
+        _write_module_deferred(self.session_path, module, not current)
+        self.notify(
+            f"Module '{module}' marked {'deferred' if not current else 'active'}."
+        )
+        self._update_module_status()
+
+    def _on_node_action_result(self, node_id: str, op_key) -> None:
+        """Callback from NodeActionSelectModal: open the contextual Actions
+        wizard (t983_11).
+
+        ``op_key`` is the chosen operation string, or None if cancelled. On
+        cancel nothing happens. ``discuss`` launches the advisory agent (no
+        wizard, no crew agent) and validates its own effective targets, so it
+        runs BEFORE the cursor-node existence check: a vanished unmarked cursor
+        must not block a discuss of marked nodes that still exist (t1823_4).
+        ``delete`` is handled inline (no wizard); every other op pushes
+        :class:`ActionsWizardScreen`, seeded from the contextual selection — the
+        screen reproduces the per-op starting-step routing in its ``on_mount``,
+        and its dismiss-result is run by ``_on_wizard_result`` →
+        ``_execute_design_op``.
+        """
+        if not op_key:
+            return
+        if op_key == "discuss":
+            self._launch_discuss(node_id)
+            return
+        # The DAG can mutate (background poll timers) while the modal is open.
+        if node_id not in list_nodes(self.session_path):
+            self.notify(
+                f"Node '{node_id}' no longer exists.", severity="error"
+            )
+            return
+        if op_key == "delete":
+            # Cascade-delete this node and its descendants. Handled inline via a
+            # dedicated confirmation modal (like the session-level delete op) —
+            # synchronous, no agent dispatch, no wizard.
+            self._open_delete_node_modal(node_id)
+            return
+        # compare/synthesize pre-check their source checklist from the marked
+        # set; the seed carries it into the screen (t983_6/t983_11).
+        marked = sorted(self._selection.effective())
+        self.push_screen(
+            ActionsWizardScreen(op_key=op_key, node_id=node_id, marked=marked),
+            self._on_wizard_result,
+        )
+
+    def _launch_discuss(self, node_id: str) -> None:
+        """Launch the advisory discuss agent over the effective targets (t1823_4).
+
+        Targets are the marked set, else the cursor node, filtered to nodes that
+        still exist (the DAG can mutate while the Operations dialog is open).
+        Opens :class:`AgentCommandScreen` (agent/model + window-vs-split); never
+        enters the wizard and never registers a crew agent.
+        """
+        live = set(list_nodes(self.session_path))
+        wanted = sorted(self._selection.effective()) or [node_id]
+        targets = [n for n in wanted if n in live]
+        if not targets:
+            self.notify("Selected node(s) no longer exist.", severity="error")
+            return
+        vanished = [n for n in wanted if n not in live]
+        if vanished:
+            self.notify(
+                f"Skipping vanished node(s): {', '.join(vanished)}",
+                severity="warning",
+            )
+        agent_name, binary, error_msg = resolve_agent_binary(_REPO_ROOT, "discuss")
+        if not binary:
+            self.notify(
+                error_msg or "Could not resolve code agent configuration",
+                severity="error",
+            )
+            return
+        if not shutil.which(binary):
+            self.notify(
+                f"{agent_name} CLI ({binary}) not found in PATH", severity="error"
+            )
+            return
+        args = [str(self.task_num), *targets]
+        full_cmd = resolve_dry_run_command(_REPO_ROOT, "discuss", *args)
+        if full_cmd is None:
+            self._run_discuss_default(args)
+            return
+        screen = AgentCommandScreen(
+            f"Discuss {', '.join(targets)}",
+            full_cmd,
+            "/aitask-brainstorm-discuss " + " ".join(args),
+            default_window_name=f"agent-discuss-{self.task_num}",
+            project_root=_REPO_ROOT,
+            operation="discuss",
+            operation_args=args,
+            default_agent_string=resolve_agent_string(_REPO_ROOT, "discuss"),
+            skill_name="brainstorm-discuss",
+            default_profile=resolve_skill_profile("brainstorm-discuss", _REPO_ROOT),
+        )
+        self.push_screen(
+            screen, lambda result, s=screen: self._on_discuss_dialog_result(s, result)
+        )
+
+    def _on_discuss_dialog_result(self, screen, result) -> None:
+        """Dispatch the Discuss dialog's result — always ``screen.full_command``.
+
+        The dialog's agent/model picker, temporary profile override and manual
+        edits all land in ``screen.full_command`` (``run_terminal`` stores it,
+        then dismisses the bare ``"run"``), so rebuilding the default wrapper
+        argv here would launch a different configuration from the one shown.
+        """
+        if isinstance(result, TmuxLaunchConfig):
+            _, err = launch_in_tmux(screen.full_command, result)
+            if err:
+                self.notify(err, severity="error")
+            elif result.new_window:
+                maybe_spawn_minimonitor(result.session, result.window)
+        elif result == "run":
+            self._run_dialog_command(screen.full_command)
+
+    def _run_dialog_command(self, command: str) -> None:
+        """Run a dialog's finalized command verbatim (the board's t1225 pattern)."""
+        self._dispatch_argv(["sh", "-c", command])
+
+    def _run_discuss_default(self, args: list[str]) -> None:
+        """Rebuild the default wrapper argv — ONLY when no dialog was available
+        (``resolve_dry_run_command`` returned None)."""
+        wrapper = str(_REPO_ROOT / ".aitask-scripts" / "aitask_codeagent.sh")
+        self._dispatch_argv([wrapper, "invoke", "discuss", *args])
+
+    def _dispatch_argv(self, argv: list[str]) -> None:
+        """Run ``argv`` in a new terminal, else inline with the TUI suspended."""
+        terminal = find_terminal()
+        if terminal:
+            spawn_in_terminal(terminal, argv, cwd=str(_REPO_ROOT))
+        else:
+            with self.suspend():
+                subprocess.call(argv, cwd=str(_REPO_ROOT))
+
+    def _on_wizard_result(self, result) -> None:
+        """Run the Actions wizard's launch result (t983_11). ``result`` is a
+        ``{op, config, subgraph}`` dict from a Launch, or None on cancel/Esc."""
+        if not result:
+            return
+        self._execute_design_op(result)
+
+    def _delete_agent_casualties(self, closure: set) -> list:
+        """Return running/waiting agents operating on an affected node.
+
+        Reads the crew worktree's ``_status.yaml`` files; for each agent whose
+        status is Running or Waiting, recovers its source/target node from
+        ``<agent>_input.md`` (``_recover_node_id_from_input``) and flags it when
+        that node is in ``closure``. Agents whose node cannot be recovered
+        (compare / synthesize / module ops operate at subgraph/HEAD scope, not a
+        single node) are treated as non-blocking. Returns a list of
+        ``(node_id, agent_name, status)`` tuples.
+        """
+        casualties = []
+        try:
+            status_files = list_agent_files(str(self.session_path), "_status.yaml")
+        except Exception:
+            return casualties
+        for sf in status_files:
+            try:
+                data = read_yaml(sf)
+            except Exception:
+                continue
+            status = data.get("status", "")
+            name = data.get("agent_name", "")
+            if status not in ("Running", "Waiting") or not name:
+                continue
+            node = self._recover_node_id_from_input(name)
+            if node and node in closure:
+                casualties.append((node, name, status))
+        return casualties
+
+    def _open_delete_node_modal(self, node_id: str) -> None:
+        """Build and push the cascade-delete confirmation modal for ``node_id``.
+
+        Computes the deletion closure, the affected linked-task modules (warn),
+        and the blocking running-agent casualties, then pushes DeleteNodeModal.
+        """
+        if is_root_node(self.session_path, node_id):
+            self.notify("Cannot delete the root design.", severity="error")
+            return
+        closure_list = node_descendants_closure(self.session_path, node_id)
+        closure = set(closure_list)
+        # Affected modules with a linked aitask — warn-only.
+        gs = _read_graph_state(self.session_path)
+        tasks = gs.get("module_tasks")
+        tasks = tasks if isinstance(tasks, dict) else {}
+        affected_modules = {
+            _node_module(self.session_path, nid) for nid in closure_list
+        }
+        linked_modules = [
+            (m, tasks[m]) for m in sorted(affected_modules) if tasks.get(m)
+        ]
+        casualties = self._delete_agent_casualties(closure)
+        self.push_screen(
+            DeleteNodeModal(node_id, closure_list, linked_modules, casualties),
+            lambda confirmed, nid=node_id: self._on_delete_node_result(
+                nid, confirmed
+            ),
+        )
+
+    def _on_delete_node_result(self, node_id: str, confirmed) -> None:
+        """Callback from DeleteNodeModal: run the cascade delete on confirm."""
+        if not confirmed:
+            return
+        # Re-check the node still exists and the agent guard still holds — the
+        # DAG / agents may have changed while the modal was open.
+        if node_id not in list_nodes(self.session_path):
+            self.notify(
+                f"Node '{node_id}' no longer exists.", severity="error"
+            )
+            return
+        if is_root_node(self.session_path, node_id):
+            self.notify("Cannot delete the root design.", severity="error")
+            return
+        closure = set(node_descendants_closure(self.session_path, node_id))
+        if self._delete_agent_casualties(closure):
+            self.notify(
+                "Delete blocked — a running agent now operates on an affected "
+                "node.",
+                severity="error",
+            )
+            return
+        report = delete_node_cascade(self.session_path, node_id)
+        if report.get("missing_root"):
+            self.notify(
+                f"Node '{node_id}' no longer exists.", severity="error"
+            )
+            return
+        if report.get("refused_root"):
+            self.notify("Cannot delete the root design.", severity="error")
+            return
+        deleted = report.get("deleted", [])
+        # Keep the Browse selection model coherent: drop every deleted node from
+        # both the marked set and the primary cursor in one call each. When the
+        # cursor node itself is deleted, NodeSelection.remove clears primary
+        # (t983_3; sole cursor since t1003).
+        for nid in deleted:
+            self._selection.remove(nid)
+        self.notify(f"Deleted {len(deleted)} node(s).")
+        self._load_existing_session()
+
+
+
+    def action_tab_session(self) -> None:
+        if isinstance(self.screen, ModalScreen):
+            return
+        self._select_tab("tab_session")
+        self._refresh_session_tab()
+
+    def action_tab_running(self) -> None:
+        if isinstance(self.screen, ModalScreen):
+            return
+        self._select_tab("tab_running")
+
+    # t983_11: op_help moved to ActionsWizardScreen.action_op_help (the wizard
+    # is a modal now). The Operations dialog keeps its own
+    # NodeActionSelectModal.action_op_help.
+
+    # ------------------------------------------------------------------
+    # Keyboard navigation helper
+    # ------------------------------------------------------------------
+
+    def _browse_toggle_pane_focus(self) -> bool:
+        """Tab toggle between the active Browse view and the shared detail pane.
+
+        Branches on the current switcher view: in list view it toggles between
+        the NodeRow list and the dimension list (the old Dashboard behavior); in
+        graph view it toggles between the DAGDisplay and the dimension list (the
+        old Graph behavior). Returns True if focus was moved (caller should stop
+        the event), False otherwise so default Tab traversal still applies.
+        """
+        focused = self.focused
+        view = self._browse_current_view()
+
+        def _focus_first_dim_row() -> bool:
+            try:
+                container = self.query_one("#browse_node_info")
+            except Exception:
+                return False
+            dim_rows = [
+                w for w in container.children
+                if isinstance(w, DimensionRow) and w.can_focus
+            ]
+            if not dim_rows:
+                return False
+            dim_rows[0].focus()
+            dim_rows[0].scroll_visible()
+            return True
+
+        if view == "list":
+            # Right → left: dimension row → corresponding (or first) node row.
+            if isinstance(focused, DimensionRow):
+                try:
+                    list_pane = self.query_one("#node_list_pane", VerticalScroll)
+                except Exception:
+                    return False
+                node_rows = [
+                    w for w in list_pane.children
+                    if isinstance(w, NodeRow) and w.can_focus
+                ]
+                if not node_rows:
+                    return False
+                target = node_rows[0]
+                if self._selection.primary:
+                    for r in node_rows:
+                        if r.node_id == self._selection.primary:
+                            target = r
+                            break
+                target.focus()
+                target.scroll_visible()
+                return True
+            # Left → right: node row → first dimension row (only if any exist).
+            if isinstance(focused, NodeRow):
+                return _focus_first_dim_row()
+            return False
+
+        # Graph view.
+        try:
+            dag = self.query_one(DAGDisplay)
+        except Exception:
+            return False
+        # Right → left: dimension row → DAGDisplay.
+        if isinstance(focused, DimensionRow):
+            dag.focus()
+            return True
+        # Left → right: DAGDisplay → first dimension row (only if any exist).
+        if focused is dag:
+            return _focus_first_dim_row()
+        return False
+
+    def _nav_tab_bar(self):
+        """The main-screen ``Tabs`` for RowNavMixin's top boundary (t1047).
+
+        Browse/Session row nav hands focus back to the tab bar when arrowing up
+        past the first row; the shared helper queries this hook for the widget.
+        """
+        try:
+            return self.query_one(TabbedContent).query_one(Tabs)
+        except Exception:
+            return None
+
+    # _navigate_rows / _focus_within now live on RowNavMixin (t1047).
+
+    def on_mount(self) -> None:
+        """Session lifecycle: load existing or prompt to initialize."""
+        if session_exists(self.task_num):
+            self._load_existing_session()
+        else:
+            self.push_screen(
+                InitSessionModal(self.task_num),
+                callback=self._on_init_result,
+            )
+
+    def _load_existing_session(self) -> None:
+        """Load session data and update the dashboard."""
+        self.session_data = load_session(self.task_num)
+        self._update_title_from_task()
+        status = self.session_data.get("status", "")
+        if status in ("completed", "archived"):
+            self.read_only = True
+        self._update_session_status()
+        self._update_module_status()
+        self._populate_node_list()
+        self.query_one(DAGDisplay).load_dag(self.session_path)
+        # Re-sync the marked set onto the freshly-rebuilt DAG (t1004) — a reload
+        # via node deletion drops removed ids from the selection, so push the
+        # current set so the cached copy stays honest.
+        self.query_one(DAGDisplay).set_marked(self._selection.marked)
+        # Restore the persisted Browse view (graph default) so the toggle
+        # choice survives a TUI reload (t983_3).
+        try:
+            view = _read_browse_view(self.session_path)
+            self.query_one("#browse_switcher", ContentSwitcher).current = (
+                BROWSE_VIEW_TO_PANE.get(view, "dag_content")
+            )
+        except Exception:
+            pass
+        # t983_11: the Actions wizard is an on-demand modal now (no Actions tab
+        # to pre-populate on session load).
+        # Re-render the Session-lifecycle op list so its disabled-state tracks
+        # the freshly-loaded status (t983_8).
+        self._refresh_session_tab()
+        try:
+            self.query_one("#status_polling_indicator", PollingIndicator).start()
+        except Exception:
+            pass
+        self._restart_status_refresh_timer()
+        self._refresh_status_strip()
+        self._try_apply_initializer_if_needed()
+        self._scan_existing_explorers()
+        self._scan_existing_synthesizers()
+        self._scan_existing_comparators()
+        self._scan_existing_module_agents()
+
+    def _restart_status_refresh_timer(self) -> None:
+        """(Re)start the 30s runtime refresh, stopping the previous interval.
+
+        ``_load_existing_session`` runs again on every explorer/initializer
+        apply; without the stop each reload stacked another 30s timer for the
+        life of the session (t1816).
+        """
+        if self._status_refresh_timer is not None:
+            self._status_refresh_timer.stop()
+        self._status_refresh_timer = self.set_interval(30, self._refresh_runtime)
+
+    def _try_apply_initializer_if_needed(self, force: bool = False) -> None:
+        """Re-attempt apply_initializer_output if n000_init is still placeholder.
+
+        Called on session load, on initializer poll completion, and via the
+        ctrl+r manual-retry binding. Surfaces failures via a persistent
+        banner widget rather than a fading toast.
+        """
+        if self._applying_initializer:
+            return
+        from brainstorm.brainstorm_session import (
+            n000_needs_apply,
+            apply_initializer_output,
+        )
+        if not force and not n000_needs_apply(self.task_num):
+            return
+        self._applying_initializer = True
+        try:
+            apply_initializer_output(self.task_num)
+        except Exception as exc:
+            self._initializer_apply_error = str(exc)
+            self._set_apply_banner(
+                f"Initializer apply failed: {exc} — "
+                f"run `ait brainstorm apply-initializer {self.task_num}` to retry"
+            )
+        else:
+            self._initializer_apply_error = None
+            self._clear_apply_banner()
+            self.notify("Initial proposal imported.")
+            self._load_existing_session()
+        finally:
+            self._applying_initializer = False
+
+    def _set_apply_banner(self, msg: str) -> None:
+        try:
+            widget = self.query_one("#initializer_apply_banner", Static)
+            widget.update(msg)
+            widget.add_class("visible")
+        except Exception:
+            pass
+
+    def _clear_apply_banner(self) -> None:
+        try:
+            widget = self.query_one("#initializer_apply_banner", Static)
+            widget.update("")
+            widget.remove_class("visible")
+        except Exception:
+            pass
+
+    def action_retry_initializer_apply(self) -> None:
+        """ctrl+r: force-retry the initializer apply, even if not flagged."""
+        self._try_apply_initializer_if_needed(force=True)
+
+    # ------------------------------------------------------------------
+    # Shared node-id recovery. ``_PATCHER_INPUT_META_RE`` is named for the
+    # (removed) patcher op but is retained because ``_recover_node_id_from_input``
+    # — used by the delete-cascade casualty scan and the explorer/synthesizer
+    # retry helpers — parses the same ``_input.md`` Metadata line.
+    # ------------------------------------------------------------------
+
+    _PATCHER_INPUT_META_RE = re.compile(
+        r"-\s*Metadata:\s*\S+/br_nodes/([A-Za-z0-9_]+)\.yaml"
+    )
+
+    # ------------------------------------------------------------------
+    # Explorer auto-apply (mirrors patcher pattern; no source_node_id —
+    # the explorer NODE_YAML carries its own parents list)
+    # ------------------------------------------------------------------
+
+    def _register_explorer_agent(self, agent_name: str) -> None:
+        """Main-thread: track a freshly-registered explorer and ensure the
+        poll timer is running."""
+        self._explorer_agents.add(agent_name)
+        self._ensure_explorer_poll_timer()
+
+    def _ensure_explorer_poll_timer(self) -> None:
+        if self._explorer_poll_timer is not None:
+            return
+        if not self._explorer_agents:
+            return
+        self._explorer_poll_timer = self.set_interval(5, self._poll_explorers)
+
+    def _stop_explorer_poll_timer(self) -> None:
+        if self._explorer_poll_timer is not None:
+            try:
+                self._explorer_poll_timer.stop()
+            except Exception:
+                pass
+            self._explorer_poll_timer = None
+
+    def _scan_existing_explorers(self) -> None:
+        """Scan the worktree for explorer agents that are in-flight or
+        completed-but-unapplied, so the poll timer keeps watching them.
+        Idempotent — safe to call from ``_load_existing_session``.
+        """
+        wt = self.session_path
+        if not wt or not Path(wt).is_dir():
+            return
+        try:
+            from brainstorm.brainstorm_session import (
+                _agent_apply_scan_should_track,
+                _explorer_needs_apply,
+            )
+        except Exception:
+            return
+        for status_path in sorted(Path(wt).glob("explorer_*_status.yaml")):
+            agent = status_path.stem[:-len("_status")]
+            if agent in self._explorer_agents:
+                continue
+            try:
+                data = read_yaml(str(status_path))
+            except Exception:
+                continue
+            status = (data or {}).get("status", "")
+            needs_apply = (
+                _explorer_needs_apply(self.task_num, agent)
+                if status == "Completed" else False
+            )
+            if not _agent_apply_scan_should_track(status, needs_apply):
+                continue
+            self._explorer_agents.add(agent)
+        self._ensure_explorer_poll_timer()
+
+    def _poll_explorers(self) -> None:
+        """Timer tick: for each tracked explorer, apply its output if it's
+        Completed. Drops entries whose output has already been applied
+        (idempotent across restarts). Stops the timer when empty.
+        """
+        if not self._explorer_agents:
+            self._stop_explorer_poll_timer()
+            return
+        try:
+            from brainstorm.brainstorm_session import (
+                _AGENT_FAILED_STATUSES,
+                _explorer_needs_apply,
+            )
+        except Exception:
+            return
+        for agent in list(self._explorer_agents):
+            if agent in self._applying_explorer:
+                continue
+            status_path = self.session_path / f"{agent}_status.yaml"
+            if not status_path.is_file():
+                continue
+            try:
+                data = read_yaml(str(status_path))
+            except Exception:
+                continue
+            status = (data or {}).get("status", "")
+            if status in _AGENT_FAILED_STATUSES:
+                self._explorer_agents.discard(agent)
+                continue
+            if status != "Completed":
+                continue
+            if not _explorer_needs_apply(self.task_num, agent):
+                # Already applied (e.g., by CLI fallback). Drop and move on.
+                self._explorer_agents.discard(agent)
+                continue
+            self._try_apply_explorer_if_needed(agent)
+        if not self._explorer_agents:
+            self._stop_explorer_poll_timer()
+
+    def _try_apply_explorer_if_needed(
+        self, agent_name: str, force: bool = False,
+    ) -> None:
+        """Single-shot apply attempt for one explorer agent. Failures
+        surface via the initializer apply banner; success refreshes the
+        DAG.
+        """
+        if agent_name in self._applying_explorer:
+            return
+        from brainstorm.brainstorm_session import (
+            _explorer_needs_apply,
+            apply_explorer_output,
+        )
+        if not force and not _explorer_needs_apply(self.task_num, agent_name):
+            return
+        self._applying_explorer.add(agent_name)
+        try:
+            try:
+                new_id = apply_explorer_output(self.task_num, agent_name)
+            except Exception as exc:
+                self._explorer_apply_errors[agent_name] = str(exc)
+                self._set_apply_banner(
+                    f"Explorer {agent_name} apply failed: {exc} — "
+                    f"run `ait brainstorm apply-explorer {self.task_num} "
+                    f"{agent_name}` to retry"
+                )
+                return
+            self._explorer_apply_errors.pop(agent_name, None)
+            self._explorer_agents.discard(agent_name)
+            self._clear_apply_banner()
+            self.notify(f"Explorer {agent_name} applied → {new_id}.")
+            self._load_existing_session()
+        finally:
+            self._applying_explorer.discard(agent_name)
+
+    # ------------------------------------------------------------------
+    # Comparator completion lifecycle (t1020)
+    # ------------------------------------------------------------------
+    # A Compare op produces analysis output only — no node. So the apply step
+    # just flips the owning compare group's status Waiting → Completed (mirrors
+    # the explorer/synthesizer register → poll → apply lifecycle, minus node
+    # creation), which clears the confusing "100% + Waiting" Status-screen state.
+
+    def _register_comparator_agent(self, agent_name: str) -> None:
+        """Main-thread: track a freshly-registered comparator and ensure the
+        poll timer is running."""
+        self._comparator_agents.add(agent_name)
+        self._ensure_comparator_poll_timer()
+
+    def _ensure_comparator_poll_timer(self) -> None:
+        if self._comparator_poll_timer is not None:
+            return
+        if not self._comparator_agents:
+            return
+        self._comparator_poll_timer = self.set_interval(
+            5, self._poll_comparators,
+        )
+
+    def _stop_comparator_poll_timer(self) -> None:
+        if self._comparator_poll_timer is not None:
+            try:
+                self._comparator_poll_timer.stop()
+            except Exception:
+                pass
+            self._comparator_poll_timer = None
+
+    def _scan_existing_comparators(self) -> None:
+        """Scan the worktree for comparator agents that are in-flight or
+        completed-but-unfinalized, so the poll timer keeps watching them.
+        Idempotent — safe to call from ``_load_existing_session``.
+        """
+        wt = self.session_path
+        if not wt or not Path(wt).is_dir():
+            return
+        try:
+            from brainstorm.brainstorm_session import (
+                _agent_apply_scan_should_track,
+                _comparator_needs_apply,
+            )
+        except Exception:
+            return
+        for status_path in sorted(Path(wt).glob("comparator_*_status.yaml")):
+            agent = status_path.stem[:-len("_status")]
+            if agent in self._comparator_agents:
+                continue
+            try:
+                data = read_yaml(str(status_path))
+            except Exception:
+                continue
+            status = (data or {}).get("status", "")
+            needs_apply = (
+                _comparator_needs_apply(self.task_num, agent)
+                if status == "Completed" else False
+            )
+            if not _agent_apply_scan_should_track(status, needs_apply):
+                continue
+            self._comparator_agents.add(agent)
+        self._ensure_comparator_poll_timer()
+
+    def _poll_comparators(self) -> None:
+        """Timer tick: for each tracked comparator, finalize its operation if
+        it's Completed. Drops entries already finalized (idempotent across
+        restarts) and failed agents. Stops the timer when empty.
+        """
+        if not self._comparator_agents:
+            self._stop_comparator_poll_timer()
+            return
+        try:
+            from brainstorm.brainstorm_session import (
+                _AGENT_FAILED_STATUSES,
+                _comparator_needs_apply,
+            )
+        except Exception:
+            return
+        for agent in list(self._comparator_agents):
+            if agent in self._applying_comparator:
+                continue
+            status_path = self.session_path / f"{agent}_status.yaml"
+            if not status_path.is_file():
+                continue
+            try:
+                data = read_yaml(str(status_path))
+            except Exception:
+                continue
+            status = (data or {}).get("status", "")
+            if status in _AGENT_FAILED_STATUSES:
+                self._comparator_agents.discard(agent)
+                continue
+            if status != "Completed":
+                continue
+            if not _comparator_needs_apply(self.task_num, agent):
+                # Already finalized (e.g., by a prior session). Drop it.
+                self._comparator_agents.discard(agent)
+                continue
+            self._try_apply_comparator_if_needed(agent)
+        if not self._comparator_agents:
+            self._stop_comparator_poll_timer()
+
+    def _try_apply_comparator_if_needed(
+        self, agent_name: str, force: bool = False,
+    ) -> None:
+        """Single-shot finalize attempt for one comparator agent. ``force``
+        (the ``i`` retry-apply path) bypasses ``_comparator_needs_apply`` so a
+        re-flip works even after the group is already Completed (an idempotent
+        no-op). Failures surface via the apply banner.
+        """
+        if agent_name in self._applying_comparator:
+            return
+        from brainstorm.brainstorm_session import (
+            _comparator_needs_apply,
+            apply_comparator_output,
+        )
+        if not force and not _comparator_needs_apply(
+            self.task_num, agent_name,
+        ):
+            return
+        self._applying_comparator.add(agent_name)
+        try:
+            try:
+                group = apply_comparator_output(self.task_num, agent_name)
+            except Exception as exc:
+                self._comparator_apply_errors[agent_name] = str(exc)
+                self._set_apply_banner(
+                    f"Comparator {agent_name} finalize failed: {exc} — "
+                    f"focus the group and press 'i' to retry"
+                )
+                return
+            self._comparator_apply_errors.pop(agent_name, None)
+            self._comparator_agents.discard(agent_name)
+            self._clear_apply_banner()
+            self.notify(
+                f"Comparator {agent_name} complete → {group}. "
+                f"Press 'o' on the group to view output."
+            )
+            self._refresh_runtime()
+        finally:
+            self._applying_comparator.discard(agent_name)
+
+    # ------------------------------------------------------------------
+    # Module op auto-apply
+    # ------------------------------------------------------------------
+
+    def _register_module_agent(self, agent_name: str) -> None:
+        self._module_agents.add(agent_name)
+        self._ensure_module_poll_timer()
+
+    def _ensure_module_poll_timer(self) -> None:
+        if self._module_poll_timer is not None:
+            return
+        if not self._module_agents:
+            return
+        self._module_poll_timer = self.set_interval(5, self._poll_module_agents)
+
+    def _stop_module_poll_timer(self) -> None:
+        if self._module_poll_timer is not None:
+            try:
+                self._module_poll_timer.stop()
+            except Exception:
+                pass
+            self._module_poll_timer = None
+
+    def _scan_existing_module_agents(self) -> None:
+        wt = self.session_path
+        if not wt or not Path(wt).is_dir():
+            return
+        try:
+            from brainstorm.brainstorm_session import (
+                _agent_apply_scan_should_track,
+                _module_decomposer_needs_apply,
+                _module_merger_needs_apply,
+                _module_syncer_needs_apply,
+            )
+        except Exception:
+            return
+        for pattern, needs_fn in (
+            ("module_decomposer_*_status.yaml", _module_decomposer_needs_apply),
+            ("module_merger_*_status.yaml", _module_merger_needs_apply),
+            ("module_syncer_*_status.yaml", _module_syncer_needs_apply),
+        ):
+            for status_path in sorted(Path(wt).glob(pattern)):
+                agent = status_path.stem[:-len("_status")]
+                if agent in self._module_agents:
+                    continue
+                try:
+                    data = read_yaml(str(status_path))
+                except Exception:
+                    continue
+                status = (data or {}).get("status", "")
+                needs_apply = (
+                    needs_fn(self.task_num, agent) if status == "Completed" else False
+                )
+                if _agent_apply_scan_should_track(status, needs_apply):
+                    self._module_agents.add(agent)
+        self._ensure_module_poll_timer()
+
+    def _poll_module_agents(self) -> None:
+        if not self._module_agents:
+            self._stop_module_poll_timer()
+            return
+        try:
+            from brainstorm.brainstorm_session import _AGENT_FAILED_STATUSES
+        except Exception:
+            return
+        for agent in list(self._module_agents):
+            if agent in self._applying_module_agent:
+                continue
+            status_path = self.session_path / f"{agent}_status.yaml"
+            if not status_path.is_file():
+                continue
+            try:
+                data = read_yaml(str(status_path))
+            except Exception:
+                continue
+            status = (data or {}).get("status", "")
+            if status in _AGENT_FAILED_STATUSES:
+                self._module_agents.discard(agent)
+                continue
+            if status != "Completed":
+                continue
+            self._try_apply_module_agent_if_needed(agent)
+        if not self._module_agents:
+            self._stop_module_poll_timer()
+
+    def _module_agent_needs_apply(self, agent_name: str) -> bool:
+        from brainstorm.brainstorm_session import (
+            _module_decomposer_needs_apply,
+            _module_merger_needs_apply,
+            _module_syncer_needs_apply,
+        )
+        if agent_name.startswith("module_decomposer_"):
+            return _module_decomposer_needs_apply(self.task_num, agent_name)
+        if agent_name.startswith("module_merger_"):
+            return _module_merger_needs_apply(self.task_num, agent_name)
+        if agent_name.startswith("module_syncer_"):
+            return _module_syncer_needs_apply(self.task_num, agent_name)
+        return False
+
+    def _try_apply_module_agent_if_needed(
+        self, agent_name: str, force: bool = False,
+    ) -> None:
+        if agent_name in self._applying_module_agent:
+            return
+        if not force and not self._module_agent_needs_apply(agent_name):
+            self._module_agents.discard(agent_name)
+            return
+        # Review gate (t929_1): for module_decompose, pause before applying so
+        # the operator can preview / steer / accept. Only decomposer ops gate;
+        # merge and sync auto-apply as before. ``force`` and an already-accepted
+        # proposal bypass the gate.
+        if (
+            not force
+            and agent_name.startswith("module_decomposer_")
+            and agent_name not in self._module_review_accepted
+            and self._module_review_enabled(agent_name)
+        ):
+            if agent_name not in self._module_review_pending:
+                self._module_review_pending.add(agent_name)
+                self._open_module_preview(agent_name)
+            return
+        from brainstorm.brainstorm_session import (
+            apply_module_decomposer_output,
+            apply_module_merger_output,
+            apply_module_syncer_output,
+        )
+        self._applying_module_agent.add(agent_name)
+        try:
+            try:
+                if agent_name.startswith("module_decomposer_"):
+                    new_ids = apply_module_decomposer_output(self.task_num, agent_name)
+                    result = ", ".join(new_ids)
+                elif agent_name.startswith("module_syncer_"):
+                    result = apply_module_syncer_output(self.task_num, agent_name)
+                else:
+                    result = apply_module_merger_output(self.task_num, agent_name)
+            except Exception as exc:
+                self._module_apply_errors[agent_name] = str(exc)
+                self._set_apply_banner(
+                    f"Module agent {agent_name} apply failed: {exc}"
+                )
+                return
+            self._module_apply_errors.pop(agent_name, None)
+            self._module_agents.discard(agent_name)
+            self._module_review_pending.discard(agent_name)
+            self._module_review_accepted.discard(agent_name)
+            self._clear_apply_banner()
+            self.notify(f"Module agent {agent_name} applied → {result}.")
+            self._load_existing_session()
+        finally:
+            self._applying_module_agent.discard(agent_name)
+
+    # ------------------------------------------------------------------
+    # Module decompose review gate (t929_1: iterate-before-apply)
+    # ------------------------------------------------------------------
+
+    def _module_review_enabled(self, agent_name: str) -> bool:
+        from brainstorm.brainstorm_session import module_decomposer_review_enabled
+        try:
+            return module_decomposer_review_enabled(self.task_num, agent_name)
+        except Exception:
+            return False
+
+    def _open_module_preview(self, agent_name: str) -> None:
+        """Parse the decomposer output and push the preview modal.
+
+        On a parse failure, fall through to the apply path (which records the
+        same error and banners it) instead of blocking on a broken preview.
+        """
+        from brainstorm.brainstorm_session import (
+            assign_inferred_module_node_ids,
+            parse_module_decomposer_output,
+        )
+        # Assign deferred IDs for infer-mode output so the preview shows the
+        # proposed names + their node ids (t929_2). No-op for names-given output.
+        assign_inferred_module_node_ids(self.task_num, agent_name)
+        out_path = Path(self.session_path) / f"{agent_name}_output.md"
+        try:
+            blocks = parse_module_decomposer_output(
+                out_path.read_text(encoding="utf-8")
+            )
+        except Exception:
+            self._module_review_pending.discard(agent_name)
+            self._module_review_accepted.add(agent_name)
+            self._try_apply_module_agent_if_needed(agent_name)
+            return
+        self.push_screen(
+            ModulePreviewScreen(agent_name, blocks),
+            lambda result, a=agent_name: self._on_module_preview_result(a, result),
+        )
+
+    def _on_module_preview_result(self, agent_name: str, result) -> None:
+        """Handle the operator's Accept / Re-run / Cancel choice."""
+        self._module_review_pending.discard(agent_name)
+        action = result.get("action") if isinstance(result, dict) else None
+        if action == "accept":
+            self._module_review_accepted.add(agent_name)
+            self._try_apply_module_agent_if_needed(agent_name)
+        elif action == "rerun":
+            steer = result.get("steer", "") if isinstance(result, dict) else ""
+            self._module_rerun_decomposer(agent_name, steer)
+        else:
+            # Cancel or escape-dismiss: discard the proposal, graph untouched.
+            self._module_cancel_decomposer(agent_name)
+
+    def _module_cancel_decomposer(self, agent_name: str) -> None:
+        from brainstorm.brainstorm_session import discard_module_decomposer_output
+        discard_module_decomposer_output(
+            self.task_num, agent_name, suffix="cancelled"
+        )
+        self._module_agents.discard(agent_name)
+        self._module_review_accepted.discard(agent_name)
+        self._module_review_pending.discard(agent_name)
+        self.notify(
+            f"Discarded module decomposition {agent_name}; graph unchanged."
+        )
+
+    @work(thread=True)
+    def _module_rerun_decomposer(self, agent_name: str, steer_text: str) -> None:
+        """Re-dispatch a decomposer with accumulated steering (t929_1).
+
+        Neutralizes the reviewed proposal (graph untouched), then registers a
+        fresh decomposer in a new group carrying the ordered revision notes. The
+        composition rule (Steering overrides the Decomposition Plan on conflict;
+        later revisions win) lives in ``_assemble_input_module_decomposer``.
+        """
+        from brainstorm.brainstorm_session import (
+            _agent_to_group_name,
+            _read_groups_file,
+            discard_module_decomposer_output,
+            record_operation,
+        )
+        wt = Path(self.session_path)
+        old_group = _agent_to_group_name(agent_name)
+        groups = _read_groups_file(str(wt / GROUPS_FILE)).get("groups", {})
+        info = groups.get(old_group, {}) if isinstance(groups, dict) else {}
+        modules = info.get("modules") or []
+        subgraph = (
+            info.get("source_subgraph")
+            or info.get("subgraph")
+            or UMBRELLA_SUBGRAPH
+        )
+        source_node = info.get("head_at_creation") or get_head(
+            self.session_path, module=subgraph
+        )
+        if not modules or not source_node:
+            self.call_from_thread(
+                self.notify,
+                "Cannot re-run: module configuration is missing.",
+                severity="error",
+            )
+            return
+        from_sections = bool(info.get("from_sections"))
+        link_to_task = bool(info.get("link_to_task"))
+        instructions = info.get("instructions", "") or ""
+        launch_mode = info.get("launch_mode") or DEFAULT_LAUNCH_MODE
+
+        # Neutralize the reviewed proposal (durable; graph untouched).
+        discard_module_decomposer_output(
+            self.task_num, agent_name, suffix="superseded"
+        )
+        self._module_agents.discard(agent_name)
+        self._module_review_accepted.discard(agent_name)
+
+        # Accumulate revisions, carried forward to the new group.
+        revisions = list(self._module_steer.get(old_group, []))
+        if steer_text and steer_text.strip():
+            revisions.append(steer_text.strip())
+
+        crew_id = self.session_data.get(
+            "crew_id", f"brainstorm-{self.task_num}"
+        )
+        new_group = self._next_group_name("module_decompose")
+        self._module_steer[new_group] = revisions
+        try:
+            new_agent = register_module_decomposer(
+                self.session_path,
+                crew_id,
+                source_node,
+                modules,
+                new_group,
+                from_sections=from_sections,
+                link_to_task=link_to_task,
+                instructions=instructions,
+                steer=revisions,
+                launch_mode=launch_mode,
+            )
+        except Exception as exc:
+            self.call_from_thread(
+                self.notify, f"Re-run failed: {exc}", severity="error",
+            )
+            return
+        record_operation(
+            self.task_num,
+            group_name=new_group,
+            operation="module_decompose",
+            agents=[new_agent],
+            head_at_creation=source_node,
+            subgraph=subgraph,
+            modules=modules,
+            from_sections=from_sections,
+            link_to_task=link_to_task,
+            source_subgraph=subgraph,
+            review_before_apply=True,
+            instructions=instructions,
+            launch_mode=launch_mode,
+        )
+        self.call_from_thread(self._register_module_agent, new_agent)
+        self.call_from_thread(
+            self.notify,
+            f"Re-running module decomposer (revision {len(revisions)}): {new_agent}",
+        )
+
+    def _recover_node_id_from_input(self, agent: str) -> str | None:
+        """Re-parse ``<agent>_input.md`` for the node-id captured by
+        ``_PATCHER_INPUT_META_RE``. Used by the delete-cascade casualty scan
+        (``_delete_agent_casualties``) to recover the node an in-flight agent
+        operates on.
+        """
+        wt = self.session_path
+        if not wt or not Path(wt).is_dir():
+            return None
+        input_path = Path(wt) / f"{agent}_input.md"
+        if not input_path.is_file():
+            return None
+        try:
+            text = input_path.read_text(encoding="utf-8")
+        except Exception:
+            return None
+        m = self._PATCHER_INPUT_META_RE.search(text)
+        return m.group(1) if m else None
+
+    def _register_synthesizer_agent(self, agent_name: str) -> None:
+        """Main-thread: track a freshly-registered synthesizer and ensure
+        the poll timer is running."""
+        self._synthesizer_agents.add(agent_name)
+        self._ensure_synthesizer_poll_timer()
+
+    def _ensure_synthesizer_poll_timer(self) -> None:
+        if self._synthesizer_poll_timer is not None:
+            return
+        if not self._synthesizer_agents:
+            return
+        self._synthesizer_poll_timer = self.set_interval(
+            5, self._poll_synthesizers,
+        )
+
+    def _stop_synthesizer_poll_timer(self) -> None:
+        if self._synthesizer_poll_timer is not None:
+            try:
+                self._synthesizer_poll_timer.stop()
+            except Exception:
+                pass
+            self._synthesizer_poll_timer = None
+
+    def _scan_existing_synthesizers(self) -> None:
+        """Scan the worktree for synthesizer agents that are in-flight or
+        completed-but-unapplied, so the poll timer keeps watching them.
+        Idempotent — safe to call from ``_load_existing_session``.
+        """
+        wt = self.session_path
+        if not wt or not Path(wt).is_dir():
+            return
+        try:
+            from brainstorm.brainstorm_session import (
+                _agent_apply_scan_should_track,
+                _synthesizer_needs_apply,
+            )
+        except Exception:
+            return
+        for status_path in sorted(Path(wt).glob("synthesizer_*_status.yaml")):
+            agent = status_path.stem[:-len("_status")]
+            if agent in self._synthesizer_agents:
+                continue
+            try:
+                data = read_yaml(str(status_path))
+            except Exception:
+                continue
+            status = (data or {}).get("status", "")
+            needs_apply = (
+                _synthesizer_needs_apply(self.task_num, agent)
+                if status == "Completed" else False
+            )
+            if not _agent_apply_scan_should_track(status, needs_apply):
+                continue
+            self._synthesizer_agents.add(agent)
+        self._ensure_synthesizer_poll_timer()
+
+    def _poll_synthesizers(self) -> None:
+        """Timer tick: for each tracked synthesizer, apply its output if
+        it's Completed. Drops entries whose output has already been
+        applied (idempotent across restarts). Stops the timer when empty.
+        """
+        if not self._synthesizer_agents:
+            self._stop_synthesizer_poll_timer()
+            return
+        try:
+            from brainstorm.brainstorm_session import (
+                _AGENT_FAILED_STATUSES,
+                _synthesizer_needs_apply,
+            )
+        except Exception:
+            return
+        for agent in list(self._synthesizer_agents):
+            if agent in self._applying_synthesizer:
+                continue
+            status_path = self.session_path / f"{agent}_status.yaml"
+            if not status_path.is_file():
+                continue
+            try:
+                data = read_yaml(str(status_path))
+            except Exception:
+                continue
+            status = (data or {}).get("status", "")
+            if status in _AGENT_FAILED_STATUSES:
+                self._synthesizer_agents.discard(agent)
+                continue
+            if status != "Completed":
+                continue
+            if not _synthesizer_needs_apply(self.task_num, agent):
+                # Already applied (e.g., by CLI fallback).
+                self._synthesizer_agents.discard(agent)
+                continue
+            self._try_apply_synthesizer_if_needed(agent)
+        if not self._synthesizer_agents:
+            self._stop_synthesizer_poll_timer()
+
+    def _try_apply_synthesizer_if_needed(
+        self, agent_name: str, force: bool = False,
+    ) -> None:
+        """Single-shot apply attempt for one synthesizer agent. Failures
+        surface via the initializer apply banner; success refreshes the
+        DAG.
+        """
+        if agent_name in self._applying_synthesizer:
+            return
+        from brainstorm.brainstorm_session import (
+            _synthesizer_needs_apply,
+            apply_synthesizer_output,
+        )
+        if not force and not _synthesizer_needs_apply(
+            self.task_num, agent_name,
+        ):
+            return
+        self._applying_synthesizer.add(agent_name)
+        try:
+            try:
+                new_id = apply_synthesizer_output(
+                    self.task_num, agent_name,
+                )
+            except Exception as exc:
+                self._synthesizer_apply_errors[agent_name] = str(exc)
+                self._set_apply_banner(
+                    f"Synthesizer {agent_name} apply failed: {exc} — "
+                    f"run `ait brainstorm apply-synthesizer "
+                    f"{self.task_num} {agent_name}` to retry"
+                )
+                return
+            self._synthesizer_apply_errors.pop(agent_name, None)
+            self._synthesizer_agents.discard(agent_name)
+            self._clear_apply_banner()
+            self.notify(f"Synthesizer {agent_name} applied → {new_id}.")
+            self._load_existing_session()
+        finally:
+            self._applying_synthesizer.discard(agent_name)
+
+    def on_tabbed_content_tab_activated(self, event) -> None:
+        """Refresh the Running tab when it becomes active."""
+        if event.pane.id == "tab_running":
+            self._refresh_status_tab()
+
+    def _refresh_runtime(self) -> None:
+        """Refresh the always-on runtime strip plus the Running tab (which
+        self-guards on the active tab). Used by the periodic interval and after
+        agent mutations so the strip stays current regardless of active tab."""
+        self._refresh_status_strip()
+        self._refresh_status_tab()
+
+    def _refresh_status_strip(self) -> None:
+        """Update the always-on runtime strip (runner state + running-op count).
+
+        Independent of the active tab (unlike _refresh_status_tab). Best-effort:
+        a missing widget or a runner-info hiccup leaves the last strip in place.
+        """
+        try:
+            strip = self.query_one("#runtime_strip", Static)
+        except Exception:
+            return
+        crew_id = self.session_data.get("crew_id", "")
+        if not crew_id:
+            strip.update(format_status_strip("none", False, 0))
+            return
+        try:
+            runner = get_runner_info(crew_id)
+            count = len(get_all_agent_processes(crew_id))
+        except Exception:
+            return
+        strip.update(
+            format_status_strip(runner["status"], runner["stale"], count)
+        )
+
+    def _toggle_group(self, name: str) -> None:
+        """Expand/collapse a Running-tab operation group.
+
+        Shared by the Enter key handler and GroupRow double-click so both entry
+        points stay in sync (t1018_3).
+        """
+        if name in self._expanded_groups:
+            self._expanded_groups.discard(name)
+        else:
+            self._expanded_groups.add(name)
+        self._refresh_status_tab()
+
+    def _refocus_group(self, group_name: str) -> None:
+        """Restore focus to a group row after a Running-tab rebuild (t1018_3).
+
+        Best-effort: a no-op if the group disappeared from the refresh. Mirrors
+        aitask_board.py _refocus_card.
+        """
+        for row in self.query(GroupRow):
+            if row.group_name == group_name:
+                row.focus()
+                return
+
+    def _refresh_status_tab(self) -> None:
+        """Populate the Status tab with operation groups and agent statuses."""
+        try:
+            self.query_one("#status_polling_indicator", PollingIndicator).flash()
+        except Exception:
+            pass
+        tabbed = self.query_one(TabbedContent)
+        if tabbed.active != "tab_running":
+            return
+
+        import os
+
+        wt_path = str(self.session_path)
+        container = self.query_one("#status_content", VerticalScroll)
+        # Preserve focus across the rebuild: capture the focused group now and
+        # restore it after the new rows mount (deferred, like the board). Without
+        # this, remove_children() drops focus on every status refresh. (t1018_3)
+        focused_group = next(
+            (row.group_name for row in self.query(GroupRow) if row.has_focus),
+            None,
+        )
+        container.remove_children()
+
+        if not os.path.isdir(wt_path):
+            container.mount(Label("Crew worktree not found", classes="status_empty"))
+            return
+
+        # Runner status section
+        crew_id = self.session_data.get("crew_id", "")
+        if crew_id:
+            runner = get_runner_info(crew_id)
+            status = runner["status"]
+            stale = runner["stale"]
+
+            # Shared derivation with the always-on runtime strip (t983_9).
+            status_text, color = derive_runner_state(status, stale)
+
+            info_parts = [f"[{color}]{status_text}[/{color}]"]
+            if runner.get("hostname"):
+                info_parts.append(f"Host: {runner['hostname']}")
+            hb_age = runner.get("heartbeat_age", "never")
+            if hb_age != "never":
+                info_parts.append(f"Heartbeat: {hb_age}")
+
+            # Augment with OS-level stats
+            runner_proc = get_runner_process_info(crew_id)
+            if runner_proc and runner_proc.get("pid") and not runner_proc.get("remote"):
+                extra = []
+                extra.append(f"PID: {runner_proc['pid']}")
+                if runner_proc.get("cpu_time") is not None:
+                    extra.append(f"CPU: {runner_proc['cpu_time']:.1f}s")
+                if runner_proc.get("memory_rss_mb") is not None:
+                    extra.append(f"RSS: {runner_proc['memory_rss_mb']:.0f}MB")
+                if extra:
+                    info_parts.extend(extra)
+
+            container.mount(
+                Label("[bold]Runner[/bold]", classes="status_section_title")
+            )
+            container.mount(Label("  ".join(info_parts)))
+
+            runner_active = status not in ("none", "stopped") and not stale
+            bar = Horizontal(classes="runner_bar")
+            container.mount(bar)
+            if not runner_active:
+                bar.mount(Button("Start Runner", classes="btn_runner_start"))
+            else:
+                bar.mount(Button("Stop Runner", classes="btn_runner_stop"))
+
+        # --- Running Processes section ---
+        if crew_id:
+            if not self._processes_synced:
+                corrected = sync_stale_processes(crew_id)
+                if corrected:
+                    self.notify(f"Auto-corrected {len(corrected)} stale agent(s)")
+                self._processes_synced = True
+
+            processes = get_all_agent_processes(crew_id)
+            container.mount(
+                Label("[bold]Running Processes[/bold]", classes="status_section_title")
+            )
+            if not processes:
+                container.mount(Label("  [dim]No running processes[/dim]"))
+            else:
+                for proc in processes:
+                    container.mount(ProcessRow(proc, crew_id))
+
+        # Read groups from br_groups.yaml
+        groups_path = self.session_path / GROUPS_FILE
+        groups: dict = {}
+        if groups_path.is_file():
+            try:
+                gdata = read_yaml(str(groups_path))
+                groups = gdata.get("groups", {}) if gdata else {}
+            except Exception:
+                pass
+
+        # Check for agent files even without groups
+        agent_files = list_agent_files(wt_path, "_status.yaml")
+
+        if not groups and not agent_files:
+            container.mount(Label("No operations yet", classes="status_empty"))
+            return
+
+        # Groups section
+        if groups:
+            container.mount(
+                Label("[bold]Operation Groups[/bold]", classes="status_section_title")
+            )
+            # Sort by created_at descending (newest first)
+            sorted_groups = sorted(
+                groups.items(),
+                key=lambda kv: kv[1].get("created_at", "") if isinstance(kv[1], dict) else "",
+                reverse=True,
+            )
+            for gname, ginfo in sorted_groups:
+                if not isinstance(ginfo, dict):
+                    continue
+                expanded = gname in self._expanded_groups
+                aggregate = self._compute_group_progress(wt_path, ginfo)
+                has_failed, has_completed = self._group_recovery_flags(
+                    wt_path, ginfo
+                )
+                container.mount(
+                    GroupRow(
+                        gname, ginfo, expanded=expanded,
+                        aggregate_progress=aggregate,
+                        has_failed_agent=has_failed,
+                        has_completed_agent=has_completed,
+                        classes="status_group_row",
+                    )
+                )
+                if expanded:
+                    self._mount_group_agents(container, wt_path, ginfo)
+
+        # Ungrouped agents section
+        grouped_agents: set[str] = set()
+        for ginfo in groups.values():
+            if isinstance(ginfo, dict):
+                for a in ginfo.get("agents", []):
+                    grouped_agents.add(a)
+
+        ungrouped = []
+        for sf in agent_files:
+            data = read_yaml(sf)
+            name = data.get("agent_name", "")
+            if name and name not in grouped_agents:
+                ungrouped.append((name, data))
+
+        if ungrouped:
+            container.mount(Label(""))
+            container.mount(
+                Label("[bold]Ungrouped Agents[/bold]", classes="status_section_title")
+            )
+            for name, data in ungrouped:
+                self._mount_agent_row(container, wt_path, name, data)
+
+        # Log files section (t439_4)
+        logs = list_agent_logs(wt_path)
+        if logs:
+            container.mount(Label(""))
+            container.mount(
+                Label(
+                    "[bold]Agent Logs[/bold]  (Enter to view)",
+                    classes="status_section_title",
+                )
+            )
+            for log_info in logs:
+                container.mount(StatusLogRow(log_info))
+
+        if focused_group is not None:
+            self.call_after_refresh(self._refocus_group, focused_group)
+
+    def _reset_agent(self, row: "AgentStatusRow") -> None:
+        """Reset an agent from Error to Waiting by updating the status file directly."""
+        import os
+
+        name = row.agent_name
+        wt_path = str(self.session_path)
+        sf = os.path.join(wt_path, f"{name}_status.yaml")
+        if os.path.isfile(sf):
+            update_yaml_field(sf, "status", "Waiting")
+            update_yaml_field(sf, "error_message", "")
+            update_yaml_field(sf, "completed_at", "")
+            self.notify(f"Agent {name} reset to Waiting")
+            self._delayed_refresh_status()
+        else:
+            self.notify(f"Status file not found for {name}", severity="error")
+
+    def _retry_agent(self, row: "AgentStatusRow") -> None:
+        """Retry a failed agent (t983_9 / t535).
+
+        Resets Error→Waiting (via _reset_agent) AND ensures the runner is live
+        so the agent is actually relaunched — distinct from bare ``w: reset``,
+        which only flips the status and relies on an already-running runner.
+        Goes through the existing ``start_runner`` gateway (no launch-logic
+        duplication).
+        """
+        self._reset_agent(row)
+        crew_id = self.session_data.get("crew_id", "")
+        if not crew_id:
+            return
+        runner = get_runner_info(crew_id)
+        if runner["status"] in ("none", "stopped") or runner["stale"]:
+            if start_runner(crew_id):
+                self.notify("Runner started — agent will relaunch")
+            else:
+                self.notify(
+                    "Reset to Waiting, but the runner failed to start",
+                    severity="warning",
+                )
+        self._refresh_runtime()
+
+    def _confirm_cleanup_agent(self, name: str) -> None:
+        """Push the cleanup confirm modal; on confirm, remove the agent's
+        on-disk status artifacts (t983_9 / t535)."""
+        def _on_confirm(confirmed: bool | None) -> None:
+            if confirmed:
+                self._cleanup_agent(name)
+
+        self.push_screen(CleanupAgentModal(name), _on_confirm)
+
+    def _cleanup_agent(self, name: str) -> None:
+        """Remove a finished/failed agent's on-disk status artifacts."""
+        import os
+
+        wt_path = str(self.session_path)
+        removed = 0
+        for suffix in ("_status.yaml", "_alive.yaml", "_output.md", "_log.txt"):
+            fp = os.path.join(wt_path, f"{name}{suffix}")
+            try:
+                if os.path.isfile(fp):
+                    os.remove(fp)
+                    removed += 1
+            except OSError as exc:
+                self.notify(
+                    f"Failed to remove {os.path.basename(fp)}: {exc}",
+                    severity="error",
+                )
+        self.notify(
+            f"Cleaned up {name} ({removed} file(s))"
+            if removed else f"Nothing to clean up for {name}"
+        )
+        self._refresh_runtime()
+
+    # ------------------------------------------------------------------
+    # Operation/group-level recovery on the Running tab (t1018_2)
+    # ------------------------------------------------------------------
+
+    def _group_recovery_flags(
+        self, wt_path: str, ginfo: dict
+    ) -> tuple[bool, bool]:
+        """Return ``(has_failed_agent, has_completed_agent)`` for a group by
+        reading each agent's on-disk status. Drives the GroupRow recovery
+        actions: ``n`` (re-run fresh) needs a failed agent; ``i`` (retry-apply)
+        needs a completed agent whose output may still need ingesting.
+        """
+        import os
+        from brainstorm.brainstorm_session import _AGENT_FAILED_STATUSES
+
+        has_failed = False
+        has_completed = False
+        for name in ginfo.get("agents") or []:
+            sf = os.path.join(wt_path, f"{name}_status.yaml")
+            if not os.path.isfile(sf):
+                continue
+            try:
+                data = read_yaml(sf)
+            except Exception:
+                continue
+            status = (data or {}).get("status", "")
+            if status in _AGENT_FAILED_STATUSES:
+                has_failed = True
+            elif status == "Completed":
+                has_completed = True
+        return has_failed, has_completed
+
+    def _retry_group_apply(self, row: "GroupRow") -> None:
+        """``i`` on a focused GroupRow: re-ingest output for the group's
+        completed agents (t1018_2). Re-homes the explorer/synthesizer
+        retry-apply logic from the removed ``ctrl+shift+x``/``ctrl+shift+y``
+        chords, but scoped to the focused group rather than the most-recent
+        completed agent in the whole worktree. Only explore/synthesize ops
+        produce apply-able output.
+        """
+        import os
+
+        op = row.group_info.get("operation", "")
+        if op == "explore":
+            applier = self._try_apply_explorer_if_needed
+        elif op == "synthesize":
+            applier = self._try_apply_synthesizer_if_needed
+        elif op == "compare":
+            applier = self._try_apply_comparator_if_needed
+        else:
+            self.notify(
+                f"Retry-apply only applies to explore/synthesize/compare "
+                f"operations (this group is '{op}').",
+                severity="warning",
+            )
+            return
+        wt_path = str(self.session_path)
+        completed = []
+        for name in row.group_info.get("agents") or []:
+            sf = os.path.join(wt_path, f"{name}_status.yaml")
+            if not os.path.isfile(sf):
+                continue
+            try:
+                data = read_yaml(sf)
+            except Exception:
+                continue
+            if (data or {}).get("status", "") == "Completed":
+                completed.append(name)
+        if not completed:
+            self.notify(
+                "No completed agents in this group to re-apply.",
+                severity="warning",
+            )
+            return
+        for name in completed:
+            applier(name, force=True)
+
+    def _open_group_operation(self, row: "GroupRow") -> None:
+        """``o`` on a focused GroupRow: open ``OperationDetailScreen`` for the
+        group (t1020). This is the output-access path for node-less operations
+        such as Compare — whose ``_output.md`` has no created node to press
+        ``o`` on. Gated on ``has_completed_agent`` so the action stays
+        consistent with the rendered hint and a Waiting group never opens a
+        placeholder-only modal.
+        """
+        if not getattr(row, "has_completed_agent", False):
+            self.notify(
+                "No completed output to open yet.", severity="warning",
+            )
+            return
+        self.push_screen(
+            OperationDetailScreen(row.group_name, self.session_path)
+        )
+
+    def _rerun_group_fresh(self, row: "GroupRow") -> None:
+        """``n`` on a focused GroupRow: relaunch the operation from scratch via
+        the pre-seeded Actions wizard, then offer to clean up the old group
+        (t1018_2).
+
+        The per-operation config (explore mandate, compare dimensions,
+        synthesize merge-rules) is NOT stored in br_groups.yaml, so it cannot
+        be reconstructed — the wizard re-collects it and doubles as the
+        destructive-action confirm. ``_run_design_op`` mints a fresh group
+        name, so the old (failed) group survives until the user cleans it up.
+        """
+        op = row.group_info.get("operation", "")
+        old_group = row.group_name
+        head = row.group_info.get("head_at_creation") or get_head(
+            self.session_path
+        )
+
+        def _after(result, _old=old_group):
+            if not result:
+                return
+            self._execute_design_op(result)
+            self._confirm_cleanup_group(_old)
+
+        self.push_screen(
+            ActionsWizardScreen(op_key=op, node_id=head, marked=[]),
+            _after,
+        )
+
+    def _confirm_cleanup_group(self, group_name: str) -> None:
+        """Offer to remove the old failed group and its agent artifacts after a
+        re-run (t1018_2). Reuses the agent-cleanup confirm modal."""
+        def _on_confirm(confirmed: bool | None) -> None:
+            if confirmed:
+                from brainstorm.brainstorm_session import delete_group
+                removed = delete_group(self.task_num, group_name)
+                self.notify(
+                    f"Cleaned up old group {group_name} "
+                    f"({len(removed)} agent(s))"
+                    if removed else f"Removed old group {group_name}"
+                )
+                self._refresh_runtime()
+
+        self.push_screen(
+            CleanupAgentModal(
+                group_name,
+                title=f"Clean up old group [bold]{group_name}[/] "
+                f"and its agents?",
+                body="[dim]Removes the group entry and every agent's status / "
+                "alive / output / log files. This cannot be undone.[/dim]",
+            ),
+            _on_confirm,
+        )
+
+    def _edit_agent_mode(self, row: "AgentStatusRow") -> None:
+        """Open the launch_mode edit modal for a Waiting agent row."""
+        import os
+
+        name = row.agent_name
+        sf = os.path.join(str(self.session_path), f"{name}_status.yaml")
+        if not os.path.isfile(sf):
+            self.notify(
+                f"Status file not found for {name}",
+                severity="error",
+            )
+            return
+        data = read_yaml(sf) or {}
+        current_mode = data.get("launch_mode", DEFAULT_LAUNCH_MODE)
+        status = data.get("status", row.agent_status)
+        self.push_screen(
+            AgentModeEditModal(
+                agent_name=name,
+                agent_status=status,
+                current_mode=current_mode,
+            ),
+            lambda result, _name=name, _current=current_mode:
+                self._on_mode_edit_result(_name, _current, result),
+        )
+
+    def _on_mode_edit_result(
+        self, agent_name: str, current_mode: str, new_mode
+    ) -> None:
+        """Callback after AgentModeEditModal closes."""
+        if new_mode is None or new_mode == current_mode:
+            return
+        crew_id = self.session_data.get("crew_id", "")
+        if not crew_id:
+            self.notify("No crew_id in session", severity="error")
+            return
+        try:
+            result = subprocess.run(
+                [
+                    AIT_PATH, "crew", "setmode",
+                    "--crew", crew_id,
+                    "--name", agent_name,
+                    "--mode", new_mode,
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except OSError as e:
+            self.notify(f"setmode failed to launch: {e}", severity="error")
+            return
+        if result.returncode == 0 and f"UPDATED:{agent_name}:{new_mode}" in result.stdout:
+            self.notify(f"Launch mode → {new_mode} for {agent_name}")
+            self._delayed_refresh_status()
+        else:
+            err = (result.stderr or result.stdout).strip() or "unknown error"
+            self.notify(f"setmode failed: {err}", severity="error")
+
+    def _delayed_refresh_status(self) -> None:
+        """Show a loading notification then refresh the status tab after 2 seconds."""
+        self.notify("Refreshing status...", timeout=2)
+        self.set_timer(2.0, self._refresh_runtime)
+
+    def _compute_group_progress(
+        self, wt_path: str, ginfo: dict
+    ) -> int | None:
+        """Return the mean per-agent progress for a group, rounded to int.
+
+        Reads each agent's ``<name>_status.yaml::progress`` value. Returns
+        ``None`` when the group has no agents on disk so the GroupRow
+        suppresses the bar. Used by Status-tab refresh to give parallel
+        ops (e.g. multi-explorer ``explore_<seq>``) a single aggregate
+        indicator at the group level (t792).
+        """
+        import os
+
+        agent_names = ginfo.get("agents") or []
+        if not agent_names:
+            return None
+        progresses: list[int] = []
+        for name in agent_names:
+            sf = os.path.join(wt_path, f"{name}_status.yaml")
+            if not os.path.isfile(sf):
+                continue
+            try:
+                data = read_yaml(sf)
+            except Exception:
+                continue
+            try:
+                p = int(data.get("progress", 0) or 0)
+            except (TypeError, ValueError):
+                p = 0
+            progresses.append(max(0, min(100, p)))
+        if not progresses:
+            return None
+        return int(round(sum(progresses) / len(progresses)))
+
+    def _mount_group_agents(
+        self, container: VerticalScroll, wt_path: str, ginfo: dict
+    ) -> None:
+        """Mount agent detail rows for an expanded group."""
+        import os
+
+        agent_names = ginfo.get("agents", [])
+        if not agent_names:
+            container.mount(Label("  (no agents)", classes="status_agent_detail"))
+            return
+
+        for name in agent_names:
+            sf = os.path.join(wt_path, f"{name}_status.yaml")
+            if os.path.isfile(sf):
+                data = read_yaml(sf)
+            else:
+                data = {"agent_name": name, "status": "Unknown"}
+            self._mount_agent_row(container, wt_path, name, data)
+
+    def _mount_agent_row(
+        self, container: VerticalScroll, wt_path: str, name: str, data: dict
+    ) -> None:
+        """Mount a single agent status row with optional output preview."""
+        import os
+        from datetime import datetime, timezone
+
+        status = data.get("status", "Unknown")
+        color = AGENT_STATUS_COLORS.get(status, "#888888")
+        atype = data.get("agent_type", "")
+        type_label = f" ({atype})" if atype else ""
+
+        bar = _format_progress_bar(data.get("progress", 0))
+        progress_str = f"  {bar}" if bar else ""
+
+        # Heartbeat info
+        alive_path = os.path.join(wt_path, f"{name}_alive.yaml")
+        hb_str = ""
+        msg_str = ""
+        if os.path.isfile(alive_path):
+            alive = read_yaml(alive_path)
+            hb = alive.get("last_heartbeat", "")
+            if hb:
+                try:
+                    ts = datetime.fromisoformat(str(hb).replace("Z", "+00:00"))
+                    if ts.tzinfo is None:
+                        ts = ts.replace(tzinfo=timezone.utc)
+                    elapsed = (datetime.now(timezone.utc) - ts).total_seconds()
+                    hb_str = f"  \u2665 {format_elapsed(elapsed)} ago"
+                except (ValueError, TypeError):
+                    pass
+            msg = alive.get("last_message", "")
+            if msg:
+                msg_str = f"  {msg}"
+
+        line = (
+            f"  [{color}]\u25cf[/{color}] {name}{type_label}  "
+            f"[{color}]{status}[/{color}]{progress_str}{hb_str}{msg_str}"
+        )
+        crew_id = self.session_data.get("crew_id", "")
+        container.mount(AgentStatusRow(name, status, line, crew_id))
+
+        # Output preview (last 10 lines)
+        output_path = os.path.join(wt_path, f"{name}_output.md")
+        if os.path.isfile(output_path):
+            try:
+                with open(output_path) as f:
+                    lines = f.readlines()
+                if lines:
+                    tail = lines[-10:]
+                    preview = "".join(tail).rstrip()
+                    if preview:
+                        container.mount(
+                            Label(
+                                f"[dim]{preview}[/dim]",
+                                classes="status_output_preview",
+                            )
+                        )
+            except Exception:
+                pass
+
+    def _update_session_status(self) -> None:
+        """Show session metadata in the right pane status area."""
+        sd = self.session_data
+        status = sd.get("status", "unknown")
+        created = sd.get("created_at", "")
+        updated = sd.get("updated_at", "")
+        created_by = sd.get("created_by", "")
+        node_count = len(list_nodes(self.session_path))
+        head = get_head(self.session_path)
+
+        info_lines = [
+            f"Status: {status}" + (" [READ ONLY]" if self.read_only else ""),
+            f"Nodes: {node_count}  HEAD: {head or 'none'}",
+            f"Created: {created}  by {created_by}",
+            f"Updated: {updated}",
+            f"Path: {self.session_path}",
+        ]
+
+        spec = sd.get("initial_spec", "")
+        if spec:
+            preview_lines = [ln for ln in spec.splitlines() if ln.strip() and not ln.startswith("---")][:2]
+            preview = " | ".join(preview_lines)
+            if len(preview) > 100:
+                preview = preview[:97] + "…"
+            info_lines.append(f"Brief: {preview}  [press b for full text]")
+
+        self.query_one("#session_status_info", Label).update("\n".join(info_lines))
+
+    def _update_module_status(self) -> None:
+        """Render the per-module fluid-status view (§4.7, UC-2, t756_5).
+
+        A read-only subgraph tree: one line per subgraph with its computed
+        status badge, the orthogonal ``deferred`` overlay, and sync/link
+        context. Sessions with only the ``_umbrella`` root show a placeholder so
+        the common single-subgraph case stays uncluttered.
+        """
+        try:
+            label = self.query_one("#module_status_info", Label)
+        except Exception:
+            return
+        rows = module_status_rows(self.session_path)
+        if not any(not r["is_umbrella"] for r in rows):
+            label.update("[dim]— no modules —[/]")
+            return
+        lines: list[str] = []
+        for r in rows:
+            status = r["status"]
+            style = MODULE_STATUS_STYLES.get(status, UNKNOWN_STATUS_STYLE)
+            color = style.color
+            hex_c = color.name if color else "#888888"
+            name = "root" if r["is_umbrella"] else r["module"]
+            extra: list[str] = []
+            if r["deferred"]:
+                extra.append("[#FF5555 italic]deferred[/]")
+            if r["task_id"]:
+                extra.append(f"[dim]t{r['task_id']}[/]")
+            if r["last_synced"]:
+                extra.append(f"[dim]synced {r['last_synced']}[/]")
+            suffix = ("  " + "  ".join(extra)) if extra else ""
+            lines.append(
+                f"[{hex_c} bold]{status}[/]  {name} "
+                f"[dim]({r['node_count']})[/]{suffix}"
+            )
+        label.update("\n".join(lines))
+
+    def _populate_node_list(self) -> None:
+        """Clear and repopulate the left pane with NodeRow widgets."""
+        pane = self.query_one("#node_list_pane", VerticalScroll)
+        pane.remove_children()
+
+        nodes = list_nodes(self.session_path)
+        head = get_head(self.session_path)
+
+        if not nodes:
+            pane.mount(Label("No nodes yet"))
+            return
+
+        marked = self._selection.marked
+        for nid in nodes:
+            node_data = read_node(self.session_path, nid)
+            desc = node_data.get("description", "")
+            row = NodeRow(nid, desc, is_head=(nid == head))
+            # Reflect the Browse marked set on the freshly-built rows (t983_3),
+            # so marks survive a list rebuild (reload, HEAD change, delete).
+            row.marked = nid in marked
+            pane.mount(row)
+
+    def _show_browse_node_detail(self, node_id: str) -> None:
+        """Update the shared Browse detail panel for the focused node.
+
+        Both Browse views feed this one handler: list-view NodeRow focus
+        (``on_descendant_focus``) and graph-view DAG focus
+        (``on_dag_display_focus_changed``). It moves the single
+        ``NodeSelection.primary`` cursor to ``node_id`` (sole Browse cursor
+        since t1003; the legacy parallel focused-node field was retired).
+        """
+        self._selection.set_primary(node_id)
+        self.query_one("#browse_node_panel", NodeDetailPanel).update(node_id)
+
+    def _show_brief_in_detail(self, spec: str) -> None:
+        """Show the full initial_spec in the detail pane (press b to toggle)."""
+        self._selection.set_primary(None)
+        # Truncate for the Static widget; full text is in n000_init proposal
+        lines = spec.splitlines()
+        if len(lines) > 30:
+            preview = "\n".join(lines[:30]) + "\n\n… (truncated — see n000_init proposal for full text)"
+        else:
+            preview = spec
+        self.query_one("#browse_node_panel", NodeDetailPanel).show_content(
+            "Task Brief", [Static(preview)])
+
+    def on_dimension_row_activated(self, event: DimensionRow.Activated) -> None:
+        """Enter on a DimensionRow → push SectionViewerScreen filtered to matching sections."""
+        node_id = self._selection.primary
+        if not node_id:
+            return
+        try:
+            proposal = read_proposal(self.session_path, node_id)
+        except Exception:
+            self.notify(
+                "Could not read proposal for this node", severity="warning"
+            )
+            return
+        parsed = parse_sections(proposal)
+        matching = get_sections_for_dimension(parsed, event.dim_key)
+        if not matching:
+            self.notify(
+                f"No proposal sections tagged with `{event.dim_key}`",
+                severity="warning",
+            )
+            return
+        # Land on the most-specific section (a nested subsection when present,
+        # else the wrapper); keep the wrapper + leaf both in the minimap filter.
+        best = best_section_for_dimension(parsed, event.dim_key)
+        from section_viewer import SectionViewerScreen
+        self.push_screen(SectionViewerScreen(
+            proposal,
+            title=f"Proposal: {node_id} — {event.dim_key}",
+            section_filter=[s.name for s in matching],
+            scroll_target=best.name if best else None,
+        ))
+
+    def on_descendant_focus(self, event) -> None:
+        """When a NodeRow gets focus, update the detail pane. Wizard node-select
+        feedback moved to ActionsWizardScreen.on_descendant_focus (t983_11)."""
+        if isinstance(event.widget, NodeRow):
+            self._show_browse_node_detail(event.widget.node_id)
+
+    @on(DAGDisplay.NodeSelected)
+    def on_dag_display_node_selected(self, event: DAGDisplay.NodeSelected) -> None:
+        """Enter on a DAG node → open the Node Hub (t983_5)."""
+        self.push_screen(
+            NodeHub(event.node_id, self.session_path),
+            self._on_node_hub_result,
+        )
+
+    @on(DAGDisplay.HeadChanged)
+    def on_dag_display_head_changed(self, event: DAGDisplay.HeadChanged) -> None:
+        """Update HEAD from DAG view."""
+        if not self.read_only:
+            set_head(self.session_path, event.node_id)
+            self._populate_node_list()
+            self._update_session_status()
+            self._update_module_status()
+            self.query_one(DAGDisplay).load_dag(self.session_path)
+
+    @on(DAGDisplay.OperationOpened)
+    def on_dag_display_operation_opened(
+        self, event: DAGDisplay.OperationOpened
+    ) -> None:
+        """Open OperationDetailScreen from DAG view ('o' key)."""
+        self.push_screen(
+            OperationDetailScreen(event.group_name, self.session_path)
+        )
+
+    @on(DAGDisplay.ProposalRequested)
+    def on_dag_display_proposal_requested(
+        self, event: DAGDisplay.ProposalRequested
+    ) -> None:
+        """Open SectionViewerScreen with the focused node's proposal ('p' key)."""
+        from section_viewer import SectionViewerScreen
+        try:
+            proposal = read_proposal(self.session_path, event.node_id)
+        except Exception:
+            self.notify(
+                f"No proposal for {event.node_id}", severity="warning"
+            )
+            return
+        self.push_screen(
+            SectionViewerScreen(proposal, title=f"Proposal: {event.node_id}")
+        )
+
+
+    @on(DAGDisplay.CompareRequested)
+    def on_dag_display_compare_requested(
+        self, event: DAGDisplay.CompareRequested
+    ) -> None:
+        """Open the dimension-matrix overlay for the graph picker's [anchor,
+        picked] pair (t983_7). A fresh modal each time, so the old
+        Compare-tab remove/re-mount race is moot."""
+        self._open_compare_matrix([event.anchor_id, event.picked_id])
+
+    @on(DAGDisplay.FocusChanged)
+    def on_dag_display_focus_changed(
+        self, event: DAGDisplay.FocusChanged
+    ) -> None:
+        """Refresh the shared Browse detail panel on graph focus change."""
+        self._show_browse_node_detail(event.node_id)
+
+    @on(DAGDisplay.TopBoundaryHit)
+    def on_dag_display_top_boundary_hit(
+        self, event: DAGDisplay.TopBoundaryHit
+    ) -> None:
+        """Refocus the tab row when Up is pressed at the top of the DAG."""
+        try:
+            tabs_widget = self.query_one(TabbedContent).query_one(Tabs)
+        except Exception:
+            return
+        tabs_widget.focus()
+        event.stop()
+
+    @on(NodeRow.OperationOpened)
+    def on_node_row_operation_opened(
+        self, event: NodeRow.OperationOpened
+    ) -> None:
+        """Open OperationDetailScreen from dashboard NodeRow ('o' key)."""
+        self.push_screen(
+            OperationDetailScreen(event.group_name, self.session_path)
+        )
+
+    @on(GroupRow.ToggleRequested)
+    def on_group_row_toggle_requested(
+        self, event: GroupRow.ToggleRequested
+    ) -> None:
+        """Expand/collapse a Running-tab group on double-click (t1018_3)."""
+        self._toggle_group(event.group_name)
+
+    # ------------------------------------------------------------------
+    # Actions wizard
+    # ------------------------------------------------------------------
+
+
+
+    # ------------------------------------------------------------------
+    # Session-lifecycle tab (t983_8)
+    # ------------------------------------------------------------------
+
+    def _refresh_session_tab(self) -> None:
+        """Render the Session-lifecycle op list (pause/resume/finalize/archive/
+        delete). These ops left the Actions wizard (t983_8); selection routes to
+        _dispatch_session_op. Disabled-state derives from _is_session_op_disabled
+        so the list re-evaluates after every reload."""
+        try:
+            container = self.query_one("#session_content", VerticalScroll)
+        except Exception:
+            return
+        container.remove_children()
+        if self.read_only:
+            container.mount(
+                Label("[italic]Session is read-only. No operations available.[/]")
+            )
+            return
+        container.mount(
+            Label(
+                "Session Lifecycle  (↑↓ Navigate  Enter Select)",
+                classes="actions_step_indicator",
+            )
+        )
+        status = self.session_data.get("status", "")
+        head = get_head(self.session_path)
+        for op_key, label, desc in _SESSION_OPS:
+            disabled = self._is_session_op_disabled(op_key, status, head)
+            container.mount(OperationRow(op_key, label, desc, disabled=disabled))
+        self.call_after_refresh(self._focus_first_session_op)
+
+    def _focus_first_session_op(self) -> None:
+        """Focus the first enabled OperationRow in the Session tab."""
+        tabbed = self.query_one(TabbedContent)
+        if tabbed.active != "tab_session":
+            return
+        try:
+            rows = self.query_one("#session_content", VerticalScroll).query(OperationRow)
+            for row in rows:
+                if not row.op_disabled:
+                    row.focus()
+                    break
+        except Exception:
+            pass
+
+    def _dispatch_session_op(self, op_key: str) -> None:
+        """Route a Session-tab op selection. delete → DeleteSessionModal;
+        the lifecycle ops get a lightweight inline confirm before executing."""
+        if op_key == "delete":
+            self.push_screen(
+                DeleteSessionModal(self.task_num), self._on_delete_result
+            )
+            return
+        self._show_session_confirm(op_key)
+
+    def _show_session_confirm(self, op_key: str) -> None:
+        """Replace the Session-tab op list with a confirm panel for ``op_key``.
+
+        Preserves the safety gate the wizard confirm step used to provide for
+        the consequential lifecycle ops (finalize/archive). Confirm executes;
+        Cancel re-renders the op list."""
+        try:
+            container = self.query_one("#session_content", VerticalScroll)
+        except Exception:
+            return
+        container.remove_children()
+        label, _desc = _OP_LABELS.get(op_key, (op_key.title(), ""))
+        summary = self._session_op_summary(op_key)
+        container.mount(Label(f"Confirm: {label}", classes="actions_step_indicator"))
+        container.mount(Static(summary, classes="actions_summary"))
+        container.mount(
+            Horizontal(
+                Button("Confirm", variant="primary", classes="btn_session_confirm"),
+                Button("Cancel", variant="default", classes="btn_session_cancel"),
+                classes="actions_buttons",
+            )
+        )
+        # Stash the pending op so the button handler knows what to execute.
+        self._session_confirm_op = op_key
+        self.call_after_refresh(self._focus_session_confirm_start)
+
+    def _session_op_summary(self, op_key: str) -> str:
+        """One-line confirmation summary for a session lifecycle op."""
+        if op_key == "pause":
+            return "Session will be paused."
+        if op_key == "resume":
+            return "Session will be resumed."
+        if op_key == "finalize":
+            head = get_head(self.session_path)
+            return f"HEAD node {head} plan will be copied to aiplans/."
+        if op_key == "archive":
+            return "Session will be archived."
+        return f"Run {op_key}?"
+
+    def _focus_session_confirm_start(self) -> None:
+        """Focus the Confirm button on the Session-tab confirm panel."""
+        try:
+            container = self.query_one("#session_content", VerticalScroll)
+        except Exception:
+            return
+        for w in container.query(Button):
+            if "btn_session_confirm" in w.classes:
+                w.focus()
+                return
+
+    @on(Button.Pressed, ".btn_session_confirm")
+    def _on_session_confirm(self) -> None:
+        """Execute the pending Session-tab lifecycle op."""
+        op_key = self._session_confirm_op
+        self._session_confirm_op = ""
+        if op_key:
+            self._execute_session_op(op_key)
+        # On success _execute_session_op → _load_existing_session already
+        # re-rendered the op list; on an early error return it did not, so
+        # restore it here. The extra render on success is idempotent.
+        self._refresh_session_tab()
+
+    @on(Button.Pressed, ".btn_session_cancel")
+    def _on_session_cancel(self) -> None:
+        """Cancel the Session-tab confirm panel — restore the op list."""
+        self._refresh_session_tab()
+
+
+    def _is_session_op_disabled(self, op_key: str, status: str, head: str | None) -> bool:
+        """Determine if a session operation should be disabled."""
+        if op_key == "pause":
+            return status != "active"
+        if op_key == "resume":
+            return status != "paused"
+        if op_key == "finalize":
+            return status != "active" or head is None
+        if op_key == "archive":
+            return status != "completed"
+        if op_key == "delete":
+            return False
+        return False
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    # --- Side-by-side proposal preview (t945) ---------------------------------
+
+
+
+
+
+    # The config-step preview minimap is now handled by ActionsWizardScreen
+    # (the pane lives inside that modal, so the SectionSelected message never
+    # reaches the App). The former App handler here was dead code (t1047).
+    # NodeDetailModal / NodeHub still handle their own modal minimaps.
+
+
+
+
+
+
+
+
+
+
+
+
+    def _config_session_op(self, container: VerticalScroll) -> None:
+        """Session operation config: confirmation only."""
+        labels = {
+            "pause": "Pause the session. Agents will not be dispatched.",
+            "resume": "Resume the paused session.",
+            "finalize": "Export the HEAD node's proposal to aiplans/ and mark session completed.",
+            "archive": "Mark the session as archived.",
+        }
+        container.mount(Label(f"[bold]{labels.get(self._wizard_op, self._wizard_op)}[/]"))
+        container.mount(Button("Next \u25b6", variant="primary", classes="btn_actions_next"))
+
+
+    def _node_sections(self, node_id: str) -> list:
+        """Return the list of ContentSection for a node's proposal."""
+        try:
+            proposal = read_proposal(self.session_path, node_id)
+        except FileNotFoundError:
+            proposal = None
+        if proposal:
+            return parse_sections(proposal).sections
+        return []
+
+    def _node_has_sections(self, node_id: str) -> bool:
+        """True when the node's proposal has structured sections."""
+        return bool(self._node_sections(node_id))
+
+
+
+
+
+
+
+
+
+
+    @on(Button.Pressed, ".btn_runner_start")
+    def _on_runner_start(self, event: Button.Pressed) -> None:
+        """Start the crew runner process."""
+        event.button.disabled = True
+        crew_id = self.session_data.get("crew_id", "")
+        if crew_id and start_runner(crew_id):
+            self.notify("Runner started")
+            self._delayed_refresh_status()
+        else:
+            self.notify("Failed to start runner", severity="error")
+
+    @on(Button.Pressed, ".btn_runner_stop")
+    def _on_runner_stop(self, event: Button.Pressed) -> None:
+        """Request the crew runner to stop."""
+        event.button.disabled = True
+        crew_id = self.session_data.get("crew_id", "")
+        if crew_id and stop_runner(crew_id):
+            self.notify("Runner stop requested")
+            self._delayed_refresh_status()
+        else:
+            self.notify("Failed to stop runner", severity="error")
+
+    def on_operation_row_activated(self, event: OperationRow.Activated) -> None:
+        """Handle a mouse click on a Session-tab OperationRow (t983_8). Wizard
+        OperationRows now live in ActionsWizardScreen, which handles their
+        activation itself (t983_11)."""
+        row = event.row
+        tabbed = self.query_one(TabbedContent)
+        # Session tab (t983_8): a clicked lifecycle op dispatches directly.
+        if tabbed.active == "tab_session":
+            if not row.op_disabled:
+                self._dispatch_session_op(row.op_key)
+
+    def _execute_session_op(self, op: str | None = None) -> None:
+        """Execute a session lifecycle operation. The Session tab (t983_8) passes
+        ``op`` explicitly; ``None`` falls back to ``_wizard_op`` for back-compat."""
+        op = op or self._wizard_op
+        try:
+            if op == "pause":
+                save_session(self.task_num, {"status": "paused"})
+                self.notify("Session paused")
+            elif op == "resume":
+                save_session(self.task_num, {"status": "active"})
+                self.notify("Session resumed")
+            elif op == "finalize":
+                dest = finalize_session(self.task_num)
+                self.notify(f"Proposal finalized to {dest}")
+            elif op == "archive":
+                archive_session(self.task_num)
+                self.notify("Session archived")
+        except Exception as e:
+            self.notify(f"Error: {e}", severity="error")
+            return
+
+        self._load_existing_session()
+
+    def _execute_design_op(self, result: dict) -> None:
+        """Dispatch a design operation to a background thread (t983_11).
+
+        ``result`` is the Actions wizard's dismiss payload
+        (``{op, config, subgraph}``); the wizard already collected ``launch_mode``
+        into ``config`` before dismissing. Seed the worker-handoff attributes
+        the background ``_run_design_op`` reads, then run it."""
+        self._wizard_op = result["op"]
+        self._wizard_config = result["config"]
+        self._wizard_subgraph = result.get("subgraph", UMBRELLA_SUBGRAPH)
+        status = self.session_data.get("status", "")
+        if status == "init":
+            save_session(self.task_num, {"status": "active"})
+            self.session_data["status"] = "active"
+        self._run_design_op()
+
+    @work(thread=True)
+    def _run_design_op(self) -> None:
+        """Register agents for the design operation in a background thread."""
+        op = self._wizard_op
+        cfg = self._wizard_config
+        crew_id = self.session_data.get("crew_id", f"brainstorm-{self.task_num}")
+        group_name = self._next_group_name(op)
+        launch_mode = cfg.get("launch_mode", DEFAULT_LAUNCH_MODE)
+        target_sections = cfg.get("target_sections")
+        # Scope the op to a subgraph: node-select ops use the selector's choice;
+        # compare/synthesize (no selector) derive it from their first input node.
+        if op == "prune_dimensions":
+            # The child joins the source node's own subgraph and becomes its HEAD.
+            subgraph = _node_module(self.session_path, cfg["source_node"])
+            head_at_creation = get_head(self.session_path, module=subgraph)
+        elif op == "module_merge":
+            subgraph = cfg.get("destination_subgraph", UMBRELLA_SUBGRAPH)
+            head_at_creation = get_head(
+                self.session_path,
+                module=cfg.get("source_subgraph", UMBRELLA_SUBGRAPH),
+            )
+        elif op in _SUBGRAPH_SELECT_OPS:
+            subgraph = self._wizard_subgraph
+            head_at_creation = get_head(self.session_path, module=subgraph)
+        else:
+            input_nodes = cfg.get("nodes") or []
+            subgraph = (
+                _node_module(self.session_path, input_nodes[0])
+                if input_nodes else UMBRELLA_SUBGRAPH
+            )
+            head_at_creation = get_head(self.session_path, module=subgraph)
+        agents_list: list[str] = []
+        operation_extra: dict = {}
+
+        try:
+            if op == "explore":
+                count = cfg["parallel"]
+                suffixes = "abcdefgh"
+                for i in range(count):
+                    suffix = suffixes[i] if count > 1 else ""
+                    agent = register_explorer(
+                        self.session_path, crew_id, cfg["mandate"],
+                        cfg["base_node"], group_name, agent_suffix=suffix,
+                        launch_mode=launch_mode,
+                        target_sections=target_sections,
+                    )
+                    agents_list.append(agent)
+                    # Track each explorer so the auto-apply poller will
+                    # ingest its output when the agent completes.
+                    self.call_from_thread(
+                        self._register_explorer_agent, agent,
+                    )
+                msg = f"Registered {len(agents_list)} explorer(s): {', '.join(agents_list)}"
+            elif op == "compare":
+                agent = register_comparator(
+                    self.session_path, crew_id, cfg["nodes"],
+                    cfg["dimensions"], group_name,
+                    launch_mode=launch_mode,
+                    target_sections=target_sections,
+                )
+                agents_list.append(agent)
+                # Track the comparator so the poller finalizes its operation
+                # status (Waiting → Completed) when the agent completes (t1020).
+                self.call_from_thread(
+                    self._register_comparator_agent, agent,
+                )
+                msg = f"Registered comparator: {agent}"
+            elif op == "synthesize":
+                agent = register_synthesizer(
+                    self.session_path, crew_id, cfg["nodes"],
+                    cfg["merge_rules"], group_name,
+                    launch_mode=launch_mode,
+                )
+                agents_list.append(agent)
+                # Track the synthesizer so the auto-apply poller will
+                # ingest its output when the agent completes.
+                self.call_from_thread(
+                    self._register_synthesizer_agent, agent,
+                )
+                msg = f"Registered synthesizer: {agent}"
+            elif op == "module_decompose":
+                operation_extra = {
+                    "modules": cfg["modules"],
+                    "from_sections": cfg["from_sections"],
+                    "link_to_task": cfg["link_to_task"],
+                    "source_subgraph": cfg["subgraph"],
+                    # Persisted so the review gate / re-run (t929_1) survive a
+                    # TUI reload — the poller reads review_before_apply, and the
+                    # Re-run path replays modules/instructions/launch_mode.
+                    "review_before_apply": cfg.get("review_before_apply", True),
+                    "instructions": cfg.get("instructions", ""),
+                    "launch_mode": launch_mode,
+                }
+                if cfg["from_sections"]:
+                    # Deterministic, no agent: run_module_decompose_from_sections
+                    # owns the group record (deleted only when refused before
+                    # any write), and no apply poller will reload, so the
+                    # worker does.
+                    try:
+                        created = run_module_decompose_from_sections(
+                            self.task_num,
+                            group_name,
+                            head_at_creation=head_at_creation,
+                            subgraph=subgraph,
+                            **operation_extra,
+                        )
+                    except ModuleDecomposePartialFailure:
+                        # Roots created before the failure (and their HEAD
+                        # moves) are already on disk — show them.
+                        self.call_from_thread(self._load_existing_session)
+                        raise
+                    self.call_from_thread(self._load_existing_session)
+                    msg = "Created module roots from sections: " + ", ".join(created)
+                else:
+                    agent = register_module_decomposer(
+                        self.session_path,
+                        crew_id,
+                        cfg["source_node"],
+                        cfg["modules"],
+                        group_name,
+                        from_sections=cfg["from_sections"],
+                        link_to_task=cfg["link_to_task"],
+                        instructions=cfg.get("instructions", ""),
+                        launch_mode=launch_mode,
+                    )
+                    agents_list.append(agent)
+                    self.call_from_thread(self._register_module_agent, agent)
+                    msg = f"Registered module decomposer: {agent}"
+            elif op == "prune_dimensions":
+                # Deterministic, no agent: run_prune_operation owns the group
+                # record (deleted only when refused before any write).
+                try:
+                    new_node = run_prune_operation(
+                        self.task_num,
+                        group_name,
+                        source_node=cfg["source_node"],
+                        kept=cfg["kept"],
+                        head_at_creation=head_at_creation,
+                        subgraph=subgraph,
+                        mode=cfg["mode"],
+                        top_n=cfg["top_n"],
+                        kept_count=len(cfg["kept"]),
+                        pruned_dimensions=cfg["dropped"],
+                    )
+                except PrunePartialFailure:
+                    # The child (and possibly the HEAD move) landed — show it.
+                    self.call_from_thread(self._load_existing_session)
+                    raise
+                self.call_from_thread(self._load_existing_session)
+                msg = f"Pruned {len(cfg['dropped'])} dimensions → {new_node}"
+            elif op == "module_merge":
+                agent = register_module_merger(
+                    self.session_path,
+                    crew_id,
+                    cfg["source_subgraph"],
+                    cfg["destination_subgraph"],
+                    cfg["merge_rules"],
+                    group_name,
+                    launch_mode=launch_mode,
+                )
+                agents_list.append(agent)
+                self.call_from_thread(self._register_module_agent, agent)
+                operation_extra = {
+                    "source_subgraph": cfg["source_subgraph"],
+                    "destination_subgraph": cfg["destination_subgraph"],
+                }
+                msg = f"Registered module merger: {agent}"
+            elif op == "module_sync":
+                agent = register_module_syncer(
+                    self.session_path,
+                    crew_id,
+                    cfg["subgraph"],
+                    group_name,
+                    instructions=cfg.get("instructions", ""),
+                    launch_mode=launch_mode,
+                )
+                agents_list.append(agent)
+                self.call_from_thread(self._register_module_agent, agent)
+                msg = f"Registered module syncer: {agent}"
+            else:
+                msg = f"Unknown operation: {op}"
+                agents_list = []
+
+            if agents_list:
+                record_operation(
+                    self.task_num,
+                    group_name=group_name,
+                    operation=op,
+                    agents=agents_list,
+                    head_at_creation=head_at_creation,
+                    subgraph=subgraph,
+                    **operation_extra,
+                )
+
+            self.call_from_thread(self.notify, msg)
+            # t983_11: the wizard modal was dismissed at launch — there is no
+            # in-tab wizard to reset, so the worker just notifies.
+
+        except Exception as e:
+            self.call_from_thread(
+                self.notify, f"Operation failed: {e}", severity="error",
+            )
+
+    def _next_group_name(self, op: str) -> str:
+        """Generate next group name (e.g., explore_001, compare_002)."""
+        groups_path = self.session_path / GROUPS_FILE
+        groups: dict = {}
+        if groups_path.is_file():
+            try:
+                data = read_yaml(str(groups_path))
+                groups = (data or {}).get("groups", {})
+            except Exception:
+                pass
+        existing = [k for k in groups if k.startswith(f"{op}_")]
+        seq = len(existing) + 1
+        return f"{op}_{seq:03d}"
+
+    def _on_delete_result(self, confirmed: bool | None) -> None:
+        """Handle DeleteSessionModal result."""
+        if confirmed:
+            self._run_delete_session()
+        else:
+            # Delete originates from the Session tab now (t983_8).
+            self._refresh_session_tab()
+
+    @work(thread=True)
+    def _run_delete_session(self) -> None:
+        """Run ait brainstorm delete in a background thread, then exit."""
+        result = subprocess.run(
+            [AIT_PATH, "brainstorm", "delete", self.task_num, "--yes"],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            self.call_from_thread(self.exit)
+        else:
+            self.call_from_thread(
+                self.notify,
+                f"Delete failed: {result.stderr.strip()}",
+                severity="error",
+            )
+            self.call_from_thread(self._refresh_session_tab)
+
+    def _on_init_result(self, result: str | None) -> None:
+        """Handle InitSessionModal result."""
+        if result is None:
+            self.exit()
+        elif result == "blank":
+            self._run_init()
+        elif isinstance(result, str) and result.startswith("import:"):
+            path = result[len("import:"):]
+            self._run_init_with_proposal(path)
+        else:
+            self.notify(f"Unknown init result: {result!r}", severity="error")
+            self.exit()
+
+    @work(thread=True)
+    def _run_init(self) -> None:
+        """Run ait brainstorm init in a background thread."""
+        result = subprocess.run(
+            [AIT_PATH, "brainstorm", "init", self.task_num],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            self.call_from_thread(self._load_existing_session)
+        else:
+            self.call_from_thread(
+                self.notify,
+                f"Init failed: {result.stderr.strip()}",
+                severity="error",
+            )
+
+    @work(thread=True)
+    def _run_init_with_proposal(self, path: str) -> None:
+        """Shell to `ait brainstorm init <N> --proposal-file <path>`, then poll."""
+        result = subprocess.run(
+            [
+                AIT_PATH, "brainstorm", "init", self.task_num,
+                "--proposal-file", path,
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            error_text = self._format_init_error(
+                f"`ait brainstorm init {self.task_num}` exited "
+                f"with code {result.returncode}.",
+                result.stdout,
+                result.stderr,
+                include_runner_log=False,
+            )
+            self.call_from_thread(self._show_init_failure, error_text)
+            return
+
+        agent_name = "initializer_bootstrap"
+        for line in result.stdout.splitlines():
+            if line.startswith("INITIALIZER_AGENT:"):
+                agent_name = line.split(":", 1)[1].strip()
+                break
+
+        if "RUNNER_START_FAILED:" in result.stderr:
+            error_text = self._format_init_error(
+                "The initializer agent was registered, but its runner "
+                f"crashed within {1.5}s of launch.\n"
+                f"To retry the runner manually:\n"
+                f"    ait crew runner --crew brainstorm-{self.task_num}",
+                result.stdout,
+                result.stderr,
+                include_runner_log=True,
+            )
+            self.call_from_thread(self._show_init_failure, error_text)
+            return
+
+        self.call_from_thread(self._start_initializer_wait, agent_name)
+
+    def _format_init_error(
+        self,
+        summary: str,
+        stdout: str,
+        stderr: str,
+        include_runner_log: bool,
+    ) -> str:
+        """Build the multi-line error body shown in InitFailureModal."""
+        parts = [summary, "", "STDERR:", stderr.rstrip() or "(empty)", "",
+                 "STDOUT:", stdout.rstrip() or "(empty)"]
+        if include_runner_log:
+            log_path = crew_worktree(self.task_num) / "_runner_launch.log"
+            if log_path.is_file():
+                try:
+                    log_text = log_path.read_text(encoding="utf-8", errors="replace")
+                except OSError as e:
+                    log_text = f"(failed to read {log_path}: {e})"
+                parts.extend(["", f"_runner_launch.log ({log_path}):", log_text.rstrip()])
+        return "\n".join(parts)
+
+    def _show_init_failure(self, error_text: str) -> None:
+        """Push InitFailureModal from the main thread."""
+        self.push_screen(
+            InitFailureModal(error_text),
+            callback=self._on_init_failure_result,
+        )
+
+    def _on_init_failure_result(self, result: str | None) -> None:
+        """Modal-result handler.
+
+        - ``retry``: re-open InitSessionModal.
+        - ``clean_and_retry``: delete the stale crew branch in a worker, then
+          either re-open InitSessionModal on success or re-show the failure
+          modal with the cleanup error appended on failure.
+        - any other value (``quit``/``None``/Escape): exit the app.
+        """
+        if result == "retry":
+            self.push_screen(
+                InitSessionModal(self.task_num),
+                callback=self._on_init_result,
+            )
+        elif result == "clean_and_retry":
+            self._cleanup_stale_crew_branch_and_retry()
+        else:
+            self.exit()
+
+    @work(thread=True)
+    def _cleanup_stale_crew_branch_and_retry(self) -> None:
+        """Delete the stale `crew-brainstorm-<N>` branch, then reopen Init modal.
+
+        Runs `git worktree prune` first so a stale worktree registration
+        does not pin the branch as "checked out elsewhere", then deletes the
+        local branch (and best-effort the remote tracking ref). On failure,
+        re-shows the InitFailureModal with the cleanup output appended.
+        """
+        crew_branch = f"crew-brainstorm-{self.task_num}"
+        cmds = [
+            ["git", "worktree", "prune"],
+            ["git", "branch", "-D", crew_branch],
+        ]
+        outputs: list[str] = []
+        success = True
+        for cmd in cmds:
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            outputs.append(
+                f"$ {' '.join(cmd)}\nexit={r.returncode}\n"
+                f"{r.stdout}{r.stderr}".rstrip()
+            )
+            if r.returncode != 0 and cmd[1] == "branch":
+                success = False
+        # Best-effort remote prune; never fails the cleanup. Bounded like
+        # every crew push, so an unanswering origin cannot stall the retry.
+        r = git_cmd(".", "push", "origin", "--delete", crew_branch,
+                    check=False, timeout=crew_git_timeout())
+        outputs.append(
+            f"$ git push origin --delete {crew_branch}\nexit={r.returncode}\n"
+            f"{r.stdout}{r.stderr}".rstrip()
+        )
+
+        if success:
+            self.call_from_thread(
+                self.notify,
+                f"Deleted stale {crew_branch}; reopening init…",
+                severity="information",
+            )
+            self.call_from_thread(
+                self.push_screen,
+                InitSessionModal(self.task_num),
+                callback=self._on_init_result,
+            )
+        else:
+            error_text = (
+                f"Failed to delete stale {crew_branch}.\n\n"
+                + "\n\n".join(outputs)
+            )
+            self.call_from_thread(self._show_init_failure, error_text)
+
+    def _start_initializer_wait(self, agent_name: str) -> None:
+        """Main-thread setup: show placeholder DAG + start polling timer."""
+        self._initializer_agent = agent_name
+        self._initializer_done = False
+        self.session_data = load_session(self.task_num)
+        self._update_title_from_task()
+        self._load_existing_session()
+        self.notify(f"Waiting for {agent_name} to complete…")
+        self._try_apply_initializer_if_needed()
+        try:
+            self.query_one("#initializer_polling_indicator", PollingIndicator).start()
+        except Exception:
+            pass
+        self._initializer_timer = self.set_interval(2, self._poll_initializer)
+
+    def _poll_initializer(self) -> None:
+        """Timer tick: check status file, apply initializer output on Completed."""
+        if self._initializer_done or self._initializer_agent is None:
+            return
+        try:
+            self.query_one("#initializer_polling_indicator", PollingIndicator).flash()
+        except Exception:
+            pass
+        status_path = (
+            self.session_path / f"{self._initializer_agent}_status.yaml"
+        )
+        if not status_path.is_file():
+            return
+        try:
+            data = read_yaml(str(status_path))
+        except Exception:
+            return
+        status = (data or {}).get("status", "")
+        if status == "Completed":
+            self._initializer_done = True
+            if self._initializer_timer is not None:
+                self._initializer_timer.stop()
+            try:
+                self.query_one("#initializer_polling_indicator", PollingIndicator).stop()
+            except Exception:
+                pass
+            try:
+                from brainstorm.brainstorm_session import apply_initializer_output
+                apply_initializer_output(self.task_num)
+                self.notify("Initial proposal imported.")
+            except Exception as e:
+                self.notify(
+                    f"Failed to apply initializer output: {e}",
+                    severity="error",
+                )
+            self._load_existing_session()
+        elif status in ("Error", "Aborted"):
+            # Post-t671, Error/Aborted is the agent's own trustworthy terminal
+            # status — it will not resume, so there is no late output to wait
+            # for. Stop polling permanently. Make one best-effort apply attempt
+            # in case the agent emitted a complete output before failing
+            # (n000_needs_apply gates on the four delimiters); ctrl+r still
+            # forces a manual retry afterwards.
+            self._initializer_done = True
+            if self._initializer_timer is not None:
+                self._initializer_timer.stop()
+            try:
+                self.query_one(
+                    "#initializer_polling_indicator", PollingIndicator
+                ).stop()
+            except Exception:
+                pass
+            self.notify(
+                f"Initializer agent {status.lower()}. "
+                f"Press ctrl+r or run "
+                f"`ait brainstorm apply-initializer {self.task_num}` to retry.",
+                severity="error",
+            )
+            self._load_existing_session()
+            self._try_apply_initializer_if_needed()
+
+
+if __name__ == "__main__":
+    task_num = sys.argv[1] if len(sys.argv) > 1 else "0"
+    app = BrainstormApp(task_num)
+    app.run()

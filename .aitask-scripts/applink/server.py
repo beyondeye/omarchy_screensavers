@@ -1,0 +1,660 @@
+"""WebSocket transport for the ait applink JSON control plane (t822_7).
+
+Wraps the pure :class:`router.FrameRouter` in a ``wss://`` WebSocket server
+(``websockets`` + a self-signed TLS context) and owns the per-connection state
+machine (Discovering → Pairing → Connected → Suspended → Disconnected,
+``aidocs/applink/protocol.md`` §Connection state machine). Verb execution is
+delegated to ``monitor_core`` via the router; this module only moves frames and
+manages connection lifecycle.
+
+The binary snapshot/data plane is NOT here — it is the next sibling (t822_8).
+
+Pane status (t2037_4). While at least one connection has a push loop, the
+server holds ONE ``MonitorClient`` subscribed to the shared monitor status
+server (``aidocs/framework/monitor_status_protocol.md``): the router and every
+push loop read status from it, and the actions go through its own fresh local
+``TmuxMonitor``. The client starts detached (its startup belongs to its
+lifetime, so one phone leaving mid-startup cannot cancel it for the others) and
+is closed when the last push loop stops, so an idle applink holds no
+subscription and the status server scans nothing on its behalf. The capture
+pins — the windows any phone streams content for — are republished after every
+routed frame and on every connection removal. With no push loop, or with
+``AITASKS_MONITOR_SERVER=0``, everything runs on the in-process ``TmuxMonitor``
+exactly as before.
+"""
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import json
+import logging
+import os
+import sys
+from pathlib import Path
+
+_APPLINK_DIR = Path(__file__).resolve().parent
+_SCRIPTS_DIR = _APPLINK_DIR.parent
+for _p in (str(_APPLINK_DIR), str(_SCRIPTS_DIR)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+from monitor.monitor_core import (  # noqa: E402
+    TmuxMonitor, TaskInfoCache, load_monitor_config,
+)
+from monitor.status_client import (  # noqa: E402
+    ENV_SWITCH as MONITOR_SERVER_ENV, MonitorClient,
+)
+from router import (  # noqa: E402
+    FrameRouter, ConnState, DeferredReply, error_frame,
+    ERR_BAD_PAYLOAD, ERR_INTERNAL, STATE_DISCOVERING, STATE_SUSPENDED,
+)
+from pusher import PushScheduler  # noqa: E402
+import paths  # noqa: E402
+import audit  # noqa: E402
+import tunnel  # noqa: E402
+from pairing import Endpoint  # noqa: E402
+
+DEFAULT_HOST = "0.0.0.0"   # accept from the LAN; the QR carries the routable IP
+# Same value as `agent_launch_utils.DEFAULT_TMUX_SESSION`, spelled separately on
+# purpose: applink is a standalone listener that must not pull in the launcher
+# module just for a string. Nothing enforces the equality — whether these two
+# should be one contract at all is open, and is tracked by t1583 (t1580).
+DEFAULT_SESSION = "aitasks"
+DEFAULT_PORT = 8765
+
+# DoS / abuse ceilings (t985). The control plane is a small LAN listener: frames
+# are tiny, a handful of devices pair, and a single host should never be able to
+# starve the others. Time-based per-IP request throttling is a documented
+# residual (follow-up applink_request_rate_limit); these bound the obvious cases.
+MAX_CONNECTIONS = 64        # global concurrent-socket ceiling
+MAX_PER_IP = 8              # per-source-IP concurrent ceiling
+MAX_FRAME_BYTES = 64 * 1024  # max inbound WebSocket frame (control frames are tiny)
+MAX_PREAUTH_FRAMES = 16     # frames allowed before a successful pair/resume
+PREAUTH_TIMEOUT = 15.0      # seconds an unauthenticated socket may live
+OPEN_TIMEOUT = 10.0         # TLS/WS opening-handshake deadline (slow-loris)
+# Deferred replies one connection may have in flight (t2037_4): each holds a
+# task and a pending status-server request until the server answers. Admission
+# is checked BEFORE a task is created; an excess request is answered at once.
+MAX_DEFERRED_PER_CONN = 4
+# v1 default permission profile assigned to a freshly paired device. The single
+# source of truth for this default across the package (the TUI runtime, the
+# server constructor, and the headless runner all reference it).
+DEFAULT_PAIR_PROFILE = "monitor_control"
+
+# History-RPC scrollback capture ceiling (t1092). Applink-only; decoupled from the
+# monitor's live `capture_lines`. The default coincides with tmux's own default
+# server `history-limit` (~2000). The config value is clamped to a sane range at
+# load (a runtime bound on the per-pull tmux capture, not just a comment).
+DEFAULT_HISTORY_CAPTURE_LINES = 2000
+HARD_MAX_HISTORY_CAPTURE_LINES = 10000
+
+
+def load_applink_config(project_root) -> dict:
+    """Load applink-specific config from project_config.yaml's ``tmux.applink``
+    section. Fault-tolerant: a missing file / missing key / non-dict / non-int /
+    out-of-range value falls back to that key's default, never raises (each key
+    degrades independently). The ``history_capture_lines`` value is clamped to
+    ``[1, HARD_MAX]``.
+
+    Advertised-endpoint keys (t1061_1): ``advertised_host`` is returned **raw**
+    (string or None) — normalization/validation lives in
+    ``pairing.resolve_advertised_endpoints`` so the CLI and config paths share
+    one normalizer and this loader keeps its never-raises contract.
+    ``advertised_kind`` returns None when absent/invalid so the resolver can
+    apply its context-dependent default (``mesh`` when an override host is set).
+    """
+    lines = DEFAULT_HISTORY_CAPTURE_LINES
+    advertised_host: str | None = None
+    advertised_port: int | None = None
+    advertised_kind: str | None = None
+    advertised_trust = "pin"
+    auto_tunnel: str | None = None
+    try:
+        import yaml
+        from pathlib import Path
+        cfg = Path(project_root) / "aitasks" / "metadata" / "project_config.yaml"
+        data = yaml.safe_load(cfg.read_text()) or {}
+        tmux = data.get("tmux") or {}
+        applink = tmux.get("applink") or {}
+        try:
+            raw = applink.get("history_capture_lines")
+            if raw is not None:
+                val = int(raw)             # non-int (str/list) raises → default below
+                if val >= 1:               # sub-1 is nonsensical → keep the default
+                    lines = min(val, HARD_MAX_HISTORY_CAPTURE_LINES)
+        except Exception:
+            pass
+        try:
+            raw = applink.get("advertised_host")
+            if isinstance(raw, str) and raw.strip():
+                advertised_host = raw.strip()
+        except Exception:
+            pass
+        try:
+            raw = applink.get("advertised_port")
+            if raw is not None:
+                val = int(raw)
+                if 1 <= val <= 65535:
+                    advertised_port = val
+        except Exception:
+            pass
+        try:
+            raw = applink.get("advertised_kind")
+            if isinstance(raw, str) and raw in ("lan", "mesh", "tunnel"):
+                advertised_kind = raw
+        except Exception:
+            pass
+        try:
+            raw = applink.get("advertised_trust")
+            if isinstance(raw, str) and raw in ("pin", "ca"):
+                advertised_trust = raw
+        except Exception:
+            pass
+        try:
+            # Auto-spawned tunnel backend (t1061_3). Only registered backend
+            # names are accepted; anything else → None (feature off).
+            raw = applink.get("auto_tunnel")
+            if isinstance(raw, str) and raw in tunnel.TUNNEL_BACKENDS:
+                auto_tunnel = raw
+        except Exception:
+            pass
+    except Exception:
+        pass  # any malformed config → safe defaults
+    return {
+        "history_capture_lines": lines,
+        "advertised_host": advertised_host,
+        "advertised_port": advertised_port,
+        "advertised_kind": advertised_kind,
+        "advertised_trust": advertised_trust,
+        "auto_tunnel": auto_tunnel,
+    }
+
+
+def monitor_server_enabled() -> bool:
+    """``AITASKS_MONITOR_SERVER`` — the same rule ``MonitorClient`` applies."""
+    return os.environ.get(MONITOR_SERVER_ENV, "1").strip() != "0"
+
+
+class AppLinkServer:
+    """Owns the WebSocket listener, the TmuxMonitor, and the frame router."""
+
+    # Class-level defaults (t2037_4) so a server built with `__new__` (the
+    # transport tests) keeps the in-process path: no status-server client.
+    _use_status_server = False
+    _client = None
+    _client_ensure = None          # injected `ensure` for the client (tests)
+    _client_config = None          # TmuxMonitor kwargs for each client's local
+    _local_factory = None          # builds each client's local (tests); else TmuxMonitor
+    _project_root = None
+    _deferred = None               # conn -> in-flight DeferredReply tasks
+    _status_log = None
+
+    def __init__(
+        self,
+        *,
+        session_table,
+        profile_gate,
+        ssl_context,
+        host: str = DEFAULT_HOST,
+        port: int,
+        pair_profile: str = DEFAULT_PAIR_PROFILE,
+        on_change=None,
+        tunnel_backend: str | None = None,
+    ) -> None:
+        self._host = host
+        self._port = port
+        self._ssl = ssl_context
+        self._on_change = on_change
+        self._ws_server = None
+        # Auto-spawned tunnel (t1061_3): the server owns the supervisor so both
+        # entry points share one lifecycle and the per-IP cap exemption can be
+        # gated locally on tunnel-active.
+        self._tunnel_backend = tunnel_backend
+        self.tunnel: tunnel.QuickTunnel | None = None
+        self._conns: set[ConnState] = set()
+        self._live: dict[ConnState, object] = {}   # conn -> live websocket
+        self._pushers: dict[ConnState, PushScheduler] = {}  # conn -> data-plane loop
+        self._conns_by_ip: dict[str, int] = {}     # per-source-IP concurrent count
+        self._sessions = session_table
+        self.error: str | None = None
+        # Security audit logger, configured once here (so both the TUI and
+        # headless startup paths inherit it) and threaded into the router.
+        self._audit = audit.get_logger(paths.sessions_dir())
+
+        project_root = paths.project_root()
+        config = load_monitor_config(project_root)
+        # Applink-only history scrollback ceiling (t1092), clamped at load.
+        self._history_capture_lines = load_applink_config(
+            project_root)["history_capture_lines"]
+        # The producer scans every session and excludes nothing (t2034_2); this
+        # server's own pane is filtered client-side by the router and pushers.
+        self._own_pane = os.environ.get("TMUX_PANE") or None
+        self._project_root = project_root
+        self._client_config = {
+            "session": DEFAULT_SESSION,
+            "capture_lines": config["capture_lines"],
+            "idle_threshold": config["idle_threshold"],
+            "agent_prefixes": config["agent_prefixes"],
+            "tui_names": config["tui_names"],
+            "compare_mode_default": config["compare_mode_default"],
+        }
+        # The in-process monitor: the router's monitor whenever no client
+        # exists, and the only one with AITASKS_MONITOR_SERVER=0.
+        self._monitor = TmuxMonitor(**self._client_config)
+        self._use_status_server = monitor_server_enabled()
+        self._client: MonitorClient | None = None
+        self._deferred: dict[ConnState, set] = {}
+        self._status_log = logging.getLogger("applink.status")
+        self._task_cache = TaskInfoCache(project_root)
+        self._router = FrameRouter(
+            session_table, profile_gate, self._monitor,
+            pair_profile=pair_profile, task_resolver=self._task_cache,
+            audit=self._audit, own_pane=self._own_pane,
+        )
+
+    # -- Lifecycle -------------------------------------------------------------
+
+    async def start(self) -> None:
+        """Start the tmux control client and the WebSocket listener."""
+        import websockets  # imported lazily so the TUI smoke path needs no dep
+
+        if self._ssl is None:
+            # wss:// is the protocol baseline; refuse to fall back to plaintext.
+            self.error = "TLS certificate unavailable (is openssl installed?)"
+            self._notify()
+            return
+        if not self._use_status_server:
+            # In-process only (AITASKS_MONITOR_SERVER=0). With the status server
+            # the stream belongs to it, and a client in fallback starts its own
+            # local control client — so the idle in-process monitor parses
+            # nothing.
+            try:
+                await self._monitor.start_control_client()
+            except Exception:
+                # Subprocess fallback still works; control client is an optimization.
+                pass
+        try:
+            self._ws_server = await websockets.serve(
+                self._handle, self._host, self._port, ssl=self._ssl,
+                max_size=MAX_FRAME_BYTES, open_timeout=OPEN_TIMEOUT,
+            )
+        except Exception as exc:
+            self.error = f"listener failed: {exc}"
+        if self.error is None and self._tunnel_backend == "cloudflared":
+            # Spawn strictly after the listener binds (there is nothing to
+            # proxy before). Failure is fail-visible via the supervisor's
+            # state/status_line — never blocks LAN serving.
+            self.tunnel = tunnel.QuickTunnel(self._port, on_change=self._notify)
+            started = await self.tunnel.start()
+            if started:
+                self._audit.info("TUNNEL_START backend=cloudflared port=%s",
+                                 self._port)
+            else:
+                self._audit.warning("TUNNEL_FAILED backend=cloudflared "
+                                    "detail=%s", self.tunnel.detail)
+        self._notify()
+
+    async def stop(self) -> None:
+        if self.tunnel is not None:
+            # Tear down the public endpoint before the listener so no new
+            # tunneled connections arrive into a closing server.
+            try:
+                await self.tunnel.stop()
+            except Exception:
+                pass
+        if self._ws_server is not None:
+            self._ws_server.close()
+            try:
+                await self._ws_server.wait_closed()
+            except Exception:
+                pass
+            self._ws_server = None
+        for tasks in list((self._deferred or {}).values()):
+            for task in list(tasks):
+                task.cancel()
+        client, self._client = self._client, None
+        if client is not None:
+            self._router.set_monitor(self._monitor)
+            with contextlib.suppress(Exception):
+                await client.close()
+        try:
+            await self._monitor.close_control_client()
+        except Exception:
+            pass
+
+    def set_pair_profile(self, profile: str) -> None:
+        self._router.set_pair_profile(profile)
+
+    # -- Connection handler ----------------------------------------------------
+
+    async def _handle(self, ws) -> None:
+        ip = self._peer_ip(ws)
+        # Admission control (t985): global + per-IP concurrent-connection
+        # ceilings, enforced BEFORE the connection is registered so a flood
+        # cannot grow the bookkeeping sets. Per-IP stops one LAN host from
+        # starving the legitimate paired phone of the global pool.
+        if len(self._conns) >= MAX_CONNECTIONS:
+            self._audit.warning("CONN_REJECTED reason=global_cap ip=%s", ip)
+            await ws.close()
+            return
+        # Loopback exemption (t1061_3): with an active auto-tunnel, ALL
+        # tunneled phones arrive from 127.0.0.1 and would share one per-IP
+        # bucket — a few racing/reconnecting devices could exhaust it. Exempt
+        # loopback from the per-IP cap only while the tunnel is active; the
+        # global MAX_CONNECTIONS ceiling and every pre-auth limit still bound
+        # loopback sources. Non-loopback behavior is unchanged.
+        loopback_exempt = ip in ("127.0.0.1", "::1") and self.tunnel_active()
+        if not loopback_exempt and self._conns_by_ip.get(ip, 0) >= MAX_PER_IP:
+            self._audit.warning("CONN_REJECTED reason=per_ip_cap ip=%s", ip)
+            await ws.close()
+            return
+
+        conn = ConnState()
+        self._conns.add(conn)
+        self._live[conn] = ws
+        self._conns_by_ip[ip] = self._conns_by_ip.get(ip, 0) + 1
+        self._audit.info("CONN_ACCEPT ip=%s", ip)
+        # Close a socket that never authenticates within PREAUTH_TIMEOUT — bounds
+        # the "open a socket, send nothing" slow-loris the frame budget misses.
+        watchdog = asyncio.ensure_future(self._preauth_watchdog(conn, ws))
+        preauth_frames = 0
+        self._notify()
+        try:
+            async for raw in ws:
+                # Pre-auth frame budget: cap frames sent before a session binds,
+                # throttling an unauthenticated malformed-frame flood.
+                if conn.session is None:
+                    preauth_frames += 1
+                    if preauth_frames > MAX_PREAUTH_FRAMES:
+                        self._audit.warning("CONN_DROP reason=preauth_flood ip=%s", ip)
+                        await ws.close()
+                        break
+                reply = self._route_raw(raw, conn)
+                if conn.bearer is not None:
+                    self._sessions.touch(conn.bearer)
+                if isinstance(reply, DeferredReply):
+                    # Answered by a task of its own; this loop never waits on
+                    # the status server (t2037_4). Bounded per connection: an
+                    # excess request is refused now, with no task created.
+                    if not self._spawn_deferred(conn, ws, reply):
+                        await ws.send(json.dumps(error_frame(
+                            reply.msg_id, reply.verb, ERR_INTERNAL,
+                            "too many requests awaiting the monitor status server",
+                            detail={"reason": "too_many_pending",
+                                    "limit": MAX_DEFERRED_PER_CONN})))
+                elif reply is not None:
+                    await ws.send(json.dumps(reply))
+                # A live subscription means the data plane is active: start (once)
+                # a per-connection push loop and wake it so subscribe /
+                # request_keyframe flush their forced keyframes immediately.
+                if conn.subscription is not None and conn.subscription.panes:
+                    self._ensure_pusher(conn, ws).wake()
+                # Any frame may have changed what this phone streams (subscribe,
+                # pause/resume, focus): republish the pins now, not only from a
+                # push pass, which a pause or an empty roster never runs.
+                self._publish_pins()
+                if conn.close_requested:
+                    await ws.close()
+                    break
+        except Exception:
+            # Connection-closed and decode errors: just drop the connection.
+            pass
+        finally:
+            watchdog.cancel()
+            for task in (self._deferred or {}).pop(conn, set()):
+                task.cancel()
+            pusher = self._pushers.pop(conn, None)
+            if pusher is not None:
+                await pusher.stop()
+            self._conns.discard(conn)
+            self._live.pop(conn, None)
+            # This phone's streamed windows leave the union even when every
+            # remaining phone is paused, then the client goes if nobody streams.
+            self._publish_pins()
+            await self._release_client_if_idle()
+            remaining = self._conns_by_ip.get(ip, 0) - 1
+            if remaining <= 0:
+                self._conns_by_ip.pop(ip, None)
+            else:
+                self._conns_by_ip[ip] = remaining
+            # A socket that drops while still holding a valid bearer is
+            # Suspended (resumable), not gone — the bearer survives.
+            if conn.session is not None and not conn.close_requested:
+                self._suspend(conn)
+            self._audit.info(
+                "CONN_CLOSE ip=%s authed=%s", ip, conn.session is not None,
+            )
+            self._notify()
+
+    @staticmethod
+    def _peer_ip(ws) -> str:
+        """Best-effort source IP of a websocket for audit + per-IP accounting."""
+        addr = getattr(ws, "remote_address", None)
+        if isinstance(addr, (tuple, list)) and addr:
+            return str(addr[0])
+        return "?"
+
+    async def _preauth_watchdog(self, conn: ConnState, ws) -> None:
+        """Close *conn* if it has not authenticated within ``PREAUTH_TIMEOUT``.
+
+        Cancelled in ``_handle``'s ``finally`` once the connection ends; if the
+        connection authenticated, the post-sleep check no-ops.
+        """
+        try:
+            await asyncio.sleep(PREAUTH_TIMEOUT)
+        except asyncio.CancelledError:
+            return
+        if conn.session is None and not conn.close_requested:
+            self._audit.warning("CONN_DROP reason=preauth_timeout ip=%s", self._peer_ip(ws))
+            try:
+                await ws.close()
+            except Exception:
+                pass
+
+    def _ensure_pusher(self, conn: ConnState, ws) -> PushScheduler:
+        """Return the connection's PushScheduler, starting it on first use."""
+        pusher = self._pushers.get(conn)
+        if pusher is None:
+            monitor = self._acquire_status_monitor()
+            pusher = PushScheduler(
+                conn, ws, monitor, audit=self._audit,
+                history_capture_lines=getattr(
+                    self, "_history_capture_lines", DEFAULT_HISTORY_CAPTURE_LINES),
+                task_resolver=getattr(self, "_task_cache", None),
+                own_pane=getattr(self, "_own_pane", None),
+                publish_pins=self._publish_pins if monitor is self._client else None,
+            )
+            self._pushers[conn] = pusher
+            pusher.start()
+        return pusher
+
+    # -- Status-server client (t2037_4) -----------------------------------------
+
+    def _acquire_status_monitor(self):
+        """The monitor a new push loop reads: the shared client (built on the
+        first push loop), or the in-process monitor when the status server is
+        disabled."""
+        if not self._use_status_server:
+            return self._monitor
+        if self._client is None:
+            self._client = self._build_client()
+            self._router.set_monitor(self._client)
+        return self._client
+
+    def _build_client(self) -> MonitorClient:
+        """A client over a FRESH local ``TmuxMonitor``, started detached.
+
+        Fresh, because a closing client releases its seeded pane cache and
+        closes its local control client: two lifetimes sharing one local would
+        let an old client's close wipe a new one's seed. Detached, so the first
+        attempt is already running when the first phone's push loop reads: the
+        client is shared by every push loop, and its startup belongs to the
+        client, not to any one loop (only ``close`` cancels it)."""
+        factory = self._local_factory
+        local = factory() if factory is not None else TmuxMonitor(**self._client_config)
+        log = self._status_log
+        client = MonitorClient(
+            local, kind="applink", own_pane=self._own_pane, session=DEFAULT_SESSION,
+            project_root=self._project_root, include_shadows=False, pins=frozenset(),
+            ensure=self._client_ensure,
+            log=log.info if log is not None else None,
+        )
+        client.start_detached()
+        return client
+
+    async def _release_client_if_idle(self) -> None:
+        """Close the client once no push loop remains. Detach first, so a
+        connection arriving during the close builds a new client."""
+        client = self._client
+        if client is None or self._pushers:
+            return
+        self._client = None
+        self._router.set_monitor(self._monitor)
+        with contextlib.suppress(Exception):
+            await client.close()
+
+    def _streamed_pins(self) -> frozenset:
+        """``(session, window)`` of every pane any non-paused phone streams
+        content for — the capture pins applink sends. A parked agent a phone
+        watches is then captured live; status-only panes are not pinned."""
+        client = self._client
+        if client is None:
+            return frozenset()
+        pairs = set()
+        for conn in list(self._pushers):
+            sub = conn.subscription
+            if sub is None or conn.paused:
+                continue
+            for pane_id in sub.panes:
+                if not sub.streams_content(pane_id):
+                    continue
+                pane = client.get_pane(pane_id)
+                if pane is not None:
+                    pairs.add((pane.session_name, pane.window_name))
+        return frozenset(pairs)
+
+    def _publish_pins(self) -> None:
+        """Send the current pin union (a no-op unless it changed)."""
+        client = self._client
+        if client is None:
+            return
+        try:
+            client.set_capture_pins(self._streamed_pins())
+        except Exception:
+            self._audit.warning("STATUS_PINS_ERROR", exc_info=True)
+
+    def _spawn_deferred(self, conn: ConnState, ws, reply: DeferredReply) -> bool:
+        """Answer ``reply`` from a task of its own, tracked per connection and
+        cancelled when the connection ends (nothing is sent after that).
+
+        Returns False — creating nothing — when the connection already has
+        ``MAX_DEFERRED_PER_CONN`` in flight, so a slow or silent status server
+        cannot grow tasks and pending requests without bound."""
+        if self._deferred is not None and \
+                len(self._deferred.get(conn, ())) >= MAX_DEFERRED_PER_CONN:
+            self._audit.warning("DEFERRED_REJECTED verb=%s reason=too_many_pending",
+                                reply.verb)
+            return False
+
+        async def answer():
+            try:
+                frame = await reply.run()
+            except Exception:
+                frame = error_frame(reply.msg_id, reply.verb, ERR_INTERNAL,
+                                    "request failed")
+            with contextlib.suppress(Exception):
+                await ws.send(json.dumps(frame))
+
+        if self._deferred is None:
+            self._deferred = {}
+        task = asyncio.ensure_future(answer())
+        tasks = self._deferred.setdefault(conn, set())
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
+        return True
+
+    def _route_raw(self, raw, conn: ConnState):
+        try:
+            env = json.loads(raw)
+        except (ValueError, TypeError, RecursionError):
+            # Robust single decode sink (t1007). RecursionError is defense-in-depth:
+            # a JSON nested deep enough to recurse needs ~200 KB, which the transport
+            # `max_size` (64 KB) already rejects, and a shallower nested-but-decoded
+            # value is caught by FrameRouter.handle's isinstance(env, dict) guard — so
+            # this only matters if the cap is ever bypassed/raised. Either way the
+            # decode failure returns BAD_PAYLOAD instead of escaping to _handle's
+            # bare connection drop.
+            return error_frame(None, None, ERR_BAD_PAYLOAD, "frame is not valid JSON")
+        return self._router.handle(env, conn)
+
+    def _suspend(self, conn: ConnState) -> None:
+        try:
+            self._sessions.set_state(conn.bearer, STATE_SUSPENDED)
+        except Exception:
+            pass
+
+    # -- Introspection (for the TUI status display) ----------------------------
+
+    def tunnel_active(self) -> bool:
+        """True only while the auto-tunnel is UP (gates the loopback per-IP
+        cap exemption). STARTING does not count: no tunneled client can
+        arrive before the public URL is published, so exempting loopback
+        pre-URL would only widen local exposure (e.g. cloudflared hanging
+        before its banner) with zero benefit."""
+        return self.tunnel is not None and self.tunnel.state == tunnel.STATE_UP
+
+    def tunnel_endpoint(self) -> Endpoint | None:
+        """The advertisable tunnel endpoint, or None when the tunnel is not
+        up. Read at BUILD time by every pairing-URI emit path (the URL
+        arrives asynchronously; snapshots go stale)."""
+        if self.tunnel is None or self.tunnel.state != tunnel.STATE_UP:
+            return None
+        host = self.tunnel.hostname
+        if not host:
+            return None
+        return Endpoint(host, 443, "tunnel", "ca")
+
+    def connection_state(self) -> str:
+        if self.error:
+            return "Disconnected"
+        live = [c for c in self._conns if c.session is not None]
+        if live:
+            return "Connected"
+        if self._conns:
+            return "Pairing"
+        return STATE_DISCOVERING
+
+    def connected_devices(self) -> list[str]:
+        return [
+            c.session.device_name or "(unnamed device)"
+            for c in self._conns
+            if c.session is not None
+        ]
+
+    def active_sessions(self):
+        """All known bearer sessions (Connected + Suspended), for the Devices screen."""
+        return self._sessions.active_sessions()
+
+    async def revoke_session(self, bearer: str) -> bool:
+        """Revoke a bearer and close any live socket holding it.
+
+        The device's bearer is invalidated immediately; an attached socket is
+        closed now (rather than waiting for its next frame to fail auth).
+        """
+        revoked = self._sessions.revoke(bearer)
+        for conn, ws in list(self._live.items()):
+            if conn.session is not None and conn.session.bearer == bearer:
+                conn.close_requested = True
+                try:
+                    await ws.close()
+                except Exception:
+                    pass
+        self._notify()
+        return revoked
+
+    def _notify(self) -> None:
+        if self._on_change is not None:
+            try:
+                self._on_change()
+            except Exception:
+                pass

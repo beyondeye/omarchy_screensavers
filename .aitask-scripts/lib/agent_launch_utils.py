@@ -1,0 +1,3604 @@
+"""agent_launch_utils - Shared utilities for launching code agents from TUI screens.
+
+Non-UI module (no Textual dependency). Provides terminal detection, agent command
+resolution, and tmux session/window management.
+
+Usage:
+    from agent_launch_utils import (
+        find_terminal, resolve_dry_run_command, resolve_agent_string,
+        is_tmux_available, get_tmux_sessions, get_tmux_windows,
+        launch_in_tmux, load_tmux_defaults, TmuxLaunchConfig,
+        AitasksSession, discover_aitasks_sessions, switch_to_pane_anywhere,
+    )
+"""
+from __future__ import annotations
+
+import contextlib
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import time
+import uuid
+from dataclasses import dataclass
+from pathlib import Path
+from typing import NamedTuple
+
+from artifact_manifest import HANDLE_RE
+from tui_registry import TUI_NAMES as _DEFAULT_TUI_NAMES
+from tmux_exec import (
+    TmuxClient,
+    decode_tmux_output,
+    encode_tmux_argv,
+    session_scope_target,
+    tmux_os_path,
+    tmux_stderr_is,
+)
+# The monitor pane marker: rule + classification live in monitor_marker (one
+# implementation, also exec'd by aitask_minimonitor.sh); the writers live here,
+# where the tmux gateway client is. Re-exported so callers have a single import.
+from monitor_marker import (  # noqa: F401
+    MONITOR_KIND_OPTION,
+    MONITOR_KINDS,
+    _process_exists,
+    monitor_marker_alive,
+    monitor_marker_state,
+)
+# The bound-helper rule (t2073_3): shadow and scratchpad panes are helpers, never
+# occupants. One definition, shared with monitor_core.
+from helper_panes import BOUND_HELPER_TARGET_OPTIONS, is_bound_helper
+
+# Known git management TUIs in preference order
+KNOWN_GIT_TUIS = ["lazygit", "gitui", "tig"]
+
+# Single Python gateway for raw tmux spawning (t952). Socket args are cached
+# once at construction from AITASKS_TMUX_SOCKET (unset → dedicated `-L ait`
+# socket, t953).
+_TMUX = TmuxClient()
+
+
+def tmux_session_target(session: str) -> str:
+    """Return an exact-match tmux ``-t`` session target (``=<session>``).
+
+    tmux resolves ``-t <name>`` as a prefix match by default, so ``-t aitasks``
+    will match ``aitasks_mob`` when only the latter is running. Prefixing the
+    name with ``=`` forces exact match and is required whenever multiple
+    aitasks projects run side-by-side with session names sharing a prefix.
+
+    Session-typed ``-t`` only; ``list-panes -s`` takes
+    :func:`tmux_session_scope_target`.
+    """
+    return f"={session}"
+
+
+def tmux_session_scope_target(session: str) -> str:
+    """Return ``=<session>:`` — the whole-session target for ``list-panes -s``.
+
+    A bare ``=<session>`` on a window-typed ``-t`` is looked up as a window
+    name first and can list a different session's panes. See
+    ``tmux_exec.session_scope_target``.
+    """
+    return session_scope_target(session)
+
+
+def tmux_window_target(session: str, window: str | int) -> str:
+    """Return an exact-match tmux ``-t`` session:window target.
+
+    Only the session part is anchored with ``=``; window names and indices
+    do not suffer tmux's session-level prefix match. Pass ``window=""`` for
+    the "trailing colon" idiom used by ``new-window`` to mean "create in this
+    session".
+    """
+    return f"={session}:{window}"
+
+
+def detect_git_tuis() -> list[str]:
+    """Return list of installed git TUI tool names."""
+    return [tool for tool in KNOWN_GIT_TUIS if shutil.which(tool)]
+
+
+@dataclass
+class TmuxLaunchConfig:
+    """Configuration for launching a command in tmux."""
+
+    session: str
+    window: str
+    new_session: bool
+    new_window: bool
+    split_direction: str = "horizontal"  # only used when new_window=False
+    # Split-pane placement/size, only used by the split branch (new_window=False
+    # and new_session=False). ``split_before`` adds tmux ``-b`` so the new pane
+    # is placed *before* the target (left for a horizontal split, above for a
+    # vertical one) instead of the default after (right/below). ``split_size``
+    # adds tmux ``-l <N>`` to size the new pane (columns for a horizontal split,
+    # rows for a vertical one). Both default to no-op so every other caller's
+    # split behavior is unchanged.
+    split_before: bool = False
+    # Rows/columns, or a tmux percentage string such as ``"40%"`` (t2211_2).
+    split_size: int | str | None = None
+    # Split branch only: add tmux ``-d`` so the new pane does NOT become the
+    # window's active pane. ``select_window=False`` alone does not do that — it
+    # only skips the later ``select-window`` — so a caller that must leave the
+    # user's focus where it was (the sitrep window's repair splits, t2211_2)
+    # sets this. Defaults to no-op so every other caller's argv is unchanged.
+    split_detached: bool = False
+    # When set, split this specific pane (``-t <pane_id>``) instead of the
+    # window's active pane. Required when the caller is itself a narrow pane in
+    # the target window (e.g. minimonitor spawning a shadow): splitting the
+    # active pane would size ``split_size`` against the wrong, narrow pane and
+    # collapse the new pane to width 1. Defaults to None (split the active pane,
+    # the historical behavior). Only used by the split branch.
+    split_target_pane: str | None = None
+    # Working directory for the new tmux pane. When set, ``launch_in_tmux``
+    # passes ``-c <cwd>`` to tmux so the launched command runs in this dir
+    # rather than inheriting the calling pane's cwd. Required for cross-
+    # session launches where the target project_root differs from the
+    # caller's cwd (e.g., monitor in project A picking a sibling task in
+    # project B's tmux session).
+    cwd: str | None = None
+    # Whether the launch may move the attached client to the new pane's window.
+    # The two in-session placement branches select the window by default: the
+    # split branch ends with ``select-window``, and ``new-window`` without
+    # ``-d`` creates *and* selects. Set False to launch out-of-sight, keeping
+    # the client on whatever window it is on (``ait monitor`` spawning a shadow
+    # into another window — being yanked away would defeat its own shadow
+    # preview column). Defaults True so every pre-existing caller's behavior is
+    # unchanged. Honored on those two branches ONLY: ``new_session`` creates a
+    # whole session and still issues its own ``switch-client``, which this flag
+    # does not gate — no caller combines the two, and suppressing the switch
+    # there would leave a brand-new session with no attached client.
+    select_window: bool = True
+
+
+#: The tmux session name an unconfigured repo reports — the fallback
+#: :func:`_read_default_session` returns when ``tmux.default_session`` is
+#: absent, matching ``tmux_bootstrap.sh::_tmux_bootstrap_resolve_session``'s bash
+#: default (what ``ait ide`` resolves through).
+#:
+#: **It is NOT unique across repos**, for two independent reasons: every
+#: unconfigured repo reports it, and a repo may also configure it deliberately
+#: (``seed/project_config.yaml`` documents exactly that as its example). Nothing
+#: at runtime can tell those two apart — a tmux session name carries no
+#: provenance — so a display that needs to identify a repo must treat this value
+#: as carrying no information at all, rather than as evidence the repo is
+#: unconfigured. See :attr:`AitasksSession.key` for the identity that IS unique.
+DEFAULT_TMUX_SESSION = "aitasks"
+
+
+def _normalize_default_session(value: object) -> str:
+    """Map a ``tmux.default_session`` value to the session name it selects.
+
+    ``None`` (YAML null — blank, ``~``, ``null``, comment-only), ``""`` and
+    whitespace-only mean "not configured" → :data:`DEFAULT_TMUX_SESSION`.
+    Anything else is ``str(value)`` unchanged, so every non-blank form the
+    YAML-backed readers accepted before keeps resolving the same way. Shared by
+    :func:`load_tmux_defaults` and :func:`_read_default_session`.
+    """
+    if value is None:
+        return DEFAULT_TMUX_SESSION
+    text = str(value)
+    return text if text.strip() else DEFAULT_TMUX_SESSION
+
+
+def _tmux_session_name_ok(name: str) -> bool:
+    """False when tmux cannot address ``name``.
+
+    tmux reads ``.`` and ``:`` as target separators, so a session so named can be
+    created and then never reached. Twin of
+    ``tmux_bootstrap.sh::_tmux_bootstrap_session_name_ok``.
+
+    Deliberately kept out of :func:`_normalize_default_session`: that function
+    cannot distinguish its callers, and :func:`read_default_session_status` must
+    still tell an illegal name apart from a blank one to report a shape for it.
+    Both readers apply this check themselves (t1828).
+    """
+    return "." not in name and ":" not in name
+
+
+@dataclass(frozen=True)
+class AitasksSession:
+    """A tmux session identified as belonging to an aitasks project.
+
+    Produced by :func:`discover_aitasks_sessions` when the session carries a
+    valid :data:`PROJECT_ROOT_OPTION` stamp, when its panes' cwds vote for an
+    aitasks project root, or when the session's name matches a legacy
+    ``AITASKS_PROJECT_<sess>`` global env entry (see that function for the
+    priority order).
+
+    When ``include_registered=True`` is passed to
+    :func:`discover_aitasks_sessions`, synthesized entries are also produced
+    from the per-user registry at ``~/.config/aitasks/projects.yaml``; those
+    carry ``is_live=False`` and their ``session`` field is the project's
+    configured tmux session name (resolved from its ``project_config.yaml``).
+    STALE registry rows (path missing the
+    ``aitasks/metadata/project_config.yaml`` marker) additionally carry
+    ``is_stale=True`` so downstream UIs can render them distinctly.
+    """
+
+    session: str           # tmux session name
+    project_root: Path     # absolute path to the project root
+    project_name: str      # basename(project_root), for display
+    is_live: bool = True   # False when synthesized from the per-user registry
+    is_stale: bool = False # True when synthesized from a STALE registry row
+    # Resolved project-group (t1025_1): registry value wins, else the repo's
+    # own project_config.yaml project_group, else None (ungrouped). Only a
+    # *valid* slug ever populates this — invalid config values resolve to None.
+    project_group: str | None = None
+    # Set on registry-synthesized entries whose `tmux.default_session` could not
+    # be read faithfully (t1811): the shape from `read_default_session_status`,
+    # while `session` fell back to DEFAULT_TMUX_SESSION. Not part of `key`.
+    # Consumers that create the session show it (TUI switcher bootstrap).
+    default_session_problem: str | None = None
+
+    @property
+    def key(self) -> str:
+        """Stable unique identity, independent of the tmux session name (t1099).
+
+        The tmux ``session`` name is NOT unique across discovered repos:
+        unconfigured repos all fall back to :data:`DEFAULT_TMUX_SESSION` (see
+        :func:`_read_default_session`), and two live repos can share a
+        basename. ``project_root`` is truly unique, so it is the identity used
+        for caching / selection / cycling by the registry-inclusive consumers
+        (stats TUI, TUI switcher) and the shared ring/group helpers; ``session``
+        stays purely the tmux label / target.
+        """
+        try:
+            return os.path.realpath(self.project_root)
+        except OSError:
+            return str(self.project_root)
+
+
+class RegistryRecord(NamedTuple):
+    """Raw per-user project registry entry."""
+
+    name: str
+    path: str
+    git_remote: str
+    last_opened: str
+    project_group: str
+
+
+def compact_root(project_root: Path) -> str:
+    """Home-abbreviated project_root — a compact, globally-unique disambiguator
+    (t1099). Used as the secondary/fallback label when project names collide
+    (stats TUI, syncer)."""
+    text = str(project_root)
+    home = str(Path.home())
+    if text == home or text.startswith(home + os.sep):
+        return "~" + text[len(home):]
+    return text
+
+
+def find_terminal() -> str | None:
+    """Find an available terminal emulator, or return None."""
+    terminal = os.environ.get("TERMINAL")
+    if terminal and shutil.which(terminal):
+        return terminal
+    for term in [
+        "alacritty", "kitty", "ghostty", "foot",
+        "x-terminal-emulator", "xdg-terminal-exec", "gnome-terminal",
+        "konsole", "xfce4-terminal", "lxterminal", "mate-terminal", "xterm",
+    ]:
+        if shutil.which(term):
+            return term
+    return None
+
+
+def spawn_in_terminal(
+    terminal: str, cmd: list[str], **popen_kwargs
+) -> subprocess.Popen:
+    """Spawn ``cmd`` in a new terminal window, detached from this process.
+
+    Wraps ``subprocess.Popen`` with ``start_new_session=True`` so the spawned
+    terminal (and the agent inside it) becomes a new session / process-group
+    leader. This lets the agent outlive the launching TUI even when the TUI is
+    NOT running inside tmux (the tmux launch path already detaches via
+    ``tmux_exec.py``). Without it, the child shares the TUI's session and
+    controlling terminal and is torn down when the TUI exits.
+
+    ``cmd`` is the argv that follows the terminal's ``--`` separator.
+    """
+    return subprocess.Popen(
+        [terminal, "--", *cmd], start_new_session=True, **popen_kwargs
+    )
+
+
+def resolve_dry_run_command(
+    project_root: Path,
+    operation: str,
+    *args: str,
+    agent_string: str | None = None,
+    extra_global_flags: list[str] | None = None,
+) -> str | None:
+    """Resolve the full agent command via --dry-run.
+
+    Calls aitask_codeagent.sh --with-agent-env --dry-run invoke <operation>
+    <args> and parses the DRY_RUN: <cmd> output. When `agent_string` is
+    provided, prepends `--agent-string <value>` before --dry-run so the wrapper
+    resolves the command for a non-default agent/model. Returns the command
+    string or None on failure.
+
+    **The command starts with `env AITASK_AGENT_STRING=<resolved> …` (t1850).**
+    Every caller LAUNCHES this string instead of letting the wrapper exec, and a
+    real `invoke` exports that variable just before its exec. Without the prefix
+    the agent starts without it, the SessionStart hook records a blank agent
+    string, and a frozen agent comes back on the project default model. The
+    prefix must stay `env`, because `env` execs into the agent: `#{pane_pid}`
+    remains the agent's pid, which the task-lock liveness anchor depends on
+    (t1465; pinned by `tests/test_launch_agent_string_env.py`).
+
+    One known gap: the command is editable in `AgentCommandScreen`, so a user who
+    hand-edits `--model` there leaves the prefix naming the resolved model. The
+    dialog's agent picker regenerates both.
+
+    `extra_global_flags` carries further **global** wrapper flags — currently
+    `["--resume-session", "<sid>"]` for the frozen-agent restore coordinator
+    (t1705_5). They must go here rather than in `*args`: positional `*args` land
+    AFTER `invoke <operation>`, where the wrapper reads them as *operation*
+    arguments, whereas a global flag has to precede `--dry-run`.
+    """
+    wrapper = str(project_root / ".aitask-scripts" / "aitask_codeagent.sh")
+    cmd = [wrapper]
+    if agent_string:
+        cmd += ["--agent-string", agent_string]
+    if extra_global_flags:
+        cmd += list(extra_global_flags)
+    cmd += ["--with-agent-env", "--dry-run", "invoke", operation] + list(args)
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=10,
+            cwd=str(project_root),
+        )
+        if result.returncode == 0:
+            output = result.stdout.strip()
+            if output.startswith("DRY_RUN: "):
+                return output[len("DRY_RUN: "):]
+        return None
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return None
+
+
+def pick_launch_argv(
+    project_root: Path,
+    task_id: str,
+    agent_string: str | None = None,
+) -> tuple[str | None, str]:
+    """The `pick` launch command and its window name.
+
+    Returns ``(full_cmd, window_name)``; ``full_cmd`` is None when the wrapper
+    could not resolve a command (no agent binary, bad agent string), and callers
+    branch on that exactly as they did before this helper existed.
+
+    Extracted (t1705_5) so the restore coordinator's ``--repick`` mode shares one
+    definition with the TUIs instead of forking it. The TUIs reach it through
+    `agent_command_screen.build_pick_screen` (t1946) — board, trails, monitor
+    and minimonitor — and `agent_restore` calls it directly.
+
+    **`agent_string` defaults to None on purpose, and that default is the whole
+    contract.** None of the three TUI sites passed an agent string before the
+    extraction, so they must keep resolving the operation's *configured* agent —
+    a helper that defaulted this to anything else would silently change which
+    agent and model every `pick` launch starts, with no error and no log line.
+    `agent_restore` is the one caller that passes a value: the frozen record's
+    own agent string, so a restored agent comes back as the agent it was.
+    `tests/test_pick_launch_argv.py` pins both halves.
+
+    ``agent-pick-<task_id>`` is a convention other code parses back out
+    (`task_id_from_window_name`, `classify_pane`) and the session store keeps as
+    durable record identity, so it is defined here rather than at each call site.
+    """
+    full_cmd = resolve_dry_run_command(
+        project_root, "pick", task_id, agent_string=agent_string)
+    return full_cmd, f"agent-pick-{task_id}"
+
+
+def resolve_agent_string(
+    project_root: Path, operation: str, *, env: dict[str, str] | None = None
+) -> str | None:
+    """Return the resolved agent string for an operation.
+
+    Shells `aitask_codeagent.sh resolve <operation>` and parses the
+    `AGENT_STRING:<value>` line. Returns the agent string or None on failure.
+
+    `env` is forwarded to the subprocess. It defaults to None (inherit), which is
+    correct for same-repo callers: a user who sets TASK_DIR expects it honored.
+    Callers resolving a *foreign* root must pass a scrubbed environment —
+    `lib/agent_string.sh` documents METADATA_DIR / TASK_DIR /
+    DEFAULT_AGENT_STRING as caller overrides, and they outrank `cwd`, so an
+    inherited value silently makes every root resolve against the same config.
+    See `cross_repo_settings.resolver_env()`.
+    """
+    wrapper = str(project_root / ".aitask-scripts" / "aitask_codeagent.sh")
+    try:
+        result = subprocess.run(
+            [wrapper, "resolve", operation],
+            capture_output=True, text=True, timeout=10,
+            cwd=str(project_root), env=env,
+        )
+        if result.returncode == 0:
+            for line in result.stdout.splitlines():
+                if line.startswith("AGENT_STRING:"):
+                    return line[len("AGENT_STRING:"):].strip()
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        pass
+    return None
+
+
+def is_tmux_available() -> bool:
+    """Check if tmux is installed."""
+    return shutil.which("tmux") is not None
+
+
+def get_tmux_sessions() -> list[str]:
+    """List running tmux session names. Returns empty list if tmux not running."""
+    rc, out = _TMUX.run(["list-sessions", "-F", "#{session_name}"])
+    if rc == 0:
+        return [s for s in out.strip().splitlines() if s]
+    return []
+
+
+def get_tmux_windows_result(
+    session: str,
+) -> tuple[list[tuple[str, str]], str | None]:
+    """List a session's windows as ``(index, name)`` tuples, keeping the error.
+
+    Returns ``(windows, error)``. ``error`` is ``None`` when the enumeration
+    succeeded (``windows`` may still be empty — a session really can have no
+    listable windows); otherwise it is a short reason string and ``windows`` is
+    empty.
+
+    Callers that make a *safety* decision from the window list must use this
+    variant, not ``get_tmux_windows``: the gateway folds ``TimeoutExpired`` /
+    ``FileNotFoundError`` / ``OSError`` into ``(-1, "")``, so a plain empty list
+    cannot distinguish "nothing is running there" from "we could not ask". A
+    fail-closed consumer needs that distinction (t1223_3).
+    """
+    rc, out = _TMUX.run(
+        ["list-windows", "-t", tmux_session_target(session),
+         "-F", "#{window_index}:#{window_name}"]
+    )
+    if rc != 0:
+        return [], f"tmux list-windows failed (rc={rc})"
+    windows = []
+    for line in out.strip().splitlines():
+        if ":" in line:
+            idx, name = line.split(":", 1)
+            windows.append((idx, name))
+    return windows, None
+
+
+def get_tmux_windows(session: str) -> list[tuple[str, str]]:
+    """List windows in a tmux session as (index, name) tuples.
+
+    Lossy convenience wrapper over :func:`get_tmux_windows_result` — an
+    enumeration failure is reported as an empty list. Unchanged behavior for
+    display/best-effort callers; see the result variant for safety decisions.
+    """
+    return get_tmux_windows_result(session)[0]
+
+
+def find_window_by_name(name: str, session: str) -> tuple[str, str] | None:
+    """Find a tmux window by name within a specific session.
+
+    Returns (session, window_index) if found, None otherwise. The session
+    parameter is required to prevent cross-project matches — the aitasks
+    framework is designed to run one tmux session per project, so whole-
+    server scans are always a bug.
+    """
+    for idx, win_name in get_tmux_windows(session):
+        if win_name == name:
+            return (session, idx)
+    return None
+
+
+def current_tmux_session() -> str | None:
+    """The caller's own session on the GATEWAY server, or None when the caller
+    is not verifiably a pane of that server.
+
+    A bare ``display-message -p '#S'`` sent to the gateway socket by a process
+    whose ``$TMUX`` names a DIFFERENT server has no client to resolve against, so
+    tmux answers with its "best" session — possibly another project's, whose
+    ``agent-pick-<id>`` window would then be selected for a same-numbered task.
+    So the probe targets the caller's own pane (``$TMUX_PANE``) and is trusted
+    only when the answering server's ``#{socket_path}`` is the socket ``$TMUX``
+    names: pane ids are per-server, and ``%0`` exists on every server.
+    """
+    return _gateway_pane_session(os.environ.get("TMUX_PANE", ""),
+                                 os.environ.get("TMUX", ""))
+
+
+def pane_on_gateway_server(pane: str, tmux_env: str) -> bool:
+    """Is ``pane`` (a ``$TMUX_PANE`` value) a pane of the GATEWAY server?
+
+    ``tmux_env`` is the ``$TMUX`` value of the process that owns ``pane``. The
+    rule is :func:`current_tmux_session`'s: pane ids are per-server, so a pane
+    id read from the environment of a process in another tmux server (the
+    user's personal one) names an unrelated pane on the gateway server — or
+    none. Anything that reads or writes a pane's options on the strength of
+    ``$TMUX_PANE`` must pass this first.
+    """
+    return _gateway_pane_session(pane, tmux_env) is not None
+
+
+def _gateway_pane_session(pane: str, tmux_env: str) -> str | None:
+    """``pane``'s session on the gateway server, or None when the gateway is not
+    verifiably the server ``tmux_env`` names (see :func:`current_tmux_session`)."""
+    if not tmux_env or not pane:
+        return None
+    rc, out = _TMUX.run(
+        ["display-message", "-p", "-t", pane, "#{socket_path}\t#{session_name}"])
+    if rc != 0:
+        return None
+    sock, _, session = out.strip().partition("\t")
+    if not _gateway_socket_matches(sock, tmux_env):
+        return None
+    return session or None
+
+
+def _gateway_socket_matches(sock: str, tmux_env: str) -> bool:
+    """Is ``sock`` (a ``#{socket_path}`` the gateway answered with) the server
+    ``tmux_env`` (a ``$TMUX`` value) names?"""
+    own_socket = tmux_env.split(",", 1)[0]
+    return bool(sock and own_socket) and (
+        os.path.realpath(sock) == os.path.realpath(own_socket))
+
+
+def gateway_pane_window(pane: str, tmux_env: str) -> tuple[str, str] | None:
+    """``(session, window_index)`` of ``pane`` on the GATEWAY server, or None.
+
+    The same server-identity rule as :func:`current_tmux_session`: ``pane`` (a
+    ``$TMUX_PANE`` value) is trusted only when the gateway's ``#{socket_path}``
+    is the socket ``tmux_env`` names, because pane ids are per-server. Used to
+    address a caller's OWN window by index, never by name — several windows can
+    share a name.
+    """
+    if not tmux_env or not pane:
+        return None
+    rc, out = _TMUX.run(
+        ["display-message", "-p", "-t", pane,
+         "#{socket_path}\t#{session_name}\t#{window_index}"])
+    if rc != 0:
+        return None
+    parts = out.strip().split("\t")
+    if len(parts) != 3 or not _gateway_socket_matches(parts[0], tmux_env):
+        return None
+    session, window_index = parts[1], parts[2]
+    if not session or not window_index.isdigit():
+        return None
+    return session, window_index
+
+
+def _sessions_owned_by(project_root: Path, candidates) -> set[str]:
+    """Those of ``candidates`` the canonical discovery rule attributes to
+    ``project_root`` (registration stamp, else pane vote, else legacy registry).
+
+    One gateway server hosts every project's sessions, so neither "the caller's
+    own session" nor "the configured session name" proves ownership: a caller
+    can sit in another project's session, and every project defaults to
+    ``default_session: aitasks``. Positive evidence only — a session the rule
+    cannot attribute, attributes elsewhere, or that does not exist is not ours.
+
+    Only the named candidates are attributed (t1950): one ``list-sessions``,
+    then per-session queries for those names alone, so a session that is not a
+    candidate is never queried. This filters by NAME, not by owner: a candidate
+    may itself belong to another project, and an unstamped one still has its
+    panes listed before the rule rejects it.
+    """
+    names = {c for c in candidates if c}
+    if not names:
+        return set()
+    want = _root_key(Path(project_root))
+    return {session for session, root in _collect_live_roots(
+                _TMUX.run, _read_registry_entry, only=names)
+            if _root_key(root) == want}
+
+
+def owned_lookup_session(project_root: Path) -> str | None:
+    """The one session a same-project window lookup may search, or None.
+
+    Task-scoped window names (``agent-pick-<id>``, ``brainstorm-<num>``) carry
+    only the task number, so only a session attributed to ``project_root`` is
+    ever searched: the caller's own session when :func:`current_tmux_session`
+    verifies it, else the project's configured ``default_session`` — each only
+    if discovery roots it in ``project_root``. Only those two candidates are
+    attributed, never the whole server. None means search nothing and let the
+    caller launch: a duplicate is recoverable, a launch suppressed by another
+    project's window is a silent wrong answer.
+    """
+    candidates = (current_tmux_session(),
+                  load_tmux_defaults(project_root)["default_session"])
+    owned = _sessions_owned_by(project_root, candidates)
+    return next((c for c in candidates if c and c in owned), None)
+
+
+def focus_existing_window(window_names, project_root: Path) -> bool:
+    """Select the first of ``window_names`` running in
+    :func:`owned_lookup_session`, through the gateway (t1951).
+
+    Returns True when such a window exists; the ``select-window`` itself is
+    best-effort.
+    """
+    session = owned_lookup_session(project_root)
+    if session is None:
+        return False
+    for name in window_names:
+        existing = find_window_by_name(name, session)
+        if existing:
+            sess, idx = existing
+            _TMUX.run(["select-window", "-t", tmux_window_target(sess, idx)])
+            return True
+    return False
+
+
+def focus_existing_agent_window(task_id: str, project_root: Path) -> bool:
+    """Select a running ``agent-pick-<id>`` / ``agent-resume-<id>`` window
+    instead of launching a duplicate agent for the same task (t1946).
+
+    Shared by the board (pick and resume) and the stand-alone trails TUI; the
+    session it searches is :func:`owned_lookup_session`'s.
+    """
+    return focus_existing_window(
+        (f"agent-pick-{task_id}", f"agent-resume-{task_id}"), project_root)
+
+
+def _walk_up_to_aitasks(path: Path) -> Path | None:
+    """Walk up from ``path`` (inclusive) until finding an aitasks project root.
+
+    An aitasks project root is any directory containing
+    ``aitasks/metadata/project_config.yaml``. Returns the matching directory
+    or ``None`` if no ancestor qualifies.
+    """
+    for p in (path, *path.parents):
+        if (p / "aitasks" / "metadata" / "project_config.yaml").is_file():
+            return p
+    return None
+
+
+def _read_registry_entry(session: str) -> Path | None:
+    """Read ``AITASKS_PROJECT_<session>`` from tmux global env.
+
+    Returns the registered project root if the entry exists and points to a
+    directory containing an aitasks project; otherwise ``None``. Handles the
+    three tmux output forms: ``VAR=value`` (set), ``-VAR`` (unset marker), and
+    empty stdout with non-zero exit (truly absent).
+    """
+    var = f"AITASKS_PROJECT_{session}"
+    # Layer-A backend read — routed through the gateway so it honors the socket
+    # flag. The gateway folds spawn errors into (-1, ""), so rc != 0 covers the
+    # former except-branch (tmux missing / timeout) as well as a real miss.
+    rc, out = _TMUX.run(["show-environment", "-g", var])
+    if rc != 0:
+        return None
+    return _registry_entry_from_output(out)
+
+
+async def _read_registry_entry_async(session: str) -> Path | None:
+    """Async sibling of :func:`_read_registry_entry` for refresh-loop callers."""
+    var = f"AITASKS_PROJECT_{session}"
+    rc, out = await _TMUX.run_async(["show-environment", "-g", var])
+    if rc != 0:
+        return None
+    return _registry_entry_from_output(out)
+
+
+def _registry_entry_from_output(out: str) -> Path | None:
+    """Parse a tmux ``show-environment`` registry value into a project root."""
+    line = out.strip()
+    if not line or line.startswith("-") or "=" not in line:
+        return None
+    _, _, value = line.partition("=")
+    value = value.strip()
+    if not value:
+        return None
+    path = Path(tmux_os_path(value))  # tmux env value -> OS path (policy 5)
+    if not (path / "aitasks" / "metadata" / "project_config.yaml").is_file():
+        return None
+    return path
+
+
+# --- Project-group slug + resolution (t1025_1) -------------------------------
+
+# Explicit "ungrouped" sentinel stored in the *registry* ``project_group`` field
+# by ``ait projects group unset``. It is registry-only and is deliberately NOT a
+# valid user slug (it fails the slug regex), so it can never collide with a real
+# group name. When the registry field holds this sentinel, discovery resolves
+# the repo to ungrouped and does NOT fall back to the repo config — this is what
+# lets ``group unset`` clear a repo whose own config declares a project_group.
+PROJECT_GROUP_UNSET_SENTINEL = "-"
+
+_PROJECT_GROUP_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+
+
+def validate_project_group_slug(slug: str) -> tuple[bool, str]:
+    """Validate a project-group slug against ``^[a-z0-9][a-z0-9_-]*$``.
+
+    Returns ``(True, "")`` when valid, else ``(False, <reason>)``. The single
+    slug authority shared by the Python consumers, the ``--validate-slug`` CLI
+    shim (used by the bash write paths), and discovery-time read validation
+    (t1025_1). Rejects — never normalizes. The reserved unset sentinel ``-`` is
+    intentionally NOT a valid slug (it fails the leading-alnum anchor).
+    """
+    if not slug:
+        return False, "empty"
+    if slug != slug.strip():
+        return False, "leading or trailing whitespace"
+    if not _PROJECT_GROUP_SLUG_RE.match(slug):
+        return False, (
+            "must match ^[a-z0-9][a-z0-9_-]*$ "
+            "(lowercase alnum / '-' / '_', starting with alnum)"
+        )
+    return True, ""
+
+
+def _resolve_config_project_group(project_root: Path) -> str | None:
+    """Read + validate ``project.project_group`` from a repo's config.
+
+    Discovery's config fallback (t1025_1 D6): returns the group slug only when
+    the repo's ``aitasks/metadata/project_config.yaml`` declares a *valid*
+    ``project.project_group``. An absent, empty, sentinel, or invalid value
+    resolves to ``None`` (a malformed config can never leak into
+    :class:`AitasksSession`). Never raises — a read error or non-UTF-8 content
+    is treated as None. The whole file is decoded up front, so an invalid byte
+    anywhere yields None rather than depending on where the scan stops.
+    """
+    cfg = project_root / "aitasks" / "metadata" / "project_config.yaml"
+    if not cfg.is_file():
+        return None
+
+    def _unquote(s: str) -> str:
+        s = s.strip()
+        if len(s) >= 2 and s[0] == s[-1] and s[0] in ('"', "'"):
+            s = s[1:-1]
+        return s
+
+    try:
+        text = cfg.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+
+    in_project_block = False
+    value = ""
+    for line in text.split("\n"):
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        if line[:1] not in (" ", "\t"):
+            in_project_block = line.startswith("project:")
+            continue
+        if not in_project_block:
+            continue
+        stripped = line.lstrip()
+        if stripped.startswith("project_group:"):
+            value = _unquote(stripped[len("project_group:"):])
+            break
+
+    if not value:
+        return None
+    valid, _reason = validate_project_group_slug(value)
+    return value if valid else None
+
+
+def _parse_registry_records() -> list[RegistryRecord]:
+    """Parse ``~/.config/aitasks/projects.yaml`` into raw registry records.
+
+    Returns a :class:`RegistryRecord` for every entry, with empty strings for
+    absent fields. This is the **single
+    registry-file reader authority** (t970): its records are what the
+    ``--list-registry`` / ``--resolve-index`` CLI below expose to the bash side
+    (``aitask_projects.sh::load_registry_or_die`` reads them through the
+    ``--list-registry-strict`` twin). Honors
+    the ``AITASKS_PROJECTS_INDEX`` env var (same override the bash side
+    supports); no PyYAML dependency.
+
+    The 5th field ``project_group`` (t1025_1) is the per-entry group membership:
+    a slug, the explicit unset sentinel ``-``, or empty (absent). It is passed
+    through verbatim — tri-state interpretation happens at the discovery layer.
+
+    An entry is emitted as soon as a ``- name:`` / indented ``name:`` line is
+    seen — the other fields may be empty — matching the bash awk ``emit()``
+    rule (which feeds the registry read+write round-trip, so name-only entries
+    and the raw remote/last/group fields must survive). This differs from
+    :func:`_read_registry_index`, which additionally requires a non-empty path
+    and annotates ``OK``/``STALE`` for the discover path.
+
+    Any read failure — including non-UTF-8 content — yields ``[]``,
+    indistinguishable from an empty registry. That is right for discovery,
+    display and pickers; a caller that must RULE OUT an entry, or that rewrites
+    the registry from this read, uses :func:`_parse_registry_records_strict`.
+    """
+    try:
+        return _parse_registry_records_strict()
+    except (OSError, UnicodeDecodeError):
+        return []
+
+
+def _parse_registry_records_strict() -> list[RegistryRecord]:
+    """:func:`_parse_registry_records`, but a read failure RAISES ``OSError``.
+
+    A missing registry file is still a definite, empty answer. Anything that
+    exists at the registry path but cannot be read as a file — a permission
+    error, a directory, an I/O error mid-read — raises, so a caller that must
+    rule out a conflicting entry (``aitask_project_resolve.sh candidates`` /
+    ``bindings``, t1869) can report "could not look" instead of "nothing
+    there". Non-UTF-8 content raises ``ValueError``, which such a caller treats
+    the same way.
+    """
+    index_path = os.environ.get("AITASKS_PROJECTS_INDEX")
+    if not index_path:
+        index_path = os.path.expanduser("~/.config/aitasks/projects.yaml")
+    # Absence must be PROVEN, not inferred. os.path.exists/lexists/isfile all
+    # return False on ANY error — including a parent directory this process may
+    # not search — so they cannot tell "no registry" from "could not look".
+    # stat() raises instead: FileNotFoundError is the only answer that means
+    # absent (and then lstat() tells a dangling symlink apart from nothing at
+    # all); every other OSError propagates as "could not read".
+    try:
+        st = os.stat(index_path)
+    except FileNotFoundError:
+        try:
+            os.lstat(index_path)
+        except FileNotFoundError:
+            return []
+        raise OSError(f"registry path is a dangling symlink: {index_path}")
+    if not stat.S_ISREG(st.st_mode):
+        raise OSError(f"registry path is not a regular file: {index_path}")
+
+    def _unquote(s: str) -> str:
+        s = s.strip()
+        if len(s) >= 2 and s[0] == s[-1] and s[0] in ('"', "'"):
+            s = s[1:-1]
+        return s
+
+    records: list[RegistryRecord] = []
+    cur_name = ""
+    cur_path = ""
+    cur_remote = ""
+    cur_last = ""
+    cur_group = ""
+
+    def _flush() -> None:
+        nonlocal cur_name, cur_path, cur_remote, cur_last, cur_group
+        if cur_name:
+            records.append(
+                RegistryRecord(
+                    name=cur_name,
+                    path=cur_path,
+                    git_remote=cur_remote,
+                    last_opened=cur_last,
+                    project_group=cur_group,
+                )
+            )
+        cur_name = ""
+        cur_path = ""
+        cur_remote = ""
+        cur_last = ""
+        cur_group = ""
+
+    with open(index_path, encoding="utf-8") as fh:
+        for raw in fh:
+            line = raw.rstrip("\n")
+            stripped = line.lstrip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            if stripped.startswith("- name:"):
+                _flush()
+                cur_name = _unquote(stripped[len("- name:"):])
+                continue
+            if stripped.startswith("name:") and line.startswith(" "):
+                _flush()
+                cur_name = _unquote(stripped[len("name:"):])
+                continue
+            if stripped.startswith("path:") and line.startswith(" "):
+                cur_path = _unquote(stripped[len("path:"):])
+                continue
+            if stripped.startswith("git_remote:") and line.startswith(" "):
+                cur_remote = _unquote(stripped[len("git_remote:"):])
+                continue
+            if stripped.startswith("last_opened:") and line.startswith(" "):
+                cur_last = _unquote(stripped[len("last_opened:"):])
+                continue
+            if stripped.startswith("project_group:") and line.startswith(" "):
+                cur_group = _unquote(stripped[len("project_group:"):])
+                continue
+    _flush()
+
+    return records
+
+
+def _read_registry_index() -> list[tuple[str, Path, str, str]]:
+    """Read the registry as ``(name, path, status, project_group)`` tuples.
+
+    Thin annotator over :func:`_parse_registry_records` (the single reader
+    authority): keeps only entries with a non-empty name *and* path, and tags
+    each ``"OK"`` (path holds the ``aitasks/metadata/project_config.yaml``
+    marker) or ``"STALE"`` (marker missing) so downstream callers
+    (``discover_aitasks_sessions``) can decide whether to render or skip. The
+    4th element is the raw registry ``project_group`` (slug, the unset sentinel
+    ``-``, or ``""`` when absent), carried through for discovery-time
+    group resolution (t1025_1). File order is preserved.
+    """
+    entries: list[tuple[str, Path, str, str]] = []
+    for record in _parse_registry_records():
+        if not (record.name and record.path):
+            continue
+        p = Path(record.path)
+        if (p / "aitasks" / "metadata" / "project_config.yaml").is_file():
+            entries.append((record.name, p, "OK", record.project_group))
+        else:
+            entries.append((record.name, p, "STALE", record.project_group))
+    return entries
+
+
+def _build_registry_group_lookup() -> dict[str, str]:
+    """Map ``realpath(registry path) -> raw registry project_group``.
+
+    Path-keyed (t1025_1 D3) so a live session whose ``project_root.name``
+    differs from its registered ``project.name`` still matches its registry row.
+    The value is the raw registry field (slug, sentinel ``-``, or ``""``);
+    tri-state interpretation is the caller's. Last writer wins on duplicate
+    paths (file order preserved).
+    """
+    lookup: dict[str, str] = {}
+    for _name, path, _status, group in _read_registry_index():
+        try:
+            key = os.path.realpath(path)
+        except OSError:
+            key = str(path)
+        lookup[key] = group
+    return lookup
+
+
+def _resolve_session_group(
+    project_root: Path,
+    registry_group: str | None,
+    config_cache: dict[str, str | None],
+) -> str | None:
+    """Resolve a session's effective project-group (t1025_1 tri-state, D1/D6).
+
+    Priority: a real registry slug wins; the registry unset sentinel ``-`` →
+    ``None`` with **no** config fallback; an absent/empty registry value falls
+    back to the repo's own (validated) ``project.project_group``; else ``None``.
+    ``registry_group`` is the raw registry field for this root (``None`` when the
+    repo has no registry row at all — e.g. a live-unregistered session).
+    ``config_cache`` memoizes the validated config read keyed by realpath.
+    """
+    if registry_group:
+        if registry_group == PROJECT_GROUP_UNSET_SENTINEL:
+            return None
+        # Registry values are written only through the validating write paths,
+        # but guard anyway so a hand-edited bad value never leaks.
+        valid, _reason = validate_project_group_slug(registry_group)
+        return registry_group if valid else None
+    try:
+        key = os.path.realpath(project_root)
+    except OSError:
+        key = str(project_root)
+    if key not in config_cache:
+        config_cache[key] = _resolve_config_project_group(project_root)
+    return config_cache[key]
+
+
+_YAML_NULLS = ("", "~", "null", "Null", "NULL")
+
+#: Every ``shape`` :func:`read_default_session_status` can report. The bash twin
+#: (``tmux_bootstrap.sh::_tmux_bootstrap_default_session_raw``) reports the same
+#: vocabulary in its ``DEFAULT_SESSION_UNREADABLE:<shape>:<cfg>`` sentinel.
+#:
+#: All but the last mean the value could not be *read*. ``illegal_tmux_name``
+#: (t1828) means the opposite: it was read correctly and is simply unusable, so
+#: the "cannot be read" framing does not cover the whole tuple. It is also the
+#: only shape :func:`load_tmux_defaults` reproduces by applying the same rule
+#: rather than by failing to parse.
+DEFAULT_SESSION_PROBLEM_SHAPES = (
+    "tab_or_control", "missing_separator", "continuation", "quoted_escape",
+    "trailing_content", "block_scalar", "flow_collection", "node_property",
+    "indicator", "mapping_indicator", "typed_scalar", "duplicate_key",
+    "flow_mapping", "invalid_block", "encoding", "non_printable",
+    "illegal_tmux_name",
+)
+
+#: The shapes that describe the whole file rather than the ``default_session``
+#: line: bytes PyYAML's Reader rejects before parsing, so every YAML-backed reader
+#: (:func:`load_tmux_defaults`) falls back too. Notices word these differently.
+DEFAULT_SESSION_FILE_SHAPES = ("encoding", "non_printable")
+
+#: Stderr sentinel the bash twin writes before its human-readable warning.
+DEFAULT_SESSION_UNREADABLE_SENTINEL = "DEFAULT_SESSION_UNREADABLE:"
+
+# PyYAML 6.0.3's implicit resolvers (yaml/resolver.py) for bool, int, float,
+# timestamp, merge and value, copied verbatim. A plain scalar matching one is
+# typed by YAML rather than read as a string. The awk twin carries the same
+# alternations; tests/test_tmux_default_session_resolvers.py checks both against
+# the installed PyYAML over a generated corpus.
+_YAML_TYPED_PLAIN = re.compile(r"""^(?:
+      yes|Yes|YES|no|No|NO|true|True|TRUE|false|False|FALSE|on|On|ON|off|Off|OFF
+    | [-+]?0b[0-1_]+
+    | [-+]?0[0-7_]+
+    | [-+]?(?:0|[1-9][0-9_]*)
+    | [-+]?0x[0-9a-fA-F_]+
+    | [-+]?[1-9][0-9_]*(?::[0-5]?[0-9])+
+    | [-+]?(?:[0-9][0-9_]*)\.[0-9_]*(?:[eE][-+][0-9]+)?
+    | \.[0-9][0-9_]*(?:[eE][-+][0-9]+)?
+    | [-+]?[0-9][0-9_]*(?::[0-5]?[0-9])+\.[0-9_]*
+    | [-+]?\.(?:inf|Inf|INF)
+    | \.(?:nan|NaN|NAN)
+    | [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]
+    | [0-9][0-9][0-9][0-9]-[0-9][0-9]?-[0-9][0-9]?(?:[Tt]|[ \t]+)[0-9][0-9]?
+      :[0-9][0-9]:[0-9][0-9](?:\.[0-9]*)?(?:[ \t]*(?:Z|[-+][0-9][0-9]?(?::[0-9][0-9])?))?
+    | <<
+    | =
+)$""", re.X)
+
+# Typed values whose ``str()`` is the source text itself, so the YAML-backed
+# readers and this reader still agree: canonical decimal ints and True/False.
+_YAML_ROUND_TRIP_TYPED = re.compile(r"^(?:0|-?[1-9][0-9]*|True|False)$")
+
+# Characters PyYAML rejects anywhere in the stream (ReaderError) or scans as a
+# line break (NEL, LS, PS). Tab is handled separately: legal in quotes and
+# comments, an error everywhere else on the value line. NUL is listed too: the
+# bash twin cannot carry it, so it maps NUL to \x01 before its awk reads the file.
+_YAML_LINE_CONTROL = re.compile("[\x00-\x08\x0a-\x1f\x7f-\x9f  ￾￿]")
+
+# PyYAML 6.0.3 Reader.NON_PRINTABLE, verbatim:
+#   [^\x09\x0A\x0D\x20-\x7E\x85\xA0-\uD7FF\uE000-\uFFFD\U00010000-\U0010ffff]
+# restricted to what a strict UTF-8 decode can yield (no surrogates survive it).
+# Matched anywhere in the file: YAML refuses the whole stream, not one line.
+_YAML_NON_PRINTABLE = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x84\x86-\x9f\ufffe\uffff]")
+
+_TMUX_KEY = re.compile(r"""^(?:tmux|"tmux"|'tmux') *:(.*)$""")
+# A named anchor alone on the `tmux:` line (PyYAML's scan_anchor alphabet).
+_YAML_ANCHOR_ONLY = re.compile(r"^&[0-9A-Za-z_-]+$")
+_DEFAULT_SESSION_KEY = re.compile(
+    r"""^(?:default_session|"default_session"|'default_session') *:(.*)$"""
+)
+
+
+def _classify_line_value(raw: str) -> tuple[str | None, str | None]:
+    """Read the text after ``default_session:`` the way YAML would, or refuse.
+
+    Returns ``(value, shape)``. ``(None, None)`` means "not configured" (empty,
+    null, comment-only or whitespace-only); ``(text, None)`` is a value YAML
+    reads back as exactly ``text``; ``(None, shape)`` is a value this reader
+    cannot read faithfully. Each rule below was measured against PyYAML 6.0.3:
+
+    * Only a space separates: a non-empty value must start with one, and
+      trimming removes spaces only (NBSP and other Unicode spaces are content).
+    * A tab outside quotes or a comment, and any character in
+      :data:`_YAML_LINE_CONTROL`, is an error for YAML.
+    * Quoted: the closing quote must be on this line; ``"…"`` must hold no
+      backslash escape and ``'…'`` no doubled quote; after the closing quote only
+      spaces may follow, optionally then a ``#`` comment.
+    * Plain: ``#`` starts a comment only as the first character or right after a
+      space, so ``team#1`` keeps its hash. The value must not start with an
+      indicator, contain ``": "`` or end with ``:``, and must not be typed by
+      :data:`_YAML_TYPED_PLAIN` unless it round-trips
+      (:data:`_YAML_ROUND_TRIP_TYPED`).
+
+    The awk twin in ``tmux_bootstrap.sh`` implements the same rules.
+    """
+    if raw == "":
+        return None, None
+    if _YAML_LINE_CONTROL.search(raw):
+        return None, "tab_or_control"
+    if raw[0] != " ":
+        return None, "tab_or_control" if raw[0] == "\t" else "missing_separator"
+    s = raw.lstrip(" ")
+    if s == "":
+        return None, None
+
+    if s[0] in "\"'":
+        quote = s[0]
+        end = s.find(quote, 1)
+        if end == -1:
+            return None, "continuation"
+        if quote == "'" and s[end + 1:end + 2] == "'":
+            return None, "quoted_escape"
+        body = s[1:end]
+        if quote == '"' and "\\" in body:
+            return None, "quoted_escape"
+        trailer = s[end + 1:].lstrip(" ")
+        if trailer and trailer[0] != "#":
+            return None, "tab_or_control" if trailer[0] == "\t" else "trailing_content"
+        return (body if body.strip() else None), None
+
+    if s[0] == "#":
+        return None, None
+    cut = s.find(" #")
+    value = (s if cut == -1 else s[:cut]).rstrip(" ")
+    if "\t" in value:
+        return None, "tab_or_control"
+    head = value[0]
+    if head in "|>":
+        return None, "block_scalar"
+    if head in "[{":
+        return None, "flow_collection"
+    if head in "&*!":
+        return None, "node_property"
+    if head in ",]}%@`" or (head in "-?:" and value[1:2] in ("", " ")):
+        return None, "indicator"
+    if value in _YAML_NULLS:
+        return None, None
+    if ": " in value or value.endswith(":"):
+        return None, "mapping_indicator"
+    if _YAML_TYPED_PLAIN.match(value) and not _YAML_ROUND_TRIP_TYPED.match(value):
+        return None, "typed_scalar"
+    return (value if value.strip() else None), None
+
+
+def _tmux_header_kind(line: str) -> str | None:
+    """Classify a column-0 line: ``None`` unless it opens the ``tmux`` key.
+
+    ``"map"`` is a block mapping, optionally followed by a comment, a named anchor
+    (``&name``, PyYAML's anchor alphabet) or exactly the ``!!map`` tag — the only
+    node properties deliberately supported. ``"flow"`` is a flow collection
+    (``{`` / ``[``) that this reader cannot parse. ``"invalid"`` is any other
+    inline content, including every other tag: ``!foo``, ``!!omap``, ``!!set``,
+    ``!!str`` and friends make YAML fail or read ``tmux`` as a non-mapping, so
+    they are reported rather than guessed. ``tmux:x`` is a different key.
+    """
+    m = _TMUX_KEY.match(line)
+    if not m:
+        return None
+    rest = m.group(1)
+    if rest == "":
+        return "map"
+    if rest[0] != " ":
+        return None
+    cut = rest.find(" #")
+    rest = (rest if cut == -1 else rest[:cut]).strip(" ")
+    if rest == "":
+        return "map"
+    if rest[0] in "{[":
+        return "flow"
+    if rest == "!!map" or _YAML_ANCHOR_ONLY.match(rest):
+        return "map"
+    return "invalid"
+
+
+def read_default_session_status(project_root: Path) -> tuple[str, str | None]:
+    """Resolve ``tmux.default_session`` and report whether it could be read.
+
+    Returns ``(session, shape)``. ``shape`` is ``None`` when the configured value
+    (or its absence) was read faithfully; otherwise it names why not, from
+    :data:`DEFAULT_SESSION_PROBLEM_SHAPES`, and ``session`` is
+    :data:`DEFAULT_TMUX_SESSION`. Never prints: this runs inside Textual TUIs
+    through :func:`discover_aitasks_sessions`, where stderr corrupts the screen.
+    Callers that can show a notice do so from the returned shape.
+
+    Line-oriented twin of ``tmux_bootstrap.sh::_tmux_bootstrap_default_session_raw``.
+    The key counts only as a direct child of a column-0 ``tmux:`` block (the
+    block's first indented content line fixes the child indent, so a 4-space
+    block works and a nested ``syncer: default_session:`` is ignored), and its
+    value is read by :func:`_classify_line_value`. Structure this reader cannot
+    follow is reported rather than guessed: a flow-collection or non-mapping
+    ``tmux`` block holding the key, a value continued onto a deeper (or
+    shallower) line, a second ``default_session`` or a later ``tmux`` block
+    (YAML keeps the last one), a file that is not valid UTF-8 (``encoding``), and
+    a character PyYAML's Reader refuses anywhere in the file (``non_printable``).
+    Precedence: ``encoding`` first (nothing else can be read), then the line
+    shapes, then ``non_printable``, then ``illegal_tmux_name``.
+
+    ``illegal_tmux_name`` (t1828) is the odd one out: the value was read
+    faithfully, but it holds ``.`` or ``:``, which tmux reads as target
+    separators, so the session could be created and never addressed. It comes
+    last because a value must be readable before it can be judged unusable, and
+    it is the one shape :func:`load_tmux_defaults` also honours — by applying
+    the same rule — so no reader is left handing tmux a name it cannot target.
+
+    Deliberately NOT detected: a line elsewhere in the file that is structurally
+    invalid YAML (e.g. a malformed entry under another top-level key). Only a full
+    parse sees it; there :func:`load_tmux_defaults`, the YAML-backed reader, falls
+    back to :data:`DEFAULT_TMUX_SESSION` while this reader returns the value.
+    """
+    cfg = project_root / "aitasks" / "metadata" / "project_config.yaml"
+    try:
+        data = cfg.read_bytes()
+    except OSError:
+        return DEFAULT_TMUX_SESSION, None
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return DEFAULT_TMUX_SESSION, "encoding"
+    if text.startswith("﻿"):
+        text = text[1:]
+
+    block: str | None = None
+    child_indent: int | None = None
+    found = False
+    value: str | None = None
+    problem: str | None = None
+    check_next = False
+    # Universal newlines, the same split open() applies; NOT str.splitlines(),
+    # which would also split on NEL/LS/PS and hide them from the control check.
+    for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        if line.strip(" \t") == "" or line.lstrip(" \t").startswith("#"):
+            continue
+        if check_next:
+            # The line after the key decides whether its value continues.
+            check_next = False
+            if line[:1] == " " and len(line) - len(line.lstrip(" ")) != child_indent:
+                problem = problem or "continuation"
+        if line[:1] not in (" ", "\t"):
+            header = _tmux_header_kind(line)
+            if header is not None and found:
+                problem = problem or "duplicate_key"
+            if header in ("flow", "invalid") and "default_session" in line:
+                problem = problem or ("flow_mapping" if header == "flow" else "invalid_block")
+            block = header
+            child_indent = None
+            continue
+        # Tab indentation is invalid YAML; the awk twin ignores it too.
+        if block is None or line[:1] == "\t":
+            continue
+        if block != "map":
+            if "default_session" in line:
+                problem = problem or ("flow_mapping" if block == "flow" else "invalid_block")
+            continue
+        stripped = line.lstrip(" ")
+        indent = len(line) - len(stripped)
+        if child_indent is None:
+            child_indent = indent
+        if indent != child_indent:
+            continue
+        m = _DEFAULT_SESSION_KEY.match(stripped)
+        if not m:
+            continue
+        if found:
+            problem = problem or "duplicate_key"
+            continue
+        found = True
+        value, shape = _classify_line_value(m.group(1))
+        problem = problem or shape
+        check_next = True
+
+    if problem is None and _YAML_NON_PRINTABLE.search(text):
+        problem = "non_printable"
+    if problem is not None:
+        return DEFAULT_TMUX_SESSION, problem
+    session = _normalize_default_session(value)
+    if not _tmux_session_name_ok(session):
+        return DEFAULT_TMUX_SESSION, "illegal_tmux_name"
+    return session, None
+
+
+def _read_default_session(project_root: Path) -> str:
+    """Read ``tmux.default_session`` from a project's config; default ``aitasks``.
+
+    The session half of :func:`read_default_session_status`: an absent, blank,
+    null or comment-only value, and one that reader cannot read faithfully, fall
+    back to :data:`DEFAULT_TMUX_SESSION` (matching the bash default), so an
+    unconfigured project's effective session name is stable across the live-tmux
+    scan and the registry-synthesis path.
+    """
+    return read_default_session_status(project_root)[0]
+
+
+def parse_default_session_unreadable(stderr: str) -> str | None:
+    """The ``shape`` from a ``DEFAULT_SESSION_UNREADABLE:<shape>:<cfg>`` line, or None.
+
+    The one parser for the bash twin's sentinel, for callers that run
+    ``tmux_bootstrap.sh`` as a subprocess and can show a notice.
+    """
+    for line in stderr.splitlines():
+        if line.startswith(DEFAULT_SESSION_UNREADABLE_SENTINEL):
+            shape = line[len(DEFAULT_SESSION_UNREADABLE_SENTINEL):].split(":", 1)[0]
+            return shape.strip() or None
+    return None
+
+
+#: Session-scoped tmux user option naming the project that owns a session
+#: (t1922). Stamped by ``_tmux_bootstrap_set_project_registry`` when ``ait ide``
+#: or the bootstrap claims a session, and gone with the session — so, unlike
+#: the global ``AITASKS_PROJECT_<session>`` it supersedes, it can never be
+#: inherited by a later session that reuses the name.
+PROJECT_ROOT_OPTION = "@aitask_project_root"
+
+#: ``list-sessions`` format: the session name and its registration in ONE
+#: round-trip. ``#{@option}`` expands to the empty string when unset.
+_SESSION_LIST_FORMAT = "#{session_name}\t#{" + PROJECT_ROOT_OPTION + "}"
+
+
+def _parse_session_list(out: str) -> list[tuple[str, str]]:
+    """``(session, registered_value)`` per line of :data:`_SESSION_LIST_FORMAT`.
+
+    Split on the FIRST tab, so a registered path containing a tab survives,
+    and keep the value EXACTLY — a project path may legitimately end in
+    whitespace, and stripping it would void that session's authoritative stamp.
+    A line without a tab is a bare session name — unregistered — which keeps
+    callers and test doubles that answer with names only working.
+    """
+    entries: list[tuple[str, str]] = []
+    for line in out.splitlines():
+        name, _, value = line.partition("\t")
+        if name:
+            entries.append((name, value))
+    return entries
+
+
+def _registered_root(value: str) -> Path | None:
+    """The session option's project root, or ``None`` if unset or not a project.
+
+    Same marker check as :func:`_registry_entry_from_output`: a value naming a
+    moved or deleted project is no registration at all.
+    """
+    if not value:
+        return None
+    # A tmux option value: into the OS representation before the filesystem
+    # sees it (identity on a UTF-8 host; tmux_gateway.md policy 5, t2236).
+    path = Path(tmux_os_path(value))
+    if not (path / "aitasks" / "metadata" / "project_config.yaml").is_file():
+        return None
+    return path
+
+
+def _root_key(path: Path) -> str:
+    """Realpath identity of a root, with :attr:`AitasksSession.key`'s fallback."""
+    try:
+        return os.path.realpath(path)
+    except OSError:
+        return str(path)
+
+
+def _pane_vote(pane_paths: list[str]) -> Path | None:
+    """The project root most of a session's panes walk up to (t1922).
+
+    Ties go to the smallest realpath, so the answer depends on the SET of pane
+    directories, never on the order tmux lists them in. Taking the first pane
+    instead let one pane that wandered into another repo re-root the whole
+    session as soon as the windows listed ahead of it were closed.
+    """
+    counts: dict[str, int] = {}
+    roots: dict[str, Path] = {}
+    for raw_path in pane_paths:
+        if not raw_path:
+            continue
+        # ``#{pane_current_path}`` is tmux text; the walk-up is filesystem.
+        candidate = _walk_up_to_aitasks(Path(tmux_os_path(raw_path)))
+        if candidate is None:
+            continue
+        key = _root_key(candidate)
+        counts[key] = counts.get(key, 0) + 1
+        roots.setdefault(key, candidate)
+    if not counts:
+        return None
+    best = min(counts, key=lambda k: (-counts[k], k))
+    return roots[best]
+
+
+def _dedupe_sessions_by_key(
+    sessions: list[AitasksSession],
+) -> list[AitasksSession]:
+    """Collapse records that resolve to the same repo, keeping the first (t1544_1).
+
+    Identity is :attr:`AitasksSession.key` — the realpath of ``project_root``,
+    with its own ``OSError`` fallback — so this is the *only* path
+    normalization involved. Three inputs can yield two records for one repo:
+
+    1. two live tmux sessions whose panes walk up to the same project root;
+    2. a registry row whose ``name`` differs from ``project_root.name`` at a
+       path that is also live (the ``live_names`` skip matches on name, so it
+       misses this one);
+    3. two registry rows pointing at the same path under different names.
+
+    All three are indistinguishable to the registry-inclusive consumers, where
+    ``key`` *is* the identity: ``merge_stats_data`` sums the same ``StatsData``
+    twice (every counter doubles), ``multi_session`` flips true for a single
+    repo, ``{s.key: label}`` maps silently collapse, and
+    :func:`disambiguate_labels` cannot honor its unique-label contract because
+    its escalation fallback (:func:`compact_root`) is identical for both
+    records. The TUI switcher fares worst: :func:`cross_group_step` finds the
+    current entry by *first* key match, so a duplicate pair traps the cycle
+    ring and every other repo becomes unreachable.
+
+    Callers append every live record before any registered one, so "first
+    wins" is also "the live record wins" whenever a live and a registered
+    record share a key — no explicit ``is_live`` preference is needed.
+    Survivors keep input order, so a caller's stable ``sort(key=session)``
+    still applies unchanged.
+    """
+    seen: set[str] = set()
+    out: list[AitasksSession] = []
+    for session in sessions:
+        key = session.key
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(session)
+    return out
+
+
+def _assemble_aitasks_sessions(
+    live_roots: list[tuple[str, Path]],
+    *,
+    include_registered: bool,
+) -> list[AitasksSession]:
+    """Build final session records from already-resolved live roots.
+
+    All non-I/O discovery behavior lives here so sync and async discovery stay
+    identical: registry/config project-group resolution, registered-project
+    synthesis, live dedupe, stale marking, and stable sorting.
+
+    Two dedupe layers run for ``include_registered=True``, and they are **not**
+    redundant — deleting either reintroduces a distinct bug:
+
+    * the ``live_names`` skip drops a registered row whose *name* matches a
+      live session's, **even at a different path** (t826_10: a STALE ghost must
+      not render beside the live repo it names);
+    * :func:`_dedupe_sessions_by_key` then drops anything resolving to a repo
+      already emitted — the only thing that catches two live sessions on one
+      root, an aliased registry row at a live path, or two registry rows on one
+      path (t1544_1).
+    """
+    # Group resolution support (t1025_1): a path-keyed registry-group lookup so
+    # live sessions match their registry row even when basename != project.name
+    # (D3), plus a per-call config cache so a repo's config is read at most once.
+    group_lookup = _build_registry_group_lookup()
+    group_config_cache: dict[str, str | None] = {}
+
+    def _group_for(project_root: Path, registry_group: str | None) -> str | None:
+        if registry_group is None:
+            try:
+                key = os.path.realpath(project_root)
+            except OSError:
+                key = str(project_root)
+            registry_group = group_lookup.get(key)
+        return _resolve_session_group(
+            project_root, registry_group, group_config_cache
+        )
+
+    found = [
+        AitasksSession(
+            session=session,
+            project_root=project_root,
+            project_name=project_root.name,
+            project_group=_group_for(project_root, None),
+        )
+        for session, project_root in live_roots
+    ]
+
+    if include_registered:
+        live_names = {s.project_name for s in found}
+        for name, root, status, group in _read_registry_index():
+            if name in live_names:
+                continue
+            session, problem = read_default_session_status(root)
+            found.append(AitasksSession(
+                session=session,
+                project_root=root,
+                project_name=name,
+                is_live=False,
+                is_stale=(status == "STALE"),
+                project_group=_group_for(root, group),
+                default_session_problem=problem,
+            ))
+
+        # One record per repo for the project-oriented consumers (t1544_1).
+        # Deliberately NOT applied to the default (no-flag) call: `ait monitor`
+        # builds {session: project_root} and lists live session names, so two
+        # live tmux sessions rooted in one repo are both real there and
+        # collapsing them would hide a session from monitor. The
+        # `include_registered` flag is exactly the project-oriented vs
+        # session-oriented boundary.
+        found = _dedupe_sessions_by_key(found)
+
+    found.sort(key=lambda s: s.session)
+    return found
+
+
+def discover_aitasks_sessions(
+    *, include_registered: bool = False
+) -> list[AitasksSession]:
+    """Enumerate aitasks-like tmux sessions on the current tmux server.
+
+    Detection is per-session in priority order (t1922):
+
+    1. **Session registration** — the session-scoped option
+       :data:`PROJECT_ROOT_OPTION`, stamped when ``ait ide`` / the bootstrap
+       claims the session. When it names a valid project it is authoritative:
+       pane directories are not consulted (and not even listed), so a pane that
+       ``cd``'d into another repo cannot re-root the session.
+    2. **Pane vote** — the project most panes' ``pane_current_path`` walks up to
+       (an ancestor containing ``aitasks/metadata/project_config.yaml``), ties to
+       the smallest realpath (:func:`_pane_vote`), so pane order never decides.
+    3. **Legacy registry fallback** — only when no pane resolves: the tmux
+       global env var ``AITASKS_PROJECT_<sess>``. It is keyed by session NAME and
+       outlives the session, which is why it can no longer outrank a pane.
+
+    Sessions matching none of these are excluded. Returns a list sorted by
+    session name for stable display. Returns an empty list when tmux is
+    unavailable or no aitasks sessions are running. No module-level caching —
+    each call re-queries tmux so long-running monitors see live state.
+
+    When ``include_registered=True``, additionally emits synthesized entries
+    for every registered project in ``~/.config/aitasks/projects.yaml`` that
+    is not already covered by a live session. Deduping is then two-layered: a
+    registered row is skipped when its ``name`` matches a live session's
+    ``project_name``, and the whole result is collapsed on
+    ``AitasksSession.key`` (realpath of ``project_root``) so one repo yields
+    exactly one record, preferring the live one (t1544_1). **The key dedupe
+    applies only to** ``include_registered=True``: the default call still
+    reports every live tmux session, including two rooted in the same repo,
+    because ``ait monitor`` keys on the session name.
+    Synthesized entries carry ``is_live=False`` and a ``session`` field
+    resolved from each project's ``tmux.default_session`` config; STALE
+    registry rows (path missing the marker file) additionally carry
+    ``is_stale=True``. Default ``False`` so existing callers (notably
+    ``ait monitor``) see identical output to today.
+    """
+    # Layer-A backend enumeration — routed through the tmux gateway so it honors
+    # the socket flag (default today). The gateway folds TimeoutExpired/
+    # FileNotFoundError/OSError into (-1, ""), so the rc != 0 branch covers them.
+    live_roots = _collect_live_roots(_TMUX.run, _read_registry_entry)
+    return _assemble_aitasks_sessions(
+        live_roots, include_registered=include_registered
+    )
+
+
+def _collect_live_roots(run, read_registry, only=None) -> list[tuple[str, Path]]:
+    """The one discovery walk, over a pluggable ``(rc, stdout)`` runner.
+
+    ``run(args)`` answers a tmux command and ``read_registry(session)`` the
+    legacy ``AITASKS_PROJECT_<sess>`` fallback. :func:`discover_aitasks_sessions`
+    passes the plain gateway primitives, so every failure folds into "nothing
+    here". :func:`discover_aitasks_sessions_checked` passes status-recording
+    adapters instead, so the SAME walk can also say whether it saw everything.
+
+    The per-session rule is :func:`discover_aitasks_sessions`' docstring. A
+    registered session (its :data:`PROJECT_ROOT_OPTION` arrives in the SAME
+    ``list-sessions`` answer) issues no further tmux call at all.
+
+    Each session's panes are listed with :func:`tmux_session_scope_target`
+    (``=<session>:``), never a bare ``=<session>``, which tmux may resolve as a
+    window of another session and so map this session to that one's root.
+
+    ``only``, when given, limits the walk to those exact session names (t1950):
+    any other session issues no per-session query, and a name absent from the
+    ``list-sessions`` answer does not exist and is simply not returned.
+    """
+    rc, out = run(["list-sessions", "-F", _SESSION_LIST_FORMAT])
+    entries = _parse_session_list(out) if rc == 0 else []
+
+    live_roots: list[tuple[str, Path]] = []
+    for session, registered in entries:
+        if only is not None and session not in only:
+            continue
+        project_root = _attribute_session(session, registered, run, read_registry)
+        if project_root is None:
+            continue
+        live_roots.append((session, project_root))
+    return live_roots
+
+
+def _attribute_session(session, registered, run, read_registry) -> Path | None:
+    """One session's project root by the canonical rule (t1922): the
+    registration stamp from its ``list-sessions`` line, else the pane vote,
+    else the legacy registry. ``None`` means unattributed."""
+    project_root = _registered_root(registered)
+    if project_root is None:
+        project_root = _unregistered_root(
+            session, run(_list_panes_argv(session)), read_registry)
+    return project_root
+
+
+def _list_panes_argv(session: str) -> list[str]:
+    return ["list-panes", "-s", "-t", tmux_session_scope_target(session),
+            "-F", "#{pane_current_path}"]
+
+
+def _unregistered_root(session, panes_answer, read_registry) -> Path | None:
+    """Rules 2–3 for one unregistered session, given its ``list-panes`` answer."""
+    prc, pout = panes_answer
+    project_root = _pane_vote(pout.strip().splitlines() if prc == 0 else [])
+    if project_root is None:
+        project_root = read_registry(session)
+    return project_root
+
+
+def _checked_adapters():
+    """Status-recording ``(run, read_registry, incomplete)`` for the checked walk.
+
+    ``incomplete`` is a one-element list the adapters set to True whenever a
+    query failed for a reason that is not a definite "nothing there".
+    """
+    incomplete = [False]
+
+    def run(args):
+        r = _TMUX.run_checked(args)
+        if r.outcome == "ok":
+            return (0, r.stdout)
+        if r.outcome in ("no_tmux", "no_server"):
+            return (1, "")
+        if args and args[0] == "list-panes" and tmux_stderr_is(
+                "no_such_session", r.stderr):
+            return (1, "")
+        incomplete[0] = True
+        return (1, "")
+
+    def read_registry(session):
+        r = _TMUX.run_checked(
+            ["show-environment", "-g", f"AITASKS_PROJECT_{session}"])
+        if r.outcome == "ok":
+            return _registry_entry_from_output(r.stdout)
+        if r.outcome in ("no_tmux", "no_server") or tmux_stderr_is(
+                "unknown_variable", r.stderr):
+            return None
+        incomplete[0] = True
+        return None
+
+    return run, read_registry, incomplete
+
+
+def unregistered_session_attribution(session: str) -> tuple[Path | None, bool]:
+    """``(root, complete)``: the root discovery gives ``session`` WITHOUT its stamp.
+
+    Rules 2–3 of :func:`discover_aitasks_sessions` (pane vote, then the legacy
+    global) for one session, through the checked adapters — so a failed query
+    answers ``complete=False``, never "nobody owns it". This is the ownership
+    evidence ``_tmux_bootstrap_set_project_registry`` consults before claiming
+    an existing, unstamped session (t1922): a session that predates the stamp
+    is not free just because it carries no stamp.
+    """
+    run, read_registry, incomplete = _checked_adapters()
+    root = _unregistered_root(session, run(_list_panes_argv(session)), read_registry)
+    return root, not incomplete[0]
+
+
+def discover_aitasks_sessions_checked() -> tuple[list[AitasksSession], bool]:
+    """:func:`discover_aitasks_sessions`, plus whether the answer is complete.
+
+    Returns ``(sessions, complete)``. The default discovery folds every tmux
+    failure into emptiness — a failed ``list-sessions`` reads as "no sessions",
+    a failed ``list-panes`` as "no pane paths", a failed ``show-environment`` as
+    "no registered root". That is right for a display loop and wrong for a
+    caller that must RULE OUT a live session before acting on another
+    candidate (``aitask_project_resolve.sh candidates``, t1869): an empty answer
+    there has to mean "nothing is running", never "could not look".
+
+    Per-command dispositions (tmux messages pinned in ``tmux_exec``):
+
+    * ``list-sessions`` — ``ok`` → the sessions; ``no_tmux`` / ``no_server`` →
+      a DEFINITE empty (no live session can exist); anything else → incomplete.
+    * ``list-panes`` — ``ok`` → the paths; a vanished session (``can't find
+      session``/``window``) or a server that died mid-scan → that session is
+      gone; anything else → incomplete.
+    * ``show-environment -g AITASKS_PROJECT_<s>`` — ``ok`` → parsed; ``unknown
+      variable`` or no server → a definite absence; anything else → incomplete.
+
+    A registered session (t1922) issues neither ``list-panes`` nor
+    ``show-environment``: its root came with the ``list-sessions`` answer, so
+    no later query can make it incomplete.
+
+    Equivalent to ``discover_aitasks_sessions()`` (``include_registered=False``)
+    whenever ``complete`` is True.
+    """
+    run, read_registry, incomplete = _checked_adapters()
+    live_roots = _collect_live_roots(run, read_registry)
+    sessions = _assemble_aitasks_sessions(live_roots, include_registered=False)
+    return sessions, not incomplete[0]
+
+
+async def discover_aitasks_sessions_async(
+    *, include_registered: bool = False
+) -> list[AitasksSession]:
+    """Async sibling of :func:`discover_aitasks_sessions`.
+
+    The tmux round-trips use :meth:`TmuxClient.run_async`; all non-I/O assembly
+    is shared with the sync path to preserve discovery parity.
+    """
+    rc, out = await _TMUX.run_async(["list-sessions", "-F", _SESSION_LIST_FORMAT])
+    entries = _parse_session_list(out) if rc == 0 else []
+
+    live_roots: list[tuple[str, Path]] = []
+    for session, registered in entries:
+        project_root = _registered_root(registered)
+        if project_root is None:
+            prc, pout = await _TMUX.run_async(_list_panes_argv(session))
+            project_root = _pane_vote(
+                pout.strip().splitlines() if prc == 0 else [])
+        if project_root is None:
+            project_root = await _read_registry_entry_async(session)
+        if project_root is None:
+            continue
+        live_roots.append((session, project_root))
+
+    return _assemble_aitasks_sessions(
+        live_roots, include_registered=include_registered
+    )
+
+
+
+# Synthetic project-group bucket for repos with no resolved group (t1025_1).
+# Cyclable like a real group via ``[`` / ``]`` but never written to the registry.
+PROJECT_GROUP_UNGROUPED_LABEL = "(ungrouped)"
+
+
+@dataclass(frozen=True)
+class GroupedSessions:
+    """Result of :func:`group_sessions` (t1025_1), consumed by the TUI layer.
+
+    ``ring`` is the left/right cycle order for the *selected* group: its members
+    (stale members kept, flagged via ``AitasksSession.is_stale``) followed by any
+    **live** session outside the group, so a user juggling several project-groups
+    can still reach any live repo. Stale out-of-group rows are dropped from the
+    ring. ``groups`` is the ordered ``[`` / ``]`` cycle of group names (real
+    groups sorted, with a synthetic ``"(ungrouped)"`` bucket appended when any
+    session has no group).
+    """
+
+    ring: list[AitasksSession]
+    groups: list[str]
+
+
+def _session_in_group(session: AitasksSession, selected_group: str | None) -> bool:
+    """Membership test for :func:`group_sessions`.
+
+    ``None`` and the synthetic ``"(ungrouped)"`` label both select the
+    no-group bucket (``project_group is None``).
+    """
+    if selected_group is None or selected_group == PROJECT_GROUP_UNGROUPED_LABEL:
+        return session.project_group is None
+    return session.project_group == selected_group
+
+
+def group_sessions(
+    sessions: list[AitasksSession],
+    selected_group: str | None,
+) -> GroupedSessions:
+    """Derive the two-axis navigation view for a selected project-group.
+
+    Pure (no I/O): operates only on already-resolved
+    :class:`AitasksSession` objects (their ``project_group`` populated by
+    :func:`discover_aitasks_sessions`). The TUI switcher and stats TUI
+    (t1025_2 / t1025_3) consume this directly rather than re-deriving grouping.
+
+    See :class:`GroupedSessions` for the ring / groups contract. Input order is
+    preserved within each ring segment.
+    """
+    members = [s for s in sessions if _session_in_group(s, selected_group)]
+    out_of_group_live = [
+        s
+        for s in sessions
+        if s.is_live and not _session_in_group(s, selected_group)
+    ]
+    ring = members + out_of_group_live
+
+    real_groups = sorted(
+        {s.project_group for s in sessions if s.project_group is not None}
+    )
+    groups = list(real_groups)
+    if any(s.project_group is None for s in sessions):
+        groups.append(PROJECT_GROUP_UNGROUPED_LABEL)
+
+    return GroupedSessions(ring=ring, groups=groups)
+
+
+def default_selected_group(
+    sessions: list[AitasksSession],
+    selected_key: str | None,
+) -> str | None:
+    """Resolve the project-group a two-axis TUI should select on open (t1025_2).
+
+    Contract — "the selected session's group, else the first groups entry":
+
+    - If a session in ``sessions`` has ``.key == selected_key`` (identity is the
+      unique ``project_root`` key, t1099 — NOT the ambiguous tmux session name),
+      return **its** ``project_group``. That value may legitimately be ``None``
+      (the session is ungrouped) — ``None`` here means *the ungrouped bucket*,
+      NOT "fall back to the first real group". :func:`group_sessions` treats a
+      ``None`` selected group as the ungrouped bucket, so an ungrouped
+      preselected session correctly stays in its own ring.
+    - Otherwise (no such session — e.g. the stats aggregate key, or a key that
+      did not survive discovery), return the first entry of
+      ``group_sessions(sessions, None).groups`` (sorted real groups, then the
+      synthetic ``PROJECT_GROUP_UNGROUPED_LABEL``), or ``None`` when there are no
+      sessions at all.
+
+    Consumed by both the TUI switcher and the stats TUI so the default-resolution
+    rule lives in exactly one tested place.
+    """
+    for s in sessions:
+        if s.key == selected_key:
+            return s.project_group
+    groups = group_sessions(sessions, None).groups
+    return groups[0] if groups else None
+
+
+def advance_selected_group(
+    groups: list[str],
+    current: str | None,
+    step: int,
+) -> str | None:
+    """Index-wrap a ``[`` / ``]`` step over the ordered ``groups`` list (t1025_2).
+
+    ``groups`` is the ``GroupedSessions.groups`` cycle (sorted real groups, then
+    ``PROJECT_GROUP_UNGROUPED_LABEL`` when any session is ungrouped). Returns the
+    group ``step`` positions away from ``current`` (wrapping), or ``current``
+    unchanged when ``groups`` is empty. If ``current`` is not in ``groups`` (it
+    fell away since the last derivation), start from the first entry. Shared so
+    the switcher and stats wrap identically.
+    """
+    if not groups:
+        return current
+    try:
+        idx = groups.index(current)
+    except ValueError:
+        idx = 0
+    return groups[(idx + step) % len(groups)]
+
+
+@dataclass(frozen=True)
+class GroupCycleSelection:
+    """Decision result for a ``[`` / ``]`` project-group cycle.
+
+    ``repoint_key`` is the unique identity key (t1099) of the session to
+    re-point onto, or ``None`` when the current selection stays valid in the new
+    group. Callers resolve the tmux label/target from the entry themselves.
+    """
+
+    selected_group: str | None
+    repoint_key: str | None = None
+
+
+def group_members(
+    sessions: list[AitasksSession],
+    selected_group: str | None,
+) -> list[AitasksSession]:
+    """The selected project-group's own members, input order (t1036).
+
+    Unlike :func:`group_sessions` (whose ``ring`` appends any **live**
+    out-of-group session so a single-group ring can still reach other repos),
+    this returns *only* the sessions that belong to ``selected_group`` (in-group
+    stale members kept, matching :func:`group_sessions`). Used by the TUI
+    switcher to render a per-group ``Session:`` row and by both TUIs' ``[`` /
+    ``]`` re-point check, where out-of-group sessions must NOT count as
+    "still selected". ``None`` / the synthetic ``PROJECT_GROUP_UNGROUPED_LABEL``
+    both select the no-group bucket (see :func:`_session_in_group`).
+    """
+    return [s for s in sessions if _session_in_group(s, selected_group)]
+
+
+def advance_group_selection(
+    sessions: list[AitasksSession],
+    selected_group: str | None,
+    selected_key: str,
+    step: int,
+    *,
+    fallback_key: str | None = None,
+) -> GroupCycleSelection | None:
+    """Advance a TUI's project-group axis and decide whether to re-point.
+
+    Shared by the switcher and stats TUI: both advance through the same group
+    order and re-point the selected session only when it is not a member of the
+    newly selected group. Membership is tested on the unique identity key
+    (t1099), not the ambiguous tmux session name. UI refresh, notifications, and
+    caller-specific fallback behavior stay at the call site.
+    """
+    groups = group_sessions(sessions, selected_group).groups
+    if len(groups) < 2:
+        return None
+
+    next_group = advance_selected_group(groups, selected_group, step)
+    members = [s.key for s in group_members(sessions, next_group)]
+    repoint_key = None
+    if selected_key not in members:
+        repoint_key = members[0] if members else fallback_key
+
+    return GroupCycleSelection(
+        selected_group=next_group,
+        repoint_key=repoint_key,
+    )
+
+
+@dataclass(frozen=True)
+class CrossGroupRingEntry:
+    """One stop in the cross-group left/right traversal (t1036).
+
+    ``session`` is the tmux session name / label (or a caller-supplied sentinel
+    such as the stats aggregate key), used for display and tmux targeting.
+    ``key`` is the unique identity (t1099 — the ``project_root`` key, or the same
+    sentinel for a caller-appended aggregate stop); stepping matches on ``key``
+    so two repos that share ``session="aitasks"`` remain individually reachable.
+    ``group`` is the project-group the entry belongs to (``None`` = the ungrouped
+    bucket), so a caller can keep its selected-group axis in sync as ``left`` /
+    ``right`` crosses a group boundary.
+    """
+
+    session: str
+    group: str | None
+    key: str
+
+
+def cross_group_ring(
+    sessions: list[AitasksSession],
+) -> list[CrossGroupRingEntry]:
+    """Flat ``left`` / ``right`` traversal order across **all** groups (t1036).
+
+    Concatenates each group's members (input order) in the ``[`` / ``]``
+    group-cycle order (:func:`group_sessions`'s ``groups``: sorted real groups,
+    then the synthetic ungrouped bucket). Every project appears exactly once —
+    each :class:`AitasksSession` has a single ``project_group`` — so stepping off
+    the last member of a group lands on the first member of the next, letting the
+    switcher show only the selected group yet still reach every repo by crossing
+    boundaries. Unlike :func:`group_sessions`'s ``ring`` it does NOT append
+    out-of-group live sessions (the cross-boundary walk already reaches them).
+    Each entry is tagged with its group (ungrouped label normalized to ``None``).
+    """
+    groups = group_sessions(sessions, None).groups
+    entries: list[CrossGroupRingEntry] = []
+    for g in groups:
+        tag = None if g == PROJECT_GROUP_UNGROUPED_LABEL else g
+        for s in sessions:
+            if _session_in_group(s, g):
+                entries.append(
+                    CrossGroupRingEntry(session=s.session, group=tag, key=s.key)
+                )
+    return entries
+
+
+def cross_group_step(
+    entries: list[CrossGroupRingEntry],
+    current_key: str | None,
+    step: int,
+) -> CrossGroupRingEntry | None:
+    """Index-wrap a ``±1`` step over a cross-group ring (t1036).
+
+    ``entries`` is :func:`cross_group_ring` output, optionally with extra
+    caller-appended stops (e.g. the stats ``__all__`` aggregate). Returns the
+    entry ``step`` positions from the one whose ``.key == current_key`` (the
+    unique identity, t1099 — starting at index 0 when ``current_key`` is absent),
+    wrapping globally, or ``None`` when ``entries`` is empty. Shared so the
+    switcher and stats wrap identically.
+    """
+    if not entries:
+        return None
+    idx = next(
+        (i for i, e in enumerate(entries) if e.key == current_key),
+        0,
+    )
+    return entries[(idx + step) % len(entries)]
+
+
+def disambiguate_labels(
+    primaries: list[str],
+    secondaries: list[str],
+    fallbacks: list[str],
+) -> list[str]:
+    """Index-aligned, guaranteed-unique display labels (t1099).
+
+    Identity is always the unique ``key``; *labels* are chosen per surface. A
+    primary that is unique among ``primaries`` renders as-is (so unique tmux
+    session names / project names look exactly as before). A repeated primary
+    escalates to ``"primary (secondary)"``; if that STILL collides, to
+    ``"primary (fallback)"``. ``fallbacks`` MUST be globally unique (e.g. a
+    compact ``project_root``), so the returned labels are always distinct — no
+    two rows can render identically even when both primary and secondary clash.
+
+    All three lists are index-aligned and must be the same length.
+    """
+    from collections import Counter
+
+    primary_counts = Counter(primaries)
+    level1 = [
+        p if primary_counts[p] == 1 else f"{p} ({s})"
+        for p, s in zip(primaries, secondaries)
+    ]
+    level1_counts = Counter(level1)
+    return [
+        lbl if level1_counts[lbl] == 1 else f"{p} ({f})"
+        for lbl, p, f in zip(level1, primaries, fallbacks)
+    ]
+
+
+def resolve_selected_key(
+    sessions: list[AitasksSession],
+    *,
+    provisional_session: str | None = None,
+    cwd: Path | None = None,
+) -> str | None:
+    """Identity key of the session a TUI should select on open (t1099).
+
+    Resolves "which repo did we open on?" by UNIQUE context so it survives the
+    default-session collision (several repos sharing ``session="aitasks"``).
+    Shared by the TUI switcher and the stats TUI so both resolve identically:
+
+    1. If ``cwd`` is given, walk it up to an aitasks root and return the entry
+       whose ``realpath(project_root)`` matches it — the repo the TUI was
+       actually launched from (unambiguous even under a session-name collision).
+    2. Else match ``.session == provisional_session``, preferring a live entry
+       (an attached / focused tmux session is real and unique among live ones).
+    3. Else the first session-name match.
+    4. Else ``None`` — let the caller pick its own safe default.
+
+    ``cwd=None`` skips step 1 (used for an explicit cross-repo preselection,
+    where the launch cwd is irrelevant).
+    """
+    if cwd is not None:
+        root = _walk_up_to_aitasks(cwd)
+        if root is not None:
+            try:
+                target = os.path.realpath(root)
+            except OSError:
+                target = str(root)
+            for s in sessions:
+                if s.key == target:
+                    return s.key
+
+    if provisional_session is not None:
+        live_match = next(
+            (s for s in sessions
+             if s.session == provisional_session and s.is_live),
+            None,
+        )
+        if live_match is not None:
+            return live_match.key
+        any_match = next(
+            (s for s in sessions if s.session == provisional_session),
+            None,
+        )
+        if any_match is not None:
+            return any_match.key
+
+    return None
+
+
+def switch_to_pane_anywhere(pane_id: str) -> bool:
+    """Teleport the attached tmux client to an arbitrary pane on this server.
+
+    Pane IDs are server-globally unique, so no session hint is required. The
+    function resolves the pane's session and window index via
+    ``display-message``, then issues ``switch-client``, ``select-window``, and
+    ``select-pane`` in order. The first non-zero exit returns ``False``.
+    Returns ``True`` on success; ``False`` if tmux is unavailable, the pane is
+    dead, or no client is attached.
+    """
+    def _display(fmt: str) -> str | None:
+        rc, out = _TMUX.run(["display-message", "-p", "-t", pane_id, fmt])
+        if rc != 0:
+            return None
+        value = out.strip()
+        return value or None
+
+    sess = _display("#{session_name}")
+    if not sess:
+        return False
+    win = _display("#{window_index}")
+    if not win:
+        return False
+
+    for args in (
+        ["switch-client", "-t", tmux_session_target(sess)],
+        ["select-window", "-t", tmux_window_target(sess, win)],
+        ["select-pane", "-t", pane_id],
+    ):
+        rc, _ = _TMUX.run(args)
+        if rc != 0:
+            return False
+    return True
+
+
+def _parse_pane_pid(stdout: str) -> int | None:
+    """Parse the first line of tmux ``-P -F`` output as an int pid, or None."""
+    stripped = stdout.strip()
+    if not stripped:
+        return None
+    line = stripped.splitlines()[0]
+    try:
+        return int(line)
+    except ValueError:
+        return None
+
+
+def _query_first_pane_pid(session: str, window: str) -> int | None:
+    """Query the first pane's pid in a freshly created session/window."""
+    rc, out = _TMUX.run(
+        ["list-panes", "-t", tmux_window_target(session, window),
+         "-F", "#{pane_pid}"]
+    )
+    if rc != 0:
+        return None
+    return _parse_pane_pid(out)
+
+
+def launch_in_tmux(command: str, config: TmuxLaunchConfig) -> tuple[int | None, str | None]:
+    """Launch a command in tmux according to the given config.
+
+    Returns ``(pane_pid, error)``. ``pane_pid`` is the PID of the process
+    tmux fork-exec'd inside the spawned pane (i.e. the agent process), or
+    ``None`` if the launch succeeded but the pid could not be captured.
+    ``error`` is ``None`` on success, otherwise a human-readable message
+    describing the tmux failure.
+
+    **``command`` is handed to tmux UNWRAPPED on purpose.** Because every
+    branch below passes the bare agent command line, tmux's ``sh -c`` execs
+    straight into the agent binary and the pane's pid *is* the agent process.
+    Task locks depend on that: ``lib/pid_anchor.sh::get_session_anchor_pid``
+    anchors a lock to the pane's pid (resolved by
+    ``lib/tmux_exec.sh::ait_tmux_self_pane_pid``) precisely because it dies
+    exactly when the agent does. Introducing a wrapper that OUTLIVES the agent
+    — a supervising shell, a ``; read`` tail, a retry loop — would make a dead
+    agent's lock keep reading as "alive", i.e. a crash that is never detected.
+    That is a quieter failure than the false-crash bug this replaced (t1465),
+    so change the launch shape only with that contract in mind.
+    """
+    cwd_args = ["-c", config.cwd] if config.cwd else []
+    if config.new_session:
+        # Create new session with a window, then switch to it. When this is the
+        # first session (no server yet), the server is spawned inside a
+        # persistent session.slice service so it survives an app.slice teardown
+        # (t956) — see TmuxClient.new_session_argv. ``new-session -d`` does not
+        # support ``-P``, so query pane_pid from list-panes after creation. The
+        # gateway returns the full argv (incl. any systemd-run/setsid prefix and
+        # the socket flag), so it goes straight to Popen, not client.spawn —
+        # with the gateway's spawn env, so the pane's PATH does not depend on
+        # ours (t1689; ``None`` = inherit).
+        tmux_cmd = _TMUX.new_session_argv(
+            config.session, config.window, command, cwd_args, config.cwd,
+        )
+        proc = subprocess.Popen(encode_tmux_argv(tmux_cmd),
+                                stderr=subprocess.PIPE, env=_TMUX.spawn_env())
+        proc.wait()
+        if proc.returncode != 0:
+            stderr = decode_tmux_output(proc.stderr.read()) if proc.stderr else ""
+            return None, f"tmux new-session failed: {stderr}"
+        pane_pid = _query_first_pane_pid(config.session, config.window)
+        # Try to switch client (works if we're inside tmux)
+        if os.environ.get("TMUX"):
+            _TMUX.spawn(
+                ["switch-client", "-t", tmux_session_target(config.session)]
+            )
+        return pane_pid, None
+    elif config.new_window:
+        rc, out = _TMUX.run(_new_window_argv(command, config, "#{pane_pid}"))
+        if rc != 0:
+            return None, f"tmux new-window failed (rc={rc})"
+        return _parse_pane_pid(out), None
+    else:
+        # Split existing window into a new pane
+        rc, out = _TMUX.run(_split_window_argv(command, config, "#{pane_pid}"))
+        if rc != 0:
+            return None, f"tmux split-window failed (rc={rc})"
+        _select_split_window(config)
+        return _parse_pane_pid(out), None
+
+
+def _new_window_argv(command: str, config: TmuxLaunchConfig,
+                     fmt: str) -> list[str]:
+    """The ``new-window -P -F <fmt>`` argv for ``config``'s window placement.
+
+    Shared by :func:`launch_in_tmux` (``#{pane_pid}``) and
+    :func:`launch_window_pane` (``#{pane_id}`` + ``#{pane_pid}``), the same way
+    :func:`_split_window_argv` is shared by the two split launches.
+    """
+    # ``new-window`` creates *and selects* unless ``-d`` is passed, so the
+    # -d is what honors select_window=False on this branch.
+    detach_args = [] if config.select_window else ["-d"]
+    cwd_args = ["-c", config.cwd] if config.cwd else []
+    return [
+        "new-window",
+        "-P", "-F", fmt,
+        *detach_args,
+        "-t", tmux_window_target(config.session, ""),
+        "-n", config.window,
+        *cwd_args,
+        command,
+    ]
+
+
+def _split_window_argv(command: str, config: TmuxLaunchConfig,
+                       fmt: str) -> list[str]:
+    """The ``split-window -P -F <fmt>`` argv for ``config``'s split placement.
+
+    Shared by :func:`launch_in_tmux` (``#{pane_pid}``) and
+    :func:`launch_split_pane` (``#{pane_id}`` + ``#{pane_pid}``) so the two
+    split launches cannot drift apart in anything but what they print back.
+    """
+    split_flag = "-h" if config.split_direction == "horizontal" else "-v"
+    # Split a specific pane when requested (so split_size sizes against that
+    # pane), else the window's active pane.
+    split_target = (config.split_target_pane
+                    or tmux_window_target(config.session, config.window))
+    split_args = ["split-window", "-P", "-F", fmt, split_flag]
+    if config.split_detached:
+        split_args.append("-d")
+    if config.split_before:
+        split_args.append("-b")
+    if config.split_size is not None:
+        split_args += ["-l", str(config.split_size)]
+    cwd_args = ["-c", config.cwd] if config.cwd else []
+    split_args += ["-t", split_target, *cwd_args, command]
+    return split_args
+
+
+def _select_split_window(config: TmuxLaunchConfig) -> None:
+    # Switch to the target window so the user sees the new pane, unless the
+    # caller wants the launch to stay out of sight (select_window=False).
+    if config.select_window:
+        _TMUX.spawn(["select-window", "-t",
+                     tmux_window_target(config.session, config.window)])
+
+
+_PANE_ID_RE = re.compile(r"%\d+")
+
+
+def launch_split_pane(
+    command: str, config: TmuxLaunchConfig,
+) -> tuple[str | None, int | None, str | None]:
+    """Split a pane like :func:`launch_in_tmux`, returning its id as well.
+
+    Returns ``(pane_id, pane_pid, error)``. The id comes from the launch's own
+    ``-P`` output, so a caller that must stamp the new pane never has to look it
+    up again by pid — a second query that can fail, and whose ``None`` cannot
+    say whether the query failed or the pane is already gone.
+
+    Each field is validated on its own: an id must look like ``%<n>`` and a pid
+    must be a positive int, else that field is ``None``. ``(None, None, None)``
+    therefore means tmux reported success but printed nothing usable — a pane
+    may exist that the caller cannot identify. ``error`` is set only when
+    ``split-window`` itself failed.
+
+    Only the split placement is supported (``new_session`` / ``new_window`` are
+    ignored). The same unwrapped-command contract as :func:`launch_in_tmux`
+    applies: the pane's pid must be the launched process itself.
+    """
+    rc, out = _TMUX.run(
+        _split_window_argv(command, config, _PANE_ID_PID_FORMAT))
+    if rc != 0:
+        return None, None, f"tmux split-window failed (rc={rc})"
+    _select_split_window(config)
+    return (*_parse_pane_id_pid(out), None)
+
+
+def launch_window_pane(
+    command: str, config: TmuxLaunchConfig,
+) -> tuple[str | None, int | None, str | None]:
+    """Open a new window like :func:`launch_in_tmux`, returning its pane id too.
+
+    The ``new-window`` sibling of :func:`launch_split_pane`, with the same
+    ``(pane_id, pane_pid, error)`` contract: each field validated on its own,
+    ``error`` set only when ``new-window`` itself failed. ``new_session`` and
+    the split fields are ignored. The same unwrapped-command contract as
+    :func:`launch_in_tmux` applies: the pane's pid must be the launched process.
+    """
+    rc, out = _TMUX.run(_new_window_argv(command, config, _PANE_ID_PID_FORMAT))
+    if rc != 0:
+        return None, None, f"tmux new-window failed (rc={rc})"
+    return (*_parse_pane_id_pid(out), None)
+
+
+_PANE_ID_PID_FORMAT = "#{pane_id}\t#{pane_pid}"
+
+
+def _parse_pane_id_pid(out: str) -> tuple[str | None, int | None]:
+    """Parse a ``#{pane_id}\\t#{pane_pid}`` launch reply, each field on its own."""
+    # Split BEFORE trimming: stripping the whole output first would eat a
+    # leading tab, shifting a valid pid into the id field when the id is empty.
+    lines = [line for line in out.splitlines() if line.strip()]
+    raw_id, _, raw_pid = (lines[0] if lines else "").partition("\t")
+    raw_id = raw_id.strip()
+    pane_id = raw_id if _PANE_ID_RE.fullmatch(raw_id) else None
+    try:
+        pane_pid = int(raw_pid.strip())
+    except ValueError:
+        pane_pid = None
+    if pane_pid is not None and pane_pid <= 0:
+        pane_pid = None
+    return pane_id, pane_pid
+
+
+def resolve_pane_id_by_pid(session: str, pid: int) -> str | None:
+    """Resolve a tmux pane id (e.g. ``%42``) from a pane pid in a session.
+
+    ``launch_in_tmux`` returns the launched pane's ``pane_pid`` (the process
+    tmux fork-exec'd), not its ``pane_id``. The shadow spawn glue (t986_5)
+    needs the ``pane_id`` to stamp the ``@aitask_shadow_target`` pane option
+    that classifies the pane as a shadow helper. Match the pid against the
+    session's panes and return the owning ``pane_id``, or ``None`` if no pane
+    has that pid (e.g. the launch failed to capture a pid, or the pane already
+    exited). Read-only; routed through the gateway.
+
+    The target is ``=<session>:``, not ``=<session>``: a bare ``=<session>`` is
+    resolved as a WINDOW first, so from a client whose current session holds a
+    window named ``<session>`` it lists the CURRENT session's panes, and a pane
+    just launched into ``<session>`` is not found (measured on tmux 3.7c,
+    t1847; the remaining bare call sites are t1874's).
+    """
+    if not pid:
+        return None
+    rc, out = _TMUX.run(
+        ["list-panes", "-s", "-t", tmux_session_scope_target(session),
+         "-F", "#{pane_id} #{pane_pid}"]
+    )
+    if rc != 0:
+        return None
+    for line in out.strip().splitlines():
+        pane_id, _, pane_pid = line.partition(" ")
+        if pane_pid.strip() == str(pid):
+            return pane_id.strip() or None
+    return None
+
+
+def pane_session(pane_id: str) -> str | None:
+    """Resolve the tmux session name that owns ``pane_id`` (``%5`` → ``aitasks``).
+
+    Routed through the cached ``_TMUX`` gateway so the shadow learner-spawn glue
+    (t1071_5) can target a new window into the *followed* agent's session without
+    issuing a raw tmux call of its own. Returns the session name, or ``None`` if
+    the pane does not exist or tmux is unavailable.
+    """
+    if not pane_id:
+        return None
+    rc, out = _TMUX.run(["display-message", "-p", "-t", pane_id, "#{session_name}"])
+    if rc != 0:
+        return None
+    return out.strip() or None
+
+
+def unique_window_name(existing: set[str], base: str) -> str:
+    """Return ``base`` if free among ``existing`` window names, else ``base-2``, ….
+
+    Pure (no tmux): mirrors ``tui_switcher.action_shortcut_explore``'s
+    ``while f"agent-explore-{n}" in running: n += 1`` uniqueness loop so multiple
+    learners spawned from shadows (t1071_5) — including several with no source task
+    id, which would otherwise all collapse to ``base`` — get distinct,
+    monitor-legible window names. The first free name is ``base`` itself; the
+    numeric suffix starts at ``2``.
+    """
+    if base not in existing:
+        return base
+    n = 2
+    while f"{base}-{n}" in existing:
+        n += 1
+    return f"{base}-{n}"
+
+
+_PANE_DIED_RE = re.compile(r"^pane-died(?:\[(\d+)\])?\s")
+
+CLEANUP_SCRIPT_NAME = "aitask_companion_cleanup.sh"
+
+
+def mark_monitor_pane(kind: str) -> bool:
+    """Stamp this process's OWN pane as a running monitor (t1451).
+
+    Writes ``<kind>:<os.getpid()>`` to :data:`MONITOR_KIND_OPTION` on
+    ``$TMUX_PANE``. The pid is what lets a guard tell a live monitor from a
+    marker left behind by a hard-killed one.
+
+    **Only the app calls this, on itself.** The spawner deliberately does not
+    stamp the pane it creates: a minimonitor booting inside a pre-stamped pane
+    would find its own marker and refuse to start unless it could identify its
+    own pane from ambient state. Not stamping removes that self-deadlock by
+    construction — our own pane can never carry a marker before we start, so
+    neither guard needs a self-exclusion rule.
+
+    Returns True when the option was written. No-ops (False) outside tmux.
+    """
+    if kind not in MONITOR_KINDS:
+        raise ValueError(f"unknown monitor kind: {kind!r}")
+    pane = os.environ.get("TMUX_PANE")
+    if not pane:
+        return False
+    rc, _ = _TMUX.run(
+        ["set-option", "-p", "-t", pane, MONITOR_KIND_OPTION,
+         f"{kind}:{os.getpid()}"]
+    )
+    return rc == 0
+
+
+def unmark_monitor_pane() -> bool:
+    """Clear this process's own pane marker (``set-option -pu``).
+
+    The normal-exit counterpart to :func:`mark_monitor_pane`. An *abnormal*
+    exit is covered by :func:`monitor_marker_state`, which classifies a marker
+    whose pid is gone as ``stale`` so the guards ignore and self-heal it.
+    """
+    pane = os.environ.get("TMUX_PANE")
+    if not pane:
+        return False
+    rc, _ = _TMUX.run(["set-option", "-pu", "-t", pane, MONITOR_KIND_OPTION])
+    return rc == 0
+
+
+def _pane_died_hook_indices(hooks_out: str) -> tuple[list[int], bool]:
+    """Parse ``show-hooks -p`` output into ``(pane_died_indices, has_cleanup)``.
+
+    ``has_cleanup`` is True when any ``pane-died`` entry already invokes
+    :data:`CLEANUP_SCRIPT_NAME`. An unindexed ``pane-died`` line counts as
+    index 0, since a bare ``set-hook -p … pane-died`` writes ``[0]``. Pure.
+    """
+    indices: list[int] = []
+    has_cleanup = False
+    for line in hooks_out.splitlines():
+        match = _PANE_DIED_RE.match(line.strip())
+        if not match:
+            continue
+        indices.append(int(match.group(1)) if match.group(1) else 0)
+        if CLEANUP_SCRIPT_NAME in line:
+            has_cleanup = True
+    return indices, has_cleanup
+
+
+def attach_companion_cleanup_hook(agent_pane: str, companion_pane: str) -> str:
+    """Wire the ``pane-died`` companion-cleanup hook onto a primary agent pane.
+
+    Sets ``remain-on-exit on`` (so the pane fires ``pane-died`` instead of
+    closing silently) and a pane-scoped ``pane-died`` hook that runs
+    ``aitask_companion_cleanup.sh <agent_pane> <companion_pane>``. The cleanup
+    script (t986_1) kills any shadow bound to ``agent_pane`` (via
+    ``@aitask_shadow_target``) and despawns ``companion_pane`` once no real
+    agent sibling remains. Used by the shadow spawn glue so a shadowed agent
+    that was not launched with this hook still auto-kills its bound shadow on
+    exit. Also armed by :func:`maybe_spawn_minimonitor` and called by
+    ``tui_switcher``'s git-TUI companion path, so every companion flow wires the
+    hook from here rather than open-coding it. Gateway-only.
+
+    ``companion_pane`` is a **best-effort hint, not the cleanup authority.** One
+    hook carries one companion id and this function never overwrites, so the
+    argument can only ever name whichever companion armed the hook *first*.
+    ``aitask_companion_cleanup.sh`` therefore discovers companions from the
+    ``@aitask_monitor_kind`` / ``@aitask_shadow_target`` markers and falls back
+    to the argument only for a pane predating the marker (t1451).
+
+    **Never overwrites an existing hook.** A bare ``set-hook -p … pane-died``
+    writes index ``[0]`` and so replaces whatever sits there. Two panes can each
+    be a companion of the same agent (a minimonitor already armed the agent, then
+    a monitor-side spawn arms it again), and blindly rewriting the hook would
+    swap the recorded ``companion`` and orphan the first companion. Returns which
+    of the three outcomes happened:
+
+    - ``"existing"`` — a ``pane-died`` hook already invokes the cleanup script;
+      nothing installed. Correct and complete because the script's shadow-kill
+      job is **marker-driven** (it kills every pane whose
+      ``@aitask_shadow_target`` matches the dying agent, whoever armed the hook),
+      so the new shadow is still cleaned up and the prior companion contract
+      survives untouched.
+    - ``"unverified"`` — ``show-hooks`` failed, so we cannot tell "no hook" from
+      "someone else's hook". Fails closed and installs nothing: overwriting is
+      silent and persistent, whereas skipping merely leaves a shadow to be closed
+      by hand, which is bounded and visible. Callers should surface this.
+    - ``"installed"`` — appended at the first free ``pane-died`` index, so an
+      unrelated ``pane-died`` hook is preserved rather than destroyed.
+
+    ``remain-on-exit`` is set in every case (it is idempotent, and the pane
+    should still fire ``pane-died`` for a hook someone else armed).
+    """
+    _TMUX.spawn(
+        ["set-option", "-p", "-t", agent_pane, "remain-on-exit", "on"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    rc, out = _TMUX.run(["show-hooks", "-p", "-t", agent_pane])
+    if rc != 0:
+        return "unverified"
+    indices, has_cleanup = _pane_died_hook_indices(out)
+    if has_cleanup:
+        return "existing"
+    script_path = str(
+        Path(__file__).resolve().parent.parent / CLEANUP_SCRIPT_NAME
+    )
+    hook_cmd = f"run-shell '{script_path} {agent_pane} {companion_pane}'"
+    slot = max(indices) + 1 if indices else 0
+    _TMUX.spawn(
+        ["set-hook", "-p", "-t", agent_pane, f"pane-died[{slot}]", hook_cmd],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    return "installed"
+
+
+def _lookup_window_name(session: str, window_index: str) -> str | None:
+    """Look up a tmux window name from its index."""
+    rc, out = _TMUX.run(
+        ["list-windows", "-t", tmux_session_target(session),
+         "-F", "#{window_index}:#{window_name}"]
+    )
+    if rc != 0:
+        return None
+    for line in out.strip().splitlines():
+        if ":" in line:
+            idx, name = line.split(":", 1)
+            if idx == window_index:
+                return name
+    return None
+
+
+#: The companion's command. The split runs it, and a companion that is still
+#: BOOTING is recognised by it (`#{pane_start_command}`, which tmux records at
+#: creation and renders as this exact string) — before its app has mounted and
+#: stamped `@aitask_monitor_kind` on itself (t2039).
+_COMPANION_ARGV = ("ait", "minimonitor")
+_COMPANION_START_COMMAND = " ".join(_COMPANION_ARGV)
+
+#: How long a spawner waits for another spawner's check-and-split (seconds).
+COMPANION_LOCK_TIMEOUT = 2.0
+_COMPANION_LOCK_SUFFIX = ".aitask-companion.lock"
+
+
+def _flock_until(fd: int, timeout: float) -> bool:
+    """Take an exclusive ``flock`` on ``fd`` within ``timeout``; False if not."""
+    import fcntl
+
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.05)
+        except OSError:
+            return False
+
+
+@contextlib.contextmanager
+def _companion_spawn_lock(session: str, win_index: str,
+                          timeout: float | None = None):
+    """Serialize companion check-and-split on one tmux server. Yields held: bool.
+
+    The "is there a companion already?" read and the split are a check-then-act,
+    and two callers can both read "none" before either splits — two `ait ide`
+    top-ups, or a top-up racing a frozen agent's same-pane restore — and then
+    both shell guards pass before either app stamps its marker (t2039). Inside
+    this lock a second caller re-reads AFTER the first one's split, and sees its
+    pane by `_COMPANION_START_COMMAND`.
+
+    One lock per SERVER, not per window: strictly coarser, needs no window id
+    before the lock, and keeps the file count at one per socket. The file sits
+    beside the server's own socket (`#{socket_path}` + suffix), in tmux's
+    per-user directory, so a test server's lock lives in its fixture dir. It is
+    never deleted (no unlink race) and a dead holder's ``flock`` is dropped by the
+    kernel, so there is no stale-lock recovery.
+
+    FAILS CLOSED: an unreadable or relative socket path, a lock file that cannot
+    be opened, or the deadline passing yields ``False``, and the caller spawns
+    nothing — the next spawn attempt retries.
+    """
+    rc, out = _TMUX.run(
+        ["display-message", "-p", "-t", tmux_window_target(session, win_index),
+         "#{socket_path}"]
+    )
+    socket_path = out.strip() if rc == 0 else ""
+    if not socket_path or "\n" in socket_path or not os.path.isabs(socket_path):
+        yield False
+        return
+    try:
+        fd = os.open(socket_path + _COMPANION_LOCK_SUFFIX,
+                     os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0), 0o600)
+    except OSError:
+        yield False
+        return
+    try:
+        held = _flock_until(
+            fd, COMPANION_LOCK_TIMEOUT if timeout is None else timeout)
+        try:
+            yield held
+        finally:
+            if held:
+                import fcntl
+                fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def _companion_pane_format() -> str:
+    """The ``list-panes -F`` format `_scan_companion_window` parses.
+
+    `#{pane_start_command}` is LAST: it is free text, and the partition keeps
+    any `|` inside it in the remainder.
+    """
+    helper_fields = "|".join(f"#{{{opt}}}" for opt in BOUND_HELPER_TARGET_OPTIONS)
+    return (f"#{{pane_id}}|#{{{MONITOR_KIND_OPTION}}}|{helper_fields}"
+            "|#{@aitask_frozen}|#{pane_dead}|#{pane_start_command}")
+
+
+@dataclass(frozen=True)
+class _CompanionScan:
+    """One window's companion facts, read from a `_companion_pane_format` list."""
+
+    #: A live-marked monitor/minimonitor, or a companion still booting.
+    present: bool
+    #: Occupants counted toward the 3-pane overcrowding limit.
+    real_panes: int
+    window_panes: frozenset[str]
+    #: Panes carrying a monitor marker whose process is gone.
+    stale_marked: tuple[str, ...]
+    #: The companions that make ``present`` true (live-marked or booting), in
+    #: listing order (t2211_2: the sitrep respawn arms its hook with one).
+    companion_panes: tuple[str, ...] = ()
+
+
+def _scan_companion_window(out: str) -> _CompanionScan:
+    """Classify a window's panes for the companion rule. Pure: no tmux calls.
+
+    The ONE definition of "a companion is already here", shared by the split
+    path (`_companion_check_and_split`) and the read-only probe
+    (`companion_present`), so the switcher never offers a spawn the split would
+    refuse for presence, nor hides one it would allow.
+
+    A live monitor is recognised by the @aitask_monitor_kind marker it stamps
+    on itself, NOT by #{pane_current_command} — that reports `python` for a
+    running monitor, so the old substring match could never fire (t1451).
+    Liveness comes from monitor_marker_state, the same implementation the
+    shell guard in aitask_minimonitor.sh execs.
+
+    A companion that is still BOOTING has no marker yet: it is recognised by
+    its start command, which tmux sets atomically with the pane (t2039).
+    Together with the lock this closes the ~1 s boot-window race in which a
+    second spawn for the same window saw no marker. The shell guard stays
+    marker-only on purpose: if it also treated a booting sibling as blocking,
+    two companions booting at once would both exit.
+
+    Bound helper panes — shadows (t986) and scratchpads (t2073) — carry a
+    helper target (`BOUND_HELPER_TARGET_OPTIONS`) and must NOT count toward
+    the overcrowding limit: a helper following the agent should not block the
+    companion minimonitor from spawning for that same agent.
+    A frozen stand-in (t1705_4) carries `@aitask_frozen` and no helper marker,
+    so without this field it would count as an ordinary occupant. It IS a real
+    occupant — counted below — but the marker is read explicitly so the
+    occupancy rule states the case rather than getting it by accident, and so
+    the field is available if a later change needs to treat it differently.
+    """
+    present = False
+    real_panes = 0
+    window_panes: set[str] = set()
+    stale_marked: list[str] = []
+    companions: list[str] = []
+    for line in out.strip().splitlines():
+        pane_id, _, rest = line.partition("|")
+        window_panes.add(pane_id)
+        marker, _, rest = rest.partition("|")
+        helper_targets = []
+        for _opt in BOUND_HELPER_TARGET_OPTIONS:
+            helper_target, _, rest = rest.partition("|")
+            helper_targets.append(helper_target)
+        frozen, _, rest = rest.partition("|")
+        dead, _, start_command = rest.partition("|")
+        if frozen.strip():
+            # A frozen stand-in occupies the window like any agent would.
+            real_panes += 1
+            continue
+        if marker:
+            if monitor_marker_alive(marker):
+                present = True
+                companions.append(pane_id)
+            else:
+                stale_marked.append(pane_id)
+            # A monitor pane is a helper either way — never counted below.
+            continue
+        if start_command.strip() == _COMPANION_START_COMMAND:
+            if dead.strip() != "1":
+                present = True               # a companion is already booting
+                companions.append(pane_id)
+            continue                         # a dead companion is a helper too
+        if not is_bound_helper(*helper_targets):
+            real_panes += 1
+    return _CompanionScan(present, real_panes, frozenset(window_panes),
+                          tuple(stale_marked), tuple(companions))
+
+
+def companion_present(pane: str) -> bool | None:
+    """Does ``pane``'s window already hold a monitor/minimonitor companion?
+
+    The read-only twin of `_companion_check_and_split`'s eligibility read — the
+    same format and the same `_scan_companion_window` — for callers that only
+    decide whether to OFFER a spawn (the TUI switcher's companion key). A live
+    marker or a booting `ait minimonitor` is present. Unlike the split path it
+    never self-heals a stale marker.
+
+    ``-t <pane>`` lists that pane's own window; an untargeted `list-panes`
+    resolves to the session's CURRENT window instead (t2039).
+
+    None means unknown — an empty pane id, a failed tmux read, or a listing that
+    does not contain ``pane`` — and callers fail closed on it.
+    """
+    if not pane:
+        return None
+    rc, out = _TMUX.run(["list-panes", "-t", pane, "-F", _companion_pane_format()])
+    if rc != 0:
+        return None
+    scan = _scan_companion_window(out)
+    if pane not in scan.window_panes:
+        return None
+    return scan.present
+
+
+def window_companion_pane(pane: str) -> str | None:
+    """The first companion (live-marked or booting) in ``pane``'s window, or None.
+
+    Read-only, the :func:`companion_present` read and rule. None also when the
+    window cannot be listed or the listing does not contain ``pane`` — a caller
+    arming a cleanup hook then simply arms none (t2211_2).
+    """
+    if not pane:
+        return None
+    rc, out = _TMUX.run(["list-panes", "-t", pane, "-F", _companion_pane_format()])
+    if rc != 0:
+        return None
+    scan = _scan_companion_window(out)
+    if pane not in scan.window_panes or not scan.companion_panes:
+        return None
+    return scan.companion_panes[0]
+
+
+def _companion_check_and_split(
+    session: str,
+    win_index: str,
+    agent_pane: str | None,
+    width: int,
+    project_root: Path | None,
+    *,
+    full_height: bool = False,
+) -> tuple[bool, str | None, str]:
+    """The eligibility read and the split: ``(split_ran, companion_pane, agent_pane)``.
+
+    Runs under `_companion_spawn_lock`; it is the ONLY eligibility read, so the
+    decision always reflects every split a previous lock holder made.
+    ``split_ran`` is False when a gate refused or the split failed;
+    ``companion_pane`` can still be None after a split whose output was empty.
+    The rule itself is `_scan_companion_window`'s.
+    """
+    rc, out = _TMUX.run(
+        ["list-panes", "-t", tmux_window_target(session, win_index),
+         "-F", _companion_pane_format()]
+    )
+    if agent_pane and rc != 0:
+        # Without the pane list there is no proof the agent is in this window.
+        return False, None, ""
+    if rc == 0:
+        scan = _scan_companion_window(out)
+        # Stale: the marking process is gone. Self-heal so the residue cannot
+        # block spawns in this window forever. Every stale pane is healed, even
+        # beside a live companion — clearing a marker whose process is verified
+        # gone is always correct.
+        for pane_id in scan.stale_marked:
+            _TMUX.spawn(
+                ["set-option", "-pu", "-t", pane_id, MONITOR_KIND_OPTION],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        if scan.present:
+            return False, None, ""
+        # Avoid overcrowding: skip if 3+ non-helper panes already exist
+        if scan.real_panes >= 3:
+            return False, None, ""
+        if agent_pane and agent_pane not in scan.window_panes:
+            # Fail closed: never place a companion for a pane in another window.
+            return False, None, ""
+
+    # Without a caller-supplied pane, capture the currently-active pane (the
+    # just-launched agent) so we can refocus it after the split. Hardcoding `.0`
+    # is wrong once the window holds more than one pane (e.g. a shadow), where
+    # the agent need not be pane 0.
+    split_target = agent_pane or tmux_window_target(session, win_index)
+    if not agent_pane:
+        rc_active, active_pane = _TMUX.run(
+            ["display-message", "-p", "-t",
+             tmux_window_target(session, win_index), "#{pane_id}"]
+        )
+        agent_pane = active_pane.strip() if rc_active == 0 else ""
+
+    # Spawn minimonitor as a right split, capturing the new pane id. With
+    # `full_height` (the sitrep window, t2211_2) tmux `-f` makes it span the
+    # whole window height instead of only the agent's cell, so it stays a right
+    # column beside an agent that has a pane split under it.
+    split_argv = ["split-window", "-h"]
+    if full_height:
+        split_argv.append("-f")
+    split_argv += ["-P", "-F", "#{pane_id}", "-l", str(width)]
+    if project_root is not None:
+        split_argv += ["-c", str(project_root)]
+    split_argv += ["-t", split_target, *_COMPANION_ARGV]
+    rc, out = _TMUX.run(split_argv)
+    if rc != 0:
+        return False, None, agent_pane or ""
+    return True, out.strip() or None, agent_pane or ""
+
+
+def maybe_spawn_minimonitor(
+    session: str,
+    window_name: str,
+    *,
+    window_index: str | None = None,
+    force_companion: bool = False,
+    explicit: bool = False,
+    project_root: Path | None = None,
+    agent_pane: str | None = None,
+    full_height: bool = False,
+) -> str | None:
+    """Spawn a minimonitor split pane if conditions are met.
+
+    Called after launch_in_tmux() creates a new window or splits into an
+    existing one. Spawns a companion minimonitor pane when the window name
+    matches a configured prefix and the window does not already contain a
+    monitor/minimonitor or TUI process.
+
+    Args:
+        session: tmux session name
+        window_name: tmux window name (for prefix matching and TUI exclusion)
+        window_index: if provided, skip the name→index lookup (existing-window case)
+        force_companion: if True, bypass the companion-prefix check and the
+            TUI-name/brainstorm exclusion check. Used for dynamic companion
+            flows like the git TUI where the window name ("git") is not
+            prefix-based and is also classified as a TUI in the registry. The
+            `auto_spawn`, existing-minimonitor, and pane-count guards still
+            apply.
+        explicit: if True, the user asked for this companion (the TUI
+            switcher's companion key), so ``tmux.minimonitor.auto_spawn`` —
+            which governs AUTOMATIC spawning only — does not apply. The
+            existing-minimonitor, pane-count and lock gates still do.
+        project_root: when set, read ``project_config.yaml`` and pass
+            ``-c <project_root>`` to ``tmux split-window`` so the companion
+            pane starts in that project's directory. Required for cross-
+            session spawns from the TUI switcher; defaults to ``Path.cwd()``
+            for legacy callers operating on the current project.
+        agent_pane: the pane the companion serves, when the caller knows it
+            (the frozen-agent restore resolves it from the launched pid,
+            t1851). It replaces the window's ACTIVE pane as the companion's
+            identity — the split lands beside it, the cleanup hook is armed on
+            it and focus returns to it — so a focus change or a split between
+            the launch and this call cannot hand the companion to the wrong
+            pane. It must be one of the window's panes: when it is not, or the
+            pane list cannot be read, nothing is spawned.
+        full_height: add tmux ``-f`` so the companion spans the full window
+            height as a right column (the sitrep window, whose agent has the
+            sitrep TUI split under it — t2211_2). Every other caller keeps the
+            split of the agent's own cell.
+
+    Returns the new companion pane id (e.g. `%42`) on success, or None if
+    no spawn happened (disabled, rejected by a gate, tmux error, etc.).
+    """
+    # Read config from project_config.yaml
+    auto_spawn = True
+    width = 40
+    companion_prefixes = ["agent-", "create-"]
+    tui_names = set(_DEFAULT_TUI_NAMES)
+    cfg_root = project_root if project_root is not None else Path.cwd()
+    config_path = cfg_root / "aitasks" / "metadata" / "project_config.yaml"
+    if config_path.is_file():
+        try:
+            import yaml
+            with open(config_path) as f:
+                data = yaml.safe_load(f) or {}
+            tmux = data.get("tmux", {})
+            if isinstance(tmux, dict):
+                mm = tmux.get("minimonitor", {})
+                if isinstance(mm, dict):
+                    if "auto_spawn" in mm:
+                        auto_spawn = bool(mm["auto_spawn"])
+                    if "width" in mm:
+                        width = int(mm["width"])
+                    if "companion_window_prefixes" in mm:
+                        companion_prefixes = list(mm["companion_window_prefixes"])
+                monitor = tmux.get("monitor", {})
+                if isinstance(monitor, dict):
+                    if "tui_window_names" in monitor:
+                        # Merge with registry defaults so new framework TUIs
+                        # are never masked by a stale override list.
+                        tui_names = set(_DEFAULT_TUI_NAMES) | set(monitor["tui_window_names"])
+        except Exception:
+            pass
+
+    if not auto_spawn and not explicit:
+        return None
+
+    if not force_companion:
+        # Check window name matches an eligible companion prefix
+        if not any(window_name.startswith(p) for p in companion_prefixes):
+            return None
+
+        # Exclude TUI windows (board, codebrowser, monitor, etc.)
+        if window_name in tui_names or window_name.startswith("brainstorm-"):
+            return None
+
+    # Resolve window index
+    win_index = window_index
+    if win_index is None:
+        rc, out = _TMUX.run(
+            ["list-windows", "-t", tmux_session_target(session),
+             "-F", "#{window_index}:#{window_name}"]
+        )
+        if rc != 0:
+            return None
+        for line in out.strip().splitlines():
+            if ":" in line:
+                idx, name = line.split(":", 1)
+                if name == window_name:
+                    win_index = idx  # keep looping — pick the *last* match
+        if win_index is None:
+            return None
+
+    # The eligibility read and the split run under one per-server lock, so a
+    # second caller always decides on a pane list that includes the first
+    # caller's split (t2039). See `_companion_spawn_lock`.
+    with _companion_spawn_lock(session, win_index) as held:
+        if not held:
+            return None
+        split_ran, companion_pane, agent_pane = _companion_check_and_split(
+            session, win_index, agent_pane, width, project_root,
+            full_height=full_height)
+    if not split_ran:
+        return None
+    # Arm the pane-died cleanup hook so the companion is despawned when the
+    # agent exits. This used to be wired only by spawn_shadow and by
+    # tui_switcher's git path, so every board- / codebrowser- / crew-launched
+    # window carried a companion with no hook at all (t1451). `agent_pane` is ""
+    # when the display-message probe failed — never arm a hook against an
+    # unknown pane. The return value is ignored on purpose: unlike spawn_shadow
+    # this path has no notification surface, and the minimonitor's own
+    # auto-close (t1446) remains the backstop when nothing is installed.
+    if agent_pane and companion_pane:
+        attach_companion_cleanup_hook(agent_pane, companion_pane)
+    # Refocus the agent pane captured above, falling back to pane .0.
+    refocus_target = agent_pane or f"{tmux_window_target(session, win_index)}.0"
+    _TMUX.spawn(
+        ["select-pane", "-t", refocus_target],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    return companion_pane
+
+
+def launch_or_focus_codebrowser(
+    session: str,
+    focus_value: str,
+    window_name: str = "codebrowser",
+) -> tuple[bool, str | None]:
+    """Set the focus env var and bring the codebrowser to the given range.
+
+    If a window named *window_name* already exists in *session*, selects
+    it; otherwise creates a new window running ``./ait codebrowser --focus
+    <focus_value>``. The env var is set first so both the reuse and the
+    cold-launch paths see it.
+
+    Returns ``(success, error_message)``. On success, error_message is None.
+    """
+    rc, _ = _TMUX.run(
+        ["set-environment", "-t", tmux_session_target(session),
+         "AITASK_CODEBROWSER_FOCUS", focus_value]
+    )
+    if rc != 0:
+        return False, "tmux set-environment failed"
+
+    rc, out = _TMUX.run(
+        ["list-windows", "-t", tmux_session_target(session),
+         "-F", "#{window_name}"]
+    )
+    if rc != 0:
+        return False, "tmux list-windows failed"
+    names = out.strip().splitlines()
+
+    if window_name in names:
+        rc, _ = _TMUX.run(
+            ["select-window", "-t",
+             tmux_window_target(session, window_name)]
+        )
+        if rc != 0:
+            return False, "tmux select-window failed"
+    else:
+        rc, _ = _TMUX.run(
+            ["new-window", "-t", tmux_window_target(session, ""),
+             "-n", window_name,
+             "./ait", "codebrowser", "--focus", focus_value]
+        )
+        if rc != 0:
+            return False, "tmux new-window failed"
+
+    return True, None
+
+
+# --- `ait trails` focus mailbox (t1957_2) -------------------------------------
+#
+# A request to open a trail in a RUNNING `ait trails` is addressed to exactly one
+# pane, never to a session: every TrailsApp in a session would poll a
+# session-wide variable, and the first to read-and-clear it would win.
+#
+# * Receiver stamp — `@aitask_trails_app <pid>` on the pane of a running
+#   TrailsApp (set by the app on itself, after its baseline read; unset on
+#   exit). A stamp whose pid is gone (crash, kill) is not a receiver.
+# * Request — `@aitask_trails_focus "<32-hex id> <handle>"` on that pane. Writers
+#   only ever OVERWRITE it and nobody ever unsets it: a reader that cleared the
+#   value after reading could erase a request written in between. The reader
+#   instead remembers the last id it saw; a new id is a new request, and the
+#   latest one wins.
+#
+# The reads go through `display-message` with the pane id echoed first, because
+# `show-options -q` and `display-message` both answer a MISSING pane with rc 0
+# and empty output — only the echo separates "no request" from "no such pane".
+
+TRAILS_FOCUS_OPTION = "@aitask_trails_focus"
+TRAILS_RECEIVER_OPTION = "@aitask_trails_app"
+_TRAILS_REQUEST_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+# A receiver stamp is a pid: ASCII digits only (`str.isdigit` also accepts `²`,
+# which `int()` refuses) and within the C int `os.kill` takes.
+_TRAILS_STAMP_RE = re.compile(r"[1-9][0-9]{0,9}")
+_PID_MAX = 2**31 - 1
+
+# --- The pane mailbox, generalized (t2211_3) ----------------------------------
+#
+# The same receiver-stamp + overwrite-only request design serves more than one
+# TUI: `ait trails` (trail handles) and `ait board` (task ids). Each pair of
+# options is one mailbox; the payload grammar is the caller's.
+
+
+def read_pane_request(pane: str, option: str) -> str | None:
+    """``pane``'s raw ``option`` value -- ``""`` when it holds no request --
+    or None when the read failed (pane gone, server unreachable)."""
+    rc, out = _TMUX.run(["display-message", "-p", "-t", pane,
+                         f"#{{pane_id}}\t#{{{option}}}"])
+    if rc != 0:
+        return None
+    echoed, sep, value = out.rstrip("\n").partition("\t")
+    if not sep or echoed != pane:
+        return None
+    return value.strip()
+
+
+def parse_pane_request(value: str | None, payload_re) -> tuple[str, str | None] | None:
+    """A raw request value -> ``(id, payload)``; ``(id, None)`` when malformed.
+
+    None for an empty value (no request). The id is the first token whatever
+    its shape, so a malformed request is still recorded as seen and never
+    retried; the payload is returned only when the id is a 32-hex request id
+    and the rest fully matches ``payload_re`` (the value is untrusted input)."""
+    text = (value or "").strip()
+    if not text:
+        return None
+    request_id, _, payload = text.partition(" ")
+    payload = payload.strip()
+    if _TRAILS_REQUEST_ID_RE.match(request_id) and payload_re.match(payload):
+        return request_id, payload
+    return request_id, None
+
+
+def mark_pane_receiver(pane: str, option: str) -> bool:
+    """Stamp ``pane`` as this process's receiver for ``option``'s mailbox."""
+    rc, _ = _TMUX.run(["set-option", "-p", "-t", pane, option, str(os.getpid())])
+    return rc == 0
+
+
+def unmark_pane_receiver(pane: str, option: str) -> bool:
+    """Remove ``pane``'s receiver stamp (best effort). The request option is
+    left alone -- nobody ever unsets it."""
+    rc, _ = _TMUX.run(["set-option", "-p", "-u", "-t", pane, option])
+    return rc == 0
+
+
+def _live_pane_receivers(session: str, option: str) -> list[tuple[str, str]] | None:
+    """``(pane_id, window_id)`` of every pane in ``session`` whose ``option``
+    stamp names a live process, in tmux's window/pane order; None when the
+    listing failed."""
+    rc, out = _TMUX.run(
+        ["list-panes", "-s", "-t", tmux_session_scope_target(session),
+         "-F", f"#{{pane_id}} #{{window_id}} #{{{option}}}"])
+    if rc != 0:
+        return None
+    receivers = []
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) != 3 or not _TRAILS_STAMP_RE.fullmatch(parts[2]):
+            continue
+        pid = int(parts[2])
+        if pid <= _PID_MAX and _process_exists(pid):
+            receivers.append((parts[0], parts[1]))
+    return receivers
+
+
+def _deliver_pane_request(receiver: tuple[str, str], option: str,
+                          payload: str) -> tuple[bool, str | None]:
+    """Write a fresh request into ``receiver``'s mailbox and select its pane."""
+    pane, window = receiver
+    rc, _ = _TMUX.run(["set-option", "-p", "-t", pane, option,
+                       f"{uuid.uuid4().hex} {payload}"])
+    if rc != 0:
+        return False, "tmux set-option failed"
+    rc, _ = _TMUX.run(["select-window", "-t", window])
+    if rc != 0:
+        return False, "tmux select-window failed"
+    rc, _ = _TMUX.run(["select-pane", "-t", pane])
+    if rc != 0:
+        return False, "tmux select-pane failed"
+    return True, None
+
+
+def read_trails_focus_request(pane: str) -> str | None:
+    """``pane``'s raw ``@aitask_trails_focus`` value — ``""`` when it holds no
+    request — or None when the read failed (pane gone, server unreachable)."""
+    return read_pane_request(pane, TRAILS_FOCUS_OPTION)
+
+
+def parse_trails_focus_request(value: str | None) -> tuple[str, str | None] | None:
+    """A raw request value -> ``(id, handle)``; ``(id, None)`` when malformed.
+
+    None for an empty value (no request). The id is the first token whatever its
+    shape, so a malformed request is still recorded as seen and never retried;
+    the handle is returned only when the id is a 32-hex request id and the rest
+    is a well-formed artifact handle (the value is untrusted input)."""
+    return parse_pane_request(value, HANDLE_RE)
+
+
+# --- A trails request that also names a task card (t2211_10) -------------------
+#
+# `"<id> <handle> <task id>"` asks a running TrailsApp to open the trail AND focus
+# that member's card. An older TrailsApp parses the payload as ONE handle and
+# refuses the two-token form as malformed (opening nothing), so the writer sends
+# it only to a receiver that advertises it: `@aitask_trails_card_focus <pid>`,
+# set by the app on its own pane BEFORE its receiver stamp and naming the same
+# pid. Any other receiver gets the bare `<handle>` it understands, plus a warning
+# for the caller.
+
+TRAILS_CARD_FOCUS_OPTION = "@aitask_trails_card_focus"
+#: A trails request payload: an artifact handle (`HANDLE_RE`'s grammar),
+#: optionally followed by one task id (`BOARD_TASK_ID_RE`'s grammar).
+_TRAILS_TARGET_RE = re.compile(
+    r"^(art:[a-z0-9][a-z0-9._-]{0,127})(?: ([0-9]+(?:_[0-9]+)?))?\Z")
+
+
+def parse_trails_focus_target(value: str | None):
+    """A raw request value -> ``(id, (handle, task | None))``; ``(id, None)``
+    when malformed; None for no request.
+
+    Both the bare-handle form and the task form parse; anything else (extra
+    tokens, a malformed handle or task id) is malformed WHOLE -- the value is
+    untrusted, so a part that does not parse is never half-applied."""
+    parsed = parse_pane_request(value, _TRAILS_TARGET_RE)
+    if parsed is None:
+        return None
+    request_id, payload = parsed
+    if payload is None:
+        return request_id, None
+    m = _TRAILS_TARGET_RE.match(payload)
+    return request_id, (m.group(1), m.group(2))
+
+
+def mark_trails_card_focus(pane: str) -> bool:
+    """Advertise that this process's receiver takes the task form."""
+    return mark_pane_receiver(pane, TRAILS_CARD_FOCUS_OPTION)
+
+
+def unmark_trails_card_focus(pane: str) -> bool:
+    return unmark_pane_receiver(pane, TRAILS_CARD_FOCUS_OPTION)
+
+
+def _trails_receiver_takes_task(pane: str) -> bool:
+    """Does ``pane``'s receiver understand the task form? True only when ONE
+    read shows the pane itself (the echo) with a capability stamp naming the
+    same pid as its receiver stamp -- a stale capability left by an earlier
+    process in that pane names another pid. Any failure answers False, so the
+    caller falls back to the form every receiver understands."""
+    rc, out = _TMUX.run(["display-message", "-p", "-t", pane,
+                         f"#{{pane_id}}\t#{{{TRAILS_RECEIVER_OPTION}}}"
+                         f"\t#{{{TRAILS_CARD_FOCUS_OPTION}}}"])
+    if rc != 0:
+        return False
+    parts = out.rstrip("\n").split("\t")
+    if len(parts) != 3 or parts[0] != pane:
+        return False
+    stamp, capability = parts[1].strip(), parts[2].strip()
+    return bool(_TRAILS_STAMP_RE.fullmatch(stamp)) and capability == stamp
+
+
+def trails_supports_task_focus(project_root: Path) -> bool:
+    """Does ``project_root``'s ``ait trails`` take ``--task`` (t2211_10)?
+
+    The ``trails_supports_focus`` text probe for the quoted flag literal
+    (``--tasks-dir`` does not contain it). Unreadable -> False."""
+    path = Path(project_root) / ".aitask-scripts" / "board" / "trails_app.py"
+    try:
+        return '"--task"' in path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+
+
+def mark_trails_receiver(pane: str) -> bool:
+    """Stamp ``pane`` as this process's trails receiver; True when written."""
+    return mark_pane_receiver(pane, TRAILS_RECEIVER_OPTION)
+
+
+def unmark_trails_receiver(pane: str) -> bool:
+    """Remove ``pane``'s receiver stamp (best effort). The request option is
+    left alone — nobody ever unsets it."""
+    return unmark_pane_receiver(pane, TRAILS_RECEIVER_OPTION)
+
+
+def _live_trails_receivers(session: str) -> list[tuple[str, str]] | None:
+    """``(pane_id, window_id)`` of every pane in ``session`` stamped by a live
+    process, in tmux's window/pane order; None when the listing failed."""
+    return _live_pane_receivers(session, TRAILS_RECEIVER_OPTION)
+
+
+def launch_or_focus_trails(
+    session: str, project_root: Path, handle: str, task_id: str | None = None,
+) -> tuple[bool, str | None]:
+    """Open trail ``handle`` in ``session``'s ``ait trails``.
+
+    A running TrailsApp (a live receiver stamp) gets the request in its own
+    pane's mailbox — ONE receiver, the first in window/pane order, so two
+    trails windows never both act on it — and that pane is selected. With none
+    running, a new ``trails`` window rooted at ``project_root`` runs
+    ``./ait trails --trail <handle>`` (argv form, no shell string). Does not
+    switch the client; the caller does.
+
+    ``task_id`` (bare: ``12`` / ``12_3``, t2211_10) also asks for that member's
+    card to be focused: the task form goes to a receiver that advertises it
+    (:func:`_trails_receiver_takes_task`) and the cold window gets
+    ``--task <id>`` when the project's trails supports it. Otherwise the trail
+    alone opens and the second value is a warning. Without ``task_id`` every
+    tmux call is the same as before.
+
+    Returns ``(success, error_or_warning)``.
+    """
+    if not HANDLE_RE.match(handle or ""):
+        return False, f"invalid trail handle: {handle!r}"
+    if task_id is not None and not BOARD_TASK_ID_RE.match(task_id):
+        return False, f"invalid task id: {task_id!r}"
+    receivers = _live_trails_receivers(session)
+    if receivers is None:
+        return False, "tmux list-panes failed"
+    if receivers:
+        if task_id is None:
+            return _deliver_pane_request(receivers[0], TRAILS_FOCUS_OPTION, handle)
+        if _trails_receiver_takes_task(receivers[0][0]):
+            return _deliver_pane_request(receivers[0], TRAILS_FOCUS_OPTION,
+                                         f"{handle} {task_id}")
+        ok, msg = _deliver_pane_request(receivers[0], TRAILS_FOCUS_OPTION, handle)
+        if not ok:
+            return ok, msg
+        return True, ("the running ait trails cannot focus a card — restart it "
+                      f"to show t{task_id}")
+    argv = ["./ait", "trails", "--trail", handle]
+    warning = None
+    if task_id is not None:
+        if trails_supports_task_focus(project_root):
+            argv += ["--task", task_id]
+        else:
+            warning = ("this project's ait trails cannot focus a card — opened "
+                       "the trail only")
+    rc, _ = _TMUX.run(
+        ["new-window", "-t", tmux_window_target(session, ""),
+         "-c", str(project_root), "-n", "trails", *argv])
+    if rc != 0:
+        return False, "tmux new-window failed"
+    return True, warning
+
+
+# --- `ait board --focus` mailbox (t2211_3) -------------------------------------
+#
+# The trails design for the board: a running KanbanApp stamps its own pane with
+# `@aitask_board_app <pid>` (after its baseline read; unset on exit), and a
+# request `@aitask_board_focus "<32-hex id> <task id>"` is written to the FIRST
+# live receiver of the session -- overwritten, never unset; the board remembers
+# the last id it saw.
+
+BOARD_FOCUS_OPTION = "@aitask_board_focus"
+BOARD_RECEIVER_OPTION = "@aitask_board_app"
+#: A board focus payload: a bare task id, parent or child (`12`, `12_3`).
+BOARD_TASK_ID_RE = re.compile(r"^[0-9]+(?:_[0-9]+)?\Z")
+
+
+def read_board_focus_request(pane: str) -> str | None:
+    return read_pane_request(pane, BOARD_FOCUS_OPTION)
+
+
+def parse_board_focus_request(value: str | None) -> tuple[str, str | None] | None:
+    """``(request id, task id)``; ``(id, None)`` for a malformed request."""
+    return parse_pane_request(value, BOARD_TASK_ID_RE)
+
+
+def mark_board_receiver(pane: str) -> bool:
+    return mark_pane_receiver(pane, BOARD_RECEIVER_OPTION)
+
+
+def unmark_board_receiver(pane: str) -> bool:
+    return unmark_pane_receiver(pane, BOARD_RECEIVER_OPTION)
+
+
+def launch_or_focus_board(
+    session: str, project_root: Path, task_id: str,
+) -> tuple[bool, str | None]:
+    """Show task ``task_id`` (bare: ``12`` / ``12_3``) in ``session``'s board.
+
+    * A running board (a live receiver stamp): the request goes to ONE
+      receiver's pane mailbox -- the first in window/pane order -- and that pane
+      is selected. ``(True, None)``.
+    * A ``board`` window without a receiver (a board started before focus
+      support, or outside a gateway pane): it is selected, and the second value
+      is a warning -- a second board is never started beside it.
+    * No board: a new ``board`` window rooted at ``project_root`` runs
+      ``./ait board --focus <id>`` (argv form, no shell string).
+
+    Does not switch the client; the caller does. ``(False, error)`` on a
+    refused id or a failed tmux call."""
+    if not BOARD_TASK_ID_RE.match(task_id or ""):
+        return False, f"invalid task id: {task_id!r}"
+    receivers = _live_pane_receivers(session, BOARD_RECEIVER_OPTION)
+    if receivers is None:
+        return False, "tmux list-panes failed"
+    if receivers:
+        return _deliver_pane_request(receivers[0], BOARD_FOCUS_OPTION, task_id)
+    rc, out = _TMUX.run(["list-windows", "-t", tmux_session_target(session),
+                         "-F", "#{window_id} #{window_name}"])
+    if rc != 0:
+        return False, "tmux list-windows failed"
+    for line in out.splitlines():
+        window_id, _, name = line.partition(" ")
+        if name == "board":
+            rc, _ = _TMUX.run(["select-window", "-t", window_id])
+            if rc != 0:
+                return False, "tmux select-window failed"
+            return True, ("the running board cannot take focus requests — restart "
+                          f"it to jump to t{task_id}")
+    rc, _ = _TMUX.run(
+        ["new-window", "-t", tmux_window_target(session, ""),
+         "-c", str(project_root), "-n", "board",
+         "./ait", "board", "--focus", task_id])
+    if rc != 0:
+        return False, "tmux new-window failed"
+    return True, None
+
+
+# --- Another project's session (t1957_4) --------------------------------------
+#
+# The linked-trail jump reaches into a DIFFERENT project's tmux session: find
+# it, start it when it is not running, check that a session name still belongs
+# to that project, and move the client there.
+
+
+@dataclass(frozen=True)
+class BootstrapResult:
+    """What ``tmux_bootstrap.sh <root>`` answered.
+
+    ``error`` is one line for the user when ``ok`` is False; ``stale`` marks the
+    ``BOOTSTRAP_FAILED:stale_path`` refusal (the path is not an aitasks project
+    any more); ``default_session_problem`` is the shape of an unreadable
+    ``tmux.default_session`` the bootstrap fell back on, when it succeeded."""
+    ok: bool
+    error: str = ""
+    stale: bool = False
+    default_session_problem: str | None = None
+
+
+def bootstrap_project_session(project_root: Path,
+                              timeout: float = 15) -> BootstrapResult:
+    """Create ``project_root``'s tmux session detached, if it is not running.
+
+    The standalone form of ``lib/tmux_bootstrap.sh`` — the one the TUI switcher
+    runs for a registered-but-inactive project and the linked-trail jump runs
+    for a target with no session. Idempotent; the session it creates is named
+    by that project's ``tmux.default_session`` and stamped with its root."""
+    script = str(Path(__file__).resolve().parent / "tmux_bootstrap.sh")
+    try:
+        result = subprocess.run(
+            ["bash", script, str(project_root)],
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
+        return BootstrapResult(False, error=str(exc))
+    stderr = result.stderr or ""
+    if result.returncode != 0:
+        lines = stderr.strip().splitlines()
+        return BootstrapResult(
+            False, error=lines[-1] if lines else "unknown error",
+            stale="BOOTSTRAP_FAILED:stale_path" in stderr)
+    return BootstrapResult(
+        True, default_session_problem=parse_default_session_unreadable(stderr))
+
+
+def live_project_session(project_root: Path) -> str | None:
+    """A live gateway session attributed to ``project_root``, or None.
+
+    Every live session is attributed by the canonical rule (registration stamp,
+    else pane vote, else legacy registry), so a session the project runs under
+    a non-default name (``ait ide --session foo``) is found too, and the
+    bootstrap is not asked to start a second one. With several, the project's
+    configured ``default_session`` wins, then the first by name."""
+    want = _root_key(Path(project_root))
+    owned = sorted({session for session, root in _collect_live_roots(
+                        _TMUX.run, _read_registry_entry)
+                    if _root_key(root) == want})
+    if not owned:
+        return None
+    default = load_tmux_defaults(Path(project_root))["default_session"]
+    return default if default in owned else owned[0]
+
+
+def is_aitasks_project(root: Path) -> bool:
+    """Does ``root`` hold an aitasks project (its ``project_config.yaml``
+    marker)? The same marker discovery and the registry readers check."""
+    return (Path(root) / "aitasks" / "metadata" / "project_config.yaml").is_file()
+
+
+def session_owned_by(session: str, project_root: Path) -> bool:
+    """Is the live ``session`` still attributed to ``project_root``?
+
+    For a session name learned earlier: in the meantime that session may have
+    stopped and its name been reused by another project. Only this one
+    candidate is attributed (:func:`_sessions_owned_by`)."""
+    if not session:
+        return False
+    return session in _sessions_owned_by(Path(project_root), {session})
+
+
+def trails_supports_focus(project_root: Path) -> bool:
+    """Does ``project_root``'s ``ait trails`` take ``--trail`` (t1957_2)?
+
+    A text probe of the project's own ``board/trails_app.py``: an older
+    framework has no ``--trail`` flag, and ``./ait trails --trail <h>`` would
+    die on argparse in the window it opens. An unreadable or missing file
+    proves nothing, so it answers False and the caller does not launch."""
+    path = Path(project_root) / ".aitask-scripts" / "board" / "trails_app.py"
+    try:
+        return "--trail" in path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+
+
+def switch_client_to(session: str) -> bool:
+    """Move the caller's tmux client to ``session``; True on success.
+
+    tmux resolves "the caller's client" from the calling process's ``$TMUX``,
+    so this only works for a caller that is a pane of the gateway server
+    (:func:`current_tmux_session` is not None)."""
+    rc, _ = _TMUX.run(["switch-client", "-t", tmux_session_target(session)])
+    return rc == 0
+
+
+def load_tmux_defaults(project_root: Path) -> dict:
+    """Load tmux defaults from project_config.yaml.
+
+    Returns dict with keys: default_session, default_split, prefer_tmux,
+    git_tui, syncer_autostart. Falls back to hardcoded defaults if config is
+    absent. A blank, null or comment-only ``default_session`` falls back to
+    :data:`DEFAULT_TMUX_SESSION` like an absent one; any other value is
+    ``str()`` of what YAML read (:func:`_normalize_default_session`).
+
+    One value YAML reads happily is refused anyway: a name holding ``.`` or
+    ``:``, which tmux cannot address (:func:`_tmux_session_name_ok`, t1828).
+    Without that check this reader would keep returning ``a.b`` while the line
+    readers announced ``illegal_tmux_name`` and fell back — and since this is the
+    reader behind session *creation* (agentcrew) and window targeting (board,
+    monitors), it is the one that would actually hand tmux the bad name.
+
+    It reports nothing: the dict has no channel for a problem, so these
+    consumers substitute the default silently. Only the readers that return a
+    shape (:func:`read_default_session_status`, the bash twin) can drive a
+    notice.
+    """
+    defaults = {
+        "default_session": DEFAULT_TMUX_SESSION,
+        "default_split": "horizontal",
+        "prefer_tmux": False,
+        "git_tui": "",
+        "syncer_autostart": False,
+    }
+    config_path = project_root / "aitasks" / "metadata" / "project_config.yaml"
+    if not config_path.is_file():
+        return defaults
+    try:
+        import yaml
+        with open(config_path) as f:
+            data = yaml.safe_load(f) or {}
+        tmux = data.get("tmux", {})
+        if isinstance(tmux, dict):
+            session = _normalize_default_session(tmux.get("default_session"))
+            defaults["default_session"] = (
+                session if _tmux_session_name_ok(session) else DEFAULT_TMUX_SESSION
+            )
+            if "default_split" in tmux:
+                val = str(tmux["default_split"]).lower()
+                if val in ("horizontal", "vertical"):
+                    defaults["default_split"] = val
+            if "prefer_tmux" in tmux:
+                defaults["prefer_tmux"] = bool(tmux["prefer_tmux"])
+            if "git_tui" in tmux:
+                defaults["git_tui"] = str(tmux["git_tui"] or "")
+            syncer = tmux.get("syncer")
+            if isinstance(syncer, dict) and "autostart" in syncer:
+                defaults["syncer_autostart"] = bool(syncer["autostart"])
+    except Exception:
+        pass
+    return defaults
+
+
+# --- Registry-file CLI (t970) -------------------------------------------------
+# Thin shell-out surface so bash (aitask_projects.sh / aitask_project_resolve.sh)
+# can read ~/.config/aitasks/projects.yaml through this single Python authority
+# instead of maintaining duplicate awk parsers. Stdlib only; touches neither
+# tmux nor Textual. Honors AITASKS_PROJECTS_INDEX via _parse_registry_records().
+
+
+def _cli_list_registry(strict: bool = False) -> int:
+    """Emit one ``name|path|git_remote|last_opened|project_group`` line per entry.
+
+    Byte-identical to the former bash awk reader — pipe-separated, empty
+    fields preserved, file order. Feeds the registry read+write round-trip, so
+    the 5th ``project_group`` field (t1025_1) must round-trip for the whole-line-
+    preserving writers (``cmd_remove`` / ``cmd_prune``) to retain group state.
+    """
+    if strict:
+        # Nothing is printed on a read failure: a partial listing followed by
+        # an error would still read as a complete one to a line consumer.
+        try:
+            records = _parse_registry_records_strict()
+        except (OSError, ValueError) as exc:
+            sys.stderr.write(f"registry unreadable: {exc}\n")
+            return 3
+    else:
+        records = _parse_registry_records()
+    out = "".join(
+        (
+            f"{record.name}|{record.path}|{record.git_remote}|"
+            f"{record.last_opened}|{record.project_group}\n"
+        )
+        for record in records
+    )
+    sys.stdout.write(out)
+    return 0
+
+
+def _cli_resolve_index(name: str) -> int:
+    """Print the path of the first registry entry matching ``name``.
+
+    Matches bash ``index_lookup_path``: first entry whose name equals ``name``
+    *and* has a non-empty path wins; prints nothing on miss. Exit 0 either way.
+    """
+    for record in _parse_registry_records():
+        if record.name == name and record.path:
+            sys.stdout.write(f"{record.path}\n")
+            return 0
+    return 0
+
+
+def _cli_validate_slug(slug: str) -> int:
+    """Validate a project-group slug for the bash write paths (t1025_1).
+
+    Exit 0 when valid; exit 1 and print the reason to stderr otherwise. The
+    single slug authority — ``ait projects group set`` and the add/sync
+    bootstrap shell out here instead of re-implementing the regex in bash.
+    """
+    valid, reason = validate_project_group_slug(slug)
+    if valid:
+        return 0
+    sys.stderr.write(f"{reason}\n")
+    return 1
+
+
+def _main(argv: list[str]) -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="agent_launch_utils.py",
+        description="Internal registry-file reader for the cross-repo project "
+        "registry. Prefer `ait projects` for user-facing use.",
+    )
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument(
+        "--list-registry",
+        action="store_true",
+        help="Emit name|path|git_remote|last_opened|project_group per entry.",
+    )
+    group.add_argument(
+        "--list-registry-strict",
+        action="store_true",
+        help="As --list-registry, but exit 3 when an existing registry cannot "
+             "be read (a missing file is still an empty, successful answer).",
+    )
+    group.add_argument(
+        "--resolve-index",
+        metavar="NAME",
+        help="Print the registry path for NAME (index-file lookup only).",
+    )
+    group.add_argument(
+        "--validate-slug",
+        metavar="SLUG",
+        help="Exit 0 if SLUG is a valid project-group slug, else 1 (+reason).",
+    )
+    args = parser.parse_args(argv)
+
+    if args.list_registry:
+        return _cli_list_registry()
+    if args.list_registry_strict:
+        return _cli_list_registry(strict=True)
+    if args.validate_slug is not None:
+        return _cli_validate_slug(args.validate_slug)
+    return _cli_resolve_index(args.resolve_index)
+
+
+if __name__ == "__main__":
+    sys.exit(_main(sys.argv[1:]))

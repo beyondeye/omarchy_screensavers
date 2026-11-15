@@ -1,0 +1,4243 @@
+"""monitor_app - TUI for monitoring tmux panes running code agents.
+
+Shows all tmux panes categorized as agents, TUIs, or other. Uses a zone-based
+navigation model: Tab cycles between 2 panels (session list, preview), Up/Down
+navigates within the session list panel, and the preview panel forwards all
+keystrokes directly to the tmux session being previewed.
+
+Usage:
+    python monitor_app.py [--session NAME] [--interval SECS] [--lines N]
+"""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import contextlib
+import os
+import sys
+from collections.abc import Callable
+from enum import Enum
+from pathlib import Path
+
+# Set up import paths before any local imports
+_SCRIPT_DIR = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_SCRIPT_DIR))
+sys.path.insert(0, str(_SCRIPT_DIR / "lib"))
+
+from monitor.tmux_monitor import (  # noqa: E402
+    PaneCategory,
+    PaneSnapshot,
+    TmuxMonitor,
+    # The ONE pane-ordering authority (t1659), shared with minimonitor — the two
+    # agent lists must not be able to drift apart.
+    pane_sort_key,
+    load_monitor_config,
+    load_project_tmux_config,
+    capture_shadow_text,
+    compute_shadow_staleness,
+    compute_block_age_staleness,
+    combine_staleness,
+    refresh_shadow_phase_stamp_async,
+    find_shadow_pane_status,
+    spawn_shadow,
+    _SHADOW_DEEP_RETRY_LINES,
+    _SHADOW_TRUNCATED_MSG,
+)
+from monitor.tmux_control import TmuxControlState  # noqa: E402
+import agent_marks  # noqa: E402
+from monitor.monitor_shared import (  # noqa: E402
+    _ansi_to_rich_text, _TASK_ID_RE, GateSummaryCache, TaskInfo, TaskInfoCache,
+    workflow_phase,
+    TaskDetailDialog, KillConfirmDialog, FreezeConfirmDialog, NextSiblingDialog, ChooseSiblingModal,
+    AgentMarksMixin, ConcernBlockInspectModal, ConcernPickerModal,
+    ShadowRejectionsMixin, STATE_STYLE_DONE,
+    format_compare_mode_glyph, format_mark_glyph, format_frozen_prefix,
+    format_pane_status,
+    format_session_divider, format_shadow_glyph, format_state_dot,
+    is_task_completed, uncertified_round_block_msg, unparsed_concerns_msg,
+    format_staleness_detail, markup_literal,
+    MonitorClient, build_monitor_client,
+)
+from monitor.concern_parser import (  # noqa: E402
+    _SENTINEL_SAFE_COLS, block_head_truncated, block_region,
+    build_clipboard_payload, concern_block_signature, concern_marker_line,
+    has_invalid_round_header, is_metadata_only_block, needs_addressing,
+    parse_block_meta, parse_concerns,
+    unrecovered_markers,
+)
+from monitor.sitrep_close import (  # noqa: E402
+    SitrepCloseMixin, SitrepNowCounter, format_sitrep_term,
+)
+from monitor.desync_summary import (  # noqa: E402
+    # The blocking `get_desync_summary` is deliberately NOT imported here
+    # (t1622): every call site in this module is on a Textual path.
+    get_desync_summary_async as _get_desync_summary_async,
+    get_desync_summary_cached as _get_desync_summary_cached,
+)
+from rich.text import Text  # noqa: E402
+from textual.content import Content  # noqa: E402
+from tui_switcher import TuiSwitcherMixin  # noqa: E402
+from shortcuts_mixin import ShortcutsMixin  # noqa: E402
+from tui_clipboard import copy_to_system_clipboard  # noqa: E402
+
+import subprocess  # noqa: E402
+from agent_launch_utils import resolve_dry_run_command, resolve_agent_string, TmuxLaunchConfig, launch_in_tmux, maybe_spawn_minimonitor, mark_monitor_pane, tmux_session_target, unmark_monitor_pane, load_tmux_defaults  # noqa: E402
+from agent_command_screen import AgentCommandScreen, build_pick_screen  # noqa: E402
+from tmux_exec import TMUX_CLIENT_FLAGS, TmuxClient, tmux_text_kwargs  # noqa: E402
+
+# Gateway client for the Layer-A backend calls below (has-session /
+# rename-session target the ait backend session by name, so they must reach
+# the dedicated gateway socket — t953). Ambient $TMUX self-probes
+# (display-message / rename-window on our own pane) stay raw by design.
+_TMUX = TmuxClient()
+
+from textual.app import App, ComposeResult  # noqa: E402
+from textual.binding import Binding  # noqa: E402
+from textual.containers import (  # noqa: E402
+    Container, Horizontal, ScrollableContainer, Vertical, VerticalScroll,
+)
+from textual.screen import ModalScreen  # noqa: E402
+from textual.timer import Timer  # noqa: E402
+from textual.widgets import Button, Footer, Header, Label, Static  # noqa: E402
+
+
+def _rename_window_argv(pane: str | None) -> list[str]:
+    """Build the ``tmux rename-window monitor`` argv, pinned to *pane*.
+
+    Returns an EMPTY list when *pane* is falsy. Without $TMUX_PANE there is no
+    reliable way to identify the monitor's own window, and an untargeted
+    ``tmux rename-window`` resolves to the attached client's *active* window —
+    which, with automatic-rename off, would permanently mislabel an unrelated
+    window (e.g. an agent-explore window or a board) as ``monitor``. Fail safe:
+    issue no rename rather than renaming an arbitrary window. See t941 / t1130.
+    """
+    if not pane:
+        return []
+    return ["tmux", *TMUX_CLIENT_FLAGS, "rename-window", "-t", pane, "monitor"]
+
+
+# -- Zone model ---------------------------------------------------------------
+
+class Zone(Enum):
+    PANE_LIST = "pane_list"
+    PREVIEW = "preview"
+    SHADOW = "shadow"
+
+
+ZONE_ORDER = [Zone.PANE_LIST, Zone.PREVIEW, Zone.SHADOW]
+
+# -- Shadow column (t1216_2) ---------------------------------------------------
+#
+# How many consecutive FULL refreshes may drop the shadow snapshot before the
+# SHADOW zone gives up and falls back to PREVIEW. A snapshot can go absent for
+# two indistinguishable reasons — the shadow pane died, or a single capture
+# failed (test_monitor_shadow_status.LifecycleTests pins that a transient
+# failure legitimately drops the entry with no stale preservation) — so the
+# grace window covers both rather than pretending they can be told apart.
+# Counted on the 3s tick, so 2 ticks is a wall-clock ~6s.
+SHADOW_ABSENT_GRACE_TICKS = 2
+
+# Minimum columns the AGENT preview must keep for the side-by-side split to be
+# worth doing. Below this the split is suppressed and only the focused column
+# is rendered full-width.
+SHADOW_MIN_AGENT_COLS = 40
+
+# Preview panel size presets: (section_max_height, preview_max_height, label)
+#
+# Numeric heights are applied as-is. String heights of the form "agents:N"
+# mean: size the pane-list to fit N agent cards and give the rest of the
+# terminal to the preview section (resolved at apply time).
+PREVIEW_AGENT_CARD_LINES = 2     # worst-case lines per PaneCard (status row + task title row)
+PREVIEW_LAYOUT_FIXED_LINES = 5   # header + session-bar + footer (3) + pane-list top/bottom border (2)
+PREVIEW_MIN_SECTION_H = 4        # minimum section height so preview is never fully hidden
+PREVIEW_MIN_PREVIEW_H = 2        # minimum inner scroll height
+
+PREVIEW_SIZES = [
+    (12, 10, "S"),
+    (24, 22, "M"),
+    (40, 38, "L"),
+    ("agents:9", "agents:9", "XL_9"),
+    ("agents:6", "agents:6", "XL_6"),
+    ("agents:3", "agents:3", "XL_3"),
+]
+PREVIEW_DEFAULT_SIZE = 1  # Medium
+
+# The abstract-key-name → tmux send-keys map (`_TEXTUAL_TO_TMUX`) and its
+# translator moved to monitor_core (t822_7); the applink `forward_key` verb and
+# this preview-zone forwarder both resolve keys via monitor_core.translate_key,
+# reached here through TmuxMonitor.forward_key.
+
+
+# -- Widgets ------------------------------------------------------------------
+
+class SessionBar(Static):
+    """One-line bar showing session name, pane count, awaiting + idle counts."""
+    pass
+
+
+class PaneCard(Static, can_focus=True):
+    """Status entry for a pane in the agents/other section."""
+
+    def __init__(self, pane_id: str, text: str, **kwargs) -> None:
+        super().__init__(text, **kwargs)
+        self.pane_id = pane_id
+
+
+class PreviewPanel(Static, can_focus=True):
+    """Focusable content preview panel — forwards keystrokes to tmux when active."""
+    pass
+
+
+class PreviewRow(Horizontal):
+    """Horizontal row holding the agent + shadow preview columns.
+
+    Owns the trigger for the narrow-split decision (t1216_2). The App-level
+    `on_resize` fires BEFORE this row has been re-laid-out, so a fit check
+    driven from there measures a stale `content_region` (verified: on a
+    120→70 resize the App handler still sees a 120-column row). Reacting to
+    the row's OWN Resize event is what makes the measurement authoritative.
+    """
+
+    on_row_resize: Callable[[], None] | None = None
+
+    def on_resize(self, event) -> None:
+        if self.on_row_resize is not None:
+            self.on_row_resize()
+
+
+class PreviewScrollContainer(ScrollableContainer):
+    """ScrollableContainer that reports user-driven scroll changes.
+
+    Hooks the private `_on_*` handlers to run after Textual's built-in
+    handlers. The notify is scheduled via `call_after_refresh` because
+    Textual commits `scroll_y` updates on the next refresh frame — reading
+    `self.scroll_y` synchronously after `super()._on_*` returns the
+    pre-scroll value.
+    """
+
+    on_user_scroll: Callable[[], None] | None = None
+    # Set synchronously inside each _on_* handler; cleared by
+    # _record_preview_scroll after the deferred state update commits.
+    # Read by _update_content_preview to skip content updates + scroll
+    # restoration on the same frame as a user scroll event, avoiding a
+    # race where the refresh tick would undo the user's scroll.
+    user_is_scrolling: bool = False
+
+    def _on_mouse_scroll_up(self, event) -> None:
+        self.user_is_scrolling = True
+        super()._on_mouse_scroll_up(event)
+        self._schedule_notify()
+
+    def _on_mouse_scroll_down(self, event) -> None:
+        self.user_is_scrolling = True
+        super()._on_mouse_scroll_down(event)
+        self._schedule_notify()
+
+    def _on_scroll_up(self, event) -> None:
+        self.user_is_scrolling = True
+        super()._on_scroll_up(event)
+        self._schedule_notify()
+
+    def _on_scroll_down(self, event) -> None:
+        self.user_is_scrolling = True
+        super()._on_scroll_down(event)
+        self._schedule_notify()
+
+    def _on_scroll_to(self, message) -> None:
+        self.user_is_scrolling = True
+        super()._on_scroll_to(message)
+        self._schedule_notify()
+
+    def _schedule_notify(self) -> None:
+        if self.on_user_scroll is not None:
+            self.call_after_refresh(self.on_user_scroll)
+
+
+class SessionRenameDialog(ModalScreen):
+    """Dialog offering to rename the current tmux session."""
+
+    DEFAULT_CSS = """
+    SessionRenameDialog {
+        align: center middle;
+    }
+    #rename-dialog {
+        width: 60;
+        height: auto;
+        background: $surface;
+        border: thick $warning;
+        padding: 1 2;
+    }
+    #rename-message {
+        margin: 0 0 1 0;
+    }
+    #rename-buttons {
+        width: 100%;
+        height: auto;
+        layout: horizontal;
+    }
+    #rename-buttons Button {
+        margin: 0 1;
+    }
+    """
+
+    BINDINGS = [
+        Binding("escape", "dismiss_dialog", "Close", show=False),
+    ]
+
+    def __init__(self, current: str, expected: str) -> None:
+        super().__init__()
+        self._current = current
+        self._expected = expected
+
+    def compose(self) -> ComposeResult:
+        with Container(id="rename-dialog"):
+            # Session names are tmux-side user input and each sits directly
+            # before `[/]`, so they are `$variables`, never interpolated (t2017).
+            yield Label(
+                Content.from_markup(
+                    "[bold yellow]Session name mismatch[/]\n\n"
+                    "Current session: [bold]$current[/]\n"
+                    "Expected session: [bold]$expected[/]\n\n"
+                    "Rename session to [bold]$expected[/]?",
+                    current=self._current, expected=self._expected,
+                ),
+                id="rename-message",
+            )
+            with Container(id="rename-buttons"):
+                yield Button("Rename", variant="warning", id="btn-rename")
+                yield Button("Continue anyway", variant="default", id="btn-continue")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "btn-rename":
+            # Gateway-routed with an explicit exact-match target (t953): with
+            # the dedicated `-L ait` socket in the argv, implicit
+            # current-session resolution would rely on $TMUX_PANE existing on
+            # the ait server — false when the monitor runs inside a legacy
+            # default-socket session. The gateway swallows exceptions into
+            # rc != 0, so branch on rc instead of try/except.
+            rc, _ = _TMUX.run(
+                ["rename-session", "-t", tmux_session_target(self._current),
+                 self._expected],
+            )
+            if rc == 0:
+                self.dismiss(True)
+            else:
+                self.app.notify("Failed to rename session", severity="error")
+                self.dismiss(False)
+        else:
+            self.dismiss(False)
+
+    def action_dismiss_dialog(self) -> None:
+        self.dismiss(False)
+
+
+class RestartConfirmDialog(ModalScreen):
+    """Confirmation dialog for restarting the task in the focused agent pane."""
+
+    BINDINGS = [Binding("escape", "dismiss_dialog", "Close", show=False)]
+
+    DEFAULT_CSS = """
+    RestartConfirmDialog { align: center middle; }
+    #restart-dialog { width: 70%; height: auto; background: $surface; border: thick $warning; padding: 1 2; }
+    #restart-header { text-style: bold; color: $warning; margin: 0 0 1 0; }
+    #restart-details { margin: 0 0 1 0; }
+    #restart-buttons { width: 100%; height: auto; layout: horizontal; }
+    #restart-buttons Button { margin: 0 1; }
+    """
+
+    def __init__(
+        self,
+        task_id: str,
+        title: str,
+        status: str,
+        idle_seconds: float,
+    ) -> None:
+        super().__init__()
+        self._task_id = task_id
+        self._title = title
+        self._status = status
+        self._idle_seconds = idle_seconds
+
+    def compose(self) -> ComposeResult:
+        with Container(id="restart-dialog"):
+            yield Static("[bold yellow]Restart Task[/]", id="restart-header")
+            # Title and status are task-file text, so they are `$variables`
+            # (t2017) — the `KillConfirmDialog` pattern. Only framework
+            # markup stays in the template.
+            variables = {
+                "task_id": self._task_id, "title": self._title,
+                "status": self._status,
+            }
+            lines = [
+                "Current:   [bold]t$task_id[/]: $title  (Status: $status)",
+                f"Terminal:  idle for {int(self._idle_seconds)}s",
+            ]
+            if self._status != "Ready":
+                lines.append(
+                    "\n[yellow]⚠ Task status is '$status' (not Ready) — "
+                    "pick workflow may behave unexpectedly[/]"
+                )
+            lines.append(
+                "\n[dim]The current pane will be killed after you confirm the spawn dialog.[/]"
+            )
+            yield Static(Content.from_markup("\n".join(lines), **variables),
+                         id="restart-details")
+            with Container(id="restart-buttons"):
+                yield Button("Restart", variant="warning", id="btn-restart")
+                yield Button("Cancel", variant="default", id="btn-cancel")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        self.dismiss(event.button.id == "btn-restart")
+
+    def action_dismiss_dialog(self) -> None:
+        self.dismiss(False)
+
+
+# -- Main app -----------------------------------------------------------------
+
+class MonitorApp(
+    AgentMarksMixin, SitrepCloseMixin, ShadowRejectionsMixin, TuiSwitcherMixin,
+    ShortcutsMixin, App
+):
+    """Textual app for monitoring tmux panes running code agents."""
+
+    _shortcuts_scope = "monitor"
+
+    #: Class-level floor for the per-tick parked set (t1685), the same rationale
+    #: as `AgentMarksMixin._session_root_map`: many test modules build the app
+    #: with `__new__` and hand-set only what they touch, so an `__init__`-only
+    #: default would AttributeError the moment a consumer read it — and the
+    #: consumers here include the concern offer and the signature scan, which
+    #: are nowhere near the parked feature. Safe to share: `_refresh_data`
+    #: **rebinds** this name every tick and never mutates the set in place.
+    _parked_pane_ids: frozenset = frozenset()
+    #: Frozen panes for this tick (t1705_7). A CLASS-LEVEL floor for the same
+    #: reason `_parked_pane_ids` has one: its consumers (the concern offer, the
+    #: signature scan) are exercised by `__new__`-built test apps that never run
+    #: `_refresh_data`.
+    _frozen_pane_ids: frozenset = frozenset()
+    #: Open Pick-now items of this project's sitrep store (t2175_5), and the
+    #: content-keyed counter behind it. Class-level floors, same rationale.
+    _sitrep_now: "int | None" = None
+    _sitrep_counter: "SitrepNowCounter | None" = None
+
+    TITLE = "tmux Monitor"
+
+    CSS = """
+    #session-bar {
+        dock: top;
+        height: 1;
+        background: $primary;
+        color: $text;
+        padding: 0 1;
+        text-style: bold;
+    }
+
+    #pane-list {
+        height: 1fr;
+        border: solid $primary-darken-2;
+    }
+
+    #pane-list.zone-active {
+        border: solid $accent;
+    }
+
+    .section-header {
+        padding: 0 1;
+        text-style: bold;
+        color: $text-muted;
+    }
+
+    PaneCard {
+        height: auto;
+        padding: 0 1;
+    }
+
+    PaneCard.selected {
+        background: $accent 30%;
+    }
+
+    PaneCard:focus {
+        background: $accent;
+        color: $text;
+    }
+
+    #content-section {
+        height: auto;
+        max-height: 24;
+        min-height: 3;
+        border-bottom: solid $primary-darken-2;
+    }
+
+    #content-section.zone-active {
+        border-bottom: solid $warning;
+    }
+
+    #content-header {
+        dock: bottom;
+        padding: 0 1;
+        text-style: bold;
+        color: $text-muted;
+    }
+
+    #preview-scroll {
+        height: 1fr;
+        max-height: 22;
+        scrollbar-gutter: stable;
+    }
+
+    #preview-row {
+        height: 1fr;
+    }
+
+    #agent-col {
+        width: 1fr;
+    }
+
+    #shadow-col {
+        width: auto;
+        display: none;
+        border-left: solid $primary-darken-2;
+    }
+
+    #shadow-col.zone-active {
+        border-left: solid $warning;
+    }
+
+    #shadow-scroll {
+        height: 1fr;
+        max-height: 22;
+        scrollbar-gutter: stable;
+    }
+
+    #shadow-header {
+        dock: bottom;
+        padding: 0 1;
+        text-style: bold;
+        color: $text-muted;
+    }
+
+    PreviewPanel {
+        height: auto;
+        background: #1a1a1a;
+        color: #d4d4d4;
+    }
+
+    PreviewPanel:focus {
+        background: #1a1a1a;
+    }
+    """
+
+    BINDINGS = [
+        *ShortcutsMixin.SHORTCUTS_MIXIN_BINDINGS,
+        Binding("tab", "switch_zone", "← Back (Tab)", show=True),
+        Binding("j", "tui_switcher", "TUI switcher"),
+        Binding("q", "quit", "Quit"),
+        Binding("s", "switch_to", "Switch"),
+        Binding("i", "show_task_info", "Task Info"),
+        Binding("r", "refresh", "Refresh"),
+        # Hidden on purpose: an alias of `r`, which is already footer-visible with
+        # the same label and action. Showing both would duplicate a footer entry
+        # rather than surface an operation.
+        Binding("f5", "refresh", "Refresh", show=False),
+        Binding("z", "cycle_preview_size", "Zoom"),
+        Binding("t", "scroll_preview_tail", "Tail"),
+        Binding("k", "kill_pane", "Kill"),
+        Binding("n", "pick_next_sibling", "Next Sibling"),
+        Binding("R", "restart_task", "Restart"),
+        Binding("enter", "send_enter", "Send ↵", show=True),
+        Binding("A", "toggle_auto_switch", "Auto"),
+        Binding("M", "toggle_multi_session", "Multi"),
+        Binding("L", "open_log", "Log"),
+        Binding("d", "cycle_compare_mode", "Detect"),
+        Binding("c", "pick_concerns", "Concerns"),
+        Binding("e", "launch_shadow", "Shadow"),
+        Binding("E", "launch_shadow_pick", "Shadow (pick)"),
+        Binding("space", "toggle_mark", "Mark"),
+        # The action id stays `toggle_parked_visibility` even though it now
+        # hides frozen agents too — it is a persisted key-override identifier
+        # (see `action_toggle_parked_visibility`). Only the label widened.
+        Binding("P", "toggle_parked_visibility", "Parked/frozen"),
+        # Frozen agents (t1705_7). `f`/`Z` are free in BOTH apps, so the two
+        # TUIs read identically; `z` is Zoom here and `R` is Restart, which is
+        # why neither could take the task's originally-proposed keys. Restore
+        # and re-pick are the frozen-agent viewer's own `R` / `P`, reached with
+        # `s` (t2054); `k` keeps its live-card meaning and branches INSIDE the
+        # action.
+        Binding("f", "freeze_current", "Freeze"),
+        Binding("Z", "freeze_all", "Freeze all"),
+        # Sitrep (t2175_5): `h` harvests the focused agent into the sitrep store,
+        # shows what was captured, and only then offers to close it; `S` opens
+        # or switches to the repository's sitrep window. Free in both apps.
+        Binding("h", "harvest_close", "Harvest"),
+        Binding("S", "open_sitrep", "Sitrep"),
+    ]
+
+    def __init__(
+        self,
+        session: str,
+        project_root: Path,
+        refresh_seconds: int = 3,
+        capture_lines: int = 200,
+        idle_threshold: float = 5.0,
+        agent_prefixes: list[str] | None = None,
+        tui_names: set[str] | None = None,
+        expected_session: str | None = None,
+        multi_session: bool = True,
+        compare_mode_default: str = "stripped",
+        rename_window: bool = False,
+        mark_pane: bool = False,
+        monitor_server: bool | None = None,
+    ) -> None:
+        super().__init__()
+        self.current_tui_name = "monitor"
+        # Only the production launcher (main()) passes rename_window=True.
+        # Test mounts keep the default False so on_mount can never rename a
+        # window on the live tmux server — a test run inside an agent's pane
+        # inherits that pane's $TMUX_PANE and would relabel the agent's own
+        # window as "monitor" (t1240).
+        self._rename_window = rename_window
+        # Same production-launcher gate, for the @aitask_monitor_kind pane
+        # marker the single-instance guards read (t1451): a run_test() mount
+        # inherits the agent's $TMUX_PANE and must not stamp a live pane.
+        self._mark_pane = mark_pane
+        # Whether this instance may subscribe to the shared status server
+        # (t2037_3): None follows AITASKS_MONITOR_SERVER, False keeps it
+        # in-process (main() passes False for an explicit --interval/--lines).
+        self._monitor_server = monitor_server
+        self._session = session
+        self._expected_session = expected_session
+        self._refresh_seconds = refresh_seconds
+        self._capture_lines = capture_lines
+        self._idle_threshold = idle_threshold
+        self._agent_prefixes = agent_prefixes
+        self._tui_names = tui_names
+        self._project_root = project_root
+        # Client view state (t2034_2): the `M` toggle and the own-pane drop live
+        # here, not in the producer — see `AgentMarksMixin._project_snapshots`.
+        self._multi_session = multi_session
+        self._own_pane_id = os.environ.get("TMUX_PANE") or None
+        self._compare_mode_default = compare_mode_default
+        self._snapshots: dict[str, PaneSnapshot] = {}
+        self._focused_pane_id: str | None = None
+        # Per-pane scroll memory: pane_id → (was_at_bottom, anchor_text).
+        # `anchor_text` is the text of the topmost visible line at the moment
+        # the user scrolled; on each refresh we locate it in the new content
+        # and re-scroll so the same line stays at the top of the viewport,
+        # which is stable against tmux's rolling capture window.
+        self._preview_scroll_state: dict[str, tuple[bool, str | None]] = {}
+        self._last_preview_pane_id: str | None = None
+        # Lines last passed to preview.update() for the focused pane. Used by
+        # _record_preview_scroll to resolve int(scroll_y) to anchor_text without
+        # mixing rendered-view coordinates with live-snapshot coordinates.
+        self._preview_rendered_lines: list[str] = []
+        # Monotonic token bumped for every scheduled preview render (t1111_5).
+        # Guards the offloaded _ansi_to_rich_text render against out-of-order /
+        # superseded resolution: an apply (and its deferred scroll restore) only
+        # touches the preview if its token is still current AND focus has not moved.
+        self._preview_render_gen: int = 0
+        # -- Shadow column mirrors of the four fields above (t1216_2). Kept
+        # separate rather than shared so a slow shadow render can never
+        # supersede an agent render (and vice versa); the two run in different
+        # worker groups for the same reason. _shadow_scroll_state is keyed by
+        # the SHADOW pane id, not the followed agent's.
+        self._shadow_scroll_state: dict[str, tuple[bool, str | None]] = {}
+        self._last_shadow_pane_id: str | None = None
+        self._shadow_rendered_lines: list[str] = []
+        self._shadow_render_gen: int = 0
+        # Consecutive FULL refreshes for which the selected agent's shadow
+        # snapshot was absent. See SHADOW_ABSENT_GRACE_TICKS.
+        self._shadow_absent_ticks: int = 0
+        # Whether the shadow column is currently shown (a shadow is known AND
+        # the side-by-side split fits — Step 4 narrow fallback).
+        self._shadow_split_ok: bool = False
+        # Last observed shadow pane width. Used to keep the column sized (and
+        # visible) while the zone HOLDS a momentarily-absent snapshot during
+        # the grace window, when no snapshot is available to measure.
+        self._last_shadow_width: int | None = None
+        # The agent whose shadow the SHADOW zone is currently bound to. Set on
+        # entry, used to tell "the selection moved" from "the snapshot blipped".
+        self._shadow_zone_agent_id: str | None = None
+        # Which preview column `t` (tail) targets. `t` is only pressable from
+        # PANE_LIST — check_action disables every non-switch_zone binding while
+        # a preview zone is focused — so this tracks the LAST-focused preview
+        # column rather than the active zone.
+        self._active_preview_zone: Zone = Zone.PREVIEW
+        # -- Shadow concern state (t1216_3). Keyed by the FOLLOWED agent's pane
+        # id, not the shadow's: the monitor's identity for a row is the agent,
+        # and a marker must survive a shadow respawn so an identical block is
+        # not re-offered.
+        #
+        # Every agent's shadow snapshot resolved on the current full tick, so
+        # the concern scan reuses the one lookup _reconcile_shadow_state already
+        # does instead of re-walking get_shadow_snapshot.
+        self._tick_shadow_snaps: dict[str, PaneSnapshot] = {}
+        # This tick's raw-capture signature per agent. Absent => no complete
+        # block => no badge. Rebuilt every tick (see _scan_concern_signatures).
+        self._concern_sig_latest: dict[str, str] = {}
+        # Signatures already offered (the picker was pushed, or the block was
+        # authoritatively shown to hold nothing forwardable) and signatures
+        # already checked with a -J capture. Each value is a frozenset holding
+        # BOTH the raw trigger digest and the -J captured one — the two capture
+        # paths hash the same block differently whenever it wraps mid-word, so a
+        # single stored string would never match again.
+        self._concern_sig_offered: dict[str, frozenset[str]] = {}
+        self._concern_sig_examined: dict[str, frozenset[str]] = {}
+        # Throttle for the sub-_SENTINEL_SAFE_COLS probe (every other tick).
+        self._concern_tick: int = 0
+        # One offer pass at a time. A busy latch rather than an exclusive worker:
+        # cancelling would orphan capture_shadow_text's subprocess, which is
+        # killed only on its own timeout.
+        self._offer_busy: bool = False
+        # Held from the `c` keypress until the picker is dismissed, so a second
+        # `c` over the open modal cannot stack another one.
+        self._concern_pick_busy: bool = False
+        # Task id of the agent the open picker belongs to, captured at pick time
+        # for the dismissal callback (t1427_2). None = unresolvable.
+        self._concern_pick_task_id: str | None = None
+        self._pane_cards: dict[str, PaneCard] = {}
+        self._selected_card_pane_id: str | None = None
+        # A `MonitorClient` wrapping this app's own `TmuxMonitor` (t2037_3) —
+        # the same read surface, served by the shared status server or
+        # in-process. Tests hand-set fakes of either shape.
+        self._monitor: TmuxMonitor | MonitorClient | None = None
+        # Fast-refresh workers in flight / asked for one more round, by
+        # refresh name (`_dispatch_fast_refresh`, t2037_3).
+        self._fast_inflight: set[str] = set()
+        self._fast_again: set[str] = set()
+        self._active_zone: Zone = Zone.PANE_LIST
+        self._preview_timer: Timer | None = None
+        self._delayed_refresh_timer: Timer | None = None
+        self._refresh_timer: Timer | None = None
+        self._preview_size_idx: int = PREVIEW_DEFAULT_SIZE
+        self._task_cache = TaskInfoCache(project_root)
+        self._gate_cache = GateSummaryCache()
+        self._auto_switch: bool = False
+        # Pane ids whose task is finished, recomputed once per refresh tick
+        # (t1322). Read by the card badge, the session bar's `done` counter and
+        # the auto-switch filter, so all three agree within a tick. Starts empty
+        # so keypress-driven rebuilds that run outside _refresh_data (e.g.
+        # action_toggle_auto_switch) reuse the last tick's set rather than
+        # triggering an N-stat fan-out on a keystroke.
+        self._completed_pane_ids: frozenset[str] = frozenset()
+        # Pane ids whose agent is parked, recomputed once per refresh tick
+        # (t1685). Same "starts empty so a keypress-driven rebuild reuses the
+        # last tick's set" contract as `_completed_pane_ids` above.
+        self._parked_pane_ids: frozenset[str] = frozenset()
+        self._frozen_pane_ids: frozenset[str] = frozenset()
+        # Prioritized-agent marks (t1326): cached reader + purge scheduling.
+        #: Advisory shadow-phase stamps queued by the card renderer, flushed
+        #: after the rebuild so the render path makes no tmux call (t1598).
+        self._pending_shadow_stamps: list[tuple[str, object]] = []
+        self._init_agent_marks()
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield SessionBar(id="session-bar")
+        yield VerticalScroll(id="pane-list")
+        # Two columns inside the preview section: the agent preview (left,
+        # elastic) and the shadow preview (right, sized to the real shadow
+        # pane's width so its content renders unwrapped). #shadow-col is
+        # display:none until a shadow is bound AND the split fits (t1216_2).
+        # The agent column keeps every id the rest of the app queries by
+        # (#preview-scroll, #content-preview, #content-header); #content-header
+        # docks to whatever its parent is, so moving it inside #agent-col
+        # re-docks it there with no CSS change.
+        yield Container(
+            PreviewRow(
+                Vertical(
+                    PreviewScrollContainer(
+                        PreviewPanel("", id="content-preview"),
+                        id="preview-scroll",
+                    ),
+                    Static("[bold]Content Preview[/]", id="content-header"),
+                    id="agent-col",
+                ),
+                Vertical(
+                    PreviewScrollContainer(
+                        PreviewPanel("", id="shadow-preview"),
+                        id="shadow-scroll",
+                    ),
+                    Static("[bold]Shadow[/]", id="shadow-header"),
+                    id="shadow-col",
+                ),
+                id="preview-row",
+            ),
+            id="content-section",
+        )
+        yield Footer()
+
+    def on_mount(self) -> None:
+        # Pure-DOM widget wiring first: it has no tmux dependency, so it must
+        # not sit behind the not-inside-tmux early return below (which would
+        # also make it unreachable from any test that scrubs $TMUX).
+        self._wire_preview_hooks()
+
+        if not os.environ.get("TMUX"):
+            self.sub_title = "Not running inside tmux"
+            self.query_one("#session-bar", SessionBar).update(
+                "[bold red]Warning:[/] Not inside tmux — monitoring requires an active tmux session"
+            )
+            return
+
+        # Rename the tmux window so the TUI switcher can find us. This runs
+        # before `_start_monitoring()` constructs `self._monitor`, so it must
+        # use raw subprocess rather than `self._monitor.tmux_run`. Gated on
+        # the constructor's rename_window flag (production launcher only) so
+        # test mounts never rename a live window (t1240).
+        if self._rename_window:
+            try:
+                rename_argv = _rename_window_argv(os.environ.get("TMUX_PANE"))
+                if rename_argv:
+                    subprocess.run(rename_argv, capture_output=True, timeout=5)
+            except Exception:
+                pass
+
+        # Stamp our own pane so the single-instance guards can see us (t1451).
+        # The spawner never does this — see mark_monitor_pane's docstring.
+        if self._mark_pane:
+            with contextlib.suppress(Exception):
+                mark_monitor_pane("monitor")
+
+        # Check if session name matches expected config. In multi-session
+        # mode the attached session name is effectively "whichever aitasks
+        # session you happen to be in"; the rename prompt is noise there.
+        if (
+            not self._multi_session
+            and self._expected_session
+            and self._session != self._expected_session
+        ):
+            # Check if a session with the expected name already exists.
+            # Pre-monitor-init: no `self._monitor` yet, so the module-level
+            # gateway client is the path here (Layer-A backend query, t953).
+            try:
+                rc, _ = _TMUX.run(
+                    ["has-session", "-t",
+                     tmux_session_target(self._expected_session)],
+                )
+                if rc == 0:
+                    # Expected session exists elsewhere — just warn
+                    self.notify(
+                        f"Session '{self._session}' differs from configured "
+                        f"'{self._expected_session}' (which already exists)",
+                        severity="warning",
+                        timeout=8,
+                        markup=False,  # session names, unstyled (t2017)
+                    )
+                else:
+                    # Offer to rename
+                    self.push_screen(
+                        SessionRenameDialog(self._session, self._expected_session),
+                        callback=self._on_session_rename,
+                    )
+                    return  # _start_monitoring called from callback
+            except Exception:
+                pass
+
+        self._start_monitoring()
+
+    def _on_session_rename(self, renamed: bool | None) -> None:
+        """Callback after session rename dialog."""
+        if renamed:
+            self._session = self._expected_session  # type: ignore[assignment]
+            self.notify(f"Session renamed to '{self._session}'", markup=False)
+        self._start_monitoring()
+
+    def _teardown_prior_monitoring(self) -> None:
+        """Cancel the prior refresh timer and close the prior monitor's
+        control client, if any.
+
+        Called at the top of `_start_monitoring()` so re-entry paths
+        (e.g., the `SessionRenameDialog` callback) do not leak a refresh
+        timer, a `tmux -C attach` subprocess, or a `tmux-control-loop`
+        bg thread. Without this guard, a session-rename re-entry doubles
+        the polling cadence and silently spawns a second control client
+        that lives until the process exits.
+        """
+        if self._refresh_timer is not None:
+            with contextlib.suppress(Exception):
+                self._refresh_timer.stop()
+            self._refresh_timer = None
+        prev = self._monitor
+        if prev is not None:
+            self._monitor = None
+
+            async def _close_prev() -> None:
+                with contextlib.suppress(Exception):
+                    await prev.close_control_client()
+
+            self.run_worker(
+                _close_prev(),
+                exclusive=False,
+                exit_on_error=False,
+                group="tmux-control-teardown",
+            )
+
+    def _start_monitoring(self) -> None:
+        """Initialize the TmuxMonitor and start refreshing."""
+        self._teardown_prior_monitoring()
+
+        kwargs: dict = {}
+        if self._agent_prefixes is not None:
+            kwargs["agent_prefixes"] = self._agent_prefixes
+        if self._tui_names is not None:
+            kwargs["tui_names"] = self._tui_names
+
+        local = TmuxMonitor(
+            session=self._session,
+            capture_lines=self._capture_lines,
+            idle_threshold=self._idle_threshold,
+            compare_mode_default=self._compare_mode_default,
+            **kwargs,
+        )
+        if self._monitor_server is False:
+            self.log("monitor status server off: explicit --interval/--lines; scanning in-process")
+        self._monitor = build_monitor_client(
+            local, kind="monitor", own_pane=self._own_pane_id,
+            session=self._session, project_root=self._project_root,
+            pins=self._capture_pins(), enabled=self._monitor_server, log=self.log,
+        )
+        monitor = self._monitor
+
+        async def _connect_control_client() -> None:
+            # The client's start: the shared server, else the in-process
+            # producer with its own control client (the old behaviour).
+            try:
+                ok = await monitor.start_control_client()
+                if not ok:
+                    self.log("tmux control mode unavailable; using subprocess fallback")
+            except Exception as exc:
+                self.log(f"tmux control mode init failed: {exc!r}")
+
+        self.run_worker(
+            _connect_control_client(),
+            exclusive=False,
+            exit_on_error=False,
+            group="tmux-control-init",
+        )
+
+        # NOT call_later / set_timer / call_after_refresh (t1598) — see the
+        # matching comment in minimonitor_app._start_monitoring. `call_later`
+        # runs the first refresh INLINE on the App's message pump, ahead of
+        # every queued keypress; `run_worker` is asyncio.create_task, the only
+        # dispatch that escapes every pump.
+        #
+        # The first refresh and every interval tick only READ (`scan=False`):
+        # under a shared server they read the subscription, so N clients never
+        # cause N scans. User actions get the scan (`_refresh_data`'s default).
+        self.run_worker(
+            self._refresh_data(scan=False),
+            name="first_refresh",
+            group="refresh-init",
+            exclusive=False,
+            exit_on_error=False,
+        )
+        self._refresh_timer = self.set_interval(
+            self._refresh_seconds, self._tick_refresh
+        )
+
+    async def _tick_refresh(self) -> None:
+        """The interval tick: a refresh that reads, never requests a scan."""
+        await self._refresh_data(scan=False)
+
+    def _wire_preview_hooks(self) -> None:
+        """Attach the preview columns' scroll + resize callbacks.
+
+        Pure DOM wiring — no tmux — so it runs unconditionally at mount.
+        """
+        try:
+            scroll = self.query_one("#preview-scroll", PreviewScrollContainer)
+            scroll.on_user_scroll = self._record_preview_scroll
+        except Exception:
+            pass
+        try:
+            shadow_scroll = self.query_one("#shadow-scroll", PreviewScrollContainer)
+            shadow_scroll.on_user_scroll = self._record_shadow_scroll
+        except Exception:
+            pass
+        try:
+            row = self.query_one("#preview-row", PreviewRow)
+            row.on_row_resize = self._schedule_shadow_fit_check
+        except Exception:
+            pass
+        self._schedule_shadow_fit_check()
+
+    async def on_unmount(self) -> None:
+        # Clear our pane marker on the normal-exit path; an abnormal exit is
+        # covered by monitor_marker_state's stale classification (t1451).
+        if getattr(self, "_mark_pane", False):
+            with contextlib.suppress(Exception):
+                unmark_monitor_pane()
+        if getattr(self, "_monitor", None) is not None:
+            try:
+                await self._monitor.close_control_client()
+            except Exception:
+                pass
+
+    @staticmethod
+    def _locate_anchor(
+        lines: list[str], anchor_text: str | None
+    ) -> int | None:
+        """Find `anchor_text` in `lines`; returns the first match or None.
+
+        Disambiguation is not needed in practice for the monitor preview:
+        duplicates tend to be consecutive (blank lines) and `lines.index`
+        picks the topmost, which is what we want for a top-of-viewport
+        anchor under a rolling buffer.
+        """
+        if anchor_text is None:
+            return None
+        try:
+            return lines.index(anchor_text)
+        except ValueError:
+            return None
+
+    def _record_preview_scroll(self) -> None:
+        """Record user scroll intent for the AGENT preview column."""
+        self._record_scroll_for(Zone.PREVIEW)
+
+    def _record_shadow_scroll(self) -> None:
+        """Record user scroll intent for the SHADOW preview column (t1216_2)."""
+        self._record_scroll_for(Zone.SHADOW)
+
+    def _record_scroll_for(self, zone: Zone) -> None:
+        """Record user scroll intent for one preview column.
+
+        Called (via PreviewScrollContainer.call_after_refresh) once the user's
+        mouse wheel / scrollbar drag / page click has committed scroll_y.
+        Anchors by the text of the topmost visible line in the currently
+        rendered content — stable against tmux's rolling capture.
+
+        Parameterised over the column rather than duplicated (t1216_2): the two
+        differ only in which scroller, state map, rendered-lines list and fast
+        refresh they act on. Note the key differs in kind — the agent column is
+        keyed by the FOLLOWED pane id, the shadow column by the SHADOW pane id.
+        """
+        if zone == Zone.SHADOW:
+            key = self._current_shadow_pane_id()
+            scroll_id = "#shadow-scroll"
+            state = self._shadow_scroll_state
+            rendered = self._shadow_rendered_lines
+            refresh = self._fast_shadow_refresh
+        else:
+            key = self._focused_pane_id
+            scroll_id = "#preview-scroll"
+            state = self._preview_scroll_state
+            rendered = self._preview_rendered_lines
+            refresh = self._fast_preview_refresh
+
+        if key is None:
+            return
+        try:
+            scroll = self.query_one(scroll_id, PreviewScrollContainer)
+        except Exception:
+            return
+        max_y = scroll.max_scroll_y
+        scroll_y = scroll.scroll_y
+        at_bottom = max_y <= 0 or scroll_y >= max_y - 1
+        anchor_text: str | None = None
+        if not at_bottom:
+            idx = int(scroll_y)
+            if 0 <= idx < len(rendered):
+                anchor_text = rendered[idx]
+
+        prev = state.get(key)
+        was_detached = prev is not None and not prev[0]
+
+        state[key] = (at_bottom, anchor_text)
+        scroll.user_is_scrolling = False
+
+        # Re-attach → pull a fresh snapshot so tail-follow resumes on latest output.
+        if was_detached and at_bottom:
+            self._dispatch_fast_refresh(refresh)
+
+    # -- Cross-session project-root resolution ---------------------------------
+
+    def _root_for_snap(self, snap: PaneSnapshot) -> Path:
+        """Project root that owns the given pane's tmux session.
+
+        Falls back to ``self._project_root`` when the pane has no session_name
+        (legacy single-session paths) or its session is not in the discovered
+        aitasks-sessions list.
+        """
+        sess = snap.pane.session_name
+        if sess and self._monitor is not None:
+            mapping = self._monitor.get_session_to_project_mapping()
+            if sess in mapping:
+                return mapping[sess]
+        return self._project_root
+
+    # -- Data refresh ----------------------------------------------------------
+
+    async def _refresh_data(self, *, scan: bool = True,
+                            _request_scan: bool = False) -> None:
+        # `scan` (t2037_3): the default is what every user-action
+        # `call_later(self._refresh_data)` site gets — under a shared status
+        # server those refreshes must also ask the server to scan. That wait
+        # never runs here when this is a `call_later` callback (it is awaited
+        # inline on the App message pump): hand it to the scan worker, which
+        # comes back as `_request_scan` — an ordinary guarded round below. The
+        # timer and the first refresh pass `scan=False` and only read.
+        if scan and self._wants_offpump_scan():
+            self._dispatch_scan_refresh()
+            return
+        # Re-entrancy guard (t1598) — the first refresh now runs in its own
+        # task, so it can overlap the first interval tick and the keypress-driven
+        # `call_later(self._refresh_data)` sites. The reset is in a `finally`
+        # because every await here can raise and CancelledError propagates on
+        # shutdown; a stranded flag stops the TUI refreshing permanently.
+        if self._refresh_inflight:
+            if _request_scan:
+                self._scan_rerun = True   # re-dispatched by that tick's finally
+            return
+        self._refresh_inflight = True
+        try:
+            if self._monitor is None:
+                return
+            monitor = self._monitor
+
+            # Save focus state before rebuild
+            saved_pane_id = self._focused_pane_id
+            saved_zone = self._active_zone
+
+            # Marks resolve BEFORE the capture, and that ordering is required
+            # rather than tidy (t1685). The parked set published below decides
+            # which agents this tick will skip capturing, and it is derived from
+            # the mark store plus this mapping — so publishing it after the
+            # capture would leak one capture-and-classify of every already-parked
+            # agent on every monitor launch.
+            #
+            # Refresh the per-session project-root mapping so cross-session task
+            # data resolves from the right project. Cheap — piggybacks on the
+            # TmuxMonitor sessions cache TTL.
+            session_roots = await self._monitor.get_session_to_project_mapping_async()
+            self._task_cache.update_session_mapping(session_roots)
+            # Prioritized marks (t1326): publish the SAME mapping to the mark code
+            # (the async value — the render path must never make a sync tmux call;
+            # see test_monitor_refresh_no_sync_tmux.py), then re-read the store.
+            # The re-read is mtime-gated, so it is one os.stat when nothing changed,
+            # and it is what makes a mark set in another repo appear within a tick.
+            self._set_session_root_map(session_roots)
+            self._refresh_marks()
+            self._publish_parked_agents()
+            # A user action under a shared server (t2037_3): with this tick's
+            # skip set and pins published, flush the pins and THEN request the
+            # scan, so the scan runs under them. Off the App pump — only the
+            # scan worker passes `_request_scan`.
+            if _request_scan and not await self._request_server_scan(monitor):
+                return
+
+            # Two-phase capture (t1111_4): offload the strip/prompt-regex CPU work,
+            # then commit under the monitor-owned generation guard. If a newer refresh
+            # reserved a later generation while we were off-loop, discard this cycle —
+            # skip the DOM rebuild entirely (the newer cycle owns it) and never write
+            # stale content into _last_content / _snapshots.
+            gen, classified = await self._monitor.capture_all_classified_async()
+            if self._monitor.capture_generation != gen:
+                return
+            snaps = self._monitor.commit_snapshots(gen, classified)
+            if snaps is None:
+                return
+            self._snapshots = self._project_snapshots(snaps)
+            # Parked-pane set for THIS tick (t1685), same contract as the
+            # completed set below: one pass, read by the list filter, the session
+            # bar, auto-switch and the concern offer, so all of them agree within
+            # a tick.
+            self._parked_pane_ids = frozenset(
+                pid for pid, snap in self._snapshots.items() if snap.parked
+            )
+            # Frozen-pane set for THIS tick (t1705_7), same contract. Kept
+            # separate from the parked set rather than merged into it: the
+            # consumers below suppress different things for different reasons,
+            # and a merged set would make "why is this suppressed?" unanswerable.
+            self._frozen_pane_ids = frozenset(
+                pid for pid, snap in self._snapshots.items() if snap.frozen
+            )
+            # Completed-pane set for THIS tick (t1322). Must run after
+            # update_session_mapping (which may clear the task cache) and before
+            # _maybe_auto_switch below, which filters on it.
+            self._completed_pane_ids = self._compute_completed_panes()
+            # NOTE: no per-tick gate-cache clear here — GateSummaryCache now
+            # invalidates by task-file mtime/size, so a live-growing ledger
+            # re-derives on the tick its file changes without re-reading unchanged
+            # ledgers from disk every 3s.
+
+            # Drop saved scroll state for panes that no longer exist.
+            stale = [
+                pid for pid in self._preview_scroll_state
+                if pid not in self._snapshots
+            ]
+            for pid in stale:
+                del self._preview_scroll_state[pid]
+            if (
+                self._last_preview_pane_id is not None
+                and self._last_preview_pane_id not in self._snapshots
+            ):
+                self._last_preview_pane_id = None
+
+            # Focus request from minimonitor (via tmux session env var). Explicit
+            # requests take priority over auto-switch heuristics. If the target
+            # pane isn't yet in the snapshot (startup race), leave the env var
+            # in place so the next refresh can retry.
+            target_name = await self._consume_focus_request()
+            if target_name:
+                for pid, snap in self._snapshots.items():
+                    if (
+                        snap.pane.category == PaneCategory.AGENT
+                        and snap.pane.window_name == target_name
+                        # A parked or frozen agent that the filter is hiding has
+                        # no card to focus, so honouring the request would set
+                        # `_focused_pane_id` to a pane the list does not render
+                        # (t1685, t1705_7). With the filter OFF the row exists
+                        # and the request is honoured as before.
+                        and not (self._hide_inactive
+                                 and (snap.parked or snap.frozen))
+                    ):
+                        self._focused_pane_id = pid
+                        saved_pane_id = pid
+                        saved_zone = Zone.PANE_LIST
+                        self._active_zone = Zone.PANE_LIST
+                        await self._clear_focus_request()
+                        break
+
+            # Auto-switch: if enabled and in pane list, move to most-idle agent
+            if self._auto_switch and saved_zone == Zone.PANE_LIST:
+                if self._maybe_auto_switch():
+                    saved_pane_id = self._focused_pane_id
+
+            attached_session = None
+            if self._multi_session:
+                attached_session = await self._read_attached_session()
+            # Off the render path (t1622): on a cache miss the sync reader ran
+            # a fresh Python interpreter inline inside `_rebuild_session_bar`.
+            # Awaited here because `_refresh_data` is already a worker task —
+            # this suspends the tick, not the App message pump. The `except`
+            # keeps a probe failure a blank string rather than a dead tick,
+            # exactly as the replaced inline call did.
+            try:
+                desync = await _get_desync_summary_async(Path.cwd(), compact=False)
+            except Exception:
+                desync = ""
+            # Open Pick-now items of this project's sitrep store (t2175_5): a
+            # small file read, recounted only when its content changed, off the
+            # message pump like the desync probe above.
+            try:
+                if self._sitrep_counter is None:
+                    self._sitrep_counter = SitrepNowCounter()
+                self._sitrep_now = await asyncio.to_thread(
+                    self._sitrep_counter.count, self._project_root)
+            except Exception:
+                self._sitrep_now = None
+            self._rebuild_session_bar(attached_session, desync=desync)
+            # Shadow reconciliation MUST run before the _restore_focus scheduling
+            # below: it can change the active zone (grace fallback / selection
+            # moved), and `saved_zone` was captured at the top of this method,
+            # before that could happen. Handing the stale value to the deferred
+            # restore would re-focus the shadow column and undo the fallback that
+            # just fired (t1216_2).
+            saved_zone = self._reconcile_shadow_state()
+            # Cheap, synchronous and I/O-free: must run BEFORE the rebuild below so
+            # the badge each card renders reflects this tick (t1216_3). The costly
+            # half (authoritative capture + toast) is dispatched as a worker at the
+            # end of this method instead, off the refresh cadence.
+            self._scan_concern_signatures()
+
+            self._pending_shadow_stamps = []
+            pane_list_rebuilt = self._rebuild_pane_list()
+            # Flush the advisory phase stamps the card renderer queued
+            # (t1598). Best-effort and never fatal, exactly as when the
+            # write happened inline.
+            for _pane_id, _signal in self._pending_shadow_stamps:
+                await refresh_shadow_phase_stamp_async(
+                    self._monitor, _pane_id, _signal)
+            self._pending_shadow_stamps = []
+            self._update_content_preview()
+            self._update_shadow_preview()
+
+            # Defer focus restoration until after Textual processes the DOM changes
+            # from remove()/mount(). Immediate restore fails because removed widgets
+            # haven't been fully detached yet.
+            self.call_after_refresh(
+                self._restore_focus, saved_pane_id, saved_zone, pane_list_rebuilt
+            )
+
+            # Concern verification + toast (t1216_3). A worker, so a stalled capture
+            # cannot stretch the refresh interval — Textual awaits the timer callback
+            # before scheduling the next one. Deliberately NOT exclusive=True:
+            # cancelling would orphan capture_shadow_text's subprocess, which is
+            # killed only on its own timeout. Re-entrancy is handled by _offer_busy,
+            # so a slow pass is not restarted rather than killed mid-flight.
+            self.run_worker(
+                self._offer_concerns(), group="concerns", exit_on_error=False
+            )
+
+            # Mark expiry / liveness sweep (t1326). DISPATCHED, not awaited: the
+            # purge can block for a full 20s wrapper timeout on a contended or
+            # wedged marks lock, and Timer._tick awaits this callback, so an inline
+            # await froze the refresh cadence for the duration (t1598).
+            self._dispatch_refresh_maintenance()
+        finally:
+            self._refresh_inflight = False
+            self._maybe_rerun_refresh()
+
+    async def _offer_concerns(self) -> None:
+        """Toast the SELECTED agent once per verified block.
+
+        Cost: at most ONE ``-J`` capture per (selected agent, newly-seen
+        signature), plus the narrow-pane probe every other tick when a
+        sub-sentinel-width shadow shows nothing. Never per tick in the steady
+        state, and never scaling with N — the badge, which does scale, is free.
+
+        The block is verified before toasting because ``concern_block_signature``
+        requires a complete *fence* but not a parsed concern: an all-malformed
+        block (the case t1274 exists for) would otherwise announce "Shadow raised
+        concerns" and then report nothing forwardable on `c`.
+        """
+        if self._monitor is None or self._offer_busy:
+            return
+        self._offer_busy = True
+        try:
+            self._concern_tick += 1
+            pane_id = self._focused_pane_id
+            # A parked agent raises no auto-offer (t1685): the user asked to stop
+            # being told about it, and its shadow's block may be arbitrarily old
+            # since the agent itself is no longer being read.
+            if pane_id is not None and (pane_id in self._parked_pane_ids
+                                        or pane_id in self._frozen_pane_ids):
+                return
+            shadow_snap = (
+                self._tick_shadow_snaps.get(pane_id) if pane_id else None
+            )
+            if shadow_snap is None:
+                return
+            seen = self._seen_concern_sigs(pane_id)
+            sig = self._concern_sig_latest.get(pane_id)  # the TRIGGER — snapshot
+            if sig is None:
+                # Nothing detected. Only a sub-sentinel-width pane can HIDE a
+                # block from the cheap detector (_SENTINEL_SAFE_COLS = 24: the
+                # fences are 21 and 18 chars), so anything wider genuinely has
+                # none and needs no subprocess.
+                if shadow_snap.pane.width >= _SENTINEL_SAFE_COLS:
+                    return
+                if self._concern_tick % 2 == 0:
+                    return  # probe every other tick
+            elif sig in seen:
+                return  # already picked, or already checked
+
+            shadow_pane = shadow_snap.pane.pane_id
+            text = await capture_shadow_text(shadow_pane)
+            if text is None:
+                return  # learned nothing; retry next tick
+            captured_sig = concern_block_signature(text)
+            if captured_sig is None:
+                return  # no complete block in the -J window
+            if sig is None:
+                # Narrow-pane path: the probe is where the badge's signature
+                # comes from, since the raw capture cannot see the fences.
+                self._concern_sig_latest[pane_id] = captured_sig
+            # Re-read AFTER the await: a concurrent `c` (its guard is independent
+            # of _offer_busy) may have offered this block while we were suspended.
+            if captured_sig in self._seen_concern_sigs(pane_id):
+                return
+            # Trigger passed EXPLICITLY from the snapshot above — re-reading it
+            # here could store a NEWER block's signature and lose it.
+            self._mark_concern_sig(
+                self._concern_sig_examined, pane_id, sig, captured_sig
+            )
+            verified = frozenset(
+                s for s in (sig, captured_sig) if s is not None
+            )
+            concerns = parse_concerns(text)
+            if not concerns:
+                if is_metadata_only_block(text):
+                    # CERTIFIED metadata-only clean-round block (t1159_1):
+                    # complete fence, exactly the header — nothing to pick,
+                    # nothing to investigate — treat as handled. (The strict
+                    # predicate matters: header + silently-dropped stray prose
+                    # parses to nothing too, but that is malformed output to
+                    # investigate, not a clean round.) Marking it OFFERED (the
+                    # same call the `c` path makes) clears the badge; the
+                    # signature stays in `_concern_sig_latest`, so downstream
+                    # freshness still sees the round advance. Residual: this
+                    # pass runs only for the FOCUSED agent, so an unfocused
+                    # agent's clean round badges until it is next focused —
+                    # clearing it tick-side would require parsing the raw
+                    # capture, which `_scan_concern_signatures` ("a TRIGGER,
+                    # never a parse") deliberately forbids.
+                    self._mark_concern_sig(
+                        self._concern_sig_offered, pane_id, sig, captured_sig
+                    )
+                    return
+                # Malformed or empty-parse block: no misleading toast. The
+                # badge stands, and `c` gives the user the precise reason.
+                return
+            eps = max(2.0, float(getattr(self, "_refresh_seconds", 3)))
+            read_stale, _ = await compute_shadow_staleness(
+                self._monitor, shadow_pane, pane_id, eps
+            )
+            # Block age (t1493): read recency alone cannot see a shadow that
+            # re-read the pane and then emitted nothing — it restamps its read
+            # stamp and reads "current" while stale concerns sit on screen.
+            last_change = None
+            if hasattr(self._monitor, "get_last_change_wall"):
+                with contextlib.suppress(Exception):
+                    last_change = self._monitor.get_last_change_wall(pane_id)
+            stale = combine_staleness(
+                read_stale, compute_block_age_staleness(text, last_change, eps)
+            )
+            # Re-check AFTER the awaits: the toast is an unsolicited interruption
+            # and must describe what is on screen NOW. The signature stays marked
+            # examined (the check really did run) and the badge is untouched, so
+            # nothing is lost when the popup is skipped.
+            if self._focused_pane_id != pane_id:
+                return
+            still = self._monitor.get_shadow_snapshot(pane_id)
+            if still is None or still.pane.pane_id != shadow_pane:
+                return  # shadow died or was rebound while we captured
+            # ...and the SAME pane may have moved on to a different block while
+            # we were suspended. Identity is not freshness: toasting "raised N
+            # concern(s)" for the block we verified would then disagree with both
+            # the badge (which tracks the newer one) and the picker a keypress
+            # later. Skip it — the newer block is not in `_examined`, so the next
+            # pass verifies and announces it on its own terms.
+            if self._concern_sig_latest.get(pane_id) not in verified:
+                return
+            actionable = sum(1 for c in concerns if needs_addressing(c))
+            info = len(concerns) - actionable
+            info_suffix = f" (+{info} informational)" if info else ""
+            # Tri-state (t1493): "could not tell" is its own state and must not
+            # render as silence, which reads as "current".
+            if stale is True:
+                stale_suffix = " (⚠ STALE — agent moved on)"
+            elif stale is None:
+                stale_suffix = " (⚠ freshness unknown)"
+            else:
+                stale_suffix = ""
+            self.notify(
+                f"Shadow raised {actionable} concern(s){info_suffix} — "
+                f"press 'c' to pick" + stale_suffix
+            )
+        finally:
+            self._offer_busy = False
+
+    async def _fast_preview_refresh(self) -> None:
+        """Lightweight refresh — only re-capture the focused pane for preview.
+
+        Uses the same two-phase/generation discipline as the full refresh
+        (t1111_4): the classify work is offloaded, and the focused pane id is
+        **pinned before the await** so a focus change during the offload can't
+        commit pane A's snapshot while the preview UI is updated for pane B.
+        """
+        if self._monitor is None:
+            return
+        pane_id = self._focused_pane_id
+        if pane_id is None:
+            return
+        gen, pane, content, result = \
+            await self._monitor.capture_pane_classified_async(pane_id)
+        if pane is None:
+            return
+        if self._monitor.capture_generation != gen:
+            return  # superseded by a newer capture → discard
+        snap = self._monitor.commit_snapshot(gen, pane, content, result)
+        if snap is None:
+            return
+        # Same client projection as the bulk refresh (t2034_2): under a shared
+        # producer this pane can come back LIVE because another client pins it,
+        # and storing that raw would overwrite our parked placeholder. A pane our
+        # view does not admit is not stored at all.
+        projected = self._project_snapshots({pane_id: snap})
+        if pane_id not in projected:
+            return
+        self._snapshots[pane_id] = projected[pane_id]  # write under the PINNED id
+        if pane_id == self._focused_pane_id:  # focus-identity guard
+            self._update_content_preview()
+
+    async def _fast_shadow_refresh(self) -> None:
+        """Lightweight refresh — only re-capture the selected agent's shadow.
+
+        `refresh_shadow_snapshot` returns None for four distinct reasons (key
+        absent — it never CREATES one; capture failed; stale write seq; shadow
+        rebound to a different pane) and all four mean the same thing: **no
+        update this tick**, never "shadow gone". The 3s full refresh owns
+        deletion, and the SHADOW_ABSENT_GRACE_TICKS counter is driven from
+        _refresh_data, not from here — so this must not hide or clear anything
+        (t1216_1 rule 5).
+
+        The followed pane id is pinned before the await, mirroring
+        _fast_preview_refresh's focus-identity guard.
+        """
+        if self._monitor is None:
+            return
+        pane_id = self._focused_pane_id
+        if pane_id is None:
+            return
+        snap = await self._monitor.refresh_shadow_snapshot(pane_id)
+        if snap is None:
+            return  # no update this tick
+        if pane_id == self._focused_pane_id:  # focus-identity guard
+            self._update_shadow_preview()
+
+    def _dispatch_fast_refresh(self, refresh) -> None:
+        """Schedule a one-column fast refresh from a key, scroll or timer callback.
+
+        ``refresh`` is ``_fast_preview_refresh`` or ``_fast_shadow_refresh``.
+        Under a :class:`MonitorClient` in server mode (t2037_3) each one sends a
+        ``refresh`` request and waits for the reply — a wait that must not run
+        via ``call_later``, which awaits its callback INLINE on the App message
+        pump (the queue that dispatches keys, t1598): a stalled server would hold
+        every following keystroke. So for ANY client it runs in a worker,
+        coalesced per column — one in flight, plus at most one more round for
+        any request made meanwhile — and the refresh keeps its own pinned-id,
+        generation and focus-identity guards.
+
+        Deliberately not gated on the client's CURRENT mode: a decision made
+        here, at scheduling time, goes stale — a client in fallback can
+        reconnect to the server before a queued ``call_later`` runs, and the
+        callback would then wait for the server on the pump. In fallback the
+        worker just runs the in-process capture off the pump. Only a non-client
+        monitor (test doubles) keeps the old ``call_later``.
+        """
+        if not isinstance(self._monitor, MonitorClient):
+            self.call_later(refresh)
+            return
+        name = getattr(refresh, "__name__", repr(refresh))
+        if name in self._fast_inflight:
+            self._fast_again.add(name)
+            return
+        self._fast_inflight.add(name)
+
+        async def _run() -> None:
+            try:
+                while True:
+                    self._fast_again.discard(name)
+                    await refresh()
+                    if name not in self._fast_again:
+                        break
+            finally:
+                self._fast_inflight.discard(name)
+
+        self.run_worker(_run(), group="fast-refresh", exclusive=False,
+                        exit_on_error=False)
+
+    def _schedule_delayed_refresh(self, delay: float = 0.3) -> None:
+        """Schedule a one-shot preview refresh after *delay* seconds.
+
+        Cancels any pending delayed refresh to avoid stacking.
+        """
+        if self._delayed_refresh_timer is not None:
+            self._delayed_refresh_timer.stop()
+        self._delayed_refresh_timer = self.set_timer(
+            delay, self._fire_delayed_refresh
+        )
+
+    def _fire_delayed_refresh(self) -> None:
+        """Fire the delayed refresh and clear the timer reference.
+
+        Never awaits the refresh: Textual's ``set_timer`` (unlike
+        ``set_interval``) wraps its callback in ``call_next``, so this runs on the
+        App message pump, and under a shared server the refresh waits for a
+        ``refresh`` reply (t2037_3). Hand it to the fast-refresh dispatcher."""
+        self._delayed_refresh_timer = None
+        self._dispatch_fast_refresh(self._fast_preview_refresh)
+
+    async def _consume_focus_request(self) -> str | None:
+        """Read the `AITASK_MONITOR_FOCUS_WINDOW` tmux session env var.
+
+        Returns the target window name if set, or None. Does NOT clear the
+        variable — use `_clear_focus_request()` after a successful match so
+        that a startup race (target pane not yet in snapshot) can be retried
+        on the next refresh tick.
+        """
+        if self._monitor is None:
+            return None
+        rc, stdout = await self._monitor.tmux_run_async([
+            "show-environment", "-t", tmux_session_target(self._session),
+            "AITASK_MONITOR_FOCUS_WINDOW",
+        ])
+        if rc != 0:
+            return None
+        line = stdout.strip()
+        if not line or "=" not in line:
+            return None
+        # tmux emits "-VAR" for unset markers; those have no "=".
+        _, _, value = line.partition("=")
+        value = value.strip()
+        return value or None
+
+    async def _clear_focus_request(self) -> None:
+        """Unset the tmux session focus-request env var."""
+        if self._monitor is None:
+            return
+        await self._monitor.tmux_run_async([
+            "set-environment", "-t", tmux_session_target(self._session),
+            "-u", "AITASK_MONITOR_FOCUS_WINDOW",
+        ])
+
+    def _agents_header_text(self, n_agents: int) -> str:
+        """The CODE AGENTS section header, including the status legend.
+
+        Built in one place because both the fast in-place path and the slow
+        rebuild path in :meth:`_rebuild_pane_list` render this line; duplicating
+        it once more would make the legend and the AUTO tag drift apart.
+        """
+        auto_label = "  [bold yellow]⟳ AUTO[/]" if self._auto_switch else ""
+        legend = (
+            "  [dim]([/][green]●[/][dim] active [/]"
+            "[bold magenta]●[/][dim] prompt [/]"
+            "[yellow]●[/][dim] idle [/]"
+            f"[{STATE_STYLE_DONE}]●[/][dim] done)[/]"
+        )
+        return f"[bold]CODE AGENTS ({n_agents})[/]{auto_label}{legend}"
+
+    def _compute_completed_panes(self) -> frozenset[str]:
+        """Pane ids whose task is finished, for THIS refresh tick (t1322).
+
+        One place, one pass: the card badge, the session bar's `done` counter
+        and the auto-switch filter must agree within a tick, and only a single
+        precomputed set guarantees that. This is also the only site that pays
+        the per-pane ``os.stat`` freshness check — every later ``get_task_info``
+        on the same tick hits a warm entry.
+        """
+        done: set[str] = set()
+        for pane_id, snap in self._snapshots.items():
+            if snap.pane.category != PaneCategory.AGENT:
+                continue
+            if snap.parked or snap.frozen:
+                # Parked and frozen agents leave the state partition (t1685,
+                # t1705_7), so
+                # they must not land in `done` either — the session bar counts
+                # them under their own term. This also skips their per-pane stat.
+                continue
+            task_id = self._task_cache.get_task_id_for_pane(snap.pane)
+            if not task_id:
+                continue
+            if is_task_completed(
+                self._task_cache.get_task_info(task_id, snap.pane.session_name)
+            ):
+                done.add(pane_id)
+        return frozenset(done)
+
+    def _maybe_auto_switch(self) -> bool:
+        """Switch focus to a pane that needs attention if the current is active.
+
+        Priority: awaiting_input > is_idle. Awaiting panes are surfaced first
+        because they are blocked on user input — no idle-threshold wait
+        required.
+
+        Completed panes (t1322) are excluded from every branch. A finished agent
+        is idle forever and, sorted by ``idle_seconds`` descending, would
+        otherwise permanently capture focus — parking the monitor on a done
+        agent and never surfacing a live one that needs input.
+
+        Parked agents (t1685) are excluded from every branch too, for a
+        different reason: they are not being captured, so their ``is_idle`` /
+        ``awaiting_input`` are "nothing observed", not "nothing happening".
+        Switching to one would move focus to a row that may not even be
+        rendered, and would present a non-verdict as a reason to look.
+
+        Returns True if focus was switched, False otherwise.
+        """
+        if self._focused_pane_id is None:
+            return False
+        current_snap = self._snapshots.get(self._focused_pane_id)
+        if current_snap is None or current_snap.pane.category != PaneCategory.AGENT:
+            return False
+        # If focused agent already needs attention, keep it — unless it is
+        # merely *completed*-idle, which needs no attention at all. A PARKED
+        # agent never holds focus here (t1685): it has no verdict to need
+        # attention with, so auto-switch must be free to move off it.
+        if not current_snap.parked and not current_snap.frozen and (
+            getattr(current_snap, "awaiting_input", False)
+            or (
+                current_snap.is_idle
+                and self._focused_pane_id not in self._completed_pane_ids
+            )
+        ):
+            return False
+        # Prefer awaiting-input panes over idle ones — they need attention
+        # more urgently (blocked on a prompt).
+        awaiting = [
+            snap for snap in self._snapshots.values()
+            if snap.pane.category == PaneCategory.AGENT
+            and not snap.parked and not snap.frozen
+            and getattr(snap, "awaiting_input", False)
+        ]
+        if awaiting:
+            awaiting.sort(key=lambda s: s.idle_seconds, reverse=True)
+            self._focused_pane_id = awaiting[0].pane.pane_id
+            return True
+        # Find idle agents, sorted by most idle first
+        idle_agents = [
+            snap for snap in self._snapshots.values()
+            if snap.pane.category == PaneCategory.AGENT and snap.is_idle
+            and not snap.parked and not snap.frozen
+            and snap.pane.pane_id not in self._completed_pane_ids
+        ]
+        if not idle_agents:
+            return False
+        idle_agents.sort(key=lambda s: s.idle_seconds, reverse=True)
+        self._focused_pane_id = idle_agents[0].pane.pane_id
+        return True
+
+    def _restore_focus(
+        self, pane_id: str | None, zone: Zone, pane_list_rebuilt: bool = True
+    ) -> None:
+        """Re-focus the previously focused widget after a rebuild."""
+        if zone == Zone.PREVIEW:
+            try:
+                self.query_one("#content-preview", PreviewPanel).focus()
+            except Exception:
+                pass
+            self._update_content_preview()
+            self._update_shadow_preview()
+            if pane_list_rebuilt:
+                self._update_selected_card_indicator(full=True)
+            return
+        # Without this branch SHADOW would fall through to the PaneCard path
+        # below, whose card.focus() fires on_descendant_focus → Zone.PANE_LIST —
+        # ejecting the user from the shadow column on EVERY 3s refresh and
+        # silently ending shadow key targeting (t1216_2).
+        if zone == Zone.SHADOW:
+            # Re-validate: this restore was QUEUED before the deferred
+            # visibility check ran, so the column may have been hidden (or the
+            # shadow may have vanished) in between. Re-focusing it then would
+            # resurrect a zone that was just left — and, because focusing the
+            # column re-enters it, would reset the absent-grace counter on
+            # every tick so the grace window could never expire.
+            # Validate on the COLUMN being shown, not on a snapshot existing:
+            # during the grace hold the snapshot is absent but the column is
+            # still up rendering the placeholder, and focus must stay there.
+            if self._shadow_split_ok:
+                try:
+                    self.query_one("#shadow-preview", PreviewPanel).focus()
+                except Exception:
+                    pass
+            else:
+                self._active_zone = Zone.PREVIEW
+                self._active_preview_zone = Zone.PREVIEW
+                try:
+                    self.query_one("#content-preview", PreviewPanel).focus()
+                except Exception:
+                    pass
+            self._update_content_preview()
+            self._update_shadow_preview()
+            if pane_list_rebuilt:
+                self._update_selected_card_indicator(full=True)
+            return
+        # If the user already navigated to a valid PaneCard during this
+        # refresh cycle, respect their selection instead of reverting to the
+        # saved id. Fixes the "arrow-keypress lost on refresh" race (t545).
+        focused = self.focused
+        if (
+            isinstance(focused, PaneCard)
+            and focused.pane_id in self._snapshots
+        ):
+            self._focused_pane_id = focused.pane_id
+        elif pane_id is not None:
+            card = self._pane_cards.get(pane_id)
+            if card is not None:
+                card.focus()
+                # Widget.focus() is deferred; on_descendant_focus may not
+                # fire before the next refresh tick, leaving saved_pane_id
+                # stale. Set _focused_pane_id directly so the next tick sees
+                # the real state.
+                self._focused_pane_id = card.pane_id
+            else:
+                # The saved pane has no card — it was filtered out (parked, with
+                # the filter on) or removed. Anchor focus rather than leaving it
+                # wherever it landed: this is the invariant a future call site
+                # cannot forget, whereas the deliberate handoff in
+                # `_focus_next_visible_card` can be bypassed (t1685).
+                cards = self._visible_pane_cards()
+                if cards:
+                    cards[0].focus()
+                    self._focused_pane_id = cards[0].pane_id
+                else:
+                    self._clear_pane_list_focus()
+                    return
+        # Sync preview with the final focus state. The _update_content_preview
+        # call in _refresh_data (line 683) may have rendered with a stale
+        # _focused_pane_id if DOM events during _rebuild_pane_list shifted
+        # focus. This second call corrects the preview. On the fast path it's
+        # cheap (same_pane check short-circuits). Fixes t576.
+        self._update_content_preview()
+        # Same for the shadow column: _focused_pane_id may have changed just
+        # above, and the shadow shown is derived from it.
+        self._update_shadow_preview()
+        # Re-apply the .selected class to the freshly-mounted card whose
+        # pane_id matches _focused_pane_id (cards were destroyed by the
+        # rebuild). Required so the preview-zone indicator survives ticks.
+        if pane_list_rebuilt:
+            self._update_selected_card_indicator(full=True)
+
+    def _switcher_selected_session(self) -> str | None:
+        """Pre-select the focused agent pane's session in the TUI switcher.
+
+        When the focused row is a code-agent card belonging to a non-attached
+        tmux session, the switcher opens with that session already selected
+        — saving the user a Left/Right cycle (t836). Non-agent rows fall
+        through to the default attached-session behavior.
+        """
+        pid = self._focused_pane_id
+        if not pid:
+            return None
+        snap = self._snapshots.get(pid)
+        if snap is None or snap.pane.category != PaneCategory.AGENT:
+            return None
+        return snap.pane.session_name or None
+
+    def _rebuild_session_bar(
+        self, attached_session: str | None = None, desync: str | None = None
+    ) -> None:
+        total = len(self._snapshots)
+        agents = [
+            s for s in self._snapshots.values()
+            if s.pane.category == PaneCategory.AGENT
+        ]
+        # The three live counters partition the NON-PARKED agents exactly as the
+        # badges do, on the same PROMPT > COMPLETED > IDLE ladder (t1322), so
+        # every such agent lands in at most one bucket and the bar can never
+        # disagree with the rows above it. Subtracting completed from idle alone
+        # would not be enough: a completed agent sitting on its final feedback
+        # prompt is both awaiting and completed, and would be counted twice while
+        # its badge read PROMPT.
+        #
+        # Parked agents (t1685) leave that partition entirely and get a fourth,
+        # separate term. They have no meaningful is_idle / awaiting_input — they
+        # are not captured — so counting them in any live bucket would put a
+        # non-verdict in the same row as three verdicts. The `parked` term is
+        # shown whether or not `P` is hiding those rows: it is the one place a
+        # hidden agent is still accounted for, and a count that appeared and
+        # disappeared with a view toggle would be worse than no count at all.
+        live = [a for a in agents if not a.parked and not a.frozen]
+        frozen_count = sum(1 for a in agents if a.frozen)
+        parked_count = sum(1 for a in agents if a.parked and not a.frozen)
+        awaiting_count = sum(1 for a in live if getattr(a, "awaiting_input", False))
+        done_count = sum(1 for a in live
+                         if a.pane.pane_id in self._completed_pane_ids
+                         and not getattr(a, "awaiting_input", False))
+        idle_count = sum(1 for a in live
+                         if a.is_idle and not getattr(a, "awaiting_input", False)
+                         and a.pane.pane_id not in self._completed_pane_ids)
+        awaiting_str = f"  [bold magenta]{awaiting_count} awaiting[/]" if awaiting_count > 0 else ""
+        done_str = f"  [{STATE_STYLE_DONE}]{done_count} done[/]" if done_count > 0 else ""
+        idle_str = f"  [yellow]{idle_count} idle[/]" if idle_count > 0 else ""
+        parked_str = f"  [dim]{parked_count} parked[/]" if parked_count > 0 else ""
+        # Its own term, independent of the `P` filter, counted disjointly from
+        # `parked` — a frozen agent carrying the parked mark is reported once.
+        frozen_str = f"  [dim]{frozen_count} frozen[/]" if frozen_count > 0 else ""
+        # Open Pick-now items in this project's sitrep store (t2175_5). The
+        # term is digits and constant words only, so it needs no escaping.
+        sitrep_term = format_sitrep_term(self._sitrep_now)
+        sitrep_str = f"  [cyan]{sitrep_term}[/]" if sitrep_term else ""
+        bar = self.query_one("#session-bar", SessionBar)
+        auto_tag = "  [bold yellow]\\[AUTO][/]" if self._auto_switch else ""
+        # Pre-fetched by `_refresh_data` (t1622). `None` means this call brought
+        # none — the keypress-driven rebuild in `action_toggle_auto_switch` — so
+        # read the cache rather than spawning: the summary costs a fresh Python
+        # interpreter and this is a synchronous handler.
+        if desync is None:
+            try:
+                desync = _get_desync_summary_cached(Path.cwd(), compact=False)
+            except Exception:
+                desync = ""
+        # Surface the control-channel state only when it is *not* the
+        # steady-state CONNECTED — keep the bar quiet during normal use.
+        state_badge = ""
+        if self._monitor is not None:
+            s = self._monitor.control_state()
+            if s == TmuxControlState.RECONNECTING:
+                state_badge = "  [yellow]control: reconnecting[/]"
+            elif s == TmuxControlState.FALLBACK:
+                state_badge = "  [red]control: fallback[/]"
+        if self._monitor is not None and self._multi_session:
+            sessions = {
+                s.pane.session_name for s in self._snapshots.values()
+                if s.pane.session_name
+            }
+            attached = attached_session or self._session
+            session_word = "session" if len(sessions) == 1 else "sessions"
+            pane_word = "pane" if total == 1 else "panes"
+            bar.update(
+                f"tmux Monitor — {len(sessions)} {session_word} "
+                f"· {total} {pane_word} · multi "
+                # Session names are tmux-side user input; each is followed by
+                # `)` / ` (`, never by a tag, so `markup_literal` is exact (t2017).
+                f"(attached: {markup_literal(attached)})"
+                f"{awaiting_str}"
+                f"{done_str}"
+                f"{idle_str}"
+                f"{parked_str}"
+                f"{frozen_str}"
+                f"{sitrep_str}"
+                f"{auto_tag}"
+                f"{desync}"
+                f"{state_badge}"
+                f"  [dim]Tab: switch panel[/]"
+            )
+        else:
+            bar.update(
+                f"tmux Monitor — session: {markup_literal(self._session)} "
+                f"({total} pane{'s' if total != 1 else ''})"
+                f"{awaiting_str}"
+                f"{done_str}"
+                f"{idle_str}"
+                f"{parked_str}"
+                f"{frozen_str}"
+                f"{sitrep_str}"
+                f"{auto_tag}"
+                f"{desync}"
+                f"{state_badge}"
+                f"  [dim]Tab: switch panel[/]"
+            )
+
+    async def _read_attached_session(self) -> str | None:
+        """Return the currently-attached tmux session name, or None on failure."""
+        if self._monitor is None:
+            return None
+        rc, stdout = await self._monitor.tmux_run_async(["display-message", "-p", "#S"])
+        if rc != 0:
+            return None
+        return stdout.strip() or None
+
+    def _format_agent_card_text(self, snap: PaneSnapshot) -> str:
+        # Membership in the per-tick set is the SOLE source of the completed
+        # flag (t1322). The `info` lookup further down may supply the title and
+        # gate summary, but must never re-derive completion: an archive landing
+        # between _compute_completed_panes and this call would flip the identity
+        # gate and leave the badge disagreeing with the session bar and the
+        # auto-switch decision for a tick.
+        if snap.frozen:
+            # Checked BEFORE parked, for the reason the capture partition
+            # states: the two can both be true of one pane, and frozen is the
+            # stronger fact. Same "nothing capture-derived on an uncaptured
+            # pane" rule as the parked branch below — which still admits the
+            # task title (t2042): the id comes from the window name and the
+            # title from the task file, the same lookup `i` uses. The gate
+            # summary and phase stay off: the phase reads the capture, and the
+            # counts of an agent that is not advancing its task add nothing
+            # `i` does not show.
+            text = (
+                f" {format_frozen_prefix(self._mark_kind(snap))} "
+                f"{snap.pane.window_index}:{markup_literal(snap.pane.window_name)} "
+                f"({snap.pane.pane_index})  [dim]frozen[/]"
+            )
+            task_id = self._task_cache.get_task_id_for_pane(snap.pane)
+            if task_id:
+                info = self._task_cache.get_task_info(
+                    task_id, snap.pane.session_name)
+                if info:
+                    text += self._title_row(task_id, info)
+            return text
+        if snap.parked:
+            # Deliberately the WHOLE row (t1685). Every other element here is
+            # either capture-derived (state dot, status badge, compare-mode
+            # glyph, shadow glyph) or a live verdict, and a parked pane was not
+            # captured — a frozen ● would read as a current idle/active answer
+            # that is in fact arbitrarily stale. The mark glyph, the window name
+            # and an explicit `parked` marker are what is actually true.
+            return (
+                f" {format_mark_glyph(agent_marks.KIND_PARKED)} "
+                f"{snap.pane.window_index}:{markup_literal(snap.pane.window_name)} "
+                f"({snap.pane.pane_index})  [dim]parked[/]"
+            )
+        completed = snap.pane.pane_id in self._completed_pane_ids
+        dot = format_state_dot(snap, completed)
+        status = format_pane_status(snap, completed)
+        if self._monitor is not None:
+            mode = self._monitor.get_compare_mode(snap.pane.pane_id)
+            is_override = self._monitor.is_compare_mode_overridden(snap.pane.pane_id)
+            shadow_snap = self._monitor.get_shadow_snapshot(snap.pane.pane_id)
+        else:
+            mode = "stripped"
+            is_override = False
+            shadow_snap = None
+        glyph = format_compare_mode_glyph(mode, is_override)
+        # Shadow-status glyph (t1133): second colored glyph right after the
+        # agent's own dot when a shadow agent is bound to this pane; empty
+        # string (no placeholder) keeps non-shadowed rows unchanged.
+        #
+        # The concern marker (t1216_3) rides on the same glyph. It is derived
+        # here for EVERY agent — that is what makes the N-agent case work: each
+        # shadow with an un-offered block is marked at zero tmux cost, while the
+        # toast fires only for the selected one.
+        shadow = format_shadow_glyph(
+            shadow_snap, has_concerns=self._has_fresh_concerns(snap.pane.pane_id)
+        )
+        shadow_part = f" {shadow}" if shadow else ""
+        # Leftmost: the prioritized mark (t1326) is a durable user annotation,
+        # deliberately outside the live state cluster. Always-on ★/☆ pair, so
+        # rows never shift when one is toggled.
+        mark = format_mark_glyph(self._mark_kind(snap))
+        # The window name is tmux-side user input (t2006): `markup_literal`,
+        # not `escape` — this markup is parsed by Textual, see the helper.
+        text = (
+            f" {mark} {dot}{shadow_part} {glyph} "
+            f"{snap.pane.window_index}:{markup_literal(snap.pane.window_name)} "
+            f"({snap.pane.pane_index})  {status}"
+        )
+        task_id = self._task_cache.get_task_id_for_pane(snap.pane)
+        if task_id:
+            info = self._task_cache.get_task_info(task_id, snap.pane.session_name)
+            if info:
+                # Gate summary sits at the END of the status row (row 1), after
+                # the status, rather than on its own line — keeps the card
+                # compact in the full monitor. (Minimonitor keeps it on a
+                # separate line; its rows are too narrow to append here.)
+                gates = self._gate_cache.summary_for(info)
+                if gates:
+                    text += f"  [dim]gates: {gates}[/]"
+                # Advisory workflow phase (t1420) — a hint beside the gate
+                # counts, never a gate on anything. Composed per tick because
+                # its live half tracks the pane, not the file.
+                signal = self._gate_cache.phase_for(
+                    info,
+                    screen_text=snap.content,
+                    awaiting_input=snap.awaiting_input,
+                    awaiting_input_kind=snap.awaiting_input_kind,
+                    agent=snap.agent_key,
+                    current_command=snap.pane.current_command,
+                )
+                phase = workflow_phase.render_phase(signal)
+                if phase:
+                    text += f"  [dim]{phase}[/]"
+                # Re-stamp the bound shadow from the SAME signal. The full
+                # monitor spawns shadows too, so without this its shadows would
+                # keep their launch-time value forever (t1420). Best-effort:
+                # COLLECTED here, written after the rebuild (t1598). This runs
+                # inside the SYNCHRONOUS card renderer, so the stamp's tmux
+                # round-trip was a blocking call on the render path — once per
+                # shadowed card, per tick. Making the renderer async is the wrong
+                # fix; queueing the write and flushing it from `_refresh_data`
+                # keeps the same best-effort, never-fatal semantics.
+                if shadow_snap is not None and self._monitor is not None:
+                    # `__dict__.setdefault`, not a class attribute: this list
+                    # is APPENDED to, so a class-level default would be shared
+                    # by every instance. `_refresh_data` rebinds it per tick;
+                    # this keeps the `__new__`-built test path instance-scoped
+                    # too.
+                    self.__dict__.setdefault(
+                        "_pending_shadow_stamps", []
+                    ).append((shadow_snap.pane.pane_id, signal))
+                text += self._title_row(task_id, info)
+        return text
+
+    @staticmethod
+    def _title_row(task_id: str, info) -> str:
+        """The indented ``t<id>: <title>`` row under an agent's status row —
+        live and frozen rows alike (t2042)."""
+        # No closing tag, deliberately (t2006): a title ending in a backslash
+        # would turn a `[/]` here into literal text, and no escaping can
+        # prevent that (see `markup_literal`). Textual closes the open style at
+        # end of input — so this must stay the LAST thing appended to the card.
+        return f"\n     [dim italic]t{task_id}: {markup_literal(info.title)}"
+
+    def _format_other_card_text(self, snap: PaneSnapshot) -> str:
+        # Name and command are user-derived (t2006). The command ends the row
+        # with its `[dim]` left open, for the reason the title row in
+        # `_format_agent_card_text` gives: a trailing backslash cannot sit
+        # before a closing tag.
+        return (
+            f" [dim]\u25cb[/] "
+            f"{snap.pane.window_index}:{markup_literal(snap.pane.window_name)} "
+            f"({snap.pane.pane_index})  "
+            f"[dim]{markup_literal(snap.pane.current_command)}"
+        )
+
+    def _rebuild_pane_list(self) -> bool:
+        container = self.query_one("#pane-list", VerticalScroll)
+        multi_mode = bool(self._monitor and self._multi_session)
+
+        agents: list[PaneSnapshot] = []
+        others: list[PaneSnapshot] = []
+        for snap in self._snapshots.values():
+            if snap.pane.category == PaneCategory.AGENT:
+                # The parked filter is applied HERE, before `desired_ids` is
+                # built below (t1685). Filtering after that comparison would
+                # leave the in-place fast path seeing an unchanged pane-id list,
+                # so pressing P — or parking an agent — would not rebuild at all.
+                if self._hide_inactive and (snap.parked or snap.frozen):
+                    continue
+                agents.append(snap)
+            elif snap.pane.category == PaneCategory.OTHER:
+                others.append(snap)
+
+        # Sort by (session_name, window_name, window_index, pane_index) so the
+        # unified multi-session list is stable across refreshes. Single-session
+        # mode produces identical session_name for every snapshot, so the sort
+        # key degrades to (window_name, …). The name leads the window slot
+        # (t1679) because the index is only launch order, while the name is what
+        # the cards show; it compares NATURALLY, and the two indices — which
+        # compare numerically — survive as the tiebreak for two windows sharing
+        # a name. Both are string fields off the tmux gateway, so a plain
+        # comparison ordered agent 10 before agent 2 (t1659).
+        agents.sort(key=lambda s: pane_sort_key(s.pane))
+        others.sort(key=lambda s: pane_sort_key(s.pane))
+
+        # Fast path: same pane set and order → update text in place, no DOM
+        # churn. This keeps the focused PaneCard alive across ticks so arrow
+        # keypresses that arrive during a refresh still resolve against a
+        # stable card list. Fixes t545 (arrow-keypress lost on refresh race).
+        desired_ids = (
+            [s.pane.pane_id for s in agents]
+            + [s.pane.pane_id for s in others]
+        )
+        current_cards = [
+            w for w in container.children if isinstance(w, PaneCard)
+        ]
+        current_ids = [c.pane_id for c in current_cards]
+        if desired_ids and desired_ids == current_ids:
+            # Header counts are unchanged (set is identical), but the
+            # agents-section header's AUTO tag can flip via
+            # action_toggle_auto_switch(). Update the agents header text in
+            # place so the "⟳ AUTO" indicator stays in sync.
+            headers = [
+                w for w in container.children
+                if isinstance(w, Static) and not isinstance(w, PaneCard)
+            ]
+            if agents and headers:
+                headers[0].update(self._agents_header_text(len(agents)))
+            by_id = {c.pane_id: c for c in current_cards}
+            self._pane_cards = by_id
+            for snap in agents:
+                by_id[snap.pane.pane_id].update(
+                    self._format_agent_card_text(snap)
+                )
+            for snap in others:
+                by_id[snap.pane.pane_id].update(
+                    self._format_other_card_text(snap)
+                )
+            return False
+
+        # Slow path (structural change): full rebuild. Arrow loss in this
+        # window is tolerable because the pane set actually changed.
+        self._pane_cards = {}
+        self._selected_card_pane_id = None
+        for widget in list(container.children):
+            widget.remove()
+
+        def mount_with_session_dividers(snaps, card_fn):
+            """Mount PaneCards with a session divider before each new group.
+
+            In multi mode, emits a `── sess_name ──` divider before the first
+            card of each session so users can see at a glance which agents
+            belong to which session, while still keeping the unified
+            single-list ordering. The style comes from
+            `monitor_shared.format_session_divider`; only the two-column indent
+            belongs to this call site.
+            """
+            current_session = None
+            for snap in snaps:
+                sess = snap.pane.session_name
+                if multi_mode and sess != current_session:
+                    current_session = sess
+                    label = sess or "?"
+                    container.mount(Static(
+                        f"  {format_session_divider(label)}",
+                        classes="session-divider",
+                    ))
+                card = PaneCard(snap.pane.pane_id, card_fn(snap))
+                container.mount(card)
+                self._pane_cards[card.pane_id] = card
+
+        if agents:
+            container.mount(Static(
+                self._agents_header_text(len(agents)),
+                classes="section-header",
+            ))
+            mount_with_session_dividers(agents, self._format_agent_card_text)
+
+        if others:
+            container.mount(Static(
+                f"[bold]OTHER ({len(others)})[/]",
+                classes="section-header",
+            ))
+            mount_with_session_dividers(others, self._format_other_card_text)
+        return True
+
+    def _update_content_preview(self) -> None:
+        try:
+            preview = self.query_one("#content-preview", PreviewPanel)
+            header = self.query_one("#content-header", Static)
+            scroll = self.query_one("#preview-scroll", PreviewScrollContainer)
+        except Exception:
+            return
+
+        # Any (re)entry supersedes an in-flight offloaded render (t1111_5): bump
+        # the render token UP FRONT so a pending _apply_preview_render scheduled by
+        # an earlier call can no longer apply — whether this call renders fresh
+        # content, clears to (empty)/prompt, or intentionally freezes the current
+        # view. Branches that decide "do not render" must still invalidate a stale
+        # render (e.g. an empty/no-focus/frozen re-entry must not be overwritten by
+        # a slow render for the same pane that was scheduled a moment earlier), so
+        # the bump lives here rather than only at schedule time. The render branch
+        # reuses `my_gen` instead of bumping again.
+        self._preview_render_gen += 1
+        my_gen = self._preview_render_gen
+
+        if not (self._focused_pane_id and self._focused_pane_id in self._snapshots):
+            header.update("[bold]Content Preview[/]")
+            preview.styles.min_width = 0
+            preview.update("[dim]Focus an agent or pane to see its output[/]")
+            self._preview_rendered_lines = []
+            self._last_preview_pane_id = self._focused_pane_id
+            return
+
+        # A frozen pane IS in `_snapshots` (with an empty `content`), so it
+        # passes the guard above and would render blank — indistinguishable from
+        # a broken capture. Checked before parked, as everywhere else (t1705_7).
+        if self._snapshots[self._focused_pane_id].frozen:
+            header.update("[bold]Content Preview[/]")
+            preview.styles.min_width = 0
+            preview.update(
+                "[dim]This agent is frozen — press s to switch to its viewer, "
+                "then R to restore or P to re-pick.[/]"
+            )
+            self._preview_rendered_lines = []
+            self._last_preview_pane_id = self._focused_pane_id
+            return
+
+        # A parked pane IS in `_snapshots` (with an empty `content`), so it
+        # passes the guard above and would render as a blank pane —
+        # indistinguishable from a broken capture. Say what is actually true
+        # instead, and name the way out (t1685).
+        if self._snapshots[self._focused_pane_id].parked:
+            header.update("[bold]Content Preview[/]")
+            preview.styles.min_width = 0
+            preview.update(
+                "[dim]This agent is parked — press Space to unpark it.[/]"
+            )
+            self._preview_rendered_lines = []
+            self._last_preview_pane_id = self._focused_pane_id
+            return
+
+        snap = self._snapshots[self._focused_pane_id]
+        saved = self._preview_scroll_state.get(self._focused_pane_id)
+        is_paused = saved is not None and not saved[0]
+        same_pane = (self._focused_pane_id == self._last_preview_pane_id)
+
+        # -- Header (always refreshed so PAUSED/LIVE badge stays current) --
+        # Window name and task title are user-derived (t2006), so they are
+        # `$variables` of a Content template rather than interpolated markup:
+        # Textual substitutes them after tokenizing, which keeps them literal
+        # even when a title ends in a backslash right before its `[/]` — the
+        # one case `markup_literal` cannot express.
+        variables = {
+            "idx": snap.pane.window_index, "name": snap.pane.window_name,
+        }
+        pane_label = "($idx:$name)"
+        task_id = self._task_cache.get_task_id_for_pane(snap.pane)
+        if task_id:
+            info = self._task_cache.get_task_info(task_id, snap.pane.session_name)
+            if info:
+                variables.update(task_id=task_id, title=info.title)
+                if self._active_zone == Zone.PREVIEW:
+                    pane_label += " [bold]t$task_id: $title[/]"
+                else:
+                    pane_label += " [dim italic]t$task_id: $title[/]"
+
+        if is_paused:
+            tag = " [bold yellow]PAUSED[/]"
+        elif self._active_zone == Zone.PREVIEW:
+            tag = " [bold green]LIVE[/]"
+        else:
+            tag = ""
+
+        if self._active_zone == Zone.PREVIEW:
+            template = f"[bold white]Content Preview[/] {pane_label}{tag}"
+        else:
+            template = f"[bold]Content Preview[/] {pane_label}{tag}"
+        header.update(Content.from_markup(template, **variables))
+
+        # -- Frozen branch: skip content + scroll updates entirely --
+        # Same pane as last tick AND (user detached OR user scroll in flight):
+        # do not call preview.update() (no layout recompute, no scroll clamp)
+        # and do not call scroll_end/scroll_to (no fighting the user).
+        if same_pane and (is_paused or scroll.user_is_scrolling):
+            self._last_preview_pane_id = self._focused_pane_id
+            return
+
+        # -- Active branch: offload the render, apply + restore scroll on the loop --
+        # Only _ansi_to_rich_text (Text.from_ansi + per-line regex) is CPU-heavy and
+        # pure, so it is offloaded (t1111_5). Everything cheap/stateful stays here on
+        # the loop: min_width, the rendered-lines bookkeeping (drives scroll-anchor
+        # save), and _last_preview_pane_id (drives same_pane) are set synchronously
+        # from the snapshot — not from the render — so their semantics stay correct
+        # immediately. preview.update(text) + scroll restore are deferred into the
+        # worker (see _apply_preview_render).
+        lines = snap.content.rstrip().splitlines()
+        if lines:
+            preview.styles.min_width = snap.pane.width
+            self._preview_rendered_lines = lines
+            # my_gen was reserved at the top of this method (every entry bumps it).
+            pane_id = self._focused_pane_id
+            if not same_pane:
+                # Pane actually switched: clear pane-A's stale body NOW so the
+                # already-updated header for pane B never sits above pane A's
+                # content while the offloaded render is in flight. Same-pane
+                # re-renders (0.3s fast-preview tick) skip this to avoid flicker.
+                preview.update("[dim]…[/]")
+            self.run_worker(
+                self._apply_preview_render(
+                    pane_id, "\n".join(lines), my_gen, saved, lines
+                ),
+                exclusive=True, group="preview", exit_on_error=False,
+            )
+        else:
+            preview.styles.min_width = 0
+            preview.update("[dim](empty)[/]")
+            self._preview_rendered_lines = []
+
+        self._last_preview_pane_id = self._focused_pane_id
+
+    async def _apply_preview_render(self, pane_id, joined, my_gen, saved, lines) -> None:
+        """Offloaded preview render + guarded application (t1111_5).
+
+        Runs the pure, CPU-heavy `_ansi_to_rich_text` off the UI thread via the
+        TmuxMonitor `_run_offloaded` seam (established in t1111_4), then applies
+        `preview.update` + scroll restore back on the loop — but only if this
+        render is still the current one (`_preview_render_gen`) AND focus has not
+        moved to another pane. A late / superseded render never overwrites the
+        preview; a stale scroll restore never lands on another pane's shared
+        scroll container.
+        """
+        if self._monitor is None:
+            return
+        # Superseded while still queued (rapid arrow-nav): don't even launch the
+        # thread. `run_worker(exclusive=True)` cancels the coroutine, but the
+        # asyncio.to_thread work is not cancellable — this check is what avoids
+        # a doomed render; the generation guard below is what enforces correctness.
+        if my_gen != self._preview_render_gen:
+            return
+        try:
+            text = await self._monitor._run_offloaded(
+                lambda: _ansi_to_rich_text(joined)
+            )
+        except Exception:
+            # Fail closed: a raising from_ansi degrades to raw text, never crashes
+            # the loop.
+            text = Text(joined)
+
+        # Back on the loop after the await:
+        if my_gen != self._preview_render_gen:
+            return  # superseded by a newer render → discard
+        if pane_id != self._focused_pane_id:
+            return  # focus moved during the offload → don't write B's preview
+        try:
+            preview = self.query_one("#content-preview", PreviewPanel)
+            scroll = self.query_one("#preview-scroll", PreviewScrollContainer)
+        except Exception:
+            return
+
+        preview.update(text)
+
+        # Scroll restore AFTER preview.update. The deferred call_after_refresh
+        # callbacks fire on a later refresh cycle, by which point focus may have
+        # moved again and `scroll` is a SHARED container — so each re-checks the
+        # generation + focused pane at execution time before touching scroll.
+        def _guarded(action, g=my_gen, p=pane_id):
+            if g == self._preview_render_gen and p == self._focused_pane_id:
+                action()
+
+        if saved is None or saved[0]:
+            # Tail follow (first view of this pane or at-bottom).
+            self.call_after_refresh(
+                lambda: _guarded(lambda: scroll.scroll_end(animate=False))
+            )
+        else:
+            anchor_text = saved[1]
+            target_idx = self._locate_anchor(lines, anchor_text)
+            if target_idx is None:
+                # Anchor rolled off the capture buffer — snap to tail so we don't
+                # get stuck on a stale position on pane-return.
+                self.call_after_refresh(
+                    lambda: _guarded(lambda: scroll.scroll_end(animate=False))
+                )
+            else:
+                target_f = float(target_idx)
+                self.call_after_refresh(
+                    lambda t=target_f: _guarded(
+                        lambda: scroll.scroll_to(y=t, animate=False)
+                    )
+                )
+
+    # -- Shadow column rendering (t1216_2) -------------------------------------
+
+    def _update_shadow_preview(self) -> None:
+        """Render the SHADOW column for the selected agent's bound shadow.
+
+        Mirrors _update_content_preview but with its OWN render generation and
+        worker group: sharing either would let the two columns cancel or clobber
+        each other's renders.
+        """
+        try:
+            preview = self.query_one("#shadow-preview", PreviewPanel)
+            header = self.query_one("#shadow-header", Static)
+            scroll = self.query_one("#shadow-scroll", PreviewScrollContainer)
+        except Exception:
+            return
+
+        # Bump UP FRONT on EVERY entry — including the absent / frozen / empty
+        # branches — so a slow in-flight render can never clobber a newer state
+        # (same discipline as _update_content_preview, t1111_5).
+        self._shadow_render_gen += 1
+        my_gen = self._shadow_render_gen
+
+        snap = None
+        if self._focused_pane_id and self._monitor is not None:
+            snap = self._monitor.get_shadow_snapshot(self._focused_pane_id)
+
+        if snap is None:
+            # The zone may still be HELD here during the grace window (see
+            # _reconcile_shadow_state), so show a placeholder rather than
+            # anything that could be mistaken for live shadow output.
+            header.update("[bold]Shadow[/]")
+            preview.styles.min_width = 0
+            preview.update("[dim](shadow unavailable)[/]")
+            self._shadow_rendered_lines = []
+            self._last_shadow_pane_id = None
+            return
+
+        shadow_pane_id = snap.pane.pane_id
+        saved = self._shadow_scroll_state.get(shadow_pane_id)
+        is_paused = saved is not None and not saved[0]
+        same_pane = (shadow_pane_id == self._last_shadow_pane_id)
+
+        label = f"({shadow_pane_id} ← {self._focused_pane_id})"
+        if is_paused:
+            tag = " [bold yellow]PAUSED[/]"
+        elif self._active_zone == Zone.SHADOW:
+            tag = " [bold green]LIVE[/]"
+        else:
+            tag = ""
+        if self._active_zone == Zone.SHADOW:
+            header.update(f"[bold white]Shadow[/] {label}{tag}")
+        else:
+            header.update(f"[bold]Shadow[/] {label}{tag}")
+
+        # Frozen branch: same shadow pane AND (user detached OR scroll in flight).
+        if same_pane and (is_paused or scroll.user_is_scrolling):
+            self._last_shadow_pane_id = shadow_pane_id
+            return
+
+        lines = snap.content.rstrip().splitlines()
+        if lines:
+            # Size the panel to the REAL shadow pane width so its content
+            # renders unwrapped (mirrors the agent preview).
+            preview.styles.min_width = snap.pane.width
+            self._shadow_rendered_lines = lines
+            if not same_pane:
+                preview.update("[dim]…[/]")
+            self.run_worker(
+                self._apply_shadow_render(
+                    shadow_pane_id, "\n".join(lines), my_gen, saved, lines
+                ),
+                exclusive=True, group="shadow-preview", exit_on_error=False,
+            )
+        else:
+            preview.styles.min_width = 0
+            preview.update("[dim](empty)[/]")
+            self._shadow_rendered_lines = []
+
+        self._last_shadow_pane_id = shadow_pane_id
+
+    async def _apply_shadow_render(
+        self, shadow_pane_id, joined, my_gen, saved, lines
+    ) -> None:
+        """Offloaded shadow render + guarded application.
+
+        Mirrors _apply_preview_render, but the identity guard compares against
+        the CURRENT shadow pane (the selection may have moved to another agent,
+        or the shadow may have been rebound) rather than the focused agent.
+        """
+        if self._monitor is None:
+            return
+        if my_gen != self._shadow_render_gen:
+            return
+        try:
+            text = await self._monitor._run_offloaded(
+                lambda: _ansi_to_rich_text(joined)
+            )
+        except Exception:
+            text = Text(joined)
+
+        if my_gen != self._shadow_render_gen:
+            return  # superseded by a newer render → discard
+        if shadow_pane_id != self._current_shadow_pane_id():
+            return  # selection moved / shadow rebound during the offload
+        try:
+            preview = self.query_one("#shadow-preview", PreviewPanel)
+            scroll = self.query_one("#shadow-scroll", PreviewScrollContainer)
+        except Exception:
+            return
+
+        preview.update(text)
+
+        def _guarded(action, g=my_gen, p=shadow_pane_id):
+            if g == self._shadow_render_gen and p == self._current_shadow_pane_id():
+                action()
+
+        if saved is None or saved[0]:
+            self.call_after_refresh(
+                lambda: _guarded(lambda: scroll.scroll_end(animate=False))
+            )
+        else:
+            target_idx = self._locate_anchor(lines, saved[1])
+            if target_idx is None:
+                self.call_after_refresh(
+                    lambda: _guarded(lambda: scroll.scroll_end(animate=False))
+                )
+            else:
+                target_f = float(target_idx)
+                self.call_after_refresh(
+                    lambda t=target_f: _guarded(
+                        lambda: scroll.scroll_to(y=t, animate=False)
+                    )
+                )
+
+    # -- Zone navigation -------------------------------------------------------
+
+    # -- Shadow concern helpers (t1216_3) --------------------------------------
+
+    @staticmethod
+    def _mark_concern_sig(
+        store: dict[str, frozenset[str]],
+        pane_id: str,
+        trigger_sig: str | None,
+        captured_sig: str,
+    ) -> None:
+        """Record BOTH the raw trigger signature and the -J captured one.
+
+        They are digests of the same block taken through different capture paths
+        (the tick's ``-p -e`` vs the picker's ``-J``), and
+        ``concern_block_signature``'s documented mid-word-wrap residual makes
+        them differ systematically whenever the block wraps mid-word. Storing
+        only one leaves the next tick's raw signature unmatched — which
+        re-captures every tick for ``_concern_sig_examined``, and never clears
+        the badge for ``_concern_sig_offered``. Bounded at two entries: a new
+        block replaces the pair.
+
+        ``trigger_sig`` is a PARAMETER, never read from ``_concern_sig_latest``
+        here: callers snapshot it BEFORE their capture await, and the 3s tick can
+        replace it with a NEWER block's signature meanwhile. Reading it at write
+        time would mark that newer block as already examined/offered and lose it
+        silently. Static for the same reason — there is no instance state to
+        reach for.
+        """
+        store[pane_id] = frozenset(
+            s for s in (trigger_sig, captured_sig) if s is not None
+        )
+
+    def _seen_concern_sigs(self, followed_pane_id: str) -> frozenset[str]:
+        """Signatures already picked OR already authoritatively checked."""
+        return self._concern_sig_offered.get(
+            followed_pane_id, frozenset()
+        ) | self._concern_sig_examined.get(followed_pane_id, frozenset())
+
+    def _scan_concern_signatures(self) -> None:
+        """Refresh the per-agent concern signatures from data the tick already has.
+
+        Zero tmux traffic: ``shadow_snap.content`` came from the same async
+        gather that captured the agents. This is a TRIGGER, never a parse — the
+        picker re-captures with ``-J`` (concern_parser's third strictness tier).
+        """
+        prev = self._concern_sig_latest
+        latest: dict[str, str] = {}
+        for followed, snap in self._tick_shadow_snaps.items():
+            # Parked agents carry no concern badge (t1685) — their row renders
+            # the parked placeholder and nothing else, so a signature computed
+            # here would have nowhere to show and would age silently.
+            if (followed in self._parked_pane_ids
+                    or followed in self._frozen_pane_ids):
+                continue
+            sig = concern_block_signature(snap.content)
+            if sig is None and snap.pane.width < _SENTINEL_SAFE_COLS:
+                # Below _SENTINEL_SAFE_COLS the fences themselves can wrap, so
+                # "no signature" is uninformative, not evidence of absence. Carry
+                # forward whatever the Step-5 probe last established — rebuilding
+                # wholesale here would clear the probe's value every tick and
+                # make a narrow-pane badge flicker on and off. For a WIDE pane
+                # absence IS evidence, so it drops (the "scrolls out" case).
+                sig = prev.get(followed)
+            if sig is not None:
+                latest[followed] = sig
+        self._concern_sig_latest = latest
+        # Evict ONLY when the agent itself is gone: a shadow that died and one
+        # whose capture blipped are indistinguishable here, and evicting on that
+        # would re-offer an identical block when the shadow respawns.
+        #
+        # Iterate the UNION of both maps: an agent whose block verified to
+        # nothing forwardable has an `_examined` entry and NO `_offered` one
+        # (the offer pass returns before marking it offered), so a loop over
+        # `_concern_sig_offered` alone would never visit it and its entry would
+        # outlive the agent for the rest of the session.
+        for pid in set(self._concern_sig_offered) | set(self._concern_sig_examined):
+            if pid not in self._snapshots:
+                self._concern_sig_offered.pop(pid, None)
+                self._concern_sig_examined.pop(pid, None)
+
+    def _has_fresh_concerns(self, followed_pane_id: str) -> bool:
+        """True when this agent's shadow has a block the user has not been
+        offered — the card badge. Derived every render, never a latched flag."""
+        sig = self._concern_sig_latest.get(followed_pane_id)
+        if sig is None:
+            return False
+        # Membership, not equality: the on-screen digest and the stored -J one
+        # are the same block through different capture paths (see
+        # _mark_concern_sig), so `!=` would leave the badge stuck on forever
+        # after a successful pick.
+        return sig not in self._concern_sig_offered.get(
+            followed_pane_id, frozenset()
+        )
+
+    # -- Shadow column helpers (t1216_2) ---------------------------------------
+
+    def _current_shadow_pane_id(self) -> str | None:
+        """Shadow pane bound to the SELECTED agent, or None.
+
+        Resolves from ``self._focused_pane_id`` — never ``_get_focused_pane_id()``,
+        which reads ``self.focused`` and returns None whenever focus is off a
+        PaneCard, i.e. always while a preview zone is active.
+
+        Answers *"is there a shadow to **read**"* (preview, key forwarding,
+        concern picker) from the cached snapshots, where lagging a tick is the
+        intended cheapness. It does **not** answer *"may I **create** one"*: the
+        cache cannot report a shadow it has not observed yet, so the launch guards
+        use the live ``find_shadow_pane_status`` lookup instead (t1216_4).
+        """
+        if not self._focused_pane_id or self._monitor is None:
+            return None
+        snap = self._monitor.get_shadow_snapshot(self._focused_pane_id)
+        return None if snap is None else snap.pane.pane_id
+
+    def _shadow_visibility_width(self) -> int | None:
+        """Width the shadow column should occupy, or None to hide it.
+
+        **Single source of truth** for every caller of
+        `_apply_shadow_visibility` — the 3s reconcile and the resize-driven fit
+        check. Deriving this in two places is a live bug: while the SHADOW zone
+        HOLDS a momentarily-absent snapshot, a caller that resolved `None`
+        instead of the last known width would hide the column and trigger
+        `_leave_shadow_zone`, collapsing the grace window to whenever the user
+        happens to resize the terminal.
+        """
+        snap = None
+        if self._focused_pane_id and self._monitor is not None:
+            snap = self._monitor.get_shadow_snapshot(self._focused_pane_id)
+        if snap is not None:
+            self._last_shadow_width = snap.pane.width
+            return snap.pane.width
+        if self._active_zone == Zone.SHADOW:
+            return self._last_shadow_width  # holding: keep the column up
+        return None
+
+    def _shadow_split_fits(self, shadow_width: int) -> bool:
+        """Whether the side-by-side split leaves the agent column usable.
+
+        Decided on the mounted row's usable content width, NOT self.size.width:
+        the screen width ignores #content-section's border, the stable
+        scrollbar gutters and padding, and at the boundary that error is
+        several columns. content_region is only meaningful post-layout, so
+        every caller schedules this via call_after_refresh.
+        """
+        try:
+            row = self.query_one("#preview-row")
+        except Exception:
+            return False  # not mounted yet — no split
+        avail = row.content_region.width
+        return (avail - (shadow_width + 1)) >= SHADOW_MIN_AGENT_COLS
+
+    def _apply_shadow_visibility(self, shadow_width: int | None) -> None:
+        """Show/size or hide #shadow-col. Runs post-layout (call_after_refresh).
+
+        `shadow_width` is None when no shadow is bound. Also resets the tail
+        target when the column is not usable, so `t` can never aim at a hidden
+        column.
+        """
+        try:
+            col = self.query_one("#shadow-col")
+            preview = self.query_one("#shadow-preview", PreviewPanel)
+        except Exception:
+            return
+        fits = shadow_width is not None and self._shadow_split_fits(shadow_width)
+        self._shadow_split_ok = fits
+        if fits:
+            # +1 for the stable scrollbar gutter.
+            col.styles.width = shadow_width + 1
+            preview.styles.min_width = shadow_width
+            col.display = True
+        else:
+            col.display = False
+            if self._active_preview_zone == Zone.SHADOW:
+                self._active_preview_zone = Zone.PREVIEW
+            if self._active_zone == Zone.SHADOW:
+                self._leave_shadow_zone("Shadow column hidden — too narrow")
+
+    def _reconcile_shadow_state(self) -> Zone:
+        """Full-refresh owner of shadow visibility, the grace counter and the
+        SHADOW-zone exit. Returns the (possibly changed) active zone.
+
+        The 0.3s tick only runs while SHADOW is FOCUSED, but the column is
+        visible whenever a shadow is bound — so the 3s refresh has to own all of
+        this or the column goes stale (or keeps showing the previous agent's
+        shadow) whenever focus sits in the pane list.
+
+        Two causes of an absent snapshot are indistinguishable here — the shadow
+        pane died, or a single capture failed — so the grace window covers both.
+        A selection change is different: it IS unambiguous (we never had a
+        snapshot for the newly selected agent), so it exits immediately.
+
+        Returns the zone so _refresh_data can rebind its `saved_zone` local
+        before handing it to the deferred _restore_focus — otherwise the restore
+        would re-focus the shadow column and UNDO the fallback just applied.
+        """
+        snap = None
+        if self._focused_pane_id and self._monitor is not None:
+            snap = self._monitor.get_shadow_snapshot(self._focused_pane_id)
+
+        if self._active_zone == Zone.SHADOW:
+            moved = (
+                self._shadow_zone_agent_id is not None
+                and self._focused_pane_id != self._shadow_zone_agent_id
+            )
+            if moved and snap is None:
+                # Unambiguous: we never had a snapshot for the newly selected
+                # agent, so this is not a blip. Leave at once rather than
+                # sitting on a placeholder for the whole grace window.
+                self._leave_shadow_zone("Agent has no shadow — back to the preview")
+            elif moved:
+                # Follow the selection onto the new agent's shadow.
+                self._shadow_zone_agent_id = self._focused_pane_id
+                self._shadow_absent_ticks = 0
+            elif snap is not None:
+                self._shadow_absent_ticks = 0
+            else:
+                self._shadow_absent_ticks += 1
+                if self._shadow_absent_ticks >= SHADOW_ABSENT_GRACE_TICKS:
+                    self._leave_shadow_zone(
+                        "Shadow gone — back to the agent preview"
+                    )
+        else:
+            self._shadow_absent_ticks = 0
+
+        # Visibility/width must be measured post-layout. Derived by the shared
+        # helper (never inline) so this path and the resize-driven fit check
+        # cannot disagree about the hold case.
+        self._schedule_shadow_fit_check()
+
+        # Drop scroll state for shadow panes that no longer exist. The same walk
+        # publishes _tick_shadow_snaps: this is the ONE place per tick that
+        # resolves every agent's shadow, and the concern scan consumes it rather
+        # than repeating the lookup (t1216_3).
+        live_shadow_ids = set()
+        tick_shadows: dict[str, PaneSnapshot] = {}
+        if self._monitor is not None:
+            for followed in list(self._snapshots):
+                s = self._monitor.get_shadow_snapshot(followed)
+                if s is not None:
+                    live_shadow_ids.add(s.pane.pane_id)
+                    tick_shadows[followed] = s
+        self._tick_shadow_snaps = tick_shadows
+        for pid in [p for p in self._shadow_scroll_state if p not in live_shadow_ids]:
+            del self._shadow_scroll_state[pid]
+        if (
+            self._last_shadow_pane_id is not None
+            and self._last_shadow_pane_id not in live_shadow_ids
+        ):
+            self._last_shadow_pane_id = None
+
+        return self._active_zone
+
+    def _zone_available(self, zone: Zone) -> bool:
+        """Whether `zone` can currently be entered.
+
+        Only SHADOW is conditional — it needs a bound shadow for the selected
+        agent AND the split to fit — so Tab behaves exactly as before for
+        agents with no shadow.
+        """
+        if zone != Zone.SHADOW:
+            return True
+        return self._current_shadow_pane_id() is not None and self._shadow_split_ok
+
+    def _enter_shadow_zone(self) -> None:
+        """Bind the SHADOW zone to the currently selected agent.
+
+        Idempotent for the SAME agent. This matters: _restore_focus re-focuses
+        #shadow-preview on every full refresh, which fires on_descendant_focus
+        and lands here — resetting the absent-grace counter unconditionally
+        would mean it could NEVER reach SHADOW_ABSENT_GRACE_TICKS and the zone
+        would hold a dead shadow forever.
+        """
+        if self._shadow_zone_agent_id != self._focused_pane_id:
+            self._shadow_zone_agent_id = self._focused_pane_id
+            self._shadow_absent_ticks = 0
+        self._active_preview_zone = Zone.SHADOW
+
+    def _leave_shadow_zone(self, reason: str | None = None) -> None:
+        """Fall back from SHADOW to PREVIEW and reset the tail target."""
+        self._active_zone = Zone.PREVIEW
+        self._active_preview_zone = Zone.PREVIEW
+        self._shadow_absent_ticks = 0
+        self._shadow_zone_agent_id = None
+        self._focus_first_in_zone()
+        self._manage_preview_timer()
+        if reason:
+            self.notify(reason)
+
+    def _switch_zone(self, direction: int = 1) -> None:
+        """Cycle active zone forward or backward, skipping unavailable zones."""
+        idx = ZONE_ORDER.index(self._active_zone)
+        # Loop rather than single-step so a skip can never land on an invalid
+        # zone (PANE_LIST is always available, so this always terminates).
+        for _ in range(len(ZONE_ORDER)):
+            idx = (idx + direction) % len(ZONE_ORDER)
+            if self._zone_available(ZONE_ORDER[idx]):
+                break
+        self._active_zone = ZONE_ORDER[idx]
+        if self._active_zone == Zone.SHADOW:
+            self._enter_shadow_zone()
+        elif self._active_zone == Zone.PREVIEW:
+            self._active_preview_zone = Zone.PREVIEW
+        self._focus_first_in_zone()
+        self._manage_preview_timer()
+        self._update_zone_indicators()
+
+    def _focus_first_in_zone(self) -> None:
+        """Focus the first focusable widget in the active zone."""
+        if self._active_zone == Zone.PANE_LIST:
+            cards = list(self.query("#pane-list PaneCard"))
+            if not cards:
+                return
+            # Restore previously focused card if possible
+            if self._focused_pane_id:
+                for card in cards:
+                    if card.pane_id == self._focused_pane_id:
+                        card.focus()
+                        return
+            # Fall back to first card
+            cards[0].focus()
+        elif self._active_zone == Zone.PREVIEW:
+            try:
+                self.query_one("#content-preview", PreviewPanel).focus()
+            except Exception:
+                pass
+        elif self._active_zone == Zone.SHADOW:
+            try:
+                self.query_one("#shadow-preview", PreviewPanel).focus()
+            except Exception:
+                pass
+
+    def _update_zone_indicators(self) -> None:
+        """Update visual indicators showing which zone is active."""
+        try:
+            for section_id, zone in [
+                ("#pane-list", Zone.PANE_LIST),
+                ("#content-section", Zone.PREVIEW),
+                ("#shadow-col", Zone.SHADOW),
+            ]:
+                widget = self.query_one(section_id)
+                widget.set_class(self._active_zone == zone, "zone-active")
+        except Exception:
+            return
+        # Refresh the preview headers (LIVE indicator) for both columns.
+        self._update_content_preview()
+        self._update_shadow_preview()
+        # Update footer to show/hide bindings based on active zone.
+        # refresh_bindings() is what actually relabels the Footer — check_action
+        # alone never does.
+        self.refresh_bindings()
+        # Keep the previewed PaneCard visually marked even when focus is on
+        # the preview pane.
+        self._update_selected_card_indicator()
+
+    def _update_selected_card_indicator(self, full: bool = False) -> None:
+        """Mark the PaneCard matching _focused_pane_id with the 'selected' class.
+
+        Provides a persistent visual hint of which agent's preview is shown,
+        even when keyboard focus has moved to the PreviewPanel.
+        """
+        focused_id = self._focused_pane_id
+        if full:
+            for card in self._pane_cards.values():
+                card.set_class(card.pane_id == focused_id, "selected")
+            self._selected_card_pane_id = (
+                focused_id if focused_id in self._pane_cards else None
+            )
+            return
+
+        old_id = self._selected_card_pane_id
+        if old_id != focused_id:
+            old_card = self._pane_cards.get(old_id) if old_id is not None else None
+            if old_card is not None:
+                old_card.set_class(False, "selected")
+
+        new_card = self._pane_cards.get(focused_id) if focused_id is not None else None
+        if new_card is not None:
+            new_card.set_class(True, "selected")
+            self._selected_card_pane_id = focused_id
+        else:
+            self._selected_card_pane_id = None
+
+    def _visible_pane_cards(self) -> list[PaneCard]:
+        """The PaneCards currently mounted in the list, in display order."""
+        try:
+            container = self.query_one("#pane-list", VerticalScroll)
+        except Exception:
+            return []
+        return [w for w in container.children if isinstance(w, PaneCard)]
+
+    def _clear_pane_list_focus(self) -> None:
+        """Leave the pane list with nothing selected, coherently (t1685).
+
+        Reachable: park the only visible agent while the filter is on. Returning
+        early instead would leave `_focused_pane_id` naming a pane with no card,
+        and `space` / `k` / `n` / `e` / the preview would all keep resolving
+        against it — the same class of stale-focus defect the handoff exists to
+        remove, just one step later.
+
+        The zone stays PANE_LIST so `P` remains dispatchable (`check_action`
+        gates on the zone, not on a selection), and the preview is re-rendered so
+        it shows its empty state rather than the parked pane's blank content.
+        """
+        self._focused_pane_id = None
+        self._selected_card_pane_id = None
+        try:
+            self.set_focus(None)
+        except Exception:
+            pass
+        self._update_content_preview()
+        self._update_shadow_preview()
+
+    def _focus_next_visible_card(self, hidden_pane_id: str | None) -> None:
+        """Move focus off a card the parked filter is about to hide.
+
+        Runs BEFORE the rebuild, which is the whole point: once the card is
+        removed there is nothing to hand off from, and `_restore_focus` has no
+        card to resolve the saved id against.
+        """
+        cards = self._visible_pane_cards()
+        remaining = [c for c in cards if c.pane_id != hidden_pane_id]
+        if not remaining:
+            self._clear_pane_list_focus()
+            return
+        # Prefer the next card after the hidden one; fall back to the previous.
+        target = remaining[0]
+        ids = [c.pane_id for c in cards]
+        if hidden_pane_id in ids:
+            idx = ids.index(hidden_pane_id)
+            after = [c for c in cards[idx + 1:] if c.pane_id != hidden_pane_id]
+            before = [c for c in cards[:idx] if c.pane_id != hidden_pane_id]
+            target = after[0] if after else (before[-1] if before else target)
+        self._focused_pane_id = target.pane_id
+        try:
+            target.focus()
+        except Exception:
+            pass
+
+    def _hand_off_focus_before_hiding(self) -> None:
+        """Mixin hook: `P` is about to hide the focused card. Move off it."""
+        pane_id = self._focused_pane_id
+        if pane_id is None:
+            return
+        snap = self._snapshots.get(pane_id)
+        if snap is None or not (snap.parked or snap.frozen):
+            return
+        self._focus_next_visible_card(pane_id)
+
+    async def action_toggle_mark(self) -> None:
+        """Cycle the focused card's mark, then keep focus on a visible card.
+
+        The handoff cannot live in the shared mixin: only the full monitor has a
+        focusable pane list, and only it can strand focus on a row the parked
+        filter removes. `_restore_focus` also carries a no-card fallback, but
+        that is the safety net — this is the deliberate move, made while the
+        card being left is still mounted.
+        """
+        pane_id = self._get_focused_pane_id()
+        await super().action_toggle_mark()
+        if pane_id and self._hide_inactive:
+            snap = self._snapshots.get(pane_id)
+            # `_cycle_mark_for` already re-read the store, so the mark is current
+            # even though this tick's snapshot predates the write.
+            if snap is not None and self._is_parked(snap):
+                self._focus_next_visible_card(pane_id)
+
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        """Show/hide footer bindings based on active zone."""
+        if self._active_zone in (Zone.PREVIEW, Zone.SHADOW):
+            return action == "switch_zone"
+        return action != "switch_zone"
+
+    def action_switch_zone(self) -> None:
+        """No-op — Tab is handled in on_key. Exists for Footer display only."""
+
+    def action_send_enter(self) -> None:
+        """No-op — Enter is handled in on_key. Exists for Footer display only."""
+
+    async def _fast_zone_refresh(self) -> None:
+        """Dispatch the 0.3s tick to the column the ACTIVE zone owns.
+
+        set_interval binds its callback once, so widening _manage_preview_timer's
+        `is None` guard to admit SHADOW would leave a PREVIEW→SHADOW transition
+        taking neither branch — the live timer would keep refreshing the agent
+        column forever. Dispatching here reads the zone at call time instead, so
+        a zone change needs no timer churn and there is no stop/recreate window
+        (t1216_2).
+        """
+        if self._active_zone == Zone.SHADOW:
+            await self._fast_shadow_refresh()
+        elif self._active_zone == Zone.PREVIEW:
+            await self._fast_preview_refresh()
+
+    def _manage_preview_timer(self) -> None:
+        """Start/stop the fast preview timer based on active zone."""
+        active = self._active_zone in (Zone.PREVIEW, Zone.SHADOW)
+        if active and self._preview_timer is None:
+            self._preview_timer = self.set_interval(0.3, self._fast_zone_refresh)
+        elif not active and self._preview_timer is not None:
+            self._preview_timer.stop()
+            self._preview_timer = None
+
+    def _nav_within_zone(self, direction: int) -> None:
+        """Move focus up/down within the current zone's cards."""
+        if self._active_zone == Zone.PANE_LIST:
+            cards = list(self.query("#pane-list PaneCard"))
+        else:
+            return  # No card navigation in preview zone
+
+        if not cards:
+            return
+        focused = self.focused
+        try:
+            idx = cards.index(focused)
+        except ValueError:
+            cards[0].focus()
+            return
+        new_idx = max(0, min(len(cards) - 1, idx + direction))
+        cards[new_idx].focus()
+
+    # -- Key handling ----------------------------------------------------------
+
+    def on_key(self, event) -> None:
+        key = event.key
+
+        # Let modal screens (e.g. TuiSwitcherOverlay) handle their own keys
+        if isinstance(self.screen, ModalScreen):
+            return
+
+        # Tab/Shift+Tab always cycle zones (in all zones including preview)
+        if key == "tab":
+            self._switch_zone(1)
+            event.stop()
+            event.prevent_default()
+            return
+        if key == "shift+tab":
+            self._switch_zone(-1)
+            event.stop()
+            event.prevent_default()
+            return
+
+        # In pane-list zone: Enter sends Enter to the focused agent's tmux pane
+        if key == "enter" and self._active_zone == Zone.PANE_LIST:
+            if self._focused_pane_id and self._monitor:
+                self._monitor.send_keys(self._focused_pane_id, "Enter")
+                self._schedule_delayed_refresh()
+            event.stop()
+            event.prevent_default()
+            return
+
+        # In the shadow zone: forward everything to the SHADOW pane. This must
+        # sit above the PREVIEW catch-all below. event.stop() is unconditional,
+        # so when the shadow is absent the key is SWALLOWED rather than falling
+        # through to the agent pane — typing a user's shadow input into a
+        # working agent would be a real hazard (t1216_2).
+        if self._active_zone == Zone.SHADOW:
+            shadow_pane = self._current_shadow_pane_id()
+            if shadow_pane and self._monitor:
+                self._forward_key_to_tmux(event, target_pane_id=shadow_pane)
+            event.stop()
+            event.prevent_default()
+            return
+
+        # In preview zone: forward everything to tmux
+        if self._active_zone == Zone.PREVIEW:
+            if self._focused_pane_id and self._monitor:
+                self._forward_key_to_tmux(event)
+            event.stop()
+            event.prevent_default()
+            return
+
+        # In non-preview zones: Up/Down navigate within zone
+        if key == "up":
+            self._nav_within_zone(-1)
+            event.stop()
+            event.prevent_default()
+        elif key == "down":
+            self._nav_within_zone(1)
+            event.stop()
+            event.prevent_default()
+
+    def _forward_key_to_tmux(self, event, target_pane_id: str | None = None) -> None:
+        """Map a Textual key event to tmux send-keys and forward it.
+
+        Key translation lives in ``monitor_core.translate_key`` (shared with the
+        applink ``forward_key`` verb, t822_7); this method only forwards the
+        key and wires the desktop fast refresh.
+
+        ``target_pane_id`` overrides the default (the focused agent pane) for
+        the SHADOW zone. The SCHEDULED refresh must match the target, or typing
+        into the shadow would re-capture the agent column instead (t1216_2).
+        """
+        target = target_pane_id or self._focused_pane_id
+        if self._monitor.forward_key(target, event.key, event.character):
+            self._dispatch_fast_refresh(
+                self._fast_shadow_refresh if target_pane_id
+                else self._fast_preview_refresh
+            )
+
+    # -- Focus tracking --------------------------------------------------------
+
+    def on_descendant_focus(self, event) -> None:
+        widget = event.widget
+        # NOTE: none of these branches clears _shadow_zone_agent_id. Focus
+        # events fire incidentally during a pane-list rebuild, and unbinding
+        # here would make the next _enter_shadow_zone look like a fresh entry
+        # and reset the absent-grace counter every tick (t1216_2). The binding
+        # is owned by _enter_shadow_zone / _leave_shadow_zone only.
+        if isinstance(widget, PaneCard):
+            self._active_zone = Zone.PANE_LIST
+            self._focused_pane_id = widget.pane_id
+            self._manage_preview_timer()
+            self._update_zone_indicators()
+        elif isinstance(widget, PreviewPanel):
+            # BOTH preview columns are PreviewPanel instances, so the zone must
+            # be disambiguated by widget id — an isinstance-only branch would
+            # silently route shadow focus to Zone.PREVIEW (t1216_2).
+            if widget.id == "shadow-preview":
+                self._active_zone = Zone.SHADOW
+                self._enter_shadow_zone()
+            else:
+                self._active_zone = Zone.PREVIEW
+                self._active_preview_zone = Zone.PREVIEW
+            self._manage_preview_timer()
+            self._update_zone_indicators()
+
+    def _get_focused_pane_id(self) -> str | None:
+        """Get pane_id from the currently focused widget."""
+        focused = self.focused
+        if isinstance(focused, PaneCard):
+            return focused.pane_id
+        return None
+
+    # -- Actions ---------------------------------------------------------------
+
+    def action_switch_to(self) -> None:
+        """Switch tmux focus to the focused pane."""
+        if self._monitor is None:
+            return
+        pane_id = self._get_focused_pane_id()
+        if pane_id is None:
+            self.notify("Focus a pane first", severity="warning")
+            return
+        if self._monitor.switch_to_pane(pane_id):
+            snap = self._snapshots.get(pane_id)
+            name = f"{snap.pane.window_name}" if snap else pane_id
+            self.notify(f"Switched to {name}", markup=False)
+        else:
+            self.notify("Failed to switch", severity="error")
+
+    def action_refresh(self) -> None:
+        """Force an immediate data refresh."""
+        self.call_later(self._refresh_data)
+        self.notify("Refreshed")
+
+    def action_cycle_preview_size(self) -> None:
+        """Cycle the preview pane through S/M/L/XL_N sizes."""
+        self._preview_size_idx = (self._preview_size_idx + 1) % len(PREVIEW_SIZES)
+        self._apply_preview_size()
+
+    def _apply_preview_size(self) -> None:
+        """Apply the current preview size index to the preview widgets."""
+        section_h, preview_h, label = PREVIEW_SIZES[self._preview_size_idx]
+
+        if isinstance(section_h, str) and section_h.startswith("agents:"):
+            # Dynamic mode: size the pane-list to fit N agent cards; the
+            # preview section gets whatever vertical space remains.
+            # self.size may be (0, 0) before the first layout pass.
+            n_agents = int(section_h.split(":", 1)[1])
+            screen_h = self.size.height or 40
+            reserve = PREVIEW_LAYOUT_FIXED_LINES + n_agents * PREVIEW_AGENT_CARD_LINES
+            section_h = max(PREVIEW_MIN_SECTION_H, screen_h - reserve)
+            preview_h = max(PREVIEW_MIN_PREVIEW_H, section_h - 2)
+
+        try:
+            section = self.query_one("#content-section")
+            scroll = self.query_one("#preview-scroll", ScrollableContainer)
+        except Exception:
+            return
+
+        # Cap the section and scroll container heights only. The inner
+        # PreviewPanel (Static) must remain free to grow to its content
+        # height so the ScrollableContainer has overflow to scroll over.
+        section.styles.max_height = section_h
+        scroll.styles.max_height = preview_h
+        # Keep the shadow column's height in step with the agent column.
+        try:
+            self.query_one(
+                "#shadow-scroll", ScrollableContainer
+            ).styles.max_height = preview_h
+        except Exception:
+            pass
+        self.notify(f"Preview size: {label}")
+        # Immediately repopulate the (possibly larger) preview without
+        # waiting for the next 3s refresh cycle.
+        self._update_content_preview()
+        self._update_shadow_preview()
+        self._schedule_shadow_fit_check()
+
+    def _schedule_shadow_fit_check(self) -> None:
+        """Re-decide the side-by-side split after the next layout pass.
+
+        content_region is meaningless before layout, so every fit decision is
+        deferred via call_after_refresh.
+        """
+        self.call_after_refresh(
+            self._apply_shadow_visibility, self._shadow_visibility_width()
+        )
+
+    def action_scroll_preview_tail(self) -> None:
+        """Jump the LAST-FOCUSED preview column to its tail and re-engage follow.
+
+        `t` is only ever pressable from PANE_LIST — check_action disables every
+        non-switch_zone binding while a preview zone is focused — so "the active
+        column" means the last-focused one, tracked in _active_preview_zone
+        (t1216_2). The two columns key their scroll state differently: the agent
+        column by the followed pane id, the shadow column by the shadow pane id.
+        """
+        if self._active_preview_zone == Zone.SHADOW:
+            scroll_id, state = "#shadow-scroll", self._shadow_scroll_state
+            key = self._current_shadow_pane_id()
+            refresh = self._fast_shadow_refresh
+        else:
+            scroll_id, state = "#preview-scroll", self._preview_scroll_state
+            key = self._focused_pane_id
+            refresh = self._fast_preview_refresh
+        try:
+            scroll = self.query_one(scroll_id, PreviewScrollContainer)
+        except Exception:
+            return
+        scroll.scroll_end(animate=False)
+        if key is not None:
+            state[key] = (True, None)
+            # Pull fresh content so tail-follow resumes on the latest output.
+            self._dispatch_fast_refresh(refresh)
+        self.notify("Tail follow")
+
+    def on_resize(self, event) -> None:
+        """Recompute dynamic sizing specs (agents:N) when the terminal is resized."""
+        section_spec, _, _ = PREVIEW_SIZES[self._preview_size_idx]
+        if isinstance(section_spec, str) and section_spec.startswith("agents:"):
+            self._apply_preview_size()
+        # NOTE: the shadow split is deliberately NOT re-decided here. This
+        # handler runs before #preview-row has been re-laid-out, so it would
+        # measure a stale content_region (a 120→70 resize still reports 120).
+        # PreviewRow.on_row_resize drives the fit check instead — the row's own
+        # Resize event is the one that carries a settled width (t1216_2).
+
+    def action_toggle_auto_switch(self) -> None:
+        """Toggle auto-switch mode on/off."""
+        self._auto_switch = not self._auto_switch
+        if self._auto_switch:
+            self.notify("Auto-switch ON: preview follows idle agents needing attention")
+        else:
+            self.notify("Auto-switch OFF: manual selection only")
+        self._rebuild_session_bar()
+        if self._rebuild_pane_list():
+            self._update_selected_card_indicator(full=True)
+
+    def action_toggle_multi_session(self) -> None:
+        """Flip the multi-session view ON/OFF in memory.
+
+        Persists only for the lifetime of this `MonitorApp` instance — no
+        config write (TUI auto-commit restriction). Client view state only
+        (t2034_2): the producer always scans every session, so the toggle
+        leaves it untouched and the scheduled refresh re-projects.
+        """
+        if self._monitor is None:
+            return
+        self._multi_session = not self._multi_session
+        state = "ON" if self._multi_session else "OFF"
+        self.notify(f"Multi-session {state}", timeout=3)
+        self.call_later(self._refresh_data)
+
+    def action_cycle_compare_mode(self) -> None:
+        """Cycle the focused pane's idle-detection compare mode."""
+        if self._monitor is None:
+            return
+        pane_id = self._get_focused_pane_id()
+        if not pane_id:
+            self.notify("Focus an agent pane first", severity="warning")
+            return
+        if getattr(self._monitor, "cycle_compare_mode_async", None) is not None:
+            # The client (t2037_3): the authoritative answer comes from the
+            # server, so wait for it in a worker — never on the App pump.
+            self.run_worker(
+                self._cycle_compare_mode_async(pane_id, "Idle detect mode"),
+                group="compare-mode", exclusive=False, exit_on_error=False,
+            )
+            return
+        new_mode, is_default = self._monitor.cycle_compare_mode(pane_id)
+        suffix = " (default)" if is_default else " (override)"
+        self.notify(f"Idle detect mode: {new_mode}{suffix}", timeout=3)
+        self.call_later(self._refresh_data)
+
+    # -- Shadow spawn (t1216_4) ------------------------------------------------
+
+    def _resolve_shadow_target(self) -> tuple[PaneSnapshot, str] | None:
+        """Validate the selected pane as a shadow target, or notify and return None.
+
+        Shared prologue of ``e`` / ``E``. Resolves from ``self._focused_pane_id``
+        — never ``_get_focused_pane_id()``, which reads ``self.focused`` and
+        returns None whenever focus is off a PaneCard.
+        """
+        pane_id = self._focused_pane_id
+        if not pane_id or pane_id not in self._snapshots:
+            self.notify("Focus an agent pane first", severity="warning")
+            return None
+        snap = self._snapshots[pane_id]
+        # Monitor-only guard: `_rebuild_pane_list` renders PaneCategory.OTHER
+        # panes as focusable PaneCards, so the selection can be a shell or a
+        # lazygit pane. minimonitor never needed this — it resolves its target
+        # via `_find_own_agent_snapshot`, which already filters on category.
+        if snap.pane.category != PaneCategory.AGENT:
+            self.notify("Shadow only applies to agent panes", severity="warning")
+            return None
+        followed_pane = snap.pane.pane_id
+        if not followed_pane:
+            self.notify("Agent pane id unavailable", severity="warning")
+            return None
+        # One shadow per followed agent (the @aitask_shadow_target option is the
+        # lifecycle binding). Live lookup, not the snapshot cache: the cache can
+        # only report a shadow it has already observed, so it cannot answer
+        # "may I create one". Fail closed — an unverifiable state must not spawn.
+        ok, existing = find_shadow_pane_status(self._monitor, followed_pane)
+        if not ok:
+            self.notify(
+                "Could not verify whether a shadow is already running",
+                severity="warning",
+            )
+            return None
+        if existing:
+            self.notify(
+                "A shadow is already running for this agent", severity="warning"
+            )
+            return None
+        return snap, followed_pane
+
+    def action_launch_shadow(self) -> None:
+        """Spawn the shadow companion agent for the SELECTED coding agent.
+
+        Builds ``/aitask-shadow <followed_pane_id> [<task_id>]`` and launches the
+        ``shadow`` codeagent — by default a new pane in the followed agent's
+        window, or a separate window when ``tmux.shadow_same_window`` is false.
+        The launcher passes only the pane id; the shadow skill captures the
+        followed pane on demand. After spawn it stamps ``@aitask_shadow_target``
+        on the new pane (the t986_1 classifier that keeps the shadow out of agent
+        lists and binds its lifecycle) and wires the followed agent's
+        ``pane-died`` cleanup hook so the shadow dies with its agent.
+
+        Sync by design: the duplicate guard's single ``list-panes`` round-trip is
+        far cheaper than the spawn that follows, and this is a user action, not
+        the refresh path that `test_monitor_refresh_no_sync_tmux` constrains.
+        """
+        if self._monitor is None:
+            return
+        target = self._resolve_shadow_target()
+        if target is None:
+            return
+        snap, followed_pane = target
+        task_id = self._task_cache.get_task_id_for_pane(snap.pane)
+        target_root = self._root_for_snap(snap)
+        args = [followed_pane] + ([task_id] if task_id else [])
+        full_cmd = resolve_dry_run_command(target_root, "shadow", *args)
+        if not full_cmd:
+            self.notify("Failed to resolve shadow command", severity="error")
+            return
+        self._spawn_shadow(full_cmd, followed_pane, task_id, target_root, snap)
+
+    def action_launch_shadow_pick(self) -> None:
+        """Open the agent/model picker, then spawn the shadow with the choice.
+
+        Same as ``action_launch_shadow`` (duplicate guard, specialized same-window
+        split placement, ``@aitask_shadow_target`` stamp + cleanup hook) but opens
+        the ``AgentCommandScreen`` first so the user can confirm / change the code
+        agent and model before the shadow starts. Cancelling launches nothing.
+
+        The dialog's own returned placement is intentionally discarded: the
+        shadow's split-target-the-followed-AGENT-pane geometry is richer than the
+        dialog's tmux tab can express, so placement stays handler-controlled in
+        ``_spawn_shadow`` and only the (possibly agent-overridden)
+        ``full_command`` is consumed.
+        """
+        if self._monitor is None:
+            return
+        target = self._resolve_shadow_target()
+        if target is None:
+            return
+        snap, followed_pane = target
+        task_id = self._task_cache.get_task_id_for_pane(snap.pane)
+        target_root = self._root_for_snap(snap)
+        args = [followed_pane] + ([task_id] if task_id else [])
+        full_cmd = resolve_dry_run_command(target_root, "shadow", *args)
+        if not full_cmd:
+            self.notify("Failed to resolve shadow command", severity="error")
+            return
+        screen = AgentCommandScreen(
+            "Shadow (pick agent)",
+            full_cmd,
+            "/aitask-shadow " + " ".join(args),
+            project_root=target_root,
+            operation="shadow",
+            operation_args=args,
+            default_agent_string=resolve_agent_string(target_root, "shadow"),
+        )
+
+        def on_shadow_result(result):
+            # Confirm returns a TmuxLaunchConfig; its placement is discarded (see
+            # docstring). Use screen.full_command (post-override), not the
+            # captured full_cmd. None (cancel) / "run" launch nothing.
+            if isinstance(result, TmuxLaunchConfig):
+                self._spawn_shadow(
+                    screen.full_command, followed_pane, task_id, target_root, snap
+                )
+
+        self.push_screen(screen, on_shadow_result)
+
+    def _spawn_shadow(
+        self,
+        full_cmd: str,
+        followed_pane: str,
+        task_id: str | None,
+        target_root: Path,
+        snap: PaneSnapshot,
+    ) -> str | None:
+        """Apply **this app's** shadow-spawn policy, then delegate the mechanics.
+
+        Kept as a per-app method deliberately — it is **not** a pass-through
+        seam. The two safety-critical decisions below differ between the monitor
+        and the minimonitor, and inlining them at both call sites in each app
+        would replicate them four times instead of twice (t1216_4).
+        """
+        if self._monitor is None:
+            return None
+        return spawn_shadow(
+            self._monitor,
+            full_cmd=full_cmd,
+            followed_pane=followed_pane,
+            followed_window=snap.pane.window_name,
+            session=snap.pane.session_name or self._session,
+            task_id=task_id,
+            target_root=target_root,
+            # The monitor is NOT the agent's companion and normally lives in
+            # another window — passing our own TMUX_PANE here would make
+            # aitask_companion_cleanup.sh kill the monitor when the agent's
+            # window runs out of real agents. None binds the hook to the new
+            # shadow pane instead.
+            companion_pane=None,
+            # Stealing the client's window would defeat the shadow preview column
+            # this monitor exists to show.
+            select_window=False,
+            notify=self.notify,
+            schedule_refresh=lambda: self.call_later(self._refresh_data),
+            # Stamped before spawn_shadow returns, so a shadow that reads
+            # `--phase` before the first refresh tick still sees the checkpoint
+            # it was launched for (t1420).
+            phase_signal=self._phase_signal_for_pane(snap),
+        )
+
+    def _phase_signal_for_pane(self, snap: PaneSnapshot):
+        """Advisory phase for a pane, or ``None`` when it cannot be resolved.
+
+        ``None`` simply leaves the pane option unwritten; the per-tick re-stamp
+        in ``_format_agent_card_text`` fills it in shortly after.
+        """
+        try:
+            task_id = self._task_cache.get_task_id_for_pane(snap.pane)
+            if not task_id:
+                return None
+            info = self._task_cache.get_task_info(task_id, snap.pane.session_name)
+            if info is None:
+                return None
+            return self._gate_cache.phase_for(
+                info,
+                screen_text=snap.content,
+                awaiting_input=snap.awaiting_input,
+                awaiting_input_kind=snap.awaiting_input_kind,
+                agent=snap.agent_key,
+                current_command=snap.pane.current_command,
+            )
+        except Exception:
+            return None
+
+    async def action_pick_concerns(self) -> None:
+        """Forward the selected agent's shadow concerns via the clipboard (t1216_3).
+
+        Captures the bound shadow pane, parses its concern block, opens the
+        shared picker modal, and on confirm copies the selected concerns (with a
+        preamble) to the clipboard. The hotkey path uses the forgiving
+        ``parse_concerns`` — the user deliberately asked to look now; the refresh
+        tick uses the cheap ``concern_block_signature`` trigger instead.
+
+        ``check_action`` disables every non-``switch_zone`` binding while a
+        preview zone is focused, so this is only ever reachable from PANE_LIST —
+        in PREVIEW / SHADOW the keystroke is forwarded to tmux, which is correct.
+        """
+        if self._concern_pick_busy:
+            return
+        pane_id = self._focused_pane_id
+        if not pane_id or pane_id not in self._snapshots:
+            self.notify("Focus an agent pane first", severity="warning")
+            return
+        shadow_pane = self._current_shadow_pane_id()
+        if not shadow_pane:
+            self.notify(
+                "No shadow agent bound to this agent — press 'e' to launch one",
+                severity="warning",
+            )
+            return
+        self._concern_pick_busy = True
+        modal_owns_guard = False
+        # Resolved HERE, not in the callback: Textual invokes the dismissal
+        # callback with the result and nothing else, so the pane — the only
+        # thing a task id can be derived from — is out of reach by then.
+        # Pinned for the same reason pane_id is: `c` acts on the agent that was
+        # selected when it was pressed.
+        self._concern_pick_task_id = self._task_cache.get_task_id_for_pane(
+            self._snapshots[pane_id].pane
+        )
+        # Snapshot the trigger BEFORE any await: the 3s tick can replace it with
+        # a newer block's signature while we capture, and marking THAT signature
+        # offered would clear its badge without ever presenting it.
+        trigger_sig = self._concern_sig_latest.get(pane_id)
+        try:
+            text = await capture_shadow_text(shadow_pane)
+            if text is None:
+                self.notify("Could not read the shadow pane", severity="warning")
+                return  # indeterminate — leave the marker untouched
+            concerns = parse_concerns(text)
+            if not concerns and block_head_truncated(text):
+                # The block is there but the window started inside it. This is
+                # the explicit user action, so pay for ONE much deeper re-capture
+                # rather than reporting a false "no concerns" (t1187).
+                deeper = await capture_shadow_text(
+                    shadow_pane, lines=_SHADOW_DEEP_RETRY_LINES
+                )
+                if deeper is not None:
+                    text = deeper
+                    concerns = parse_concerns(text)
+                if not concerns:
+                    self.notify(_SHADOW_TRUNCATED_MSG, severity="warning")
+                    return  # indeterminate — marker untouched
+            if not concerns:
+                lost = unrecovered_markers(text)
+                # A round header without certification (t1159_1): a complete
+                # block whose non-item content the scanner silently dropped,
+                # a still-streaming header-only block, or a Round:-shaped
+                # header that fails the grammar (zero / zero-padded /
+                # oversized — meta reads None, but the producer TRIED to emit
+                # metadata). None is a clean round, and "no concerns" would
+                # hide emitted output — warn and show the raw block, like the
+                # lost-markers case.
+                certified = is_metadata_only_block(text)
+                uncertified_meta = (
+                    None if lost or certified else parse_block_meta(text)
+                )
+                round_headed = uncertified_meta is not None or (
+                    not lost and not certified
+                    and has_invalid_round_header(text)
+                )
+                if lost:
+                    self.notify(
+                        unparsed_concerns_msg(len(lost)), severity="warning"
+                    )
+                elif certified:
+                    # A CERTIFIED metadata-only block records a clean round
+                    # (t1159_1) — name the round instead of the generic line.
+                    meta = parse_block_meta(text)
+                    self.notify(
+                        f"Clean review (round {meta.round}) — no concerns"
+                    )
+                elif round_headed:
+                    self.notify(
+                        uncertified_round_block_msg(
+                            uncertified_meta.round if uncertified_meta
+                            else None
+                        ),
+                        severity="warning",
+                    )
+                else:
+                    self.notify("No concerns detected on the shadow pane")
+                # Definitive ONLY when the capture does contain a complete block:
+                # the user has just been told (or, via the raw view below,
+                # shown) precisely what is in it and it will never become
+                # parseable, so clear the badge. With no complete block here we
+                # learned nothing about the badged one — leave it. (A streaming
+                # header-only block has no complete fence, so it is naturally
+                # NOT marked and stays offerable.)
+                done_sig = concern_block_signature(text)
+                if done_sig is not None:
+                    self._mark_concern_sig(
+                        self._concern_sig_offered, pane_id, trigger_sig, done_sig
+                    )
+                if lost or round_headed:
+                    # No picker means no banner to hang the `u` affordance off,
+                    # so open the raw view directly (t1293). It owns the pick
+                    # guard until dismissed, exactly like the picker does —
+                    # otherwise a second `c` would stack inspect modals.
+                    self.push_screen(
+                        ConcernBlockInspectModal(lost, block_region(text) or ""),
+                        callback=self._on_inspect_closed,
+                    )
+                    modal_owns_guard = True
+                return
+            eps = max(2.0, float(getattr(self, "_refresh_seconds", 3)))
+            read_stale, _ = await compute_shadow_staleness(
+                self._monitor, shadow_pane, pane_id, eps
+            )
+            # Block age from the SAME `text` that produced `concerns`, so the
+            # verdict and the block it labels always describe one capture
+            # (t1493). The monitor has no continuous staleness banner, so the
+            # picker is its only owner of this warning.
+            last_change = None
+            if hasattr(self._monitor, "get_last_change_wall"):
+                with contextlib.suppress(Exception):
+                    last_change = self._monitor.get_last_change_wall(pane_id)
+            age = compute_block_age_staleness(text, last_change, eps)
+            stale = combine_staleness(read_stale, age)
+            block_meta = parse_block_meta(text)
+            # pane_id stays PINNED across these awaits, unlike the toast path: `c`
+            # is an explicit action against the agent selected when it was
+            # pressed, so its modal and marker belong to that agent even if the
+            # selection drifts mid-capture.
+            self._mark_concern_sig(
+                self._concern_sig_offered, pane_id, trigger_sig,
+                concern_block_signature(text),
+            )
+            task_id = self._concern_pick_task_id
+            entries = await self._fetch_rejected_entries(task_id)
+            self.push_screen(
+                ConcernPickerModal(
+                    concerns,
+                    narrow=False,  # the monitor is full-width, unlike minimonitor
+                    stale=stale,  # tri-state (t1493) — None renders its own banner
+                    unrecovered=unrecovered_markers(text),
+                    raw_block=block_region(text) or "",
+                    rejected_entries=entries,
+                    store_unavailable=not task_id,
+                    block_meta=block_meta,
+                    stale_detail=format_staleness_detail(age, block_meta),
+                ),
+                callback=self._on_concerns_picked,
+            )
+            modal_owns_guard = True  # released by the callback, not here
+        finally:
+            if not modal_owns_guard:
+                self._concern_pick_busy = False
+
+    def _on_concerns_picked(self, result) -> None:
+        """Modal callback: forward and/or persist the user's dispositions.
+
+        Also releases the pick guard. Textual invokes this on every dismissal
+        (including ``None`` on Esc), and holding the guard until then is what
+        stops a second `c` over the open picker stacking another one.
+
+        ``result`` is a ``ConcernPickResult`` on confirm, or ``None`` on
+        cancel — in which case nothing is written (no side effect before an
+        explicit confirm). The shared body lives on ``ShadowRejectionsMixin``;
+        only the guard release is monitor-specific.
+        """
+        self._concern_pick_busy = False
+        self.apply_concern_pick_result(result, self._concern_pick_task_id)
+
+    def _on_inspect_closed(self, _result) -> None:
+        """Release the pick guard when the raw-block view closes (t1293).
+
+        The all-malformed path pushes :class:`ConcernBlockInspectModal` instead
+        of the picker, so it needs its own release — without it the guard would
+        stay held and every later `c` would be silently swallowed.
+        """
+        self._concern_pick_busy = False
+
+    def action_show_task_info(self) -> None:
+        """Show task detail dialog for the focused agent pane."""
+        pane_id = self._get_focused_pane_id()
+        if not pane_id:
+            self.notify("Focus an agent pane first", severity="warning")
+            return
+        snap = self._snapshots.get(pane_id)
+        if not snap:
+            return
+        task_id = self._task_cache.get_task_id_for_pane(snap.pane)
+        if not task_id:
+            self.notify("No task ID in window name", severity="warning")
+            return
+        # Force refresh cache to get latest content
+        sess = snap.pane.session_name
+        self._task_cache.invalidate(task_id, sess)
+        info = self._task_cache.get_task_info(task_id, sess)
+        if not info:
+            self.notify(f"Task t{task_id} not found", severity="error")
+            return
+        self.push_screen(TaskDetailDialog(info))
+
+    def action_open_log(self) -> None:
+        """Open the ANSI-aware log viewer for the focused agent pane."""
+        pane_id = self._get_focused_pane_id()
+        if not pane_id:
+            self.notify("Focus an agent pane first", severity="warning")
+            return
+        snap = self._snapshots.get(pane_id)
+        if not snap:
+            return
+        window_name = snap.pane.window_name
+        if not window_name.startswith("agent-"):
+            self.notify("Not an agent pane", severity="warning")
+            return
+        agent_name = window_name[len("agent-"):]
+        if agent_name.startswith("pick-"):
+            self.notify("Pick launcher panes have no agent log")
+            return
+        root = self._root_for_snap(snap)
+        crews_root = root / ".aitask-crews"
+        log_path = None
+        if crews_root.exists():
+            for crew_dir in sorted(crews_root.glob("crew-*")):
+                candidate = crew_dir / f"{agent_name}_log.txt"
+                if candidate.exists():
+                    log_path = candidate
+                    break
+        if log_path is None:
+            # `agent_name` is cut from the window name: tmux-side input (t2017).
+            self.notify(
+                f"No log file found for {agent_name}",
+                severity="warning", markup=False,
+            )
+            return
+        try:
+            subprocess.Popen(
+                ["./ait", "crew", "logview", "--path", str(log_path)],
+                cwd=str(root),
+                start_new_session=True,  # outlive the monitor TUI (esp. outside tmux)
+            )
+            self.notify(f"Opening log for {agent_name}", markup=False)
+        except OSError as exc:
+            self.notify(f"Failed to launch log viewer: {exc}", severity="error")
+
+    def _confirm_drop_frozen(self, snap) -> None:
+        """Confirm before retiring a frozen record — the capture is the only
+        copy of that agent's output, and dropping deletes it."""
+        window = snap.pane.window_name
+
+        def confirmed(yes: bool | None) -> None:
+            if yes:
+                self._drop_frozen(snap)
+
+        self.push_screen(
+            FreezeConfirmDialog(
+                "Drop this frozen agent?",
+                # NOT "restore or re-pick it instead": a VERIFIED restore or
+                # re-pick deletes the capture too (`agent_sessions.py`, the
+                # `ack = "hook"` branch). Only a failed or liveness-only one
+                # keeps it, so the only reliable way to keep the transcript is
+                # to copy it out of the viewer (t1777).
+                #
+                # The window name sits directly before `[/]`, so it is a
+                # `$variable`, never interpolated (t2017).
+                Content.from_markup(
+                    "[bold]$window[/]\n\n"
+                    "[bold red]Its captured output is deleted[/] along with "
+                    "the record, and the stand-in pane is closed. This cannot "
+                    "be undone. A verified restore or re-pick deletes it too "
+                    "— copy it first.",
+                    window=window,
+                ),
+                # The button must name THIS verb, not the screen's default one:
+                # a "Freeze" button here would read as the reversible operation
+                # while deleting the only copy of the agent's output (t1705_7).
+                confirm_label="Drop",
+                destructive=True,
+            ),
+            confirmed,
+        )
+
+    def _current_agent_snapshot(self):
+        """The focused card — this app's "the agent I am on".
+
+        The same target `k` (kill), `R` (restart) and `space` (mark) already act
+        on, so the frozen keys introduce no new selection concept. Cards that
+        are merely visible are never acted on.
+        """
+        pane_id = self._get_focused_pane_id()
+        return self._snapshots.get(pane_id) if pane_id else None
+
+    def action_kill_pane(self) -> None:
+        """Show kill confirmation dialog for the focused pane."""
+        if self._monitor is None:
+            return
+        pane_id = self._get_focused_pane_id()
+        if not pane_id:
+            self.notify("Focus a pane first", severity="warning")
+            return
+        snap = self._snapshots.get(pane_id)
+        if not snap:
+            return
+        if self._is_frozen(snap):
+            # A frozen pane holds a stand-in viewer, not an agent: nothing to
+            # kill, and what `k` means here is "retire this record and its
+            # capture". Routed to the leased, preflighted
+            # `aitask_frozen.sh drop` — see `_drop_frozen` (t1705_7).
+            self._confirm_drop_frozen(snap)
+            return
+        task_info = None
+        task_id = self._task_cache.get_task_id_for_pane(snap.pane)
+        if task_id:
+            task_info = self._task_cache.get_task_info(task_id, snap.pane.session_name)
+        pane_id = snap.pane.pane_id
+        self.push_screen(
+            KillConfirmDialog(snap, task_info),
+            callback=lambda ok: self._on_kill_confirmed(ok, pane_id),
+        )
+
+    def _on_kill_confirmed(self, confirmed: bool | None, pane_id: str) -> None:
+        """Callback after kill confirmation dialog.
+
+        ``pane_id`` is the pane the dialog described, bound when it opened —
+        never re-read from ``_focused_pane_id``, which refresh moves while the
+        dialog is up (focus requests, auto-switch, focus restoration), so a
+        confirmation for one agent could otherwise kill another (t2065).
+        """
+        if not confirmed or self._monitor is None:
+            return
+        snap = self._snapshots.get(pane_id)
+        name = snap.pane.window_name if snap else pane_id
+        # Re-read at kill time, not when `k` opened the dialog: the agent may
+        # have been frozen since, and a frozen pane would take the smart kill's
+        # unleased kill-then-drop (t2065, as t2057 did for `n`).
+        state = self._kill_target_state(pane_id)
+        if state == "frozen":
+            self.notify(f"{name} is frozen — not killed; press k again to "
+                        "drop it", severity="warning", markup=False)
+            return
+        if state != "live":
+            self.notify(f"Could not confirm {name} is still live — not killed",
+                        severity="warning", markup=False)
+            return
+        ok, _ = self._monitor.kill_agent_pane_smart(pane_id)
+        if ok:
+            if self._focused_pane_id == pane_id:
+                self._focused_pane_id = None
+            self.notify(f"Killed {name}", markup=False)
+            self.call_later(self._refresh_data)
+        else:
+            self.notify(f"Failed to kill {name}", severity="error",
+                        markup=False)
+
+    def _close_live_after_harvest(self, identity) -> None:
+        """`h`'s live close (t2175_5): the guarded run kill, then `k`'s tail.
+
+        Never `kill_agent_pane_smart`: that kills whatever occupies the pane id,
+        and a freeze or restore can have respawned another process into it
+        since the harvest. `_guarded_close` re-checks the state and kills only
+        the harvested run (`kill_agent_run_guarded`).
+        """
+        pane_id = identity.pane_id
+        snap = self._snapshots.get(pane_id)
+        name = snap.pane.window_name if snap else pane_id
+        status, _ = self._guarded_close(identity)
+        if status != "killed":
+            return
+        if self._focused_pane_id == pane_id:
+            self._focused_pane_id = None
+        self.notify(f"Closed {name}", markup=False)
+        self.call_later(self._refresh_data)
+
+    def _default_sitrep_target(self):
+        """`S` with no agent focused: this monitor's own project and session."""
+        return self._project_root, self._session
+
+    def action_pick_next_sibling(self) -> None:
+        """Find and launch next sibling task for the focused agent pane."""
+        if self._monitor is None:
+            return
+        pane_id = self._get_focused_pane_id()
+        if not pane_id:
+            self.notify("Focus an agent pane first", severity="warning")
+            return
+        snap = self._snapshots.get(pane_id)
+        if not snap:
+            return
+        task_id = self._task_cache.get_task_id_for_pane(snap.pane)
+        if not task_id:
+            self.notify("No task ID in window name", severity="warning")
+            return
+        sess = snap.pane.session_name
+        self._task_cache.invalidate(task_id, sess)
+        current_info = self._task_cache.get_task_info(task_id, sess)
+        # If task file not found, it was likely archived (Done) — still allow sibling pick
+        current_title = current_info.title if current_info else f"(archived t{task_id})"
+        current_status = current_info.status if current_info else "Done"
+
+        result = self._task_cache.find_next_sibling(task_id, sess)
+        if not result:
+            self.notify("No ready siblings or children found", severity="warning")
+            return
+        suggested_id, suggested_title, suggested_kind = result
+        parent_id = self._task_cache.get_parent_id(task_id) or task_id
+
+        self.push_screen(
+            NextSiblingDialog(
+                task_id, current_title, current_status,
+                suggested_id, suggested_title, parent_id,
+                suggested_followup_kind=suggested_kind,
+            ),
+            callback=self._on_next_sibling_result,
+        )
+
+    def _on_next_sibling_result(self, result: tuple[str, str] | None) -> None:
+        """Callback after next-sibling dialog."""
+        if result is None:
+            return
+        action, payload = result
+        if action == "pick":
+            self._launch_pick_for_sibling(payload)
+            return
+        # action == "choose": payload is parent_id; open the sibling picker.
+        pane_id = self._focused_pane_id
+        if pane_id is None or self._monitor is None:
+            return
+        snap = self._snapshots.get(pane_id)
+        if not snap:
+            return
+        task_id = self._task_cache.get_task_id_for_pane(snap.pane)
+        if not task_id:
+            return
+        sess = snap.pane.session_name
+        siblings = self._task_cache.find_ready_siblings(task_id, sess)
+        if not siblings:
+            self.notify("No Ready siblings to choose from", severity="warning")
+            return
+
+        def _on_picked(sib_id: str | None) -> None:
+            if sib_id:
+                self._launch_pick_for_sibling(sib_id)
+
+        self.push_screen(ChooseSiblingModal(payload, siblings), callback=_on_picked)
+
+    def _launch_pick_for_sibling(self, target_id: str) -> None:
+        """Launch `/aitask-pick <target_id>` for the focused pane's session.
+
+        Kills the current pane first if the current task is a parent split
+        into children, was archived, or is Done — matching the heuristic
+        used by the immediate "Pick t<N>" path. A failed kill is reported as
+        an error and keeps the pane focused; the dialog opens either way.
+        """
+        pane_id = self._focused_pane_id
+        if pane_id is None or self._monitor is None:
+            return
+        snap = self._snapshots.get(pane_id)
+        if not snap:
+            return
+        task_id = self._task_cache.get_task_id_for_pane(snap.pane)
+        if not task_id:
+            return
+        sess = snap.pane.session_name
+        current_info = self._task_cache.get_task_info(task_id, sess)
+
+        target_root = self._root_for_snap(snap)
+        # Shared dialog construction (t1946); it resolves the configured pick
+        # agent (no agent_string), exactly as this site did before.
+        screen = build_pick_screen(target_root, target_id)
+        if screen is None:
+            self.notify(f"Failed to resolve pick command for t{target_id}", severity="error")
+            return
+
+        is_parent_with_children = "_" not in task_id
+        if is_parent_with_children or not current_info or current_info.status == "Done":
+            old_name = snap.pane.window_name
+            # Only a pane proven LIVE right now is killed: a frozen stand-in
+            # would take `kill_agent_pane_smart`'s unleased kill-then-drop path
+            # and silently delete its capture (t2057/t2058). The pick dialog
+            # still opens either way.
+            state = self._kill_target_state(pane_id)
+            if state == "live":
+                # A failed kill leaves the pane running: say so and keep its
+                # focus rather than reporting a kill that never happened (t2078).
+                ok, _ = self._monitor.kill_agent_pane_smart(pane_id)
+                if ok:
+                    self._focused_pane_id = None
+                    self.notify(f"Killed {old_name}", markup=False)
+                else:
+                    self.notify(f"Failed to kill {old_name}", severity="error",
+                                markup=False)
+            elif state == "frozen":
+                self.notify(f"{old_name} is frozen — not killed; drop it with k",
+                            severity="warning", markup=False)
+            else:
+                self.notify(f"Could not confirm {old_name} is still live — "
+                            "not killed", severity="warning", markup=False)
+
+        def on_pick_result(pick_result):
+            if isinstance(pick_result, TmuxLaunchConfig):
+                _, err = launch_in_tmux(screen.full_command, pick_result)
+                if err:
+                    # tmux's stderr names the session (t2017).
+                    self.notify(f"Launch failed: {err}", severity="error",
+                                markup=False)
+                    return
+                if pick_result.new_window:
+                    maybe_spawn_minimonitor(pick_result.session, pick_result.window)
+                self.notify(f"Launched agent for t{target_id}")
+            self.call_later(self._refresh_data)
+
+        self.push_screen(screen, on_pick_result)
+
+    def action_restart_task(self) -> None:
+        """Kill the focused idle agent pane and re-run pick for the same task."""
+        if self._monitor is None:
+            return
+        pane_id = self._get_focused_pane_id()
+        if not pane_id:
+            self.notify("Focus an agent pane first", severity="warning")
+            return
+        snap = self._snapshots.get(pane_id)
+        if not snap:
+            return
+        if self._is_frozen(snap):
+            # A FROZEN card has no process to restart. Restore and re-pick are
+            # the frozen-agent viewer's own keys (t2054), so say where they are
+            # instead of acting. This runs BEFORE the idle check below: a
+            # frozen pane is never "idle", it has no verdict at all, so that
+            # check would reject it with a misleading reason.
+            self.notify(
+                "That agent is frozen — press s to switch to its viewer, "
+                "then R to restore or P to re-pick",
+                severity="warning",
+            )
+            return
+        if not snap.is_idle:
+            self.notify(
+                "Restart only available when the terminal is idle",
+                severity="warning",
+            )
+            return
+        task_id = self._task_cache.get_task_id_for_pane(snap.pane)
+        if not task_id:
+            self.notify("No task ID in window name", severity="warning")
+            return
+        sess = snap.pane.session_name
+        self._task_cache.invalidate(task_id, sess)
+        info = self._task_cache.get_task_info(task_id, sess)
+        title = info.title if info else f"(archived t{task_id})"
+        status = info.status if info else "Done"
+
+        self.push_screen(
+            RestartConfirmDialog(task_id, title, status, snap.idle_seconds),
+            callback=lambda ok: self._on_restart_confirmed(ok, pane_id, task_id),
+        )
+
+    def _on_restart_confirmed(
+        self, confirmed: bool | None, pane_id: str, task_id: str
+    ) -> None:
+        if not confirmed:
+            return
+        if self._monitor is None:
+            return
+        snap = self._snapshots.get(pane_id)
+        if not snap:
+            self.notify("Focused pane no longer exists", severity="warning")
+            return
+
+        target_root = self._root_for_snap(snap)
+        # Shared dialog construction (t1946); it resolves the configured pick
+        # agent (no agent_string), exactly as this site did before.
+        screen = build_pick_screen(target_root, task_id)
+        if screen is None:
+            self.notify(
+                f"Failed to resolve pick command for t{task_id}",
+                severity="error",
+            )
+            return
+
+        old_window_name = snap.pane.window_name
+
+        def on_pick_result(pick_result):
+            if isinstance(pick_result, TmuxLaunchConfig):
+                # Tear down the old agent before launching. In the common
+                # single-agent-per-window case, kill_agent_pane_smart kills
+                # the whole window (matching the behaviour added in t556) so
+                # the new `agent-pick-<id>` window does not collide with a
+                # stale one of the same name. In the rare multi-agent-split
+                # case, only the restarted pane dies and siblings survive;
+                # maybe_spawn_minimonitor's last-match window lookup keeps
+                # the new companion attached to the correct window even if
+                # two windows share a name transiently.
+                if self._monitor:
+                    # Re-read at kill time (t2065): the agent may have been
+                    # frozen since `r` opened the dialogs. Without a live kill
+                    # there is no restart — launching anyway would duplicate
+                    # the task beside the frozen stand-in.
+                    state = self._kill_target_state(pane_id)
+                    if state == "frozen":
+                        self.notify(
+                            f"{old_window_name} is frozen — not restarted; "
+                            "press s to switch to its viewer, then R to "
+                            "restore or P to re-pick",
+                            severity="warning", markup=False)
+                        self.call_later(self._refresh_data)
+                        return
+                    if state != "live":
+                        self.notify(
+                            f"Could not confirm {old_window_name} is still "
+                            "live — not restarted",
+                            severity="warning", markup=False)
+                        self.call_later(self._refresh_data)
+                        return
+                    ok, _ = self._monitor.kill_agent_pane_smart(pane_id)
+                    if not ok:
+                        # A failed kill leaves the old agent running;
+                        # launching anyway would put two agents on one
+                        # task (t2075).
+                        self.notify(
+                            f"Failed to kill {old_window_name} — not "
+                            "restarted",
+                            severity="warning", markup=False)
+                        self.call_later(self._refresh_data)
+                        return
+                    if self._focused_pane_id == pane_id:
+                        self._focused_pane_id = None
+                    self.notify(f"Killed {old_window_name}", markup=False)
+                _, err = launch_in_tmux(screen.full_command, pick_result)
+                if err:
+                    # tmux's stderr names the session (t2017).
+                    self.notify(f"Launch failed: {err}", severity="error",
+                                markup=False)
+                    return
+                if pick_result.new_window:
+                    maybe_spawn_minimonitor(pick_result.session, pick_result.window)
+                self.notify(f"Restarted agent for t{task_id}")
+            self.call_later(self._refresh_data)
+
+        self.push_screen(screen, on_pick_result)
+
+
+def _detect_tmux_session() -> str | None:
+    """Auto-detect the current tmux session name, or None if not inside tmux."""
+    if not os.environ.get("TMUX"):
+        return None
+    try:
+        result = subprocess.run(
+            ["tmux", *TMUX_CLIENT_FLAGS, "display-message", "-p", "#S"],
+            capture_output=True, timeout=5, **tmux_text_kwargs(),
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    except Exception:
+        pass
+    return None
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="tmux pane monitor TUI")
+    parser.add_argument("--session", "-s", default=None, help="tmux session name")
+    parser.add_argument("--interval", "-i", type=int, default=None, help="refresh interval in seconds")
+    parser.add_argument("--lines", "-n", type=int, default=None, help="lines to capture per pane")
+    parser.add_argument(
+        "--headless-for-applink", action="store_true",
+        help="Run the applink bridge headless (no TUI), serving only the mobile "
+             "listener. See 'ait monitor --headless-for-applink --help' for options.",
+    )
+    # Operator verbs for the shared monitor status server (t2246). The launcher
+    # intercepts both and runs `status_server.py restart|status`; they are
+    # declared here only so `ait monitor --help` lists them.
+    parser.add_argument(
+        "--restart-server", action="store_true",
+        help="Restart this tmux server's shared monitor status server (verified "
+             "SIGTERM, then a fresh start for the same version; --version V of "
+             "another framework version only stops that server, and its own "
+             "clients restart it) and exit.",
+    )
+    parser.add_argument(
+        "--server-status", action="store_true",
+        help="List this tmux server's monitor status servers (pid, start time, "
+             "version, script) and exit.",
+    )
+    args = parser.parse_args()
+
+    if args.restart_server or args.server_status:
+        print(
+            "Run the status-server verbs via the launcher: "
+            "ait monitor --restart-server | --server-status",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+
+    # The launcher (aitask_monitor.sh) intercepts --headless-for-applink before
+    # exec and routes to applink/headless.py, so this branch only fires on a
+    # direct `python monitor_app.py --headless-for-applink` that bypassed the
+    # launcher's dep-probe and routing. Fail clearly instead of opening the TUI.
+    if args.headless_for_applink:
+        print(
+            "Run the applink headless bridge via the launcher: "
+            "ait monitor --headless-for-applink",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+
+    project_root = Path(__file__).resolve().parents[2]
+    config = load_monitor_config(project_root)
+    tmux_config = load_project_tmux_config(project_root)
+
+    # The configured session name (used for mismatch check). A blank/null
+    # value means the default, exactly as `ait ide` resolves it (t1800).
+    configured_session = load_tmux_defaults(project_root)["default_session"]
+
+    # Resolve session: CLI > current tmux session > config > default
+    if args.session:
+        session = args.session
+        expected_session = None  # explicit CLI choice, no mismatch check
+    else:
+        session = _detect_tmux_session()
+        if session is not None:
+            # Auto-detected; check against config
+            expected_session = configured_session if session != configured_session else None
+        else:
+            session = configured_session
+            expected_session = None
+
+    refresh_seconds = args.interval if args.interval is not None else tmux_config.get("monitor", {}).get("refresh_seconds", 3)
+    capture_lines = args.lines if args.lines is not None else config.get("capture_lines", 200)
+    # The shared status server (t2037_3) scans with each project's
+    # project_config.yaml and cannot honour a per-instance override, so an
+    # explicit --interval / --lines keeps THIS instance in-process.
+    monitor_server = False if (args.lines is not None or args.interval is not None) else None
+
+    app = MonitorApp(
+        session=session,
+        project_root=project_root,
+        refresh_seconds=refresh_seconds,
+        capture_lines=capture_lines,
+        idle_threshold=config.get("idle_threshold", 5.0),
+        agent_prefixes=config.get("agent_prefixes"),
+        tui_names=config.get("tui_names"),
+        expected_session=expected_session,
+        compare_mode_default=config.get("compare_mode_default", "stripped"),
+        rename_window=True,
+        mark_pane=True,   # production launcher only — see MonitorApp.__init__
+        monitor_server=monitor_server,
+    )
+    app.run()
+
+
+if __name__ == "__main__":
+    main()

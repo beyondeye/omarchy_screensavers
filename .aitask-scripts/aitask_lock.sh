@@ -1,0 +1,930 @@
+#!/usr/bin/env bash
+# aitask_lock.sh - Atomic task lock management
+# Uses a separate git orphan branch 'aitask-locks' with per-task lock files.
+# Atomicity is achieved via git push rejection on non-fast-forward updates
+# (compare-and-swap semantics).
+#
+# Public usage (via ait dispatcher):
+#   ait lock <task_id>                     Lock task (auto-detects email)
+#                                          (exit 0=locked, 1=held by someone
+#                                           else, 13=held by a live session of
+#                                           yours on this host, 14=held by a
+#                                           session of yours whose liveness
+#                                           could not be established)
+#   ait lock <task_id> --email <email>     Lock task with explicit email
+#   ait lock --unlock <task_id>            Release lock
+#   ait lock --check <task_id>             Check if locked (exit 0=locked, 1=free)
+#   ait lock --list                        List all active locks
+#   ait lock --list --batch                Machine-readable snapshot +
+#                                          availability verdict (LOCKS_OK /
+#                                          LOCKS_UNINITIALIZED / LOCKS_UNAVAILABLE)
+#   ait lock --init                        Initialize the aitask-locks branch
+#   ait lock --cleanup                     Remove stale locks for archived tasks
+#                                          (exit 0=done, 11=branch unreadable,
+#                                           12=removal push rejected)
+#
+# Also called internally by:
+#   .aitask-scripts/aitask_pick_own.sh (lock acquisition and cleanup)
+#   .claude/skills/aitask-pick/SKILL.md (during task pick workflow)
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/terminal_compat.sh
+source "$SCRIPT_DIR/lib/terminal_compat.sh"
+# shellcheck source=lib/task_utils.sh
+source "$SCRIPT_DIR/lib/task_utils.sh"
+# shellcheck source=lib/pid_anchor.sh
+source "$SCRIPT_DIR/lib/pid_anchor.sh"
+
+BRANCH="aitask-locks"
+MAX_RETRIES=5
+
+DEBUG=false
+
+TASK_DIR="${TASK_DIR:-aitasks}"
+ARCHIVED_DIR="${ARCHIVED_DIR:-aitasks/archived}"
+
+# --- Helpers ---
+
+debug() {
+    if [[ "$DEBUG" == true ]]; then
+        info "[debug] $*" >&2
+    fi
+}
+
+# Check whether a git remote named 'origin' exists (non-fatal)
+has_remote() {
+    git remote get-url origin &>/dev/null
+}
+
+# Check that a git remote named 'origin' exists (fatal)
+require_remote() {
+    if ! has_remote; then
+        die_code 10 "No git remote 'origin' configured. Cannot initialize atomic task locks."
+    fi
+}
+
+# Probe the lock branch on origin. Returns a tri-state exit code so the
+# caller can distinguish "branch genuinely missing" (LOCK_INFRA_MISSING,
+# exit 10) from "cannot reach origin" (LOCK_ERROR:fetch_failed, exit 11).
+#   0 = branch exists on remote
+#   1 = remote reachable but branch not present
+#   2 = remote unreachable / auth error / other ls-remote failure
+lock_branch_exists_on_remote() {
+    local rc=0
+    git ls-remote --exit-code --heads origin "$BRANCH" &>/dev/null || rc=$?
+    case $rc in
+        0) return 0 ;;
+        2) return 1 ;;
+        *) return 2 ;;
+    esac
+}
+
+get_hostname() {
+    hostname 2>/dev/null || echo "unknown"
+}
+
+# PID to anchor the lock to: a process whose lifetime tracks the AGENT SESSION.
+#
+# NOT $PPID. On the path that matters, aitask_pick_own.sh runs this script
+# inside a command substitution, so $PPID was the claim script itself — dead
+# seconds after the lock was written. Every same-host re-pick therefore emitted
+# RECLAIM_CRASH and a genuine crash became indistinguishable from normal
+# operation (t1465). The resolution ladder, the AIT_AGENT_PID override, and the
+# UNKNOWN ("-") outcome are documented in lib/pid_anchor.sh.
+get_lock_pid() {
+    get_session_anchor_pid
+}
+
+get_timestamp() {
+    date '+%Y-%m-%d %H:%M'
+}
+
+# --- Init: create the aitask-locks branch ---
+
+# STDOUT CONTRACT (audited — t1641): prose only. No structured record shares this
+# verb's stdout, so the info()/success() calls below are not mixing channels. If
+# a machine-readable record is ever added here, move the prose to stderr in the
+# same change rather than layering the two — see list_locks() for the pattern.
+init_lock_branch() {
+    require_remote
+
+    # Check if branch already exists on remote
+    if git ls-remote --heads origin "$BRANCH" 2>/dev/null | grep -q "$BRANCH"; then
+        info "Lock branch '$BRANCH' already exists on remote."
+        return 0
+    fi
+
+    info "Initializing lock branch '$BRANCH'..."
+
+    # Create an empty tree and initial commit via git plumbing
+    local empty_tree_hash commit_hash
+    empty_tree_hash=$(printf '' | git mktree)
+    commit_hash=$(echo "ait: Initialize task lock branch" | git commit-tree "$empty_tree_hash")
+
+    # Push as new branch
+    if git push origin "$commit_hash:refs/heads/$BRANCH" 2>/dev/null; then
+        success "Lock branch '$BRANCH' created"
+    else
+        die "Failed to push lock branch. Check remote permissions."
+    fi
+}
+
+# --- Lock: atomically acquire a task lock ---
+
+# STDOUT CONTRACT (audited, deliberately unchanged — t1641): stdout carries BOTH
+# structured records — LOCK_RECLAIM: / LOCK_LIVE_HOLDER: /
+# LOCK_UNVERIFIABLE_HOLDER: / PRIOR_LOCK: / LOCK_HOLDER: — and one line of human
+# prose, success "Locked task t<id>". Its only PROGRAMMATIC consumer,
+# aitask_pick_own.sh:359 and :441, captures 2>&1 and prefix-greps, so it is
+# insensitive to the split; every other caller is a human typing `ait lock <id>`.
+#
+# Two things must survive any future cleanup here:
+#   1. aitask_pick_own.sh:386 parses the PROSE "already locked by <email>" as a
+#      legacy fallback whenever no LOCK_HOLDER: record is present. That text is
+#      emitted by die() below (line ~258) and so is already on stderr — it
+#      reaches the consumer only because the consumer merges the streams. Moving
+#      it, rewording it, or "tidying" it into a record silently breaks that
+#      fallback, and no test in this repo would notice.
+#   2. Because that consumer merges 2>&1, it CANNOT detect a regression in this
+#      verb's stream split. Splitting prose from records here therefore needs an
+#      explicit per-verb stdout contract plus a direct-CLI regression test for
+#      `ait lock <task_id>` FIRST. t1641 narrowed --list only, and stopped here
+#      on purpose rather than changing an output nothing can verify.
+lock_task() {
+    local task_id="$1"
+    local email="$2"
+    local lock_file="t${task_id}_lock.yaml"
+
+    if ! has_remote; then
+        debug "No remote — skipping lock (single-user mode)"
+        return 0
+    fi
+    debug "Attempting to lock task t$task_id for $email"
+
+    local attempt=0
+
+    while [[ $attempt -lt $MAX_RETRIES ]]; do
+        attempt=$((attempt + 1))
+        debug "Attempt $attempt/$MAX_RETRIES"
+
+        # Step 1: Probe lock branch on origin (tri-state), then fetch.
+        # `|| probe_rc=$?` keeps `set -e` from killing this line on rc>0.
+        debug "Probing branch '$BRANCH' on origin..."
+        local probe_rc=0
+        lock_branch_exists_on_remote || probe_rc=$?
+        case $probe_rc in
+            0) ;;
+            1) die_code 10 "Lock branch '$BRANCH' not found on remote. Run 'ait setup' to initialize." ;;
+            *) die_code 11 "Failed to reach origin to check '$BRANCH' (network or auth issue)." ;;
+        esac
+        debug "Fetching branch '$BRANCH' from origin..."
+        if ! git fetch origin "$BRANCH" --quiet 2>/dev/null; then
+            die_code 11 "Failed to fetch '$BRANCH' from origin (network or auth issue)."
+        fi
+        debug "Fetch successful"
+
+        local parent_hash current_tree_hash
+        parent_hash=$(git rev-parse "origin/$BRANCH")
+        current_tree_hash=$(git rev-parse "origin/$BRANCH^{tree}")
+
+        # Step 2: Check if lock file already exists in tree
+        local prior_pid="-" prior_starttime="-" prior_locked_at_field="-" prior_lock_host="-"
+        local prior_starttime_kind="proc"
+        if git ls-tree "$current_tree_hash" -- "$lock_file" 2>/dev/null | grep -q "$lock_file"; then
+            # Lock exists — read it for informative message
+            local lock_content locked_by locked_at
+            lock_content=$(git show "origin/$BRANCH:$lock_file" 2>/dev/null || echo "unknown")
+            locked_by=$(echo "$lock_content" | grep '^locked_by:' | sed 's/locked_by: *//')
+            locked_at=$(echo "$lock_content" | grep '^locked_at:' | sed 's/locked_at: *//')
+            local locked_hostname
+            locked_hostname=$(echo "$lock_content" | grep '^hostname:' | sed 's/hostname: *//')
+            [[ -z "$locked_hostname" ]] && locked_hostname="unknown"
+
+            # Capture PID-anchor fields from prior lock for crash-recovery
+            # detection in aitask_pick_own.sh. Pre-anchor locks lack these
+            # fields — `|| true` keeps pipefail from killing the script;
+            # missing fields collapse to "-" for shape-stable downstream parsing.
+            prior_pid=$(echo "$lock_content" | grep '^pid:' | sed 's/pid: *//' || true)
+            prior_starttime=$(echo "$lock_content" | grep '^pid_starttime:' | sed 's/pid_starttime: *//' || true)
+            prior_starttime_kind=$(echo "$lock_content" | grep '^pid_starttime_kind:' | sed 's/pid_starttime_kind: *//' || true)
+            prior_locked_at_field="$locked_at"
+            prior_lock_host="$locked_hostname"
+            [[ -z "$prior_pid" ]] && prior_pid="-"
+            [[ -z "$prior_starttime" ]] && prior_starttime="-"
+            # Absent kind => a lock written before the field existed, which can
+            # only have come from the /proc path.
+            [[ -z "$prior_starttime_kind" ]] && prior_starttime_kind="proc"
+            [[ -z "$prior_locked_at_field" ]] && prior_locked_at_field="-"
+
+            # Idempotent: if same email owns the lock, refresh it
+            if [[ "$locked_by" == "$email" ]]; then
+                debug "Lock already held by same user, refreshing"
+                # Surface a structured signal when the prior lock was held on a
+                # different host — the caller (aitask_pick_own.sh / Step 4 of
+                # task-workflow) uses it to prompt for confirmation before a
+                # multi-PC reclaim. Same-host re-locks stay silent.
+                local current_hostname
+                current_hostname=$(get_hostname)
+                if [[ -n "$locked_hostname" \
+                      && "$locked_hostname" != "unknown" \
+                      && "$locked_hostname" != "$current_hostname" ]]; then
+                    echo "LOCK_RECLAIM:${locked_hostname}|${locked_at}|${current_hostname}"
+                fi
+                # Same host, same email: the mutex's blind spot. Matching on
+                # email alone made this branch hand the lock to a SECOND live
+                # agent session without a word — two panes owned one task and
+                # duplicated its work (t1466). The anchor t1465 put in the lock
+                # is the discriminator: refuse anything that is not provably
+                # THIS session or provably gone.
+                #
+                # Cross-host is deliberately excluded: a PID from another
+                # machine is not comparable here, and that case already has its
+                # own confirmation path (LOCK_RECLAIM, just above). A hostname
+                # of "unknown" is not comparable either — two machines both
+                # reporting it would compare equal.
+                if [[ -n "$locked_hostname" \
+                      && "$locked_hostname" != "unknown" \
+                      && "$locked_hostname" == "$current_hostname" ]] \
+                   && ! lock_anchor_is_self "$prior_pid" "$prior_starttime" \
+                                            "$prior_starttime_kind"; then
+                    local prior_liveness
+                    prior_liveness=$(lock_holder_liveness "$prior_pid" \
+                        "$prior_starttime" "$prior_starttime_kind")
+                    case "$prior_liveness" in
+                        alive)
+                            echo "LOCK_LIVE_HOLDER:${locked_by}|${locked_at}|${locked_hostname}|${prior_pid}"
+                            die_code 13 "Task t$task_id is held by a live session of yours on this host (pid $prior_pid, since $locked_at). Let it finish, or release it with './ait lock --unlock $task_id'."
+                            ;;
+                        unknown)
+                            # "Cannot tell" is its own state, and it must not
+                            # default to taking the lock. But only when an
+                            # anchor was actually RECORDED: a lock carrying
+                            # "-"/"0"/nothing never named a session, so there is
+                            # nothing to verify, and refusing it would bar every
+                            # pre-anchor lock and every claim made outside tmux
+                            # from ever being resumed. Those keep their existing
+                            # behaviour (acquire, then RECLAIM_STATUS).
+                            if [[ "$prior_pid" =~ ^[0-9]+$ ]] && (( prior_pid > 0 )); then
+                                echo "LOCK_UNVERIFIABLE_HOLDER:${locked_by}|${locked_at}|${locked_hostname}|${prior_pid}"
+                                die_code 14 "Task t$task_id is held by a session on this host (pid $prior_pid, since $locked_at) whose liveness could not be established. Confirm it is gone, then re-claim with --force, or release it with './ait lock --unlock $task_id'."
+                            fi
+                            ;;
+                    esac
+                fi
+                # Always emit PRIOR_LOCK so aitask_pick_own.sh can decide
+                # between RECLAIM_CRASH (same-host, dead PID) and
+                # RECLAIM_STATUS (anomaly fallback). Even on cross-host
+                # reclaim it is informative.
+                echo "PRIOR_LOCK:${prior_pid}|${prior_starttime}|${prior_lock_host}|${prior_locked_at_field}|${prior_starttime_kind}"
+            else
+                # Structured output for machine parsing (by aitask_pick_own.sh)
+                echo "LOCK_HOLDER:${locked_by}|${locked_at}|${locked_hostname}"
+                die "Task t$task_id is already locked by $locked_by (since $locked_at, hostname: $locked_hostname)"
+            fi
+        fi
+
+        # Step 3: Build lock file content (YAML)
+        # pid_starttime_kind records WHICH source produced the identity token:
+        # `proc` / `bsdinfo` are strong, while a `ps`-derived token is only
+        # second-granular and therefore cannot prove liveness (see
+        # lib/pid_anchor.sh). Both come from ONE probe, so they cannot disagree.
+        local lock_pid lock_starttime lock_starttime_kind lock_yaml
+        lock_pid=$(get_lock_pid)
+        read -r lock_starttime_kind lock_starttime <<<"$(get_pid_identity "$lock_pid")"
+        lock_yaml="task_id: $task_id
+locked_by: $email
+locked_at: $(get_timestamp)
+hostname: $(get_hostname)
+pid: $lock_pid
+pid_starttime: $lock_starttime
+pid_starttime_kind: $lock_starttime_kind"
+
+        # Step 4: Create new commit via git plumbing
+        local blob_hash new_tree_hash commit_hash_new
+
+        blob_hash=$(echo "$lock_yaml" | git hash-object -w --stdin)
+
+        # Build new tree: existing entries (minus old lock if refreshing) + new lock
+        new_tree_hash=$( {
+            git ls-tree "$current_tree_hash" | grep -v "	${lock_file}$" || true
+            printf "100644 blob %s\t%s\n" "$blob_hash" "$lock_file"
+        } | git mktree )
+
+        commit_hash_new=$(echo "ait: Lock task t$task_id for $email" | \
+            git commit-tree "$new_tree_hash" -p "$parent_hash")
+
+        # Step 5: Push — fails if another PC locked simultaneously
+        debug "Pushing to origin..."
+        if git push origin "$commit_hash_new:refs/heads/$BRANCH" 2>/dev/null; then
+            debug "Lock acquired for t$task_id"
+            success "Locked task t$task_id"
+            return 0
+        fi
+
+        # Push failed (race condition) — retry
+        debug "Push failed (race condition)"
+        if [[ $attempt -lt $MAX_RETRIES ]]; then
+            warn "Lock race detected (attempt $attempt/$MAX_RETRIES), retrying..." >&2
+            sleep "0.$((RANDOM % 4 + 1))"
+        fi
+    done
+
+    die_code 12 "Failed to lock task t$task_id after $MAX_RETRIES attempts."
+}
+
+# --- Unlock: atomically release a task lock ---
+
+unlock_task() {
+    local task_id="$1"
+    local lock_file="t${task_id}_lock.yaml"
+
+    if ! has_remote; then
+        debug "No remote — skipping unlock (single-user mode)"
+        return 0
+    fi
+    debug "Attempting to unlock task t$task_id"
+
+    local attempt=0
+
+    while [[ $attempt -lt $MAX_RETRIES ]]; do
+        attempt=$((attempt + 1))
+        debug "Attempt $attempt/$MAX_RETRIES"
+
+        # Step 1: Probe lock branch on origin (tri-state), then fetch.
+        # `|| probe_rc=$?` keeps `set -e` from killing this line on rc>0.
+        local probe_rc=0
+        lock_branch_exists_on_remote || probe_rc=$?
+        case $probe_rc in
+            0) ;;
+            1) die_code 10 "Lock branch '$BRANCH' not found on remote. Run 'ait setup' to initialize." ;;
+            *) die_code 11 "Failed to reach origin to check '$BRANCH' (network or auth issue)." ;;
+        esac
+        if ! git fetch origin "$BRANCH" --quiet 2>/dev/null; then
+            die_code 11 "Failed to fetch '$BRANCH' (network or auth issue)."
+        fi
+
+        local parent_hash current_tree_hash
+        parent_hash=$(git rev-parse "origin/$BRANCH")
+        current_tree_hash=$(git rev-parse "origin/$BRANCH^{tree}")
+
+        # Step 2: If lock file doesn't exist, succeed silently (idempotent)
+        if ! git ls-tree "$current_tree_hash" -- "$lock_file" 2>/dev/null | grep -q "$lock_file"; then
+            debug "Lock file does not exist, nothing to unlock"
+            return 0
+        fi
+
+        # Step 3: Build new tree WITHOUT the lock file
+        local new_tree_hash commit_hash_new
+        new_tree_hash=$( { git ls-tree "$current_tree_hash" | grep -v "	${lock_file}$" || true; } | git mktree )
+        commit_hash_new=$(echo "ait: Unlock task t$task_id" | \
+            git commit-tree "$new_tree_hash" -p "$parent_hash")
+
+        # Step 4: Push
+        debug "Pushing to origin..."
+        if git push origin "$commit_hash_new:refs/heads/$BRANCH" 2>/dev/null; then
+            debug "Lock released for t$task_id"
+            return 0
+        fi
+
+        # Retry on race
+        debug "Push failed (race condition)"
+        if [[ $attempt -lt $MAX_RETRIES ]]; then
+            warn "Unlock race detected (attempt $attempt/$MAX_RETRIES), retrying..." >&2
+            sleep "0.$((RANDOM % 4 + 1))"
+        fi
+    done
+
+    die_code 12 "Failed to unlock task t$task_id after $MAX_RETRIES attempts."
+}
+
+# --- Check: is a task locked? ---
+
+# STDOUT CONTRACT: stdout is the lock RECORD — the raw lock-file YAML — and
+# nothing else; absence of a lock is signalled by the exit status (1) with an
+# empty stdout. Consumers parse it as data: task-workflow's pre-implementation
+# ownership guard reads the `hostname:` line out of it to detect a multi-PC
+# reclaim. So no informational prose may be added to this function's stdout —
+# route anything for a human through warn()/stderr, the way list_locks() does
+# for its degenerate cases (t1641).
+check_lock() {
+    local task_id="$1"
+    local lock_file="t${task_id}_lock.yaml"
+
+    if ! has_remote; then
+        return 1  # Not locked (no remote = no locks possible)
+    fi
+
+    if ! git fetch origin "$BRANCH" --quiet 2>/dev/null; then
+        # Branch doesn't exist — not locked
+        return 1
+    fi
+
+    local current_tree_hash
+    current_tree_hash=$(git rev-parse "origin/$BRANCH^{tree}" 2>/dev/null) || return 1
+
+    if git ls-tree "$current_tree_hash" -- "$lock_file" 2>/dev/null | grep -q "$lock_file"; then
+        # Locked — print lock info to stdout
+        git show "origin/$BRANCH:$lock_file" 2>/dev/null
+        return 0
+    else
+        return 1
+    fi
+}
+
+# --- List: show all active locks ---
+
+# Extract a `key: value` field from lock-file YAML. Prints the value (empty when
+# the key is absent) and always exits 0. A `grep '^key:'` pipeline would exit 1
+# on a missing key and, under `set -euo pipefail`, abort the whole listing — the
+# same class t1370 removed from cleanup_locks().
+#   $1 = key, $2 = lock file content
+_lock_field() {
+    printf '%s\n' "$2" | awk -v k="^$1:" '$0 ~ k { sub(/^[^:]*: */, ""); print; exit }'
+}
+
+# Degenerate "no locks" messages are prose for humans, not records. --list's
+# stdout is a machine-readable channel — one `t<id>: locked by <who> on <host>
+# since <ts>` line per RECOGNIZED lock — and info() wraps its argument in ANSI
+# color escapes, so emitting these on stdout forced every consumer to strip
+# escapes and pattern-match the record shape just to tell "no locks" from a
+# lock. Empty stdout means "no recognized lock records" — NOT that the lock
+# tree is empty: a blob with no task_id: is skipped below and is visible only
+# under --debug (t1641).
+_list_note() { info "$1" >&2; }
+
+list_locks() {
+    if ! has_remote; then
+        _list_note "No locks (no remote configured)"
+        return 0
+    fi
+
+    if ! git fetch origin "$BRANCH" --quiet 2>/dev/null; then
+        _list_note "No locks (branch not initialized)"
+        return 0
+    fi
+
+    local current_tree_hash
+    current_tree_hash=$(git rev-parse "origin/$BRANCH^{tree}" 2>/dev/null) || {
+        _list_note "No locks"
+        return 0
+    }
+
+    local lock_files
+    # awk, not grep: an empty lock branch makes `grep` exit 1, which under
+    # `set -euo pipefail` kills --list before the emptiness guard below.
+    lock_files=$(git ls-tree "$current_tree_hash" | awk '$4 ~ /_lock\.yaml$/ {print $4}')
+
+    if [[ -z "$lock_files" ]]; then
+        _list_note "No active locks"
+        return 0
+    fi
+
+    while IFS= read -r lf; do
+        local content tid lby lat lhost
+        content=$(git show "origin/$BRANCH:$lf" 2>/dev/null)
+
+        # task_id identifies the record — without it there is no lock to report.
+        tid=$(_lock_field task_id "$content")
+        if [[ -z "$tid" ]]; then
+            debug "Skipping unrecognized lock file: $lf"
+            continue
+        fi
+
+        # A corrupt lock file must still be REPORTED, not silently dropped: the
+        # board's parser (aitask_board.py refresh_lock_map) requires non-empty
+        # fields, so an empty value would make it discard this lock entirely.
+        # "unknown" matches the placeholder lock_task() already uses (line 166).
+        lby=$(_lock_field locked_by "$content");  lby="${lby:-unknown}"
+        lat=$(_lock_field locked_at "$content");  lat="${lat:-unknown}"
+        lhost=$(_lock_field hostname "$content"); lhost="${lhost:-unknown}"
+
+        echo "t${tid}: locked by $lby on $lhost since $lat"
+    done <<< "$lock_files"
+}
+
+# --- List (machine-readable): one fetched snapshot, plus an AVAILABILITY verdict
+#
+# `list_locks` above fails OPEN: an absent branch, a network failure and an empty
+# branch all end in "no locks". For a consumer that decides whether it may commit
+# another session's file, that is the wrong direction — an outage can easily
+# coincide with a live editor — so this form distinguishes them (t1599_3).
+#
+# Output (stdout; prose notes stay on stderr):
+#   LOCKS_OK                 snapshot is trustworthy; the lines below are complete
+#   LOCKS_REF:<sha>          the lock-branch commit the snapshot was read from
+#   LOCK:<id>|<email>|<host>|<pid>|<starttime>|<kind>     zero or more
+#   LOCKS_UNINITIALIZED      no lock branch (or no remote) — no task CAN be locked
+#   LOCKS_UNAVAILABLE        branch exists but is unreadable — decide nothing
+#
+# The status answers exactly ONE question — "is this snapshot trustworthy?" — and
+# nothing about any particular task. Whether a GIVEN task is held is answered by
+# the LOCK: lines. There is deliberately no "no locks anywhere" status: a
+# readable branch with no locks is LOCKS_OK with zero LOCK: lines. A separate
+# global token invites using it as a per-task precondition, which would let an
+# unrelated live lock on tY gate a decision about tX.
+#
+# The human `--list` output is deliberately untouched: aitask_board.py's
+# refresh_lock_map() regex-parses that prose line.
+list_locks_batch() {
+    if ! has_remote; then
+        _list_note "No locks (no remote configured)"
+        echo "LOCKS_UNINITIALIZED"
+        return 0
+    fi
+
+    # The tri-state probe lock_task()/unlock_task() already use for
+    # die_code 10 vs 11. check_lock() never calls it, which is why it fails open.
+    local probe_rc=0
+    lock_branch_exists_on_remote || probe_rc=$?
+    case $probe_rc in
+        1) _list_note "No locks (branch not initialized)"
+           echo "LOCKS_UNINITIALIZED"; return 0 ;;
+        2) _list_note "Lock branch unreachable"
+           echo "LOCKS_UNAVAILABLE"; return 0 ;;
+    esac
+
+    # Branch exists. From here a failure is an OUTAGE, not an absence.
+    if ! git fetch origin "$BRANCH" --quiet 2>/dev/null; then
+        _list_note "Lock branch fetch failed"
+        echo "LOCKS_UNAVAILABLE"; return 0
+    fi
+
+    local ref_hash current_tree_hash
+    ref_hash=$(git rev-parse "origin/$BRANCH" 2>/dev/null) || {
+        _list_note "Lock branch ref unreadable"
+        echo "LOCKS_UNAVAILABLE"; return 0
+    }
+    current_tree_hash=$(git rev-parse "origin/$BRANCH^{tree}" 2>/dev/null) || {
+        _list_note "Lock branch tree unreadable"
+        echo "LOCKS_UNAVAILABLE"; return 0
+    }
+
+    echo "LOCKS_OK"
+    echo "LOCKS_REF:${ref_hash}"
+
+    local lock_files
+    # awk, not grep: an empty lock branch makes `grep` exit 1, which under
+    # `set -euo pipefail` would kill the listing before it can report LOCKS_OK
+    # with zero entries — the "readable, nothing held" case.
+    lock_files=$(git ls-tree "$current_tree_hash" | awk '$4 ~ /_lock\.yaml$/ {print $4}')
+    [[ -z "$lock_files" ]] && return 0
+
+    while IFS= read -r lf; do
+        [[ -z "$lf" ]] && continue
+        local content tid lby lhost lpid lstart lkind
+        content=$(git show "origin/$BRANCH:$lf" 2>/dev/null) || {
+            # A blob we cannot read makes the SNAPSHOT incomplete, and a
+            # consumer that treats an incomplete snapshot as complete would
+            # decide "not locked" for whatever this record held. Fail closed.
+            _list_note "Lock record unreadable: $lf"
+            echo "LOCKS_UNAVAILABLE"
+            return 0
+        }
+
+        tid=$(_lock_field task_id "$content")
+        if [[ -z "$tid" ]]; then
+            debug "Skipping unrecognized lock file: $lf"
+            continue
+        fi
+
+        # Same placeholder discipline as the human form: never emit an empty
+        # field, or a consumer splitting on | silently mis-aligns.
+        lby=$(_lock_field locked_by "$content");          lby="${lby:-unknown}"
+        lhost=$(_lock_field hostname "$content");         lhost="${lhost:-unknown}"
+        lpid=$(_lock_field pid "$content");               lpid="${lpid:--}"
+        lstart=$(_lock_field pid_starttime "$content");   lstart="${lstart:--}"
+        # Absent kind defaults to proc, matching the reader at the top of this
+        # file and pid_anchor.sh's own backward-compat default.
+        lkind=$(_lock_field pid_starttime_kind "$content"); lkind="${lkind:-proc}"
+
+        echo "LOCK:${tid}|${lby}|${lhost}|${lpid}|${lstart}|${lkind}"
+    done <<< "$lock_files"
+}
+
+# --- Cleanup: remove stale locks for archived tasks ---
+
+# Internal: true when a failed `git fetch` of the lock branch means the branch
+# simply is not there — nothing to clean — as opposed to a remote we could not
+# read. Both fetch sites branch on this, so the two cannot drift apart.
+#   $1 = captured git stderr
+_cleanup_branch_absent() {
+    case "${1:-}" in
+        *"couldn't find remote ref"*|*"not our ref"*) return 0 ;;
+    esac
+    return 1
+}
+
+# Internal: report a lock branch we could not read. Reuses the canonical push
+# classifier from task_utils.sh so the wording matches task_sync's for the same
+# git failure.
+#   $1 = captured git stderr ("" when undeterminable)
+#   $2 = stale locks already identified and left in place ("" when none/unknown)
+_cleanup_warn_unreadable() {
+    local git_err="${1:-}" stale_count="${2:-}" reason detail="" left
+    reason="$(_task_push_classify "" "$git_err")"
+    if [[ "$reason" == "unknown" && -n "$git_err" ]]; then
+        detail=" (git: $(_task_push_first_line "$git_err"))"
+    fi
+    if [[ -n "$stale_count" && "$stale_count" != "0" ]]; then
+        left="${stale_count} stale lock(s) left in place"
+    else
+        left="stale lock cleanup did not run"
+    fi
+    warn "could not read the '$BRANCH' lock branch — ${left}; $(_task_push_reason_hint "$reason" "./ait lock --cleanup")${detail}"
+}
+
+# Best-effort for callers (aitask_pick_own.sh never lets it block a pick), but
+# honest about its own outcome — a swallowed failure lets stale locks pile up
+# until a later pick reports LOCK_FAILED for a task nobody is working on.
+#
+# Exit contract:
+#   0   completed: no remote, lock branch absent, nothing stale, or all stale
+#       locks removed
+#   11  the lock branch could not be READ (initial fetch/rev-parse, or the
+#       mid-retry refresh) — any identified stale locks were left in place
+#   12  the branch stayed readable but the removal push was rejected on all
+#       MAX_RETRIES attempts
+# STDOUT CONTRACT (audited — t1641): prose only. This verb's machine-readable
+# verdict rides its EXIT STATUS (0 = completed, 11 = lock branch unreadable,
+# 12 = removal push rejected), not stdout, so the info()/success() calls below
+# share the stream with nothing. Same rule as init_lock_branch(): if a record is
+# ever added to stdout here, move the prose to stderr in the same change.
+cleanup_locks() {
+    if ! has_remote; then
+        debug "No remote — skipping lock cleanup"
+        return 0
+    fi
+
+    # Disambiguate "branch genuinely absent" (nothing to clean) from "cannot
+    # read origin" (cleanup did not run). LC_ALL=C keeps git's message
+    # parseable — task_utils.sh pins it only inside _ait_data_git.
+    local fetch_err=""
+    if ! fetch_err="$(LC_ALL=C git fetch origin "$BRANCH" --quiet 2>&1)"; then
+        if _cleanup_branch_absent "$fetch_err"; then
+            debug "Lock branch '$BRANCH' not on remote — nothing to clean up"
+            return 0
+        fi
+        _cleanup_warn_unreadable "$fetch_err" ""
+        return 11
+    fi
+
+    local parent_hash current_tree_hash
+    if ! parent_hash=$(git rev-parse "origin/$BRANCH" 2>/dev/null) ||
+       ! current_tree_hash=$(git rev-parse "origin/$BRANCH^{tree}" 2>/dev/null); then
+        _cleanup_warn_unreadable "" ""
+        return 11
+    fi
+
+    local lock_files
+    # awk, not grep: an empty lock branch makes `grep` exit 1, which under
+    # `set -euo pipefail` kills the sweep before the emptiness guard below.
+    lock_files=$(git ls-tree "$current_tree_hash" | awk '$4 ~ /_lock\.yaml$/ {print $4}')
+
+    [[ -z "$lock_files" ]] && return 0
+
+    local stale_files=()
+
+    while IFS= read -r lf; do
+        # Extract task ID from filename (t109_lock.yaml -> 109). Parameter
+        # expansion, not a grep pipeline: a stray non-t<N> file would make
+        # `grep -oE` exit 1 and abort the whole sweep.
+        local tid="${lf#t}"
+        tid="${tid%%_*}"
+        if [[ ! "$tid" =~ ^[0-9]+$ ]]; then
+            debug "Skipping unrecognized lock file: $lf"
+            continue
+        fi
+
+        # Check if task is archived
+        if ls "$ARCHIVED_DIR"/t${tid}_*.md &>/dev/null; then
+            stale_files+=("$lf")
+            debug "Stale lock: $lf (task archived)"
+        fi
+    done <<< "$lock_files"
+
+    if [[ ${#stale_files[@]} -eq 0 ]]; then
+        debug "No stale locks found"
+        return 0
+    fi
+
+    info "Removing ${#stale_files[@]} stale lock(s)..."
+
+    # Build grep pattern to filter out stale lock files
+    local filter_pattern
+    filter_pattern=$(printf "%s\n" "${stale_files[@]}" | sed 's/\./\\./g' | paste -sd'|' -)
+
+    local attempt=0
+
+    while [[ $attempt -lt $MAX_RETRIES ]]; do
+        attempt=$((attempt + 1))
+
+        local new_tree_hash commit_hash_new
+        new_tree_hash=$( { git ls-tree "$current_tree_hash" | grep -vE "	(${filter_pattern})$" || true; } | git mktree )
+        commit_hash_new=$(echo "ait: Cleanup ${#stale_files[@]} stale lock(s)" | \
+            git commit-tree "$new_tree_hash" -p "$parent_hash")
+
+        if git push origin "$commit_hash_new:refs/heads/$BRANCH" 2>/dev/null; then
+            success "Cleaned up ${#stale_files[@]} stale lock(s)"
+            return 0
+        fi
+
+        # Re-fetch and rebuild on retry (tree may have changed). A failure HERE
+        # is a read failure, not push exhaustion: reporting it as 12 would send
+        # the user to a push-retry hint for a connectivity problem.
+        debug "Push failed during cleanup, retrying..."
+        sleep "0.$((RANDOM % 4 + 1))"
+        if ! fetch_err="$(LC_ALL=C git fetch origin "$BRANCH" --quiet 2>&1)"; then
+            if _cleanup_branch_absent "$fetch_err"; then
+                # The branch vanished mid-sweep (concurrent delete, or a
+                # re-init). Its locks went with it, so there is nothing left to
+                # clean — and retrying would push our rebuilt tree back and
+                # resurrect every lock the branch used to hold.
+                debug "Lock branch '$BRANCH' disappeared mid-sweep — nothing left to clean up"
+                return 0
+            fi
+            _cleanup_warn_unreadable "$fetch_err" "${#stale_files[@]}"
+            return 11
+        fi
+        if ! parent_hash=$(git rev-parse "origin/$BRANCH" 2>/dev/null) ||
+           ! current_tree_hash=$(git rev-parse "origin/$BRANCH^{tree}" 2>/dev/null); then
+            _cleanup_warn_unreadable "" "${#stale_files[@]}"
+            return 11
+        fi
+    done
+
+    warn "failed to remove ${#stale_files[@]} stale lock(s) after ${attempt} push attempt(s) — they remain on the '$BRANCH' branch; retry './ait lock --cleanup', or clear one with './ait lock --unlock <task_id>'"
+    return 12
+}
+
+# --- Email auto-detection ---
+
+# Auto-detect user email: userconfig.yaml -> emails.txt
+# Mirrors the board TUI's _get_user_email() logic
+get_user_email_with_fallback() {
+    local email
+    email=$(get_user_email)
+    if [[ -n "$email" ]]; then
+        echo "$email"
+        return
+    fi
+    local emails_file="${TASK_DIR:-aitasks}/metadata/emails.txt"
+    if [[ -f "$emails_file" ]]; then
+        head -1 "$emails_file" | tr -d '[:space:]'
+    fi
+}
+
+# Resolve email for --lock: use explicit arg or auto-detect
+# Usage: resolve_lock_email [--email <email>]
+# Remaining args after resolution are left in LOCK_EXTRA_ARGS
+resolve_lock_email() {
+    if [[ "${1:-}" == "--email" ]]; then
+        echo "${2:?Missing email address after --email}"
+        return
+    fi
+    local email
+    email=$(get_user_email_with_fallback)
+    if [[ -z "$email" ]]; then
+        die "No email provided and none found in userconfig.yaml or emails.txt. Use --email <email> or configure aitasks/metadata/userconfig.yaml"
+    fi
+    debug "Auto-detected email: $email"
+    echo "$email"
+}
+
+# --- Main ---
+
+show_help() {
+    cat <<'EOF'
+Usage: ait lock [--debug] <command> [args]
+
+Atomic task lock management. Prevents two SESSIONS — not just two users — from
+working on the same task simultaneously. Locks are stored on a separate git
+branch (aitask-locks). When no git remote is configured, lock operations are
+silently skipped (single-user mode — no locking needed).
+
+A lock held by your own email on this host is refreshed silently only when it
+was taken by THIS session. One taken by another session of yours is refused
+while that session is still running (exit 13), or while its liveness cannot be
+established (exit 14); release it with --unlock, or override with
+'aitask_pick_own.sh <task_id> --force'.
+
+Commands:
+  <task_id>                        Lock a task (auto-detects email from userconfig).
+                                   Exit 0 = locked, 1 = held by another user,
+                                   13 = held by a live session of yours on this
+                                   host, 14 = held by a session of yours whose
+                                   liveness could not be established.
+  --lock <task_id> [--email EMAIL] Lock a task (explicit syntax)
+  --unlock <task_id>               Release a task lock
+  --check <task_id>                Check if locked (exit 0=locked, 1=free).
+                                   stdout is the lock record (raw YAML) when
+                                   locked, and empty when not.
+  --list                           List all currently locked tasks. stdout
+                                   carries one record per recognized lock —
+                                   "t<id>: locked by <email> on <host> since
+                                   <ts>" — and nothing else; informational
+                                   messages go to stderr. Empty stdout means no
+                                   RECOGNIZED records, not that the lock branch
+                                   is empty: a lock file with no task_id: field
+                                   is skipped and shown only under --debug.
+  --list --batch                   Same snapshot, machine-readable, plus an
+                                   AVAILABILITY verdict (--list alone fails
+                                   open: an absent branch, a network failure and
+                                   an empty branch all read as "no locks"):
+                                     LOCKS_OK              snapshot trustworthy
+                                     LOCKS_REF:<sha>       lock-branch commit
+                                     LOCK:<id>|<email>|<host>|<pid>|<starttime>|<kind>
+                                     LOCKS_UNINITIALIZED   no branch / no remote
+                                     LOCKS_UNAVAILABLE     unreadable — decide
+                                                           nothing
+                                   The verdict describes the SNAPSHOT, never a
+                                   task: a readable branch holding no locks is
+                                   LOCKS_OK with zero LOCK: lines. Whether a
+                                   given task is held is answered by the LOCK:
+                                   lines alone.
+  --init                           Initialize the aitask-locks branch on remote
+  --cleanup                        Remove stale locks for archived tasks.
+                                   Exit 0 = completed (including nothing to do),
+                                   11 = the lock branch could not be read,
+                                   12 = the removal push was rejected on every
+                                   retry. Failures warn on stderr.
+
+Options:
+  --email EMAIL  Override email for locking (default: auto-detect from
+                 aitasks/metadata/userconfig.yaml or emails.txt)
+  --debug        Enable verbose debug output
+  --help         Show this help message
+
+Examples:
+  ait lock 42                      # Lock task t42 (auto-detect email)
+  ait lock 42 --email user@co.com  # Lock with explicit email
+  ait lock --unlock 42             # Unlock task t42
+  ait lock --check 42              # Check if t42 is locked
+  ait lock --list                  # Show all locks
+EOF
+}
+
+# Parse --debug flag first
+while [[ "${1:-}" == "--debug" ]]; do
+    DEBUG=true
+    shift
+done
+
+case "${1:-}" in
+    --init|init)
+        init_lock_branch
+        ;;
+    --lock|lock)
+        shift
+        LOCK_TASK_ID="${1:?Usage: ait lock <task_id> [--email <email>]}"
+        shift
+        LOCK_EMAIL=$(resolve_lock_email "$@")
+        lock_task "$LOCK_TASK_ID" "$LOCK_EMAIL"
+        ;;
+    --unlock|unlock)
+        shift
+        UNLOCK_TASK_ID="${1:?Usage: aitask_lock.sh --unlock <task_id>}"
+        unlock_task "$UNLOCK_TASK_ID"
+        ;;
+    --check|check)
+        shift
+        CHECK_TASK_ID="${1:?Usage: aitask_lock.sh --check <task_id>}"
+        check_lock "$CHECK_TASK_ID"
+        ;;
+    --list|list)
+        # The --debug pre-parse loop above only strips flags BEFORE the verb, so
+        # `--list --batch` has to be consumed here.
+        shift
+        case "${1:-}" in
+            --batch) list_locks_batch ;;
+            "")      list_locks ;;
+            *)       die "Unknown option for --list: $1. Use --help for usage." ;;
+        esac
+        ;;
+    --cleanup|cleanup)
+        # Called bare on purpose. `set -e` propagates cleanup_locks' exact
+        # return code (11/12) as the script's exit status, and — unlike a
+        # `cleanup_locks || rc=$?` guard — it leaves `set -e` ACTIVE inside the
+        # function, so an unexpected failure mid-sweep aborts loudly instead of
+        # being swallowed and carried on with bogus state.
+        cleanup_locks
+        ;;
+    --help|-h)
+        show_help
+        ;;
+    "")
+        die "No command specified. Use --help for usage."
+        ;;
+    *)
+        # Bare task ID: treat as --lock shortcut (e.g., "ait lock 42")
+        if [[ "$1" =~ ^t?[0-9]+(_[0-9]+)?$ ]]; then
+            LOCK_TASK_ID="${1#t}"
+            shift
+            LOCK_EMAIL=$(resolve_lock_email "$@")
+            lock_task "$LOCK_TASK_ID" "$LOCK_EMAIL"
+        else
+            die "Unknown option: $1. Use --help for usage."
+        fi
+        ;;
+esac

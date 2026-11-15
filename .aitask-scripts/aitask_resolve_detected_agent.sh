@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+# aitask_resolve_detected_agent.sh - Resolve detected agent/model into agent string
+# Encapsulates the JSON lookup so code agents don't need to parse models JSON manually.
+#
+# Usage: ./.aitask-scripts/aitask_resolve_detected_agent.sh --agent <agent> --cli-id <model_id>
+#
+# Output (single line, always exit 0):
+#   AGENT_STRING:<agent>/<name>            — exact match found
+#   AGENT_STRING:<agent>/<name>            — suffix match found (opencode only)
+#   AGENT_STRING_FALLBACK:<agent>/unregistered_<normalised cli_id>
+#                                          — no match; see fallback_model_name()
+#
+# The fallback model name is RESERVED: every `unregistered_*` name is outside
+# the set of registered model names. Registry writers refuse the prefix
+# (aitask_add_model.sh validate_name, aitask_opencode_models.sh's pre-write
+# guard, the aitask-refresh-code-models skill), so a fallback parses through
+# every parse_agent_string copy (^([a-z]+)/([a-z0-9_]+)$) yet can never be
+# credited to a registered model — `opus5-5` must not become `opus5_5`.
+#
+# AITASK_AGENT_STRING env var acts as a default only when neither --agent nor
+# --cli-id is passed; explicit args always win for deterministic resolution.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/terminal_compat.sh
+source "$SCRIPT_DIR/lib/terminal_compat.sh"
+# shellcheck source=lib/task_utils.sh
+source "$SCRIPT_DIR/lib/task_utils.sh"
+
+METADATA_DIR="${TASK_DIR:-aitasks}/metadata"
+SUPPORTED_AGENTS=(claudecode codex opencode)
+
+# --- Argument parsing ---
+agent=""
+cli_id=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --agent)
+            agent="$2"
+            shift 2
+            ;;
+        --cli-id)
+            cli_id="$2"
+            shift 2
+            ;;
+        *)
+            die "Unknown argument: $1. Usage: aitask_resolve_detected_agent.sh --agent <agent> --cli-id <model_id>"
+            ;;
+    esac
+done
+
+# --- Fast path: env var default (only when no explicit args) ---
+# Explicit --agent/--cli-id always win for deterministic resolution; the env var
+# acts only as a default when the caller passes neither.
+if [[ -z "$agent" && -z "$cli_id" && -n "${AITASK_AGENT_STRING:-}" ]]; then
+    echo "AGENT_STRING:${AITASK_AGENT_STRING}"
+    exit 0
+fi
+
+if [[ -z "$agent" ]]; then
+    die "Missing required argument: --agent"
+fi
+if [[ -z "$cli_id" ]]; then
+    die "Missing required argument: --cli-id"
+fi
+
+# --- Validate agent ---
+valid=false
+for a in "${SUPPORTED_AGENTS[@]}"; do
+    if [[ "$a" == "$agent" ]]; then
+        valid=true
+        break
+    fi
+done
+if [[ "$valid" != "true" ]]; then
+    die "Invalid agent: $agent. Must be one of: ${SUPPORTED_AGENTS[*]}"
+fi
+
+# Normalise an unregistered cli_id into the reserved fallback namespace:
+# lowercase, each run of non-[a-z0-9] -> "_", trim "_", empty -> "unknown",
+# then prefix "unregistered_". claude-opus-5-5[1m] -> unregistered_claude_opus_5_5_1m
+fallback_model_name() {
+    local id
+    # tr, not sed: sed works per line, so an embedded newline would split the
+    # name and break the single-line output contract. tr -c maps every byte
+    # outside [a-z0-9] (newlines included) to "_", -s squeezes the runs. LC_ALL=C
+    # keeps it bytewise, so multibyte input behaves the same with GNU and BSD tr.
+    id=$(printf '%s' "$1" | LC_ALL=C tr 'A-Z' 'a-z' | LC_ALL=C tr -c 'a-z0-9' '_' | LC_ALL=C tr -s '_')
+    id="${id#_}"
+    id="${id%_}"
+    [[ -n "$id" ]] || id="unknown"
+    echo "unregistered_${id}"
+}
+
+# --- Locate models file ---
+models_file="$METADATA_DIR/models_${agent}.json"
+if [[ ! -f "$models_file" ]]; then
+    echo "AGENT_STRING_FALLBACK:${agent}/$(fallback_model_name "$cli_id")"
+    exit 0
+fi
+
+# --- Exact match ---
+name=$(jq -r --arg id "$cli_id" '.models[] | select(.cli_id == $id) | .name' "$models_file" | head -1)
+if [[ -n "$name" ]]; then
+    echo "AGENT_STRING:${agent}/${name}"
+    exit 0
+fi
+
+# --- Suffix match (opencode only) ---
+if [[ "$agent" == "opencode" ]]; then
+    name=$(jq -r --arg id "$cli_id" '.models[] | select(.cli_id | endswith("/" + $id)) | .name' "$models_file" | head -1)
+    if [[ -n "$name" ]]; then
+        echo "AGENT_STRING:${agent}/${name}"
+        exit 0
+    fi
+fi
+
+# --- Fallback ---
+echo "AGENT_STRING_FALLBACK:${agent}/$(fallback_model_name "$cli_id")"
+exit 0

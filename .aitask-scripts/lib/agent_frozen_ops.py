@@ -1,0 +1,1117 @@
+#!/usr/bin/env python3
+"""Store-wrapper and tmux plumbing shared by the frozen-agent engines (t1738).
+
+Imported by `lib/agent_freeze.py` (the freeze transaction + the §C reconcile
+repair table) and by `lib/agent_restore.py` (the restore coordinator, t1705_5).
+It exists so the two engines *share* the store's wire protocol rather than
+forking it: the verb names, the argument shapes, the `NONCE_MISMATCH` /
+`TRANSITION_REFUSED` / `LEASE_HELD` exit codes and the failure-injection seam
+names are defined once, here.
+
+**The dependency arrow runs ONE way.** This module must never import
+`agent_freeze` or `agent_restore` — and it deliberately does not import
+`agent_sessions` either. `agent_freeze.py`'s reconcile has to keep settling
+abandoned restores with **no coordinator present**, so nothing it depends on may
+reach back toward the coordinator.
+
+Two hard boundaries, both load-bearing, are owned here:
+
+1. **Every tmux call goes through `TmuxClient`** (`lib/tmux_exec.py`), the
+   sanctioned gateway. `tests/test_no_raw_tmux.sh` enforces it.
+2. **Every store WRITE goes through the shell wrapper**
+   (`aitask_agent_sessions.sh`), never by importing `agent_sessions`' mutators.
+   The wrapper is the store's sole writer because it holds the mutex around the
+   read-modify-write; importing the transition functions would write unlocked
+   and lose updates. Reads (`show` / `list`) go through the same wrapper for one
+   parsing path, even though they take no lock.
+
+THE SEAM RULE — state and behaviour through the module; pure names by import.
+:data:`_TMUX` and :func:`store` are **swapped in place** by the unit tests
+(`tests/test_agent_frozen_ops.py`, `tests/test_agent_freeze.py`) so the engines
+can run with no tmux and no store file. Both are looked up as *this* module's
+globals at call time, so one swap redirects every consumer — including
+:func:`store_show` and :func:`store_records`, which call `store(...)`, and every
+helper that calls :func:`run`.
+
+Consequently an engine must call these functions **through the module**::
+
+    import agent_frozen_ops as frozen_ops
+    rc, out = frozen_ops.store("show", record_id)     # correct
+
+and must NEVER import-alias the swapped names::
+
+    from agent_frozen_ops import store as _store      # WRONG: binds the
+                                                      # original object and
+                                                      # silently misses the swap
+
+`tests/test_agent_frozen_ops.py` enforces that rule directly: it fails if any
+engine module holds a global bound to the original `store` / `_TMUX` object.
+Constants (:data:`SESSIONS_SH`, the `EXIT_*` codes, :data:`PANE_FACT_FORMAT`,
+:data:`PANE_FACT_KEYS`, :data:`WINDOW_FACT_FORMAT`, :data:`WINDOW_FACT_KEYS`) and
+the :class:`StageFailure` class are never swapped and may be imported by name.
+
+Test seams, honoured **only** under ``AITASKS_TEST_MODE=1``:
+
+* :func:`make_fail_at` builds a per-engine ``fail_at`` bound to one environment
+  variable — ``AITASKS_FREEZE_FAIL_AT`` for the freeze engine,
+  ``AITASKS_RESTORE_FAIL_AT`` for the restore coordinator — so each engine's
+  injected failures cannot fire in the other;
+* :func:`pause_at` reads the shared ``AITASKS_FROZEN_PAUSE_AT``, which names a
+  stage in whichever engine is running.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import secrets
+import signal
+import subprocess
+import sys
+from pathlib import Path
+
+_LIB_DIR = Path(__file__).resolve().parent
+_SCRIPTS_DIR = _LIB_DIR.parent
+for _p in (str(_SCRIPTS_DIR), str(_LIB_DIR)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+from monitor.monitor_core import (  # noqa: E402
+    FROZEN_OPTION,
+    RECORD_OPTION,
+    RESPAWN_TOKEN_OPTION,
+    STANDIN_READY_OPTION,
+    AGENT_SESSION_OPTION,
+)
+from tmux_exec import TmuxClient, session_scope_target  # noqa: E402
+from config_utils import load_yaml_config  # noqa: E402
+
+#: The gateway client. SWAPPED BY TESTS — read it through :func:`run` (or as a
+#: module global from inside this file), never by import-aliasing it elsewhere.
+_TMUX = TmuxClient()
+
+#: The store's sole writer. Invoked as a subprocess, never imported (see the
+#: module docstring).
+SESSIONS_SH = _SCRIPTS_DIR / "aitask_agent_sessions.sh"
+
+#: Wrapper exit codes the engines branch on. The full table is in
+#: `aitask_agent_sessions.sh`'s header.
+EXIT_LOCK_BUSY = 3
+EXIT_TRANSITION_REFUSED = 5
+EXIT_NONCE_MISMATCH = 6
+EXIT_SESSION_MISMATCH = 7
+EXIT_LEASE_HELD = 8
+EXIT_HARVEST_REQUIRED = 9   # drop of unharvested capture text (t2175_2)
+
+
+class StageFailure(Exception):
+    """Injected failure at a named stage (test seam only)."""
+
+    def __init__(self, stage: str) -> None:
+        super().__init__(f"injected failure at {stage}")
+        self.stage = stage
+
+
+# --- the restore acknowledgement grace --------------------------------------
+
+#: Seconds a `restoring` record is given to be VERIFIED before it may be
+#: liveness-confirmed instead (§C/§D). Two kinds of evidence verify it: the
+#: replacement agent's SessionStart hook ack, or, for a codex resume, the session
+#: of the rollout the resumed process holds open (t2040). Both verify the resumed
+#: session id, which is what permits deleting the only copy of the capture, so
+#: confirming early would trade the strong signal for the weak one. A codex
+#: resume fires its hook only at the user's first turn, so for codex the rollout
+#: is the evidence that normally arrives inside this window.
+RESTORE_ACK_GRACE = 20.0
+
+
+def restore_ack_grace(root: "str | os.PathLike | None" = None) -> float:
+    """`frozen.restore_ack_grace`, with a TEST-ONLY env seam (t1705_5).
+
+    Precedence: ``AITASKS_RESTORE_ACK_GRACE`` (only under
+    ``AITASKS_TEST_MODE=1``) > ``frozen.restore_ack_grace`` in the project's
+    ``aitasks/metadata/project_config.yaml`` > :data:`RESTORE_ACK_GRACE`.
+    Non-positive and unparseable values at either layer fall back to the default.
+
+    **It lives here, in the SHARED module, on purpose.** Both the restore
+    coordinator (`agent_restore`) and reconcile (`agent_freeze`) read it, and
+    they must not be able to disagree: if reconcile used a longer grace than the
+    coordinator, it could liveness-confirm a record the coordinator is still
+    polling for, moving it to `live` behind the coordinator's back so its next
+    verb fails `NONCE_MISMATCH` and the user's restore is silently lost. Hosting
+    it in `agent_freeze` instead would force the coordinator to import the repair
+    module for one function — the exact one-way-arrow violation this module
+    exists to prevent (t1738; parent-plan amendment B6).
+
+    The env seam is gated on test mode for the same reason
+    ``agent_sessions._stale_op_grace`` is: a stray variable in a developer's
+    shell must never reconfigure a real coordinator's ack window. It shortens
+    only the *waiting* half — it is not a way to skip the hook ack, which is
+    still strictly preferred whenever it arrives first.
+    """
+    if test_mode():
+        raw = os.environ.get("AITASKS_RESTORE_ACK_GRACE", "")
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            value = 0.0
+        if value > 0:
+            return value
+
+    base = Path(root) if root else Path.cwd()
+    cfg_path = base / "aitasks" / "metadata" / "project_config.yaml"
+    try:
+        cfg = load_yaml_config(cfg_path, {})
+    except Exception:
+        # Broad on purpose, mirroring `agent_freeze.capture_max_lines`: this runs
+        # mid-restore, and a malformed or unreadable project config must degrade
+        # to the default rather than abort a transaction that has already
+        # respawned the user's agent pane.
+        return RESTORE_ACK_GRACE
+    section = cfg.get("frozen") if isinstance(cfg, dict) else None
+    if not isinstance(section, dict):
+        return RESTORE_ACK_GRACE
+    try:
+        configured = float(section.get("restore_ack_grace", RESTORE_ACK_GRACE))
+    except (TypeError, ValueError):
+        return RESTORE_ACK_GRACE
+    return configured if configured > 0 else RESTORE_ACK_GRACE
+
+
+#: Slack added on top of dispatch + ack grace before a watcher gives up on a
+#: restore. It absorbs the store write and the watcher's own poll cadence, not
+#: the coordinator's waiting — that part is :func:`restore_ack_grace`.
+RESTORE_SETTLE_SLACK = 10.0
+
+
+def restore_settle_timeout(root: "str | os.PathLike | None" = None, *,
+                           dispatch_grace: float) -> float:
+    """How long a UI may watch a dispatched restore before reporting a stall.
+
+    A watcher's deadline must be derived from the coordinator's OWN waiting,
+    never fixed: `agent_restore` gives a `restoring` record up to
+    :func:`restore_ack_grace` seconds to be acknowledged by its replacement
+    agent's SessionStart hook before it may be liveness-confirmed instead. A
+    watcher whose deadline is shorter than that grace warns and stops its timer
+    while the restore is still legitimately in flight, so a project that raised
+    the grace gets a spurious "still restoring" on every successful restore and
+    never sees the success.
+
+    At the default grace this returns exactly the 40.0s the first watcher
+    hardcoded (10 dispatch + 20 ack + 10 slack) — the value was right for the
+    default and wrong as a constant.
+    """
+    return dispatch_grace + restore_ack_grace(root) + RESTORE_SETTLE_SLACK
+
+
+# --- seams ------------------------------------------------------------------
+
+
+def test_mode() -> bool:
+    return os.environ.get("AITASKS_TEST_MODE") == "1"
+
+
+def make_fail_at(env_var: str):
+    """Build a ``fail_at(stage)`` seam bound to ``env_var``.
+
+    Each engine gets its own variable (`AITASKS_FREEZE_FAIL_AT`,
+    `AITASKS_RESTORE_FAIL_AT`) so a test injecting a failure into one engine
+    cannot trip the other — the two run in the same process during a live
+    freeze-then-restore sequence.
+    """
+
+    def fail_at(stage: str) -> None:
+        """Raise when the fail seam names this stage. No-op outside test mode."""
+        if test_mode() and os.environ.get(env_var) == stage:
+            raise StageFailure(stage)
+
+    fail_at.env_var = env_var       # introspectable; nothing branches on it
+    return fail_at
+
+
+def pause_at(stage: str) -> None:
+    """SIGSTOP self when the pause seam names this stage.
+
+    Stopping THIS process (rather than sleeping) is what makes the paused-owner
+    lease case honest: `_pid_alive` is fail-closed and a stopped process is
+    alive, so a concurrent `reconcile` must refuse takeover no matter how much
+    grace has elapsed. A sleep would prove the same thing only by accident.
+    """
+    if test_mode() and os.environ.get("AITASKS_FROZEN_PAUSE_AT") == stage:
+        os.kill(os.getpid(), signal.SIGSTOP)
+
+
+# --- tmux gateway -----------------------------------------------------------
+
+
+def run(args: list[str], timeout: float | None = None) -> tuple[int, str]:
+    """`TmuxClient.run` through the swappable module-level client.
+
+    The one place the engines reach tmux. Passing ``timeout=None`` uses the
+    client's own default rather than forcing a value, so the gateway keeps
+    ownership of that policy.
+    """
+    if timeout is None:
+        return _TMUX.run(args)
+    return _TMUX.run(args, timeout=timeout)
+
+
+# --- store wrapper ----------------------------------------------------------
+
+
+def store(*argv: str, timeout: float = 20.0) -> tuple[int, str]:
+    """Run the store wrapper. Returns ``(rc, output)``; never raises.
+
+    The wrapper folds its stderr into stdout already, so one stream carries both
+    the success line and the refusal line. A spawn failure is reported as
+    ``(1, "ERROR:...")`` rather than propagating, because every caller is
+    mid-transaction and needs to reach its rollback rather than a traceback.
+    """
+    try:
+        proc = subprocess.run(
+            [str(SESSIONS_SH), *argv],
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return 1, f"ERROR:{exc}"
+    out = (proc.stdout or "") + (proc.stderr or "")
+    return proc.returncode, out.strip()
+
+
+def store_show(record_id: str) -> dict[str, str]:
+    """``show <id> --json`` as a dict; ``{}`` when the record is gone or unreadable.
+
+    Every value is the stored one, verbatim (t2067): the ``--json`` form is one
+    ``RECORD:<json>`` line, so a value with surrounding whitespace or a line
+    break in it reaches the action as stored. Anything but exactly one decodable
+    record is ``{}`` — the same answer as a refusal, never a partial record.
+    """
+    rc, out = store("show", record_id, "--json")
+    if rc != 0:
+        return {}
+    records = [_decode_record(line) for line in out.splitlines()
+               if line.startswith("RECORD:")]    # folded stderr noise is skipped
+    if len(records) != 1 or records[0] is None:
+        return {}
+    return records[0]
+
+
+def _decode_record(line: str) -> dict[str, str] | None:
+    """One ``RECORD:<json>`` line as :func:`store_show`'s shape (every value a
+    str); None when it is not a JSON object."""
+    try:
+        raw = json.loads(line[len("RECORD:"):])
+    except ValueError:
+        return None
+    if not isinstance(raw, dict):
+        return None
+    return {str(k): str(v) for k, v in raw.items()}
+
+
+def store_records(*filters: str) -> list[dict[str, str]] | None:
+    """``list <filters> --full`` as full records: :func:`store_show`'s shape for
+    every matching record, from ONE store read (t2041).
+
+    None when the store could not be read, and None when the batch did not
+    parse: a listing that cannot be read whole is never a partial one. Values
+    are the stored ones verbatim, exactly as :func:`store_show` reads them.
+    """
+    rc, out = store("list", *filters, "--full")
+    if rc != 0:
+        return None
+    records: list[dict[str, str]] = []
+    for line in out.splitlines():
+        if not line.startswith("RECORD:"):
+            continue                    # folded stderr noise, never a record
+        record = _decode_record(line)
+        if record is None:
+            return None
+        records.append(record)
+    return records
+
+
+def usable_identifier(value: str) -> bool:
+    """Whether a stored ``codeagent_session_id`` / ``task_id`` can be launched with.
+
+    THE rule the `ait ide` offer and the restore / freeze actions share (t2067):
+    non-empty, every character printable, no whitespace. Reads are verbatim, so
+    a stored ``" "`` or ``"\nsess"`` arrives as such; it names no session and no
+    task, and is treated exactly like a blank — refused, never launched.
+    """
+    return (bool(value) and value.isprintable()
+            and not any(c.isspace() for c in value))
+
+
+def nonce_from(line: str) -> str:
+    """The nonce in a ``FREEZING:<id>|<nonce>`` / ``LEASED:<id>|<nonce>`` line."""
+    _, _, tail = line.partition("|")
+    return tail.strip()
+
+
+# --- tmux helpers -----------------------------------------------------------
+
+PANE_FACT_FORMAT = "\t".join([
+    "#{session_name}", "#{window_name}", "#{pane_id}", "#{pane_pid}",
+    "#{pane_dead}", "#{pane_current_path}",
+    f"#{{{RECORD_OPTION}}}", f"#{{{FROZEN_OPTION}}}",
+    f"#{{{STANDIN_READY_OPTION}}}", f"#{{{AGENT_SESSION_OPTION}}}",
+])
+PANE_FACT_KEYS = (
+    "session", "window", "pane_id", "pane_pid", "pane_dead", "path",
+    "record", "frozen", "standin_ready", "agent_session",
+)
+
+
+def pane_facts(pane_id: str) -> dict[str, str]:
+    """Every fact a transaction needs about a pane, in ONE round trip.
+
+    `display-message -p` against a specific `-t` target is the shape
+    `aitask_shadow_capture.sh` established for self-identification: one call, a
+    tab-joined format, positional read. Returns ``{}`` when the pane is gone —
+    which is a legitimate observation, not an error.
+    """
+    rc, out = run(["display-message", "-p", "-t", pane_id, PANE_FACT_FORMAT])
+    if rc != 0:
+        return {}
+    line = out.splitlines()[0] if out.splitlines() else ""
+    parts = line.split("\t")
+    if len(parts) != len(PANE_FACT_KEYS):
+        return {}
+    return _facts(PANE_FACT_KEYS, parts)
+
+
+def _facts(keys: tuple[str, ...], parts: list[str]) -> dict[str, str]:
+    """A tab-split tmux read as a dict: every field stripped but ``window``.
+
+    A window NAME may legally begin or end with spaces, and it is compared
+    against the record's stored name, which is read verbatim (t2067). Stripping
+    it here would make a renamed window fail its own verification.
+    """
+    return {k: v if k == "window" else v.strip() for k, v in zip(keys, parts)}
+
+
+def pane_location(pane_id: str) -> tuple[str, int]:
+    """``(pane_id, pane_pid)`` after a respawn; ``("", 0)`` when the pane is gone.
+
+    ``("", 0)`` is exactly the gone-pane pair `freeze-commit` documents, so the
+    caller can pass this through unmodified.
+    """
+    rc, out = run(["display-message", "-p", "-t", pane_id,
+                   "#{pane_id}\t#{pane_pid}"])
+    if rc != 0:
+        return "", 0
+    parts = (out.splitlines() or [""])[0].split("\t")
+    if len(parts) != 2 or not parts[0].strip():
+        return "", 0
+    try:
+        return parts[0].strip(), int(parts[1].strip())
+    except ValueError:
+        return "", 0
+
+
+def set_option(pane_id: str, option: str, value: str) -> bool:
+    rc, _ = run(["set-option", "-p", "-t", pane_id, option, value])
+    return rc == 0
+
+
+def unset_option(pane_id: str, option: str) -> bool:
+    rc, _ = run(["set-option", "-pu", "-t", pane_id, option])
+    return rc == 0
+
+
+#: `TmuxClient.run`'s rc when tmux could not be reached AT ALL —
+#: `FileNotFoundError` / `OSError` / timeout. Distinct from a non-zero rc, which
+#: is tmux answering "no such pane". See :func:`probe_pane`.
+TMUX_UNREACHABLE = -1
+
+#: The three facts :func:`probe_pane` reads, as one tab-joined format.
+PROBE_PANE_FORMAT = "\t".join(
+    ["#{pane_id}", f"#{{{FROZEN_OPTION}}}", "#{pane_dead}"])
+PROBE_PANE_KEYS = ("pane_id", "frozen", "dead")
+
+
+def probe_pane(pane_id: str) -> tuple[str, dict[str, str] | None]:
+    """Ask tmux about ONE pane. Returns ``(verdict, facts)``.
+
+    Verdicts: ``"present"`` (facts are the pane's), ``"gone"`` (tmux answered
+    that no such pane exists — including "no server running", which means the
+    same thing), or ``"unknown"`` (tmux could not be reached at all).
+
+    The three are kept apart deliberately. Collapsing ``unknown`` into ``gone``
+    is the mistake that reintroduces V9: a coordinator that cannot reach tmux
+    would conclude the stand-in is already gone, skip the kill, and delete the
+    record and its only capture while a live stamped viewer is still sitting in
+    that pane — the one state `reconcile` cannot repair, because it iterates
+    records and that pane no longer has one. The restore router (t1773) needs
+    the same distinction for the mirror-image reason: reading an unreachable
+    tmux as "gone" would launch a SECOND agent into a new window while the
+    original stand-in is still alive.
+
+    Asking about the pane directly, rather than looking for it in a window
+    listing, also means the answer does not depend on the record's `session` /
+    `window` fields still being current: those are display values, and a tmux
+    restart or a rename makes a window-scoped lookup miss a pane that is very
+    much alive.
+
+    Shared surface (t1773): `agent_freeze.drop_record` preflights its
+    destructive kill with this, and `agent_restore.restore` routes on it. It
+    lives here because `agent_restore` must not import `agent_freeze`.
+    """
+    rc, out = run(["display-message", "-p", "-t", pane_id, PROBE_PANE_FORMAT])
+    if rc == TMUX_UNREACHABLE:
+        return "unknown", None
+    if rc != 0:
+        return "gone", None
+    parts = (out.splitlines() or [""])[0].split("\t")
+    if len(parts) != len(PROBE_PANE_KEYS) or not parts[0].strip():
+        return "gone", None
+    return "present", {k: v.strip() for k, v in zip(PROBE_PANE_KEYS, parts)}
+
+
+def tmux_quote(s: str) -> str:
+    r"""Quote a command string for tmux's OWN lexer.
+
+    `if-shell` takes its branch as a single string that the tmux server then
+    parses as commands, so a command that has already been shell-quoted needs
+    one more level. The double-quote form with backslash escaping of ``\``,
+    ``"`` and ``$`` was measured (t1773) to round-trip a command containing
+    ``'``, ``"``, ``$``, ``;`` and ``>`` into the pane's `pane_start_command`
+    unchanged. tmux single-quotes are fully literal with no escape, so they
+    cannot carry a command that itself contains a single quote — which the
+    agent command strings routinely do.
+    """
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$") + '"'
+
+
+# --- restore-attempt identity (t1875) ---------------------------------------
+#
+# A gone-pane restore starts its agent in a NEW window. Until the record tracks
+# that pane, the pane is identified by marks ON THE PANE, never by the record's
+# `pane_id` — that field is a hint, and a restarted server renumbers from `%0`,
+# so a surviving attempt can sit at exactly the `%N` a record remembers.
+#
+#   * the ATTEMPT NAME, set atomically by `new-window -n`, claims the window
+#     from its first instant;
+#   * the ATTEMPT MARK (`@aitask_restore_attempt=<id>:<nonce8>`), set once the
+#     pane is identified, keeps the claim after the window is renamed to its
+#     `agent-…` name (monitor and companion key on that prefix).
+#
+# A live pane claiming record R through either is a SURVIVOR — a restore-launched
+# agent R does not track — unless it proves it is R's viewer with
+# `@aitask_standin_ready == R`. Only a mounted stand-in writes that mark, and
+# every respawn INTO an agent clears it in the same dispatch, so it is evidence
+# the pane itself produced. Restore, reopen and drop all apply this one rule.
+
+#: The attempt mark's pane option.
+RESTORE_ATTEMPT_OPTION = "@aitask_restore_attempt"
+
+#: The attempt window name: record id, then the first 8 of the lease nonce.
+#: Deliberately NOT `agent_reopen.ATTEMPT_RE` (`aitask-reopen-…`): a restore
+#: attempt runs an AGENT, and reopen must never read it as a viewer attempt.
+RESTORE_ATTEMPT_RE = re.compile(r"^aitask-restore-([0-9a-f]{8})-([0-9a-f]{8})$")
+
+#: The attempt mark's value shape, `<record id>:<nonce8>`.
+_RESTORE_MARK_RE = re.compile(r"^([0-9a-f]{8}):([0-9a-f]{8})$")
+
+
+def restore_attempt_name(record_id: str, nonce: str) -> str:
+    return f"aitask-restore-{record_id}-{nonce[:8]}"
+
+
+def restore_attempt_value(record_id: str, nonce: str) -> str:
+    """The attempt mark's value. Hex and `:` only, so safe in a `#{==:…}`."""
+    return f"{record_id}:{nonce[:8]}"
+
+
+def restore_attempt_record(window_name: str, mark: str) -> str:
+    """The record id a pane claims through a restore attempt, or ``""``.
+
+    The mark wins over the name: after the rename the name no longer says
+    anything, and before the mark is set the name is all there is.
+    """
+    m = _RESTORE_MARK_RE.match((mark or "").strip())
+    if m:
+        return m.group(1)
+    m = RESTORE_ATTEMPT_RE.match((window_name or "").strip())
+    return m.group(1) if m else ""
+
+
+def is_restore_survivor(record_id: str, window_name: str, mark: str,
+                        ready: str, dead: bool) -> bool:
+    """Is this pane a LIVE restore-launched agent that ``record_id`` does not track?
+
+    There is no "unless it is the record's own pane" clause, by design: the
+    recorded `pane_id` is a hint a recycled `%N` can match. The only exemption
+    is the pane's own proof that a stand-in of this record is mounted there.
+    """
+    if dead or not record_id:
+        return False
+    if restore_attempt_record(window_name, mark) != record_id:
+        return False
+    return (ready or "").strip() != record_id
+
+
+#: One row of :func:`find_restore_survivors`' scan.
+_SURVIVOR_FORMAT = "\t".join([
+    "#{pane_id}", "#{pane_pid}", "#{pane_dead}", "#{session_name}",
+    "#{window_name}", f"#{{{RESTORE_ATTEMPT_OPTION}}}",
+    f"#{{{STANDIN_READY_OPTION}}}",
+])
+_SURVIVOR_ARITY = 7
+
+
+def run_checked(args: list[str]):
+    """`TmuxClient.run_checked` through the swappable client.
+
+    A test fake that only implements ``run`` is adapted: rc 0 is ``ok`` and
+    anything else is ``failed`` — the fail-closed reading, since a fake cannot
+    say "no server".
+    """
+    checked = getattr(_TMUX, "run_checked", None)
+    if checked is not None:
+        return checked(args)
+    rc, out = _TMUX.run(args)
+    return _CheckedAnswer("ok" if rc == 0 else "failed", rc, out, "")
+
+
+class _CheckedAnswer:
+    """The `TmuxResult` shape, for adapted fakes (no import of tmux_exec's)."""
+
+    def __init__(self, outcome: str, rc: int, stdout: str, stderr: str) -> None:
+        self.outcome, self.rc, self.stdout, self.stderr = outcome, rc, stdout, stderr
+
+
+def find_restore_survivors(record_id: str) -> list[dict[str, str]] | None:
+    """Every pane that is a restore survivor of ``record_id``, dead ones included.
+
+    ONE `list-panes -a` pass over the whole server — never a probe of the
+    record's `pane_id`, which misses the ordinary shape (the survivor in another
+    pane, the record naming a gone one). Each hit is a dict with ``pane_id``,
+    ``pane_pid``, ``dead`` (``"1"``/``"0"``), ``session`` and ``window``.
+
+    Returns ``None`` when tmux could not be read: callers fail CLOSED on it,
+    because "could not look" must never pass for "no survivor". "No server
+    running" is a definite answer — no panes at all — and returns ``[]``: a
+    restore after a machine restart must still be able to bootstrap one.
+
+    Dead panes are reported (with ``dead="1"``) so the caller can remove them;
+    :func:`is_restore_survivor` decides only the LIVE question.
+    """
+    result = run_checked(["list-panes", "-a", "-F", _SURVIVOR_FORMAT])
+    if result.outcome in ("no_server", "no_tmux"):
+        return []
+    if result.outcome != "ok":
+        return None
+    hits: list[dict[str, str]] = []
+    # NOT `stdout.strip().splitlines()`: the trailing fields are options that
+    # are empty on most panes, and a whole-buffer strip eats the last row's tabs.
+    for line in result.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) != _SURVIVOR_ARITY:
+            continue
+        pane_id, pid, dead, session, window, mark, ready = (p.strip() for p in parts)
+        is_dead = dead == "1"
+        if restore_attempt_record(window, mark) != record_id:
+            continue
+        if not is_dead and not is_restore_survivor(record_id, window, mark,
+                                                   ready, False):
+            continue            # a mounted stand-in of this record: a viewer
+        if is_dead and ready == record_id:
+            continue            # a dead viewer is reconcile's, not ours
+        hits.append({"pane_id": pane_id, "pane_pid": pid,
+                     "dead": "1" if is_dead else "0",
+                     "session": session, "window": window, "mark": mark})
+    return hits
+
+
+def survivor_detail(hit: dict[str, str]) -> str:
+    """``restore_survivor:<session>:<window>|pane:<id>`` — the shared wire tail."""
+    session = hit.get("session", "").replace("|", "/")
+    window = hit.get("window", "").replace("|", "/")
+    return f"restore_survivor:{session}:{window}|pane:{hit.get('pane_id', '')}"
+
+
+def clear_restore_attempt(pane_id: str, value: str) -> None:
+    """Unset the attempt mark on ``pane_id`` ONLY if it still carries ``value``.
+
+    One `if-shell -F` dispatch. A bare `set-option -pu` would be a separate call
+    that a server restart can land on a recycled `%N` — another record's attempt,
+    whose mark is its ONLY claim once its window was renamed. ``value`` names the
+    record and the attempt nonce, so it matches nothing but the pane that attempt
+    created.
+    """
+    if not pane_id or not _RESTORE_MARK_RE.match(value or ""):
+        return
+    run(["if-shell", "-F", "-t", pane_id,
+         f"#{{==:#{{{RESTORE_ATTEMPT_OPTION}}},{value}}}",
+         f"set-option -pu -t {pane_id} {RESTORE_ATTEMPT_OPTION}"])
+
+
+def clear_restore_attempt_claiming(pane_id: str, record_id: str,
+                                   pane_pid: int) -> None:
+    """Unset whatever attempt mark on ``pane_id`` claims ``record_id``.
+
+    The recovery half of :func:`retire_restore_marks` (t2066). That one derives
+    the mark's value from a nonce, and a reconcile pass that leased the record
+    and failed to settle it replaced `op_nonce` with its own: the next pass's
+    derived value then matches no mark. So the value is read off the pane.
+
+    The read is only a proposal. The unset is ONE `if-shell -F` dispatch whose
+    condition re-checks the mark value AND ``pane_pid``, because a server
+    restart between the read and the unset can land on a recycled `%N`. The pid
+    half is what confines this to the pane the record now tracks — a mark naming
+    this record on any other process is a survivor, and stays. Neither half is
+    pre-checked here: the dispatch is the guard.
+    """
+    if not pane_id or pane_pid <= 0 or not re.fullmatch(r"[0-9a-f]{8}",
+                                                         record_id or ""):
+        return
+    facts = window_facts(pane_id)
+    if not facts:
+        return
+    mark = facts.get("mark", "")
+    # The empty name is deliberate: only a MARK is recovered, and a value
+    # `restore_attempt_record` accepts is hex and `:` only — safe in a `#{==:…}`.
+    if restore_attempt_record("", mark) != record_id:
+        return
+    run(["if-shell", "-F", "-t", pane_id,
+         f"#{{&&:#{{==:#{{{RESTORE_ATTEMPT_OPTION}}},{mark}}},"
+         f"#{{==:#{{pane_pid}},{pane_pid}}}}}",
+         f"set-option -pu -t {pane_id} {RESTORE_ATTEMPT_OPTION}"])
+
+
+def clear_stamp_if(pane_id: str, record_id: str, pane_pid: int = 0) -> None:
+    """Unset ``@aitask_frozen`` on ``pane_id`` ONLY if it is ``record_id``'s.
+
+    Same single-dispatch shape as :func:`clear_restore_attempt`, for the same
+    recycled-`%N` reason: an unguarded unset could strip another record's stamp.
+
+    With ``pane_pid`` the condition also requires the pane to still run that
+    process (t2062). A record id is reused across freeze cycles, so the stamp
+    alone cannot tell a stale stamp on the agent a restore brought back from the
+    legitimate stamp of a stand-in the SAME record got when it was frozen again
+    — and a clear issued late would strip the latter. Every caller retiring a
+    stamp after the record went `live` knows that agent's pid and passes it.
+    """
+    if not pane_id or not re.fullmatch(r"[0-9a-f]{8}", record_id or ""):
+        return
+    condition = f"#{{==:#{{{FROZEN_OPTION}}},{record_id}}}"
+    if pane_pid > 0:
+        condition = f"#{{&&:{condition},#{{==:#{{pane_pid}},{pane_pid}}}}}"
+    run(["if-shell", "-F", "-t", pane_id, condition,
+         f"set-option -pu -t {pane_id} {FROZEN_OPTION}"])
+
+
+def restore_marks_left(pane_id: str, record_id: str, pane_pid: int) -> str:
+    """What of ``record_id``'s is still on its `live` agent's pane, read back.
+
+    Run AFTER a caller's whole retirement sequence (t2062): `if-shell` answers 0
+    even when its branch fails, so only a re-read proves a clear took. Returns
+    ``""`` when nothing is left (or the pane is gone, or no longer runs
+    ``pane_pid`` — whatever is on it then is not this agent's),
+    ``marks_retained:<stamp|mark|stamp,mark>`` when something is, and
+    ``marks_unverified`` when tmux could not be read. The mark counts whatever
+    its nonce: a mark from an earlier attempt that the t2066 recovery did not
+    clear is just as left behind.
+    """
+    if not pane_id:
+        return ""
+    facts = window_facts(pane_id)
+    if facts is None:
+        return "marks_unverified"
+    if not facts or (pane_pid > 0
+                     and int_or_zero(facts.get("pane_pid")) != pane_pid):
+        return ""
+    left = []
+    if facts.get("frozen") == record_id:
+        left.append("stamp")
+    if restore_attempt_record("", facts.get("mark", "")) == record_id:
+        left.append("mark")
+    return f"marks_retained:{','.join(left)}" if left else ""
+
+
+def retire_restore_marks(pane_id: str, record_id: str, nonce: str,
+                         pane_pid: int = 0) -> None:
+    """Retire a restored pane's marks: the stamp, and this attempt's mark.
+
+    Both are GUARDED single dispatches (t1875). A bare unset is a separate call
+    a server restart can land on a recycled `%N` — another record's pane — and
+    strip its stamp, or its attempt mark, which after the rename is the only
+    claim a gone-pane attempt has. The mark's value is derived from the nonce
+    `restore-begin` minted for the attempt, so it matches nothing else; on a
+    same-pane restore no pane carries it and the dispatch is a no-op.
+
+    Shared by every engine that settles a restore as `live`: the coordinator
+    (`agent_restore`) and reconcile's recovery of an abandoned one
+    (`agent_freeze`, t2045). A `live` record whose pane keeps its stamp cannot
+    be frozen again until reconcile repairs it (t2062).
+
+    ``pane_pid`` is the restored agent's: it confines the stamp clear to that
+    process (see :func:`clear_stamp_if`). This only dispatches; whether the
+    clears took is :func:`restore_marks_left`'s question, asked once the caller
+    has finished every clear of its own.
+    """
+    if pane_id:
+        clear_stamp_if(pane_id, record_id, pane_pid)
+        clear_restore_attempt(pane_id, restore_attempt_value(record_id, nonce))
+
+
+# --- window-name primitives (t1883) ------------------------------------------
+#
+# The tmux half of the attempt-identity protocol that `agent_restore` (a gone-pane
+# launch) and `agent_reopen` (a fresh viewer) both run: find a window by its
+# per-attempt name, kill it only while a claim still holds, rename it only while
+# it is stamped. They live here because `agent_reopen` imports `agent_restore`,
+# so neither coordinator can hold them for the other. What stays in each
+# coordinator is its own seam and its own labelling of a kill that did not take.
+
+#: `display-message` read of an attempt/viewer pane — the union of the facts
+#: either coordinator reads, so both parse one shape.
+WINDOW_FACT_FORMAT = "\t".join([
+    "#{pane_id}", "#{pane_pid}", "#{session_name}", "#{window_name}",
+    "#{window_id}", f"#{{{FROZEN_OPTION}}}", f"#{{{RESTORE_ATTEMPT_OPTION}}}",
+])
+WINDOW_FACT_KEYS = ("pane_id", "pane_pid", "session", "window", "window_id",
+                    "frozen", "mark")
+
+
+def window_facts(pane_id: str) -> dict[str, str] | None:
+    """The pane's window facts; ``{}`` when it is gone; None when tmux is unreachable."""
+    rc, out = run(["display-message", "-p", "-t", pane_id, WINDOW_FACT_FORMAT])
+    if rc == TMUX_UNREACHABLE:
+        return None
+    if rc != 0:
+        return {}
+    parts = (out.splitlines() or [""])[0].split("\t")
+    if len(parts) != len(WINDOW_FACT_KEYS) or not parts[0].strip():
+        return {}
+    return _facts(WINDOW_FACT_KEYS, parts)
+
+
+def find_pane_by_window_name(session: str, name: str) -> tuple[str, str, int]:
+    """``(verdict, pane_id, pane_pid)`` of the window named ``name`` in ``session``.
+
+    ``found`` / ``none`` / ``unknown``. Filtered in Python rather than by a
+    ``session:window`` target, because a window target cannot address a name
+    containing `.` or `:`; the session is targeted as ``=<s>:``, which cannot
+    resolve as a window of another session (t1874). More than one pane under a
+    per-attempt name is not a state either coordinator produces, so it is
+    ``unknown`` rather than guessed.
+    """
+    rc, out = run([
+        # `=<s>:`, never a bare `=<s>`: see "Target formatting" in
+        # aidocs/framework/tmux_gateway.md.
+        "list-panes", "-s", "-t", session_scope_target(session),
+        "-F", "#{window_name}\t#{pane_id}\t#{pane_pid}"])
+    if rc == TMUX_UNREACHABLE:
+        return "unknown", "", 0
+    if rc != 0:
+        return "none", "", 0
+    hits = [p for p in (ln.split("\t") for ln in out.splitlines())
+            if len(p) == 3 and p[0] == name]
+    if not hits:
+        return "none", "", 0
+    if len(hits) > 1:
+        return "unknown", "", 0
+    try:
+        return "found", hits[0][1].strip(), int(hits[0][2].strip())
+    except ValueError:
+        return "unknown", "", 0
+
+
+def window_name_condition(name: str) -> str:
+    """The ``if-shell -F`` condition "this pane's window is still named ``name``"."""
+    return f"#{{==:#{{window_name}},{name}}}"
+
+
+def kill_window_read(pane_id: str, condition: str
+                     ) -> tuple[str, str, dict[str, str] | None]:
+    """`kill-window` on ``pane_id``'s window only if ``condition`` holds there.
+
+    Check and kill are ONE `if-shell -F` dispatch, then an after-read — the
+    verdict contract of :func:`kill_if_stamped`: ``gone`` / ``present`` /
+    ``unknown``. ``condition`` always names a per-attempt value, so a recycled
+    `%N` in a restarted server cannot match it.
+
+    Returns ``(verdict, reason, after)``. A surviving window is always
+    ``present`` / ``kill-failed`` here, with ``after`` holding its facts, so a
+    caller can say WHY without another tmux call; ``after`` is None otherwise.
+    """
+    before = window_facts(pane_id)
+    if before is None:
+        return "unknown", "tmux unreachable", None
+    if not before:
+        return "gone", "pane-gone", None
+    run(["if-shell", "-F", "-t", pane_id, condition, f"kill-window -t {pane_id}"])
+    after = window_facts(pane_id)
+    if after is None:
+        return "unknown", "tmux unreachable", None
+    if not after:
+        return "gone", "", None
+    return "present", "kill-failed", after
+
+
+def kill_window_if(pane_id: str, condition: str) -> tuple[str, str]:
+    """:func:`kill_window_read` without the after-read facts."""
+    verdict, reason, _after = kill_window_read(pane_id, condition)
+    return verdict, reason
+
+
+def rename_window_if_stamped(pane_id: str, record_id: str, final: str, *,
+                             dispatch: bool = True) -> bool:
+    """Stamp-guarded rename of ``pane_id``'s window, verified by a re-read.
+
+    ``dispatch=False`` skips the rename and only verifies — a caller's seam.
+    """
+    if dispatch:
+        run(["if-shell", "-F", "-t", pane_id,
+             f"#{{==:#{{{FROZEN_OPTION}}},{record_id}}}",
+             f"rename-window -t {pane_id} {tmux_quote(final)}"])
+    after = window_facts(pane_id)
+    return bool(after) and after.get("window") == final
+
+
+#: Sentinel :func:`_pre_read` returns as the server pid when tmux could not be
+#: reached at all (never a real pid, which is numeric).
+TMUX_UNREACHABLE_MARK = "unreachable"
+
+#: What both stamp-conditional dispatches read BEFORE dispatching: the pane id
+#: and the server pid. Pane-scoped first, because that field is the only one
+#: that says whether the pane exists.
+PRE_READ_FORMAT = "#{pane_id}\t#{pid}"
+
+
+def _pre_read(pane_id: str) -> tuple[str, str]:
+    """``(pane_id, server_pid)`` before a dispatch; ``("", ...)`` when gone.
+
+    `display-message -p -t <gone pane>` exits ZERO, and a server-scoped format
+    like ``#{pid}`` still expands — only the pane-scoped fields come back empty
+    (measured on tmux 3.6a, `tests/test_frozen_respawn_atomic_live.sh` K4). So
+    neither the exit status nor the server pid says whether the pane is there;
+    the pane id is the signal, exactly as :func:`pane_facts` / :func:`probe_pane`
+    validate theirs. The server pid rides along so a later after-read can name a
+    restart. ``server_pid`` is :data:`TMUX_UNREACHABLE_MARK` when tmux could not
+    be reached at all — distinct from "no such pane", for the same V9 reason
+    :func:`probe_pane` keeps its three verdicts apart.
+    """
+    rc, out = run(["display-message", "-p", "-t", pane_id, PRE_READ_FORMAT])
+    if rc == TMUX_UNREACHABLE:
+        return "", TMUX_UNREACHABLE_MARK
+    if rc != 0:
+        return "", ""
+    parts = (out.splitlines() or [""])[0].split("\t")
+    if len(parts) != 2 or not parts[0].strip():
+        return "", ""
+    return parts[0].strip(), parts[1].strip()
+
+
+#: The four FIXED after-facts :func:`respawn_if_stamped` reads in ONE round
+#: trip. The caller's stamp option is appended per call as a fifth field (t1783),
+#: so a miss can say whether the pane is still the caller's.
+RESPAWN_PROBE_FORMAT = "\t".join(
+    [f"#{{{RESPAWN_TOKEN_OPTION}}}", "#{pane_id}", "#{pane_pid}", "#{pid}"])
+
+
+def respawn_if_stamped(
+    pane_id: str,
+    command: str,
+    *,
+    option: str,
+    expect: str,
+    env: dict[str, str] | None = None,
+    unset: str | None = None,
+) -> tuple[bool, str, int, str]:
+    """`respawn-pane -k`, but ONLY if the pane still carries ``option == expect``.
+
+    Returns ``(fired, pane_id, pane_pid, reason)``.
+
+    THE CHECK AND THE KILL TRAVEL AS ONE DISPATCH. `if-shell -F` makes the
+    server evaluate the stamp and run the branch inside a single command-queue
+    execution, so nothing can interleave between them. A two-call
+    probe-then-respawn leaves a window a tmux SERVER RESTART can slip through:
+    pane ids are monotonic within a server and never reused, but a restarted
+    server renumbers from ``%0``, so a recorded ``%N`` can come back owned by an
+    unrelated live agent — and `respawn-pane -k` would kill it.
+
+    `if-shell` exits 0 whether or not its branch ran, so "did it fire" needs
+    evidence. **A pid delta is NOT that evidence.** The same restart window
+    makes the before-read describe the old stamped pane and the after-read an
+    unrelated recycled ``%N``, so a correctly REJECTED dispatch still shows a
+    changed pid. A caller that read that as success would record a stranger's
+    pid as `launch_pid`, and `restore-confirm` would then liveness-confirm
+    somebody else's agent as the restored one.
+
+    The evidence is therefore POSITIVE and BRANCH-SPECIFIC: a fresh per-call
+    token written by a `set-option` that is the LAST command of the matched
+    branch. Pane options die with the pane, so a recycled ``%N`` cannot carry
+    it; a rejected branch never runs it; and an `if-shell` sequence aborts after
+    a failing command, so the token also proves the respawn ahead of it
+    succeeded. **Absent token ⇒ nothing was touched**, and the caller is handed
+    no location at all — ``("", 0)`` — so it cannot adopt a stranger's pane even
+    by accident.
+
+    ``reason`` names why a non-firing dispatch did not fire —
+    ``stamp-mismatch``, ``server-restarted``, ``pane-gone`` or
+    ``respawn-failed``. The token alone decides *whether it fired*; the reason
+    carries one further contract a caller may act on (t1783):
+    ``respawn-failed`` means the after-read found the pane still carrying
+    ``expect`` on the same server — the branch matched and the respawn itself
+    did not take, so the pane is STILL THE CALLER'S. It is the only miss on
+    which a caller may unstamp or retry. Every other miss means nothing of the
+    caller's is in that pane (gone, or a recycled ``%N`` under a stranger), and
+    touching it — even to clear a stamp — would be acting on somebody else's.
+
+    ``unset`` clears one pane option inside the same branch, ahead of the
+    respawn (the stand-in-ready mark, which survives `respawn-pane` and would
+    otherwise read as "this cycle's viewer is already up").
+    """
+    pre_pane, server_before = _pre_read(pane_id)
+    if not pre_pane:
+        return False, "", 0, "pane-gone"
+
+    token = secrets.token_hex(8)
+    inner: list[str] = []
+    if unset:
+        inner.append(f"set-option -pu -t {pane_id} {unset}")
+    respawn_cmd = ["respawn-pane", "-k"]
+    for name, value in (env or {}).items():
+        respawn_cmd += ["-e", f"{name}={value}"]
+    respawn_cmd += ["-t", pane_id, tmux_quote(command)]
+    inner.append(" ".join(respawn_cmd))
+    # LAST, so its presence also proves the respawn ahead of it succeeded.
+    inner.append(f"set-option -p -t {pane_id} {RESPAWN_TOKEN_OPTION} {token}")
+
+    pause_at("respawn_dispatch")
+    run(["if-shell", "-F", "-t", pane_id,
+         f"#{{==:#{{{option}}},{expect}}}", " ; ".join(inner)])
+
+    rc, out = run(["display-message", "-p", "-t", pane_id,
+                   RESPAWN_PROBE_FORMAT + f"\t#{{{option}}}"])
+    if rc != 0:
+        return False, "", 0, "pane-gone"
+    parts = (out.splitlines() or [""])[0].split("\t")
+    if len(parts) != 5:
+        return False, "", 0, "pane-gone"
+    seen_token, new_pane, new_pid, server_after, stamp = (p.strip() for p in parts)
+    if seen_token and seen_token == token:
+        unset_option(pane_id, RESPAWN_TOKEN_OPTION)
+        return True, new_pane, int_or_zero(new_pid), ""
+    if server_after != server_before:
+        return False, "", 0, "server-restarted"
+    if stamp == expect:
+        # Same server, our stamp still on it, no token: the branch matched and
+        # the respawn did not take. The pane is still ours — say so.
+        return False, "", 0, "respawn-failed"
+    return False, "", 0, "stamp-mismatch"
+
+
+def kill_if_stamped(
+    pane_id: str,
+    *,
+    option: str,
+    expect: str,
+    window: bool = False,
+) -> tuple[str, str]:
+    """`kill-pane` (or `kill-window` when ``window``) on ``pane_id``, but ONLY
+    if the pane still carries ``option == expect``. Returns ``(verdict, reason)``.
+
+    Verdicts:
+
+    * ``"gone"`` — the pane no longer exists: our branch fired, or the server
+      that held it restarted (or it was already gone before the dispatch —
+      reason ``pane-gone``). Either way there is nothing left to kill.
+    * ``"present"`` — the pane is untouched. ``reason`` says why:
+      ``kill-failed`` (still carrying ``expect`` — the branch matched and the
+      kill did not take), ``server-restarted`` or ``stamp-mismatch``.
+    * ``"unknown"`` — tmux could not be reached at all. Decide NOTHING on it:
+      the pane may be alive and stamped, and a caller that read this as "gone"
+      would delete a record whose only capture a live viewer still guards.
+
+    THE CHECK AND THE KILL TRAVEL AS ONE DISPATCH, for the same reason as
+    :func:`respawn_if_stamped`: a tmux server restart between a probe and a kill
+    can hand the kill an unrelated agent's recycled ``%N`` (t1773, t1783).
+
+    A kill needs DIFFERENT evidence than a respawn. The branch-token trick
+    cannot apply here: the token would be a pane option on the very pane the
+    branch just killed. But a kill also needs less. The *safety* property —
+    never kill a ``%N`` that is not ours — is delivered by the single
+    `if-shell -F` dispatch on its own. The *outcome* a caller needs is "the
+    pane is gone", which one after-read answers; whether it went because our
+    branch fired or because the server that held it restarted changes nothing
+    the caller does next. So the after-read carries the stamp and the server
+    pid only to NAME a non-firing dispatch, never to decide it.
+
+    ``-t <pane>`` resolves to that pane's window for `kill-window`, so the
+    caller's sibling count and its kill cannot mean different windows
+    (`agent_freeze._other_real_agents`). Pinned in
+    `tests/test_frozen_respawn_atomic_live.sh` (K3).
+    """
+    pre_pane, server_before = _pre_read(pane_id)
+    if server_before == TMUX_UNREACHABLE_MARK:
+        return "unknown", "tmux unreachable"
+    if not pre_pane:
+        return "gone", "pane-gone"
+
+    verb = "kill-window" if window else "kill-pane"
+    pause_at("kill_dispatch")
+    run(["if-shell", "-F", "-t", pane_id,
+         f"#{{==:#{{{option}}},{expect}}}", f"{verb} -t {pane_id}"])
+
+    rc, out = run(["display-message", "-p", "-t", pane_id,
+                   "\t".join(["#{pane_id}", f"#{{{option}}}", "#{pid}"])])
+    if rc == TMUX_UNREACHABLE:
+        return "unknown", "tmux unreachable"
+    if rc != 0:
+        return "gone", ""
+    parts = (out.splitlines() or [""])[0].split("\t")
+    if len(parts) != 3 or not parts[0].strip():
+        return "gone", ""
+    _, stamp, server_after = (p.strip() for p in parts)
+    if stamp == expect:
+        return "present", "kill-failed"
+    if server_after != server_before:
+        return "present", "server-restarted"
+    return "present", "stamp-mismatch"
+
+
+def respawn(pane_id: str, command: str, env: dict[str, str] | None = None) -> bool:
+    """`respawn-pane -k` the pane into ``command``.
+
+    ``-k`` kills whatever is running there first. t1705_1 measured that this
+    fires NO `pane-died` hook — window, companion pane and the pane id all
+    survive — which is why the freeze can reuse the agent's own pane at all.
+
+    ``env`` adds one ``-e NAME=value`` flag per entry (t1705_5), which is how the
+    restore coordinator delivers the four ``AITASK_RESTORE_*`` identity variables
+    and ``AITASK_AGENT_STRING`` (t1802) to the replacement agent. tmux sets them
+    in the spawned process's own
+    environment, so the command string carries no wrapper and nothing execs
+    through ``env`` — and crucially ``#{pane_pid}`` still names the agent itself,
+    which is the property the task-lock liveness anchor depends on (t1465).
+    Measured for one variable by spike Case 3b and for four repeated flags by
+    Case 3c; the ``env VAR=… <cmd>`` command-string prefix remains the proven
+    fallback for a tmux build without ``-e``.
+    """
+    args = ["respawn-pane", "-k"]
+    for name, value in (env or {}).items():
+        args += ["-e", f"{name}={value}"]
+    args += ["-t", pane_id, command]
+    rc, _ = run(args)
+    return rc == 0
+
+
+# --- record-field parsing ---------------------------------------------------
+
+
+def int_or_zero(value) -> int:
+    """Coerce a store record's numeric field; ``0`` for missing or malformed.
+
+    Zero is the store's own "not recorded" pid, so an unparsable field and an
+    absent one degrade to the same value the state machine already treats as
+    "no evidence".
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0

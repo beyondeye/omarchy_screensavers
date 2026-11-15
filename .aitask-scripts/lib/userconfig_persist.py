@@ -1,0 +1,219 @@
+"""Single persistence layer for the per-user (gitignored) userconfig.yaml.
+
+This module is the canonical home for reading and writing top-level keys of
+`aitasks/metadata/userconfig.yaml` (`email`, `last_used_labels`, `shortcuts`,
+`minimonitor_key_hints`, …). `shortcut_persist` and the bash `last_used_labels` helpers both go through
+the `_load_full` / `_atomic_dump` round-trip defined here, so no two writers can
+disagree on the file's representation.
+
+Every write round-trips the **whole file** through `yaml.safe_load` /
+`yaml.safe_dump` and replaces it atomically (`os.replace` of a temp file in the
+same directory). That is what makes the file safe against the writer-style
+collision that previously corrupted it: no caller ever line-edits a multi-line
+YAML value, so a block-style value can never be left with orphaned `- item`
+continuation lines.
+
+`last_used_labels` is emitted in flow style (`[a, b]`) for compactness; nested
+mappings such as `shortcuts:` stay in block style.
+
+YAML comments are not preserved across a round-trip (PyYAML safe_dump drops
+them); the standard header comment is re-emitted only for freshly-created
+files. No existing framework helper preserves comments either
+(`config_utils.save_yaml_config` uses PyYAML safe_dump), so this matches the
+established convention.
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+import yaml
+
+
+class MalformedUserConfigError(Exception):
+    """Raised when userconfig.yaml exists but is not parseable YAML.
+
+    Distinct from the missing-file case (which legitimately yields ``{}``).
+    Write paths must surface this rather than round-trip an empty dict, which
+    would erase the user's other top-level keys (``email``,
+    ``last_used_labels``, ``shortcuts``). Read-only consumers may catch it and
+    degrade to their default.
+    """
+
+
+_USERCONFIG_HEADER = "# Local user configuration (gitignored, not shared)\n"
+
+
+class _FlowList(list):
+    """A list subclass rendered in YAML flow style (``[a, b]``)."""
+
+
+def _represent_flow_list(dumper, data):
+    return dumper.represent_sequence(
+        "tag:yaml.org,2002:seq", list(data), flow_style=True
+    )
+
+
+yaml.SafeDumper.add_representer(_FlowList, _represent_flow_list)
+
+
+def _userconfig_path() -> Path:
+    """Path to userconfig.yaml, honoring the ``TASK_DIR`` env override.
+
+    Defaults to ``aitasks`` (relative to cwd) when ``TASK_DIR`` is unset, which
+    matches the framework default and the path TUIs use after chdir-ing to the
+    repo root. The bash helpers pass ``TASK_DIR`` through explicitly so tests
+    and non-default layouts target the right file.
+    """
+    base = os.environ.get("TASK_DIR", "aitasks")
+    return Path(base) / "metadata" / "userconfig.yaml"
+
+
+def _load_full() -> dict:
+    path = _userconfig_path()
+    if not path.is_file():
+        return {}
+    with open(path, "r", encoding="utf-8") as f:
+        try:
+            data = yaml.safe_load(f) or {}
+        except yaml.YAMLError as exc:
+            # A malformed file is NOT the same as a missing one. Raising here
+            # (rather than degrading to {}) keeps the write paths that round-trip
+            # the whole file via _atomic_dump from silently overwriting a corrupt
+            # userconfig.yaml with {} and erasing the user's other top-level keys.
+            raise MalformedUserConfigError(
+                f"{path} is not valid YAML: {exc}"
+            ) from exc
+    return data if isinstance(data, dict) else {}
+
+
+def _atomic_dump(data: dict) -> None:
+    path = _userconfig_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Emit last_used_labels in flow style ([a, b]) while leaving nested mappings
+    # (e.g. shortcuts:) in block style. Normalize on a shallow copy so the
+    # caller's dict is not mutated.
+    labels = data.get("last_used_labels")
+    if isinstance(labels, list) and not isinstance(labels, _FlowList):
+        data = {**data, "last_used_labels": _FlowList(labels)}
+
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(path.parent), prefix=".userconfig.", suffix=".yaml.tmp"
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            # Re-emit the standard header only for freshly-created files; a
+            # round-trip of an existing file drops comments (PyYAML).
+            if not path.is_file():
+                f.write(_USERCONFIG_HEADER)
+            yaml.safe_dump(
+                data, f, default_flow_style=False, sort_keys=False, allow_unicode=True
+            )
+        os.replace(tmp_name, path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+def get_last_used_labels() -> list[str]:
+    """Return the last_used_labels list (empty if absent or not a list)."""
+    try:
+        val = _load_full().get("last_used_labels")
+    except MalformedUserConfigError as exc:
+        # Read-only consumer: degrade to "no labels" on a malformed config
+        # rather than crashing the label picker. Write paths (set_last_used_labels,
+        # shortcut_persist) instead let this propagate so a corrupt file is never
+        # round-tripped back to disk.
+        sys.stderr.write(
+            f"userconfig_persist: ignoring malformed config: {exc}\n"
+        )
+        return []
+    if val is None:
+        return []
+    if isinstance(val, str):
+        # Tolerate a stray scalar "a,b" just in case.
+        return [s.strip() for s in val.split(",") if s.strip()]
+    if isinstance(val, list):
+        return [str(x).strip() for x in val if str(x).strip()]
+    return []
+
+
+def set_last_used_labels(labels: list[str]) -> None:
+    """Persist last_used_labels, round-tripping the whole file safely."""
+    data = _load_full()
+    data["last_used_labels"] = list(labels)
+    _atomic_dump(data)
+
+
+#: Top-level key holding minimonitor's key-hint band mode (t2212):
+#: ``collapsed`` or ``full``. Any other value — or none — means full.
+_MINIMONITOR_KEY_HINTS_KEY = "minimonitor_key_hints"
+
+
+def get_minimonitor_key_hints_collapsed() -> bool:
+    """Whether a newly started minimonitor should open with collapsed hints.
+
+    Fail-soft: a missing, unreadable or malformed userconfig — or an
+    unrecognised value — yields ``False`` (the full band), so a broken config
+    can never hide the key surface.
+    """
+    try:
+        val = _load_full().get(_MINIMONITOR_KEY_HINTS_KEY)
+    except MalformedUserConfigError as exc:
+        sys.stderr.write(
+            f"userconfig_persist: ignoring malformed config: {exc}\n"
+        )
+        return False
+    except OSError:
+        return False
+    return val == "collapsed"
+
+
+def set_minimonitor_key_hints_collapsed(collapsed: bool) -> None:
+    """Persist the key-hint band mode, round-tripping the whole file safely.
+
+    Raises ``MalformedUserConfigError`` on a corrupt file rather than
+    overwriting it (the caller keeps the toggle for its session).
+    """
+    data = _load_full()
+    data[_MINIMONITOR_KEY_HINTS_KEY] = "collapsed" if collapsed else "full"
+    _atomic_dump(data)
+
+
+def _csv_to_list(csv: str) -> list[str]:
+    return [s.strip() for s in csv.split(",") if s.strip()]
+
+
+def _main(argv: list[str]) -> int:
+    if not argv:
+        sys.stderr.write(
+            "usage: userconfig_persist.py {get-labels|set-labels [csv]}\n"
+        )
+        return 2
+    cmd = argv[0]
+    try:
+        if cmd == "get-labels":
+            print(",".join(get_last_used_labels()))
+            return 0
+        if cmd == "set-labels":
+            set_last_used_labels(_csv_to_list(argv[1] if len(argv) > 1 else ""))
+            return 0
+    except MalformedUserConfigError as exc:
+        # Fail loud (no traceback): the bash wrapper treats a non-zero exit as a
+        # signal to fall back to its block-safe line-editor, which never
+        # round-trips the whole file.
+        sys.stderr.write(f"userconfig_persist: {exc}\n")
+        return 1
+    sys.stderr.write(f"unknown command: {cmd}\n")
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main(sys.argv[1:]))

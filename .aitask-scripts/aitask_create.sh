@@ -1,0 +1,2922 @@
+#!/usr/bin/env bash
+
+# aitask_create.sh - Interactive AI task creation with fzf
+# Creates task files in aitasks/ directory with YAML front matter
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/terminal_compat.sh
+source "$SCRIPT_DIR/lib/terminal_compat.sh"
+source "$SCRIPT_DIR/lib/task_utils.sh"
+# shellcheck source=lib/archive_utils.sh
+source "$SCRIPT_DIR/lib/archive_utils.sh"
+# shellcheck source=lib/atomic_write.sh
+source "$SCRIPT_DIR/lib/atomic_write.sh"
+# shellcheck source=lib/stale_lock.sh
+source "$SCRIPT_DIR/lib/stale_lock.sh"
+# shellcheck source=lib/followup_kinds_sh.sh
+source "$SCRIPT_DIR/lib/followup_kinds_sh.sh"
+
+TASK_DIR="aitasks"
+ARCHIVED_DIR="aitasks/archived"
+if [[ -f "aitasks/archived/old.tar.zst" ]]; then
+    ARCHIVE_FILE="aitasks/archived/old.tar.zst"
+elif [[ -f "aitasks/archived/old.tar.gz" ]]; then
+    ARCHIVE_FILE="aitasks/archived/old.tar.gz"
+else
+    ARCHIVE_FILE=""
+fi
+
+# Batch mode variables
+BATCH_MODE=false
+BATCH_NAME=""
+BATCH_DESC=""
+BATCH_DESC_FILE=""
+BATCH_PRIORITY="medium"
+BATCH_EFFORT="medium"
+BATCH_TYPE="feature"
+BATCH_STATUS="Ready"
+BATCH_LABELS=""
+BATCH_DEPS=""
+BATCH_XDEPS=""
+BATCH_XDEPREPO=""
+BATCH_VERIFIES=""
+BATCH_GATES=""
+BATCH_ALSO_BLOCKS_DEPENDENTS=""
+BATCH_COMMIT=false
+BATCH_SILENT=false
+BATCH_PARENT=""
+BATCH_NO_SIBLING_DEP=false
+BATCH_ASSIGNED_TO=""
+BATCH_ANCHOR=""
+BATCH_FOLLOWUP_OF=""
+BATCH_FOLLOWUP_KIND=""
+BATCH_ISSUE=""
+BATCH_PULL_REQUEST=""
+BATCH_CONTRIBUTOR=""
+BATCH_CONTRIBUTOR_EMAIL=""
+BATCH_FILE_REFS=()
+BATCH_AUTO_MERGE=false
+# Explicit premise_baseline for the new task (t1663_3). Internal: carry-over
+# inheritance passes it so the origin's value -- or "" for none -- overrides the
+# creation-time seed. _SET distinguishes an explicit "" from "not passed".
+BATCH_PREMISE_BASELINE=""
+BATCH_PREMISE_BASELINE_SET=false
+
+# Draft/finalize mode variables
+BATCH_FINALIZE=""
+BATCH_FINALIZE_ALL=false
+DRAFT_DIR="aitasks/new"
+MAX_PARENT_ID_CLAIM_RETRIES=5
+
+# Resolved topic-anchor (bare task id, or "" for a topic root). Computed by
+# resolve_anchor() in batch mode from --anchor/--followup-of/--parent; the
+# create_*_file emitters read this global. Stays "" in interactive mode (no
+# anchor emitted), so the emit is always safe.
+RESOLVED_ANCHOR=""
+
+# The premise_baseline value resolve_premise_seed() decided for the task being
+# written ("" = none). Set immediately before each serializer call.
+PREMISE_SEED=""
+
+# --- Helper Functions ---
+
+show_help() {
+    cat << 'EOF'
+Usage: aitask_create.sh [options]
+
+Interactive mode (default):
+  Run without arguments for interactive task creation with fzf.
+
+Batch mode (for automation):
+  --batch                Enable batch mode (non-interactive)
+  --name, -n NAME        Task name (required, will be sanitized)
+  --desc, -d DESC        Task description
+  --desc-file FILE       Read description from file (use - for stdin)
+  --priority, -p LEVEL   Priority: high, medium, low (default: medium)
+  --effort, -e LEVEL     Effort: low, medium, high (default: medium)
+  --type, -t TYPE        Issue type (see aitasks/metadata/task_types.txt, default: feature)
+  --status, -s STATUS    Status: Ready, Editing, Implementing, Postponed (default: Ready)
+  --assigned-to, -a EMAIL  Email of person assigned to task (optional)
+  --anchor ID            Topic-anchor task id (group key). Accepts N / N_M
+                         (a leading "t" is stripped); validated to exist.
+                         Mutually exclusive with --followup-of; rejected with
+                         --parent (a child inherits its parent's anchor).
+  --followup-of ID       Anchor this task to the topic root of source task ID:
+                         reads ID's anchor (or, for an anchorless child source,
+                         its parent; else ID itself). Flattened — never chains.
+                         Mutually exclusive with --anchor; rejected with --parent.
+  --followup-kind KIND   Mark this task as an auto-spawned follow-up of KIND
+                         (provenance, orthogonal to --type). One of:
+                         manual_verification, risk_mitigation, upstream_defect,
+                         verification_failure, carry_over, qa_test_gap,
+                         review_finding, docs_gap. Omit for genuine new work.
+                         "manual_verification" requires --type manual_verification.
+  --issue URL            Issue tracker URL (e.g., GitHub issue URL)
+  --labels, -l LABELS    Comma-separated labels. Each is sanitized (lowercased;
+                         invalid chars -> "_"); a label that sanitizes to
+                         nothing is dropped with a warning. Any label not yet
+                         in aitasks/metadata/labels.txt is added there and
+                         committed together with the task. Drafts register
+                         their vocabulary at finalize time, not at draft time.
+  --gates GATES          Comma-separated declared gate names (see
+                         aitasks/metadata/gates.yaml; optional)
+  --also-blocks-dependents GATES
+                         Comma-separated per-task extra gates required before
+                         dependents unblock (optional; augments registry defaults)
+  --deps DEPS            Comma-separated dependency task numbers
+  --xdeps DEPS           Comma-separated cross-repo dependency task numbers
+                         (in the format used inside --xdeprepo). Requires
+                         --xdeprepo. IDs are validated cross-repo at create.
+  --xdeprepo NAME        Cross-repo project name (resolved via the registry)
+                         that --xdeps numbers refer to. Both fields are
+                         required together.
+  --verifies VERIFIES    Comma-separated task IDs this task verifies. Usually a
+                         manual_verification task, but not restricted to one —
+                         any issue_type may carry it.
+  --file-ref REF         Append a file reference; repeatable. REF format:
+                         PATH | PATH:N | PATH:N-M | PATH:N-M^N-M^...
+                         (^ joins multiple ranges on the same path).
+  --premise-baseline VALUE
+                         Internal (carry-over inheritance): the new task's
+                         premise_baseline, overriding creation-time seeding;
+                         "" means none. Requires --commit. VALUE is
+                         '<full commit id> @ YYYY-MM-DD HH:MM'.
+  --auto-merge           When used with --file-ref and --commit, fold any
+                         pending Ready/Editing task that already references
+                         the same file path(s) into the new task. Reuses
+                         the aitask_fold_* scripts.
+  --no-auto-merge        (default) Warn about matching tasks but do NOT
+                         fold them. Use with --file-ref to preview.
+  --parent, -P NUM       Create as child of specified parent task number
+  --no-sibling-dep       Don't auto-add dependency on previous sibling (for child tasks)
+  --commit               Claim real ID and commit to git immediately (auto-finalize)
+  --finalize FILE        Finalize a specific draft from aitasks/new/ (claim ID, move, commit)
+  --finalize-all         Finalize all drafts in aitasks/new/
+  --silent               Output only the created filename (for scripting)
+  --help, -h             Show this help
+
+Draft workflow:
+  By default (without --commit), batch mode creates a draft in aitasks/new/.
+  Drafts use timestamp-based names and have no real task number.
+  Use --finalize or --finalize-all to assign real IDs and commit.
+  The --commit flag auto-finalizes immediately (requires network).
+  A committed task that carries --file-ref or --verifies (or a finalized draft
+  with a file_references/verifies list) is seeded with premise_baseline = HEAD.
+
+Examples:
+  # Interactive mode (supports draft management)
+  ./aitask_create.sh
+
+  # Batch mode - creates draft (no network needed)
+  ./aitask_create.sh --batch --name "fix_login_bug" --desc "Fix the login issue"
+
+  # Batch mode - auto-finalize with real ID (requires network)
+  ./aitask_create.sh --batch --name "add_feature" --desc "Add new feature" \
+      --priority high --effort medium --type feature --labels "ui,urgent" --commit
+
+  # Finalize a specific draft
+  ./aitask_create.sh --batch --finalize draft_20260213_1423_fix_login.md
+
+  # Finalize all pending drafts
+  ./aitask_create.sh --batch --finalize-all
+
+  # Create a child task of parent t1
+  ./aitask_create.sh --batch --parent 1 --name "first_subtask" --desc "First subtask"
+
+  # Create child without sibling dependency
+  ./aitask_create.sh --batch --parent 1 --name "parallel_task" --desc "Can run in parallel" --no-sibling-dep
+
+  # Read description from stdin
+  echo "Long description here" | ./aitask_create.sh --batch --name "my_task" --desc-file -
+EOF
+}
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --batch) BATCH_MODE=true; shift ;;
+            --name|-n) BATCH_NAME="$2"; shift 2 ;;
+            --desc|-d) BATCH_DESC="$2"; shift 2 ;;
+            --desc-file) BATCH_DESC_FILE="$2"; shift 2 ;;
+            --priority|-p) BATCH_PRIORITY="$2"; shift 2 ;;
+            --effort|-e) BATCH_EFFORT="$2"; shift 2 ;;
+            --type|-t) BATCH_TYPE="$2"; shift 2 ;;
+            --status|-s) BATCH_STATUS="$2"; shift 2 ;;
+            --labels|-l) BATCH_LABELS="$2"; shift 2 ;;
+            --deps) BATCH_DEPS="$2"; shift 2 ;;
+            --xdeps) BATCH_XDEPS="$2"; shift 2 ;;
+            --xdeprepo) BATCH_XDEPREPO="$2"; shift 2 ;;
+            --verifies) BATCH_VERIFIES="$2"; shift 2 ;;
+            --premise-baseline) BATCH_PREMISE_BASELINE="$2"; BATCH_PREMISE_BASELINE_SET=true; shift 2 ;;
+            --gates) BATCH_GATES="$2"; shift 2 ;;
+            --also-blocks-dependents) BATCH_ALSO_BLOCKS_DEPENDENTS="$2"; shift 2 ;;
+            --parent|-P) BATCH_PARENT="$2"; shift 2 ;;
+            # --project is handled in main() before parse_args (cross-repo
+            # redirect); never reaches here.
+            --no-sibling-dep) BATCH_NO_SIBLING_DEP=true; shift ;;
+            --assigned-to|-a) BATCH_ASSIGNED_TO="$2"; shift 2 ;;
+            --anchor) BATCH_ANCHOR="$2"; shift 2 ;;
+            --followup-of) BATCH_FOLLOWUP_OF="$2"; shift 2 ;;
+            --followup-kind) BATCH_FOLLOWUP_KIND="$2"; shift 2 ;;
+            --issue) BATCH_ISSUE="$2"; shift 2 ;;
+            --pull-request) BATCH_PULL_REQUEST="$2"; shift 2 ;;
+            --contributor) BATCH_CONTRIBUTOR="$2"; shift 2 ;;
+            --contributor-email) BATCH_CONTRIBUTOR_EMAIL="$2"; shift 2 ;;
+            --file-ref) validate_file_ref "$2"; BATCH_FILE_REFS+=("$2"); shift 2 ;;
+            --auto-merge) BATCH_AUTO_MERGE=true; shift ;;
+            --no-auto-merge) BATCH_AUTO_MERGE=false; shift ;;
+            --commit) BATCH_COMMIT=true; shift ;;
+            --finalize) BATCH_FINALIZE="$2"; shift 2 ;;
+            --finalize-all) BATCH_FINALIZE_ALL=true; shift ;;
+            --silent) BATCH_SILENT=true; shift ;;
+            --help|-h) show_help; exit 0 ;;
+            *) die "Unknown option: $1" ;;
+        esac
+    done
+}
+
+# Resolve the topic-anchor (group key) for the task being created from the
+# --anchor / --followup-of / --parent flags, setting the global RESOLVED_ANCHOR
+# to a bare task id ("" for a topic root). The unifying rule: an anchor always
+# points at the topic ROOT. Enforces mutual exclusion and the child-inherits
+# rule. Call after parse_args, before any create_*_file. See the t1016 design
+# and normalize_anchor_id() in lib/task_utils.sh.
+resolve_anchor() {
+    RESOLVED_ANCHOR=""
+
+    # A child's anchor is always inherited from its parent; explicit anchor
+    # flags are mutually exclusive with --parent and with each other.
+    if [[ -n "$BATCH_PARENT" && ( -n "$BATCH_ANCHOR" || -n "$BATCH_FOLLOWUP_OF" ) ]]; then
+        die "--anchor/--followup-of cannot be combined with --parent (a child inherits its parent's anchor; re-anchor after creation via aitask_update.sh --anchor)."
+    fi
+    if [[ -n "$BATCH_ANCHOR" && -n "$BATCH_FOLLOWUP_OF" ]]; then
+        die "--anchor and --followup-of are mutually exclusive."
+    fi
+
+    if [[ -n "$BATCH_ANCHOR" ]]; then
+        RESOLVED_ANCHOR=$(normalize_anchor_id "$BATCH_ANCHOR")
+    elif [[ -n "$BATCH_FOLLOWUP_OF" ]]; then
+        local src_bare src_file src_anchor=""
+        src_bare=$(normalize_anchor_id "$BATCH_FOLLOWUP_OF")
+        src_file=$(resolve_task_file "$src_bare" 2>/dev/null || true)
+        if [[ -n "$src_file" && -f "$src_file" ]]; then
+            src_anchor=$(read_yaml_field "$src_file" "anchor")
+        fi
+        if [[ -n "$src_anchor" ]]; then
+            RESOLVED_ANCHOR="$src_anchor"
+        elif [[ "$src_bare" =~ ^([0-9]+)_[0-9]+$ ]]; then
+            # Anchorless child source → fall back to its parent (the topic root).
+            RESOLVED_ANCHOR="${BASH_REMATCH[1]}"
+        else
+            RESOLVED_ANCHOR="$src_bare"
+        fi
+    elif [[ -n "$BATCH_PARENT" ]]; then
+        local parent_bare="${BATCH_PARENT#t}" parent_file parent_anchor=""
+        parent_file=$(resolve_task_file "$parent_bare" 2>/dev/null || true)
+        if [[ -n "$parent_file" && -f "$parent_file" ]]; then
+            parent_anchor=$(read_yaml_field "$parent_file" "anchor")
+        fi
+        if [[ -n "$parent_anchor" ]]; then
+            RESOLVED_ANCHOR="$parent_anchor"
+        else
+            RESOLVED_ANCHOR="$parent_bare"
+        fi
+    fi
+}
+
+# --- Step 1: Task Number Functions ---
+# Note: get_next_task_number() removed. Parent task IDs are now assigned via
+# aitask_claim_id.sh (atomic counter) during finalization.
+# get_next_task_number_local() is defined later as a fallback.
+# Child task IDs use get_next_child_number() (local scan + mkdir-based lock).
+# The lock serializes concurrent child creation for the same parent, which can
+# happen when the planning workflow creates multiple children in parallel.
+
+# --- Parent/Child Task Functions ---
+
+# Check if a task is a parent (has child directory)
+is_parent_task() {
+    local task_num="$1"
+    [[ -d "$TASK_DIR/t${task_num}" ]]
+}
+
+# Get parent task file path from task number
+get_parent_task_file() {
+    local parent_num="$1"
+    local parent_file
+    parent_file=$(ls "$TASK_DIR"/t${parent_num}_*.md 2>/dev/null | head -1)
+    echo "$parent_file"
+}
+
+# Get next child number for a parent task
+get_next_child_number() {
+    local parent_num="$1"
+    local child_dir="$TASK_DIR/t${parent_num}"
+    local max_child=0
+    local num
+
+    # Check active children
+    if [[ -d "$child_dir" ]]; then
+        for f in "$child_dir"/t${parent_num}_*_*.md; do
+            [[ -e "$f" ]] || continue
+            num=$(basename "$f" | grep -oE "^t${parent_num}_[0-9]+" | sed "s/t${parent_num}_//")
+            [[ -n "$num" && "$num" -gt "$max_child" ]] && max_child="$num"
+        done
+    fi
+
+    # Check archived children
+    if [[ -d "$ARCHIVED_DIR/t${parent_num}" ]]; then
+        for f in "$ARCHIVED_DIR/t${parent_num}"/t${parent_num}_*_*.md; do
+            [[ -e "$f" ]] || continue
+            num=$(basename "$f" | grep -oE "^t${parent_num}_[0-9]+" | sed "s/t${parent_num}_//")
+            [[ -n "$num" && "$num" -gt "$max_child" ]] && max_child="$num"
+        done
+    fi
+
+    # Check compressed archive for children
+    if [[ -n "$ARCHIVE_FILE" && -f "$ARCHIVE_FILE" ]]; then
+        while IFS= read -r line; do
+            num=$(echo "$line" | grep -oE "t${parent_num}_[0-9]+" | head -1 | sed "s/t${parent_num}_//")
+            [[ -n "$num" && "$num" -gt "$max_child" ]] && max_child="$num"
+        done < <(_archive_list "$ARCHIVE_FILE" | grep -E "t${parent_num}/t${parent_num}_[0-9]+")
+    fi
+
+    echo $((max_child + 1))
+}
+
+# Acquire per-parent lock for child task creation (prevents parallel races).
+# Shared mutex helper (t1496; also used by aitask_gate.sh's gate lock): the
+# stale reclaim is single-winner and never displaces a live holder — see
+# lib/stale_lock.sh for the invariants.
+_CHILD_LOCK_DIR=""
+_CHILD_LOCK_TOKEN=""
+acquire_child_lock() {
+    local parent_num="$1" lock_dir
+    lock_dir="$(ait_lock_dir "child_${parent_num}")" || \
+        die "Failed to resolve child lock base for parent $parent_num"
+    # Opts in to markerless guard reclaim (t1598) — see acquire_gate_lock.
+    if ! stale_lock_acquire "$lock_dir" 20 0.5 "child lock for parent $parent_num" \
+            "$_STALE_LOCK_GC_WINDOW_DEFAULT"; then
+        # The prefix predates t1496 (tests pin it); the describe suffix is the
+        # recovery hint.
+        die "Failed to acquire child creation lock for parent $parent_num after 20 attempts$(stale_lock_describe "$lock_dir")"
+    fi
+    _CHILD_LOCK_DIR="$lock_dir"
+    _CHILD_LOCK_TOKEN="$STALE_LOCK_TOKEN"
+}
+
+# The parent_num argument is kept for call-site compatibility; the held lock's
+# path/token live in the globals (one lock at a time — see lib/stale_lock.sh).
+release_child_lock() {
+    local rc=0
+    if [[ -n "$_CHILD_LOCK_DIR" ]]; then
+        stale_lock_release "$_CHILD_LOCK_DIR" "$_CHILD_LOCK_TOKEN" || rc=1
+    fi
+    _CHILD_LOCK_DIR=""
+    _CHILD_LOCK_TOKEN=""
+    return "$rc"
+}
+
+# Explicit-release form: a genuinely retained lock must surface as a command
+# failure, never as silent success with the parent key wedged (t1496 inv. 6).
+release_child_lock_checked() {
+    if ! release_child_lock "$@"; then
+        die "child creation lock not released — the parent key stays wedged (see warning above)"
+    fi
+}
+
+# warn_task_written_not_committed <task_id> — the commit-failure branch shared by
+# all four create-and-commit sites (t1725_2, finding 7).
+#
+# Deliberately NOT a die. By the time a commit can fail the id is already claimed
+# and the file is on disk, so dying makes the caller retry — and each retry
+# claims a FRESH id. t1722/t1723/t1724 are one follow-up spawned three times in
+# seven minutes that way. Exiting 0 with the path on stdout removes the caller's
+# reason to retry; the next sync sweeps the file under its own task id.
+#
+# Only a NON-wedge failure reaches here (index lock, hook, pathspec): task_git's
+# assert_data_worktree_clean exits the process on a wedged worktree, so this
+# branch never has to re-check for one.
+warn_task_written_not_committed() {
+    local task_id="$1" first_line
+    first_line="$(printf '%s\n' "${AIT_COMMIT_SCOPED_ERR:-}" | grep -m1 -v '^[[:space:]]*$' || true)"
+    [[ -n "$first_line" ]] || first_line="git reported no message"
+    warn "task ${task_id} file written but NOT committed (${first_line}) — it will be swept into the next sync's auto-commit under its own task id; do not re-run create"
+}
+
+# EXIT-trap form: capture the incoming status, release errexit-safely, preserve
+# a meaningful nonzero status, and flip 0 -> 1 only when release itself failed.
+_child_lock_exit_trap() {
+    local rc=$?
+    if ! release_child_lock; then
+        if [[ $rc -eq 0 ]]; then rc=1; fi
+    fi
+    exit "$rc"
+}
+
+# Interactive selection of parent task
+select_parent_task() {
+    local tasks
+    # Get all tasks (including all statuses) for parent selection
+    tasks=$("$SCRIPT_DIR/aitask_ls.sh" -v -s all 99 2>/dev/null || echo "")
+
+    if [[ -z "$tasks" ]]; then
+        echo ""
+        return
+    fi
+
+    local options
+    options=$(echo -e "None - create standalone task\n$tasks")
+
+    local selected
+    selected=$(echo "$options" | fzf --prompt="Parent task: " --height=15 --no-info \
+        --header="Select parent task (or None for standalone)")
+
+    if [[ -z "$selected" ]] || echo "$selected" | grep -q "^None"; then
+        echo ""
+        return
+    fi
+
+    # Extract task number from selected line (format: t10_name.md [...])
+    echo "$selected" | grep -oE '^t[0-9]+' | sed 's/t//'
+}
+
+# Update parent's children_to_implement list
+update_parent_children_to_implement() {
+    local parent_num="$1"
+    local child_id="$2"  # e.g., "t1_2"
+
+    local parent_file
+    parent_file=$(get_parent_task_file "$parent_num")
+
+    if [[ -z "$parent_file" || ! -f "$parent_file" ]]; then
+        echo -e "${YELLOW}Warning: Could not find parent task t$parent_num to update${NC}" >&2
+        return 1
+    fi
+
+    # Read current children_to_implement from parent file
+    local current_children=""
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^children_to_implement: ]]; then
+            # Extract list: [t1_1, t1_2] -> t1_1,t1_2
+            current_children=$(parse_yaml_list "$(echo "$line" | sed 's/children_to_implement://')")
+            break
+        fi
+    done < "$parent_file"
+
+    # Add new child to list
+    if [[ -z "$current_children" ]]; then
+        current_children="$child_id"
+    else
+        current_children="$current_children,$child_id"
+    fi
+
+    # Update the parent file using aitask_update.sh if available, otherwise inline update.
+    # Route stdout to stderr so silent callers (e.g. --silent mode capturing $(aitask_create.sh))
+    # don't pick up the "Updated: <file>" announcement as if it were the created filename.
+    if [[ -x "$SCRIPT_DIR/aitask_update.sh" ]]; then
+        "$SCRIPT_DIR/aitask_update.sh" --batch "$parent_num" --add-child "$child_id" >&2 2>/dev/null || {
+            # Fallback: inline update if aitask_update.sh doesn't support --add-child yet
+            update_parent_children_inline "$parent_file" "$current_children"
+        }
+    else
+        update_parent_children_inline "$parent_file" "$current_children"
+    fi
+}
+
+# Inline update of parent's children_to_implement (fallback)
+update_parent_children_inline() {
+    local parent_file="$1"
+    local children_list="$2"
+
+    local children_yaml
+    children_yaml=$(format_yaml_list "$children_list")
+
+    # Read file content
+    local content
+    content=$(cat "$parent_file")
+
+    # Check if children_to_implement already exists
+    if grep -q "^children_to_implement:" "$parent_file"; then
+        # Replace existing line
+        content=$(echo "$content" | sed "s/^children_to_implement:.*$/children_to_implement: $children_yaml/")
+    else
+        # Add after labels line (before created_at)
+        content=$(echo "$content" | awk -v line="children_to_implement: $children_yaml" '/^labels:/{print; print line; next}1')
+    fi
+
+    # Update timestamp
+    local timestamp
+    timestamp=$(get_timestamp)
+    content=$(echo "$content" | sed "s/^updated_at:.*$/updated_at: $timestamp/")
+
+    # Write back
+    echo "$content" > "$parent_file"
+}
+
+# Create child task file in parent's subdirectory
+create_child_task_file() {
+    local parent_num="$1"
+    local child_num="$2"
+    local task_name="$3"
+    local priority="$4"
+    local effort="$5"
+    local deps="$6"
+    local description="$7"
+    local issue_type="$8"
+    local status="$9"
+    local labels="${10}"
+    local issue="${11:-}"
+    local pull_request="${12:-}"
+    local contributor="${13:-}"
+    local contributor_email="${14:-}"
+    local file_references="${15:-}"
+    local verifies="${16:-}"
+    # premise_baseline (t1663_3): the value resolve_premise_seed() decided --
+    # the creation-time seed, an explicit --premise-baseline, or "" for none.
+    local premise_baseline="${17:-}"
+
+    local child_dir="$TASK_DIR/t${parent_num}"
+    mkdir -p "$child_dir"
+
+    local child_id="t${parent_num}_${child_num}"
+    local filename="${child_id}_${task_name}.md"
+    local filepath="$child_dir/$filename"
+
+    local timestamp
+    timestamp=$(get_timestamp)
+
+    local deps_yaml
+    deps_yaml=$(format_yaml_list "$deps")
+
+    local labels_yaml
+    labels_yaml=$(format_yaml_list "$labels")
+
+    # Create the file with YAML front matter (same format as regular tasks)
+    # The body is a renderer for ait_atomic_render (lib/atomic_write.sh):
+    # it is staged beside the target and renamed into place, so a scan of
+    # aitasks/*.md never catches the new file at zero bytes. Renderer
+    # contract: must NOT rely on `set -e` (the calling context disables it).
+    # Every command here is an `echo` or a `[[ ]]` test, whose only failure
+    # mode is a broken output fd -- which fails the trailing `echo` too. Any
+    # command added here that can fail on its own needs `|| return 1`.
+    _ait_create_child_task_file_body() {
+        echo "---"
+        echo "priority: $priority"
+        echo "effort: $effort"
+        echo "depends: $deps_yaml"
+        # Cross-repo fields. As of t832_10, `xdeprepo:` may appear alone
+        # (intent-only mode); `xdeps:` still requires `xdeprepo:`
+        # (enforced by validate_xdeps_pair).
+        if [[ -n "${BATCH_XDEPS:-}" ]]; then
+            local xdeps_yaml
+            xdeps_yaml=$(format_yaml_list "$BATCH_XDEPS")
+            echo "xdeps: $xdeps_yaml"
+        fi
+        if [[ -n "${BATCH_XDEPREPO:-}" ]]; then
+            echo "xdeprepo: $BATCH_XDEPREPO"
+        fi
+        echo "issue_type: $issue_type"
+        echo "status: $status"
+        echo "labels: $labels_yaml"
+        # Only write gates if present (opt-in declared gate set; read from the
+        # batch global, mirroring xdeps/xdeprepo above). t635_1.
+        if [[ -n "${BATCH_GATES:-}" ]]; then
+            local gates_yaml
+            gates_yaml=$(format_yaml_list "$BATCH_GATES")
+            echo "gates: $gates_yaml"
+        fi
+        # Only write also_blocks_dependents if present (per-task extra unblock
+        # gates; augments registry blocks_dependents defaults). t635_3.
+        if [[ -n "${BATCH_ALSO_BLOCKS_DEPENDENTS:-}" ]]; then
+            local abd_yaml
+            abd_yaml=$(format_yaml_list "$BATCH_ALSO_BLOCKS_DEPENDENTS")
+            echo "also_blocks_dependents: $abd_yaml"
+        fi
+        # Only write verifies if present
+        if [[ -n "$verifies" ]]; then
+            local verifies_yaml
+            verifies_yaml=$(format_yaml_list "$verifies")
+            echo "verifies: $verifies_yaml"
+        fi
+        # Only write file_references if present
+        if [[ -n "$file_references" ]]; then
+            local file_refs_yaml
+            file_refs_yaml=$(format_yaml_path_list "$file_references") || return 1
+            echo "file_references: $file_refs_yaml"
+        fi
+        # Only write premise_baseline if present (t1663_3). Right after the
+        # scope lines it is seeded from; the serializer emits it verbatim.
+        if [[ -n "$premise_baseline" ]]; then
+            echo "premise_baseline: $premise_baseline"
+        fi
+        # Only write anchor (topic group key) if present
+        if [[ -n "$RESOLVED_ANCHOR" ]]; then
+            echo "anchor: $RESOLVED_ANCHOR"
+        fi
+        # Only write followup_kind (auto-spawned follow-up provenance) if present
+        if [[ -n "$BATCH_FOLLOWUP_KIND" ]]; then
+            echo "followup_kind: $BATCH_FOLLOWUP_KIND"
+        fi
+        # Only write issue if present
+        if [[ -n "$issue" ]]; then
+            echo "issue: $issue"
+        fi
+        if [[ -n "$pull_request" ]]; then
+            echo "pull_request: $pull_request"
+        fi
+        if [[ -n "$contributor" ]]; then
+            echo "contributor: $contributor"
+        fi
+        if [[ -n "$contributor_email" ]]; then
+            echo "contributor_email: $contributor_email"
+        fi
+        echo "created_at: $timestamp"
+        echo "updated_at: $timestamp"
+        echo "---"
+        echo ""
+        echo "$description"
+    }
+    ait_atomic_render "$filepath" _ait_create_child_task_file_body \
+        || die "could not write task file: $filepath"
+
+    echo "$filepath"
+}
+
+# --- Draft and Finalization Functions ---
+
+# Generate draft filename with timestamp
+get_draft_filename() {
+    local task_name="$1"
+    local timestamp
+    timestamp=$(date '+%Y%m%d_%H%M')
+    echo "draft_${timestamp}_${task_name}.md"
+}
+
+# Create a draft task file in DRAFT_DIR
+create_draft_file() {
+    local task_name="$1"
+    local priority="$2"
+    local effort="$3"
+    local deps="$4"
+    local description="$5"
+    local issue_type="$6"
+    local status="$7"
+    local labels="$8"
+    local assigned_to="${9:-}"
+    local issue="${10:-}"
+    local parent_num="${11:-}"
+    local pull_request="${12:-}"
+    local contributor="${13:-}"
+    local contributor_email="${14:-}"
+    local file_references="${15:-}"
+    local verifies="${16:-}"
+    # Cross-repo project name. When set (interactive path) overrides
+    # BATCH_XDEPREPO. The xdeps list still comes only from BATCH_XDEPS
+    # since interactive collection of cross-repo deps is out of scope
+    # for t832_10.
+    local xdeprepo_arg="${17:-}"
+
+    mkdir -p "$DRAFT_DIR"
+
+    local draft_name
+    draft_name=$(get_draft_filename "$task_name")
+    local filepath="$DRAFT_DIR/$draft_name"
+
+    local timestamp
+    timestamp=$(get_timestamp)
+
+    local deps_yaml
+    deps_yaml=$(format_yaml_list "$deps")
+
+    local labels_yaml
+    labels_yaml=$(format_yaml_list "$labels")
+
+    # Resolve effective xdeps/xdeprepo: interactive `xdeprepo_arg` wins
+    # over the BATCH_XDEPREPO global; xdeps stays batch-only. The two
+    # YAML lines emit independently (intent-only `xdeprepo:` is allowed
+    # by validate_xdeps_pair as of t832_10).
+    local eff_xdeps="${BATCH_XDEPS:-}"
+    local eff_xdeprepo="${xdeprepo_arg:-${BATCH_XDEPREPO:-}}"
+
+    # The body is a renderer for ait_atomic_render (lib/atomic_write.sh):
+    # it is staged beside the target and renamed into place, so a scan of
+    # aitasks/*.md never catches the new file at zero bytes. Renderer
+    # contract: must NOT rely on `set -e` (the calling context disables it).
+    # Every command here is an `echo` or a `[[ ]]` test, whose only failure
+    # mode is a broken output fd -- which fails the trailing `echo` too. Any
+    # command added here that can fail on its own needs `|| return 1`.
+    _ait_create_draft_file_body() {
+        echo "---"
+        echo "priority: $priority"
+        echo "effort: $effort"
+        echo "depends: $deps_yaml"
+        if [[ -n "$eff_xdeps" ]]; then
+            local xdeps_yaml
+            xdeps_yaml=$(format_yaml_list "$eff_xdeps")
+            echo "xdeps: $xdeps_yaml"
+        fi
+        if [[ -n "$eff_xdeprepo" ]]; then
+            echo "xdeprepo: $eff_xdeprepo"
+        fi
+        echo "issue_type: $issue_type"
+        echo "status: $status"
+        echo "labels: $labels_yaml"
+        # Only write gates if present. Drafts carry gates too: finalize_draft
+        # sed-copies the draft to the real task (it does not call create_task_file),
+        # so the batch create -> finalize flow would otherwise drop --gates (t635_1).
+        if [[ -n "${BATCH_GATES:-}" ]]; then
+            local gates_yaml
+            gates_yaml=$(format_yaml_list "$BATCH_GATES")
+            echo "gates: $gates_yaml"
+        fi
+        # also_blocks_dependents rides along the draft for the same reason (t635_3).
+        if [[ -n "${BATCH_ALSO_BLOCKS_DEPENDENTS:-}" ]]; then
+            local abd_yaml
+            abd_yaml=$(format_yaml_list "$BATCH_ALSO_BLOCKS_DEPENDENTS")
+            echo "also_blocks_dependents: $abd_yaml"
+        fi
+        # Only write verifies if present
+        if [[ -n "$verifies" ]]; then
+            local verifies_yaml
+            verifies_yaml=$(format_yaml_list "$verifies")
+            echo "verifies: $verifies_yaml"
+        fi
+        if [[ -n "$file_references" ]]; then
+            local file_refs_yaml
+            file_refs_yaml=$(format_yaml_path_list "$file_references") || return 1
+            echo "file_references: $file_refs_yaml"
+        fi
+        echo "draft: true"
+        if [[ -n "$assigned_to" ]]; then
+            echo "assigned_to: $assigned_to"
+        fi
+        # Only write anchor (topic group key) if present
+        if [[ -n "$RESOLVED_ANCHOR" ]]; then
+            echo "anchor: $RESOLVED_ANCHOR"
+        fi
+        # Only write followup_kind (auto-spawned follow-up provenance) if present
+        if [[ -n "$BATCH_FOLLOWUP_KIND" ]]; then
+            echo "followup_kind: $BATCH_FOLLOWUP_KIND"
+        fi
+        if [[ -n "$issue" ]]; then
+            echo "issue: $issue"
+        fi
+        if [[ -n "$pull_request" ]]; then
+            echo "pull_request: $pull_request"
+        fi
+        if [[ -n "$contributor" ]]; then
+            echo "contributor: $contributor"
+        fi
+        if [[ -n "$contributor_email" ]]; then
+            echo "contributor_email: $contributor_email"
+        fi
+        if [[ -n "$parent_num" ]]; then
+            echo "parent: $parent_num"
+        fi
+        echo "created_at: $timestamp"
+        echo "updated_at: $timestamp"
+        echo "---"
+        echo ""
+        echo "$description"
+    }
+    ait_atomic_render "$filepath" _ait_create_draft_file_body \
+        || die "could not write task file: $filepath"
+
+    echo "$filepath"
+}
+
+# Extract task name from a draft filename
+# draft_20260213_1423_fix_login.md -> fix_login
+extract_name_from_draft() {
+    local draft_file="$1"
+    local basename_f
+    basename_f=$(basename "$draft_file" .md)
+    # Remove "draft_YYYYMMDD_HHMM_" prefix
+    echo "$basename_f" | sed 's/^draft_[0-9]*_[0-9]*_//'
+}
+
+# Extract parent number from draft frontmatter (if it's a child task draft)
+extract_parent_from_draft() {
+    local draft_path="$1"
+    local in_yaml=false
+    while IFS= read -r line; do
+        if [[ "$line" == "---" ]]; then
+            if [[ "$in_yaml" == true ]]; then break; fi
+            in_yaml=true
+            continue
+        fi
+        if [[ "$in_yaml" == true && "$line" =~ ^parent:[[:space:]]*(.*) ]]; then
+            echo "${BASH_REMATCH[1]}" | tr -d '[:space:]'
+            return
+        fi
+    done < "$draft_path"
+    echo ""
+}
+
+# Finalize a single draft: claim real ID, move to aitasks/, commit
+# Enforce the manual_verification gate invariant on a just-finalized task file.
+# A pre-existing / hand-edited draft can carry gates a manual_verification task
+# cannot reach (it skips Steps 6-8); rewrite its `gates:` line in place so the
+# finalized task never lands in the unarchivable state. No-op for any other
+# issue_type or a task with no `gates:` field. See filter_gates_for_issue_type
+# (t1156). The run_batch_mode() sink filters the --commit path; this covers the
+# separate --finalize path.
+enforce_manual_verification_gate_invariant() {
+    local filepath="$1"
+    local dtype dgates stripped kept
+    dtype=$(read_yaml_field "$filepath" issue_type)
+    [[ "$dtype" == "manual_verification" ]] || return 0
+    dgates=$(read_yaml_field "$filepath" gates)
+    [[ -n "$dgates" ]] || return 0
+    # read_yaml_field returns the inline flow list, e.g. "[risk_evaluated, build_verified]".
+    dgates="${dgates#[}"
+    dgates="${dgates%]}"
+    stripped=$(filter_gates_for_issue_type "$dtype" "$dgates" 2>&1 >/dev/null)
+    [[ -n "$stripped" ]] || return 0
+    kept=$(filter_gates_for_issue_type "$dtype" "$dgates" 2>/dev/null)
+    sed_inplace "s/^gates:.*/gates: $(format_yaml_list "$kept")/" "$filepath"
+    info "manual_verification: dropped unreachable gate(s) from finalized draft: ${stripped#STRIPPED:}"
+}
+
+# Register a finalized task's labels in the vocabulary. Drafts live in the
+# gitignored aitasks/new/ and are never committed, so the vocabulary write is
+# deferred to finalize time — otherwise an abandoned draft would leak its labels
+# into the worktree permanently. The labels themselves were already normalized
+# when the draft was created (run_batch_mode).
+_register_task_labels() {
+    local filepath="$1"
+    local raw csv
+    # Every exit path must leave a TRUTHFUL signal. The three early returns below
+    # never reach add_labels_csv_to_file (which is what normally resets these), and
+    # finalize_all_drafts loops finalize_draft in ONE process -- so without this a
+    # later draft would inherit an earlier draft's AIT_LABELS_ADDED and stage
+    # labels.txt under the wrong commit (t1599_4 / t1662).
+    AIT_LABELS_ADDED=()
+    [[ -f "$filepath" ]] || return 0
+    raw=$(grep -m1 '^labels:' "$filepath" 2>/dev/null | sed 's/^labels: *//' || true)
+    [[ -z "$raw" ]] && return 0
+    csv=$(parse_yaml_list "$raw")
+    [[ -z "$csv" ]] && return 0
+    add_labels_csv_to_file "$csv"
+    return 0
+}
+
+# resolve_premise_seed <has_scope: true|false>
+# Decide the premise_baseline of the task about to be written and leave it in
+# PREMISE_SEED ("" = none). Design: aidocs/framework/task_premise_staleness.md
+# ("Seeding"). Called directly, never inside $( ), and never dies -- an advisory
+# field must not block creation.
+#   - an explicit --premise-baseline (already canonicalised by run_batch_mode)
+#     wins, "" included, unless the second argument is ignore_override (the
+#     finalize path, which never takes the flag -- defence in depth behind the
+#     main()/run_batch_mode refusals): that is how a carry-over inherits its origin's value, or
+#     the origin's absence, instead of a fresh HEAD;
+#   - no derivable scope (no file_references, no verifies) -> none. That covers
+#     --followup-of alone, which writes only anchor:, never an exact origin;
+#   - otherwise HEAD of the working directory -- the repository root, which is
+#     the repository aitask_premise_stale.sh checks -- stamped with the time.
+#     No HEAD commit (an unborn branch) -> none, with a warning; absent reads
+#     SKIP, the designed legacy behaviour.
+resolve_premise_seed() {
+    local has_scope="$1" override="${2:-honor_override}" rev=""
+    PREMISE_SEED=""
+    if [[ "$override" == honor_override && "$BATCH_PREMISE_BASELINE_SET" == true ]]; then
+        PREMISE_SEED="$BATCH_PREMISE_BASELINE"
+        return 0
+    fi
+    [[ "$has_scope" == true ]] || return 0
+    rev="$(git rev-parse --verify --quiet 'HEAD^{commit}' 2>/dev/null)" || rev=""
+    if [[ ! "$rev" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]]; then
+        warn "premise_baseline not seeded: no HEAD commit"
+        return 0
+    fi
+    PREMISE_SEED="$rev @ $(get_timestamp)"
+    return 0
+}
+
+# seed_finalized_premise_baseline <task_file>
+# The finalize_draft half of creation-time seeding: a draft is never seeded (it
+# is not committed), so the commit point that finalizes it is where the value is
+# stamped. This is the path codebrowser's create-task action takes -- it runs
+# the INTERACTIVE create, which writes a draft and finalizes it here.
+# Both inputs are read through YAML (read_premise_seed_fields): a hand-edited
+# draft may hold a block-style list that the line-oriented readers miss. A draft
+# that already carries the key -- even null -- is left alone, so a second
+# premise_baseline: key is never written. Any read or write failure leaves the
+# task unseeded with a warning and lets finalization continue.
+seed_finalized_premise_baseline() {
+    local filepath="$1" out="" rc=0 refs verifies has_scope=false
+    out="$(read_premise_seed_fields "$filepath")" || rc=$?
+    if [[ $rc -ne 0 || "$out" == "INVALID:frontmatter" ]]; then
+        warn "premise_baseline not seeded: frontmatter of $filepath unreadable"
+        return 0
+    fi
+    [[ "$(sed -n 1p <<< "$out")" == BASELINE_ABSENT ]] || return 0
+    refs="$(sed -n 's/^REFS://p' <<< "$out")"
+    verifies="$(sed -n 's/^VERIFIES://p' <<< "$out")"
+    if (( refs > 0 || verifies > 0 )); then
+        has_scope=true
+    fi
+    resolve_premise_seed "$has_scope" ignore_override
+    [[ -n "$PREMISE_SEED" ]] || return 0
+    # The value is [0-9a-f], " @ ", digits, "-" and ":" only, so it is safe in
+    # awk -v (no backslash escapes to interpret). Inserted just before the
+    # frontmatter's closing ---; exit 1 if there was none to insert before.
+    _ait_seed_premise_body() {
+        awk -v line="premise_baseline: $PREMISE_SEED" '
+            !done && $0 == "---" { n++; if (n == 2) { print line; done = 1 } }
+            { print }
+            END { if (!done) exit 1 }
+        ' "$filepath" || return 1
+    }
+    if ! ait_atomic_render "$filepath" _ait_seed_premise_body; then
+        warn "premise_baseline not seeded: could not rewrite $filepath"
+    fi
+    return 0
+}
+
+finalize_draft() {
+    local draft_path="$1"
+    local silent="${2:-false}"
+
+    if [[ ! -f "$draft_path" ]]; then
+        die "Draft file not found: $draft_path"
+    fi
+
+    # This is where a draft becomes committed task data — it claims an id and
+    # commits — so it is guarded, while create_draft_file() deliberately is not
+    # (t1725_2). One site covers every finalize_draft caller.
+    assert_task_data_writable
+
+    local task_name
+    task_name=$(extract_name_from_draft "$draft_path")
+    local parent_num
+    parent_num=$(extract_parent_from_draft "$draft_path")
+
+    local task_id filepath
+
+    if [[ -n "$parent_num" ]]; then
+        # Child task: lock to prevent parallel races on child number assignment
+        acquire_child_lock "$parent_num"
+        trap '_child_lock_exit_trap' EXIT
+        ait_archive_rearm_exit_trap
+
+        local child_num
+        child_num=$(get_next_child_number "$parent_num")
+
+        task_id="t${parent_num}_${child_num}"
+        local child_dir="$TASK_DIR/t${parent_num}"
+        mkdir -p "$child_dir"
+        filepath="$child_dir/${task_id}_${task_name}.md"
+
+        # Copy content, remove draft-specific fields
+        sed '/^draft: true$/d; /^parent: .*$/d' "$draft_path" > "$filepath"
+        enforce_manual_verification_gate_invariant "$filepath"
+        seed_finalized_premise_baseline "$filepath"
+        _register_task_labels "$filepath"
+        # Did THIS draft append to the shared vocabulary? Read per-call, right after
+        # the registration that produced it (t1599_4 / t1662).
+        local _stage_labels=false
+        if (( ${#AIT_LABELS_ADDED[@]} > 0 )); then
+            _stage_labels=true
+        fi
+
+        # Update parent's children_to_implement
+        update_parent_children_to_implement "$parent_num" "$task_id"
+
+        rm -f "$draft_path"
+
+        if [[ "$silent" != "true" ]]; then
+            success "Finalized child task: $filepath (ID: $task_id)"
+        fi
+
+        # Git commit
+        local parent_file
+        parent_file=$(get_parent_task_file "$parent_num")
+        # labels.txt joins the pathspec ONLY when this invocation actually appended
+        # to the vocabulary. `commit -- <paths>` commits worktree content, so naming
+        # it unconditionally would carry a concurrent session's append (t1662).
+        local -a commit_paths=( "$filepath" )
+        [[ -n "$parent_file" ]] && commit_paths+=( "$parent_file" )
+        if [[ "$_stage_labels" == true ]]; then
+            commit_paths+=( "$LABELS_FILE" )
+        fi
+        local humanized_name
+        humanized_name=$(echo "$task_name" | tr '_' ' ')
+        local crc=0
+        task_git_commit_scoped "ait: Add child task ${task_id}: ${humanized_name}" \
+            "${commit_paths[@]}" || crc=$?
+        local committed=true
+        if [[ "$crc" -eq 2 ]]; then
+            warn "nothing to commit for ${task_id}"
+        elif [[ "$crc" -ne 0 ]]; then
+            warn_task_written_not_committed "${task_id}"
+            committed=false
+        fi
+
+        # Skipped when uncommitted: there is no commit to merge, and the lock
+        # release + `trap - EXIT` below still run either way.
+        $committed && run_auto_merge_if_needed "${parent_num}_${child_num}" "$filepath"
+
+        release_child_lock_checked "$parent_num"
+        trap - EXIT
+        ait_archive_rearm_exit_trap
+    else
+        # Parent task: claim from atomic counter.
+        # Absorb the status: claim_unique_parent_id runs inside $( ), where a die()
+        # exits only the subshell, so the status is all that reaches us. Aborting
+        # here writes nothing -- the draft is still on disk and the `rm -f
+        # "$draft_path"` below has not run (t1755).
+        local claimed_id claim_rc=0
+        claimed_id=$(claim_unique_parent_id true) || claim_rc=$?
+        if (( claim_rc != 0 )); then
+            die "Task ID claim failed (see the error above). Draft left at $draft_path; nothing was created."
+        fi
+
+        task_id="t${claimed_id}"
+        filepath="$TASK_DIR/${task_id}_${task_name}.md"
+
+        # Copy content, remove draft field
+        sed '/^draft: true$/d' "$draft_path" > "$filepath"
+        enforce_manual_verification_gate_invariant "$filepath"
+        seed_finalized_premise_baseline "$filepath"
+        _register_task_labels "$filepath"
+        # Per-call, read immediately after the registration (t1599_4 / t1662).
+        local _stage_labels=false
+        if (( ${#AIT_LABELS_ADDED[@]} > 0 )); then
+            _stage_labels=true
+        fi
+
+        rm -f "$draft_path"
+
+        # Store email if present in frontmatter
+        local assigned_email
+        assigned_email=$(grep '^assigned_to:' "$filepath" 2>/dev/null | sed 's/assigned_to: *//' || true)
+        if [[ -n "$assigned_email" ]]; then
+            add_email_to_file "$assigned_email"
+        fi
+
+        if [[ "$silent" != "true" ]]; then
+            success "Finalized: $filepath (ID: $task_id)"
+        fi
+
+        # Git commit. labels.txt joins the pathspec only when this invocation
+        # appended to the vocabulary (t1662); the helper is always --quiet, which
+        # is why the old silent/non-silent fork collapses to one call -- that fork
+        # existed only to keep git's own summary out of the --silent stdout channel.
+        local -a commit_paths=( "$filepath" )
+        if [[ "$_stage_labels" == true ]]; then
+            commit_paths+=( "$LABELS_FILE" )
+        fi
+        local humanized_name
+        humanized_name=$(echo "$task_name" | tr '_' ' ')
+        local crc=0
+        task_git_commit_scoped "ait: Add task ${task_id}: ${humanized_name}" \
+            "${commit_paths[@]}" || crc=$?
+        local committed=true
+        if [[ "$crc" -eq 2 ]]; then
+            warn "nothing to commit for ${task_id}"
+        elif [[ "$crc" -ne 0 ]]; then
+            warn_task_written_not_committed "${task_id}"
+            committed=false
+        fi
+
+        $committed && run_auto_merge_if_needed "$claimed_id" "$filepath"
+    fi
+
+    if [[ "$silent" == "true" ]]; then
+        echo "$filepath"
+    fi
+}
+
+# Finalize all drafts in DRAFT_DIR
+finalize_all_drafts() {
+    local silent="${1:-false}"
+
+    if [[ ! -d "$DRAFT_DIR" ]] || ! ls "$DRAFT_DIR"/draft_*.md &>/dev/null; then
+        if [[ "$silent" != "true" ]]; then
+            info "No draft files found in $DRAFT_DIR/"
+        fi
+        return 0
+    fi
+
+    local count=0
+    for draft_file in "$DRAFT_DIR"/draft_*.md; do
+        [[ -e "$draft_file" ]] || continue
+        finalize_draft "$draft_file" "$silent"
+        count=$((count + 1))
+    done
+
+    if [[ "$silent" != "true" ]]; then
+        success "Finalized $count draft(s)"
+    fi
+}
+
+# Local-only task number scan (fallback when atomic counter is unavailable)
+get_next_task_number_local() {
+    local max_num=0
+    local num
+
+    if ls "$TASK_DIR"/t*_*.md &>/dev/null; then
+        for f in "$TASK_DIR"/t*_*.md; do
+            num=$(basename "$f" | grep -oE '^t[0-9]+' | sed 's/t//')
+            [[ "$num" -gt "$max_num" ]] && max_num="$num"
+        done
+    fi
+
+    if ls "$ARCHIVED_DIR"/t*_*.md &>/dev/null; then
+        for f in "$ARCHIVED_DIR"/t*_*.md; do
+            num=$(basename "$f" | grep -oE '^t[0-9]+' | sed 's/t//')
+            [[ "$num" -gt "$max_num" ]] && max_num="$num"
+        done
+    fi
+
+    if [[ -n "$ARCHIVE_FILE" && -f "$ARCHIVE_FILE" ]]; then
+        while IFS= read -r line; do
+            num=$(echo "$line" | grep -oE 't[0-9]+' | head -1 | sed 's/t//')
+            [[ -n "$num" && "$num" -gt "$max_num" ]] && max_num="$num"
+        done < <(_archive_list "$ARCHIVE_FILE" | grep -E 't[0-9]+')
+    fi
+
+    echo $((max_num + 1))
+}
+
+active_parent_task_exists() {
+    local task_num="$1"
+    ls "$TASK_DIR"/t${task_num}_*.md &>/dev/null
+}
+
+claim_parent_id_once() {
+    local allow_interactive_fallback="${1:-false}"
+    local claimed_id
+    # mktemp CAN fail (TMPDIR missing, full, read-only, or not a directory).
+    # Unchecked, $claim_stderr stayed EMPTY, `2>"$claim_stderr"` became an
+    # ambiguous redirect, and the claim could not run at all -- surfacing as shell
+    # noise ("line NNN: : No such file or directory", "cat: ''") plus a misleading
+    # "Atomic ID counter failed: unknown error" that names the wrong cause.
+    #
+    # lib/task_utils.sh's _ait_cs_sink degrades to /dev/null instead. That is
+    # correct THERE because its mktemp runs after the file is written and the id
+    # claimed, so aborting would burn an id. Here nothing has been written yet, so
+    # a deliberate abort costs nothing and fails closed on a shared, cross-machine
+    # counter (t1755).
+    local claim_errf
+    claim_errf="$(mktemp "${TMPDIR:-/tmp}/ait_claim_id_err.XXXXXX" 2>/dev/null)" \
+        || die "Cannot allocate a temp file for the ID-claim diagnostic (is TMPDIR=${TMPDIR:-/tmp} writable?); refusing to claim a task ID."
+    claimed_id=$("$SCRIPT_DIR/aitask_claim_id.sh" --claim 2>"$claim_errf") || {
+        local claim_err
+        claim_err=$(cat "$claim_errf")
+        rm -f "$claim_errf"
+
+        if [[ "$allow_interactive_fallback" == "true" && -t 0 ]]; then
+            echo "" >&2
+            warn "Atomic ID counter failed: ${claim_err:-unknown error}" >&2
+            warn "Local scan may cause duplicate IDs if other users are active." >&2
+            echo "" >&2
+            printf "Use local scan anyway? (y/N): " >&2
+            local answer
+            read -r answer
+            if [[ "$answer" =~ ^[Yy]$ ]]; then
+                claimed_id=$(get_next_task_number_local)
+            else
+                die "Aborted. See the counter error above."
+            fi
+        else
+            die "Atomic ID counter failed: ${claim_err:-unknown error}"
+        fi
+    }
+    rm -f "$claim_errf" 2>/dev/null
+    echo "$claimed_id"
+}
+
+claim_unique_parent_id() {
+    local allow_interactive_fallback="${1:-false}"
+    local attempt claimed_id once_rc
+
+    for ((attempt = 1; attempt <= MAX_PARENT_ID_CLAIM_RETRIES; attempt++)); do
+        # errexit does NOT survive a command substitution -- bash clears it in the
+        # subshell -- and a die() inside claim_parent_id_once exits only THAT
+        # subshell. So the exit status is the one signal that survives; without
+        # absorbing it here the loop fell through to active_parent_task_exists ""
+        # (false, no t_*.md exists), echoed an EMPTY id and returned 0, and the
+        # caller wrote and committed aitasks/t_<name>.md (t1755).
+        #
+        # Declare once_rc first: `local x=$(…)` would mask the status in local's
+        # own return value, so `|| once_rc=$?` would never fire.
+        once_rc=0
+        claimed_id=$(claim_parent_id_once "$allow_interactive_fallback") || once_rc=$?
+        if (( once_rc != 0 )); then
+            # Not retryable: the counter is unavailable, or the user declined the
+            # local-scan fallback. Retrying would only reprint the same error. The
+            # retry below is for the id-COLLISION case alone.
+            return "$once_rc"
+        fi
+        # The single choke point that makes an id-less filename structurally
+        # impossible; callers check only the status and never restate this.
+        if [[ ! "$claimed_id" =~ ^[0-9]+$ ]]; then
+            warn "Atomic ID counter returned a non-numeric task ID ('$claimed_id')."
+            return 1
+        fi
+        if active_parent_task_exists "$claimed_id"; then
+            warn "Claimed task ID t$claimed_id already exists as an active parent task; retrying ($attempt/$MAX_PARENT_ID_CLAIM_RETRIES)." >&2
+            continue
+        fi
+        echo "$claimed_id"
+        return 0
+    done
+
+    die "Failed to claim a unique active parent task ID after $MAX_PARENT_ID_CLAIM_RETRIES attempts."
+}
+
+# List draft files with summary info
+list_drafts() {
+    if [[ ! -d "$DRAFT_DIR" ]] || ! ls "$DRAFT_DIR"/draft_*.md &>/dev/null; then
+        return 1
+    fi
+
+    local drafts=()
+    for f in "$DRAFT_DIR"/draft_*.md; do
+        [[ -e "$f" ]] || continue
+        local name parent_info=""
+        name=$(extract_name_from_draft "$f")
+        local parent
+        parent=$(extract_parent_from_draft "$f")
+        [[ -n "$parent" ]] && parent_info=" (child of t$parent)"
+        drafts+=("$(basename "$f") - ${name}${parent_info}")
+    done
+
+    if [[ ${#drafts[@]} -eq 0 ]]; then
+        return 1
+    fi
+
+    printf '%s\n' "${drafts[@]}"
+    return 0
+}
+
+# --- Step 2: Metadata Collection ---
+
+select_priority() {
+    task_levels_lines | fzf --prompt="Priority: " --height=10 --no-info --header="Select task priority"
+}
+
+select_effort() {
+    task_levels_lines_asc | fzf --prompt="Effort: " --height=10 --no-info --header="Select estimated effort"
+}
+
+select_issue_type() {
+    get_valid_task_types | fzf --prompt="Issue type: " --height=10 --no-info --header="Select issue type"
+}
+
+select_status() {
+    echo -e "Ready\nEditing\nImplementing\nPostponed" | fzf --prompt="Status: " --height=12 --no-info --header="Select task status"
+}
+
+# Cross-repo project picker. Writes the chosen project name to stdout, or
+# empty if the user picks "None (single-repo)" / cancels / no registered
+# resolvable projects exist. STALE registry entries are skipped with a
+# stderr warn. Caller stores the result in a local `xdeprepo` to thread
+# through draft creation.
+select_xdeprepo() {
+    local list_out
+    list_out=$("$SCRIPT_DIR/aitask_project_resolve.sh" list 2>/dev/null || true)
+    if [[ -z "$list_out" ]]; then
+        echo ""
+        return
+    fi
+
+    local -a candidates=()
+    local line name path status
+    while IFS= read -r line; do
+        [[ "$line" == PROJECT:* ]] || continue
+        IFS=':' read -r _ name path status <<< "$line"
+        case "$status" in
+            RESOLVED)
+                # Exclude the current project (resolves to $(pwd)) from the
+                # candidate list — a task cannot declare itself cross-repo
+                # against its own project.
+                if [[ "$path" != "$(pwd)" ]]; then
+                    candidates+=("$name")
+                fi
+                ;;
+            STALE)
+                warn "Cross-repo registry entry '$name' → $path is stale (skipped)" >&2
+                ;;
+        esac
+    done <<< "$list_out"
+
+    if [[ ${#candidates[@]} -eq 0 ]]; then
+        echo ""
+        return
+    fi
+
+    local options selected
+    options=$(printf '%s\n' "None (single-repo)" "${candidates[@]}")
+    selected=$(echo "$options" | fzf --prompt="Cross-repo project: " --height=12 --no-info \
+        --header="Select a cross-repo project (or None) — sets xdeprepo:" 2>/dev/null || echo "")
+
+    if [[ -z "$selected" ]] || [[ "$selected" == "None (single-repo)" ]]; then
+        echo ""
+        return
+    fi
+    echo "$selected"
+}
+
+# Consumed by labels_file_path() in lib/task_utils.sh. Keep the assignment: the
+# task_git staging sites below reference "$LABELS_FILE" directly, and under
+# `set -e` (without -u) an unset variable would expand to `task_git add ""`,
+# whose `|| true` would silently stop committing the vocabulary.
+LABELS_FILE="${TASK_DIR}/metadata/labels.txt"
+EMAILS_FILE="$AIT_EMAILS_FILE"
+# Budget for the contributor-list mutex, in the attempts x sleep form
+# stale_lock_acquire takes (~10s, matching acquire_child_lock above and
+# EMAILS_LOCK_TIMEOUT in aitask_pick_own.sh). Overridable so tests can drive both
+# the busy path and a long wait without waiting out the default.
+EMAILS_LOCK_ATTEMPTS="${EMAILS_LOCK_ATTEMPTS:-20}"
+EMAILS_LOCK_SLEEP="${EMAILS_LOCK_SLEEP:-0.5}"
+TASK_TYPES_FILE="aitasks/metadata/task_types.txt"
+
+ensure_emails_file() {
+    local dir
+    dir=$(dirname "$EMAILS_FILE")
+    mkdir -p "$dir"
+    touch "$EMAILS_FILE"
+}
+
+add_email_to_file() {
+    local email="$1"
+    [[ -n "$email" ]] || return 0
+    ensure_emails_file
+
+    # "This call OWES emails.txt a commit" — NOT "this call appended" (t1626).
+    # Two disjoint things set it, and both must reach the single commit tail at
+    # the bottom, which is why neither membership check returns early any more.
+    local needs_email_commit=false
+
+    if grep -qFx -- "$email" "$EMAILS_FILE" 2>/dev/null; then
+        # (a) RECOVERY, pre-lock. Already on disk — but membership alone must
+        # not end the call. An address appended by a write whose commit never
+        # happened is stranded exactly here: an "appended" flag would stay
+        # false and the file would stay dirty forever, because every later call
+        # short-circuits in the same place. Consult HEAD instead.
+        ait_email_is_committed "$email" || needs_email_commit=true
+    else
+        # `echo >> ; sort -u -o` is a read-modify-write, and `sort -o` renames a
+        # SNAPSHOT over the target — so a concurrent session's append made after that
+        # snapshot is erased. Atomicity is not serialization: hold the shared mutex,
+        # or do not write. This is the SAME lock path store_email() takes in
+        # aitask_pick_own.sh (t1608). The two reach it through different adapters —
+        # this one calls lib/stale_lock.sh directly, that one via lib/registry_lock.sh
+        # — but registry_lock delegates to stale_lock on the caller's dir, so both
+        # contend on one mkdir mutex. Keep both call sites on `ait_lock_dir emails`.
+        local lockdir token rc=0 rel_rc=0
+        lockdir="$(ait_lock_dir emails)" || return 0
+        # Same markerless-guard window registry_lock.sh passes, and that agreement
+        # is REQUIRED, not incidental (t1598): `ait_lock_dir emails` is reached both
+        # here and through registry_lock_acquire in aitask_pick_own.sh, so if the two
+        # disagreed then whether a wedged guard self-heals would depend on which
+        # writer happened to arrive first.
+        if ! stale_lock_acquire "$lockdir" "$EMAILS_LOCK_ATTEMPTS" "$EMAILS_LOCK_SLEEP" \
+                "contributor list" "$_STALE_LOCK_GC_WINDOW_DEFAULT"; then
+            # Best-effort, like store_email: the address is already recorded in the
+            # task's own assigned_to, only the autocomplete vocabulary misses it — and
+            # the task file is on disk uncommitted by now, so failing here would
+            # strand it to fix a strictly smaller problem. Nothing was written under
+            # the mutex, so there is nothing to commit either.
+            warn "contributor list busy — email not recorded$(stale_lock_describe "$lockdir")"
+            return 0
+        fi
+        token="$STALE_LOCK_TOKEN"
+        {
+            # Re-check under the lock: a holder we waited on may have added it.
+            if ! grep -qFx -- "$email" "$EMAILS_FILE" 2>/dev/null; then
+                # CHAINED ON PURPOSE. errexit is suppressed inside a group tested by
+                # `|| rc=$?`, so as two statements a failed append followed by a
+                # successful sort would leave the group's status at 0 — reporting
+                # success for an address that was never written. `&&` makes the
+                # append's failure the group's status, and skips a sort that would
+                # only rewrite the unchanged file.
+                #
+                # The flag sits BETWEEN the append and the sort, never behind both:
+                # the append is the write it answers for (t1614's ordering).
+                printf '%s\n' "$email" >> "$EMAILS_FILE" &&
+                    needs_email_commit=true &&
+                    sort -u "$EMAILS_FILE" -o "$EMAILS_FILE"
+            else
+                # (b) RECOVERY, under the lock. The holder we waited on added it
+                # and may have died — or had its own commit fail — between
+                # releasing the mutex and committing. Our pre-lock check ran
+                # while the address was still absent, so this is the ONLY place
+                # that interleaving can be caught (t1626). Same rule as (a).
+                #
+                # Pure read plus an assignment, kept LAST in the branch: it
+                # cannot set rc, so the group's status still answers for the
+                # append.
+                ait_email_is_committed "$email" || needs_email_commit=true
+            fi
+        } || rc=$?
+        # Keep the release STATUS rather than discarding it. Note the direction:
+        # a non-zero status means OUR OWN lock dir is still in place (guard busy,
+        # or a failed verified-rm), so the commit below is MORE serialized then,
+        # not less — gating it on this status would skip it precisely when it is
+        # safest. The genuinely ambiguous case ("not owner … leaving intact") is
+        # reported as SUCCESS. So the commit always runs; a retained mutex must
+        # never silently swallow an address that is already on disk.
+        stale_lock_release "$lockdir" "$token" || rel_rc=$?
+        [[ $rel_rc -eq 0 ]] || warn "add_email_to_file: contributor-list lock not fully released — the lock dir stays until stale_lock's dead-record reclaim clears it"
+        [[ $rc -eq 0 ]] || warn "add_email_to_file: failed to record ${email} (rc=$rc)"
+    fi
+
+    # The single commit tail. Path-scoped, and in its OWN commit that names no
+    # task: emails.txt is shared, so a commit of it may legitimately carry a
+    # concurrent session's append, and only a task-free message stays true.
+    # Same shape and message as commit_and_push() in aitask_pick_own.sh.
+    #
+    # Deliberately OUTSIDE the mutex, matching that split: task_git can die()
+    # on a wedged data worktree, and this critical section has no EXIT trap, so
+    # committing inside it would leak the lock dir. `sort -o` renames a temp
+    # over the target and a single short append is not torn, so the worst a
+    # concurrent writer can cause is a commit that lags its line by one write —
+    # and that line's own writer owes it a commit, which the recovery paths
+    # above now guarantee.
+    if [[ "$needs_email_commit" == true ]]; then
+        local crc=0
+        task_git_commit_scoped "ait: Record contributor email" "$EMAILS_FILE" || crc=$?
+        [[ $crc -eq 1 ]] && warn "could not commit ${EMAILS_FILE}"
+    fi
+    return 0
+}
+
+# sanitize_label / ensure_labels_file / get_existing_labels / add_label_to_file
+# live in lib/task_utils.sh — do not re-define them here.
+
+# --- Task Types Management ---
+
+ensure_task_types_file() {
+    local dir
+    dir=$(dirname "$TASK_TYPES_FILE")
+    mkdir -p "$dir"
+    touch "$TASK_TYPES_FILE"
+}
+
+# Write-path wrapper: keeps the ensure_task_types_file side effect, delegates
+# the read to lib/task_utils.sh::read_valid_task_types (shared with
+# aitask_update.sh, aitask_stats_legacy.sh and aitask_ls.sh).
+get_valid_task_types() {
+    ensure_task_types_file
+    read_valid_task_types "$TASK_TYPES_FILE"
+}
+
+validate_task_type() {
+    local type="$1"
+    if ! grep -qFx "$type" <(get_valid_task_types); then
+        local valid
+        valid=$(get_valid_task_types | tr '\n' ', ' | sed 's/,$//')
+        die "Invalid type: $type (must be one of: $valid)"
+    fi
+}
+
+# validate_xdeps_pair is defined in lib/task_utils.sh and shared with
+# aitask_update.sh. It reads BATCH_XDEPS / BATCH_XDEPREPO / SCRIPT_DIR
+# from the caller's environment.
+
+# Get labels interactively - sets SELECTED_LABELS variable
+# This function works directly with the terminal, not via command substitution
+get_labels_interactive() {
+    # Disable exit-on-error for this function (fzf and file operations can return non-zero)
+    set +e
+
+    SELECTED_LABELS=""
+    local selected_labels=()
+
+    # Offer the previous-task labels as a one-time menu entry in the first
+    # iteration. If the user selects it, we seed the selection with those
+    # labels and suppress the entry on subsequent loops.
+    local prev_labels_csv=""
+    local prev_labels_display=""
+    local offered_prev=false
+    prev_labels_csv=$(get_last_used_labels 2>/dev/null || true)
+    if [[ -n "$prev_labels_csv" ]]; then
+        prev_labels_display=">> Use labels from previous task (${prev_labels_csv})"
+    fi
+
+    while true; do
+        # Build options list, filtering out already selected labels
+        local existing_labels
+        existing_labels=$(get_existing_labels)
+
+        local available_labels=""
+        if [[ -n "$existing_labels" ]]; then
+            # Filter out already selected labels
+            while IFS= read -r lbl; do
+                local is_selected=false
+                for sel in "${selected_labels[@]}"; do
+                    if [[ "$sel" == "$lbl" ]]; then
+                        is_selected=true
+                        break
+                    fi
+                done
+                if [[ "$is_selected" == "false" ]]; then
+                    if [[ -n "$available_labels" ]]; then
+                        available_labels="${available_labels}"$'\n'"${lbl}"
+                    else
+                        available_labels="$lbl"
+                    fi
+                fi
+            done <<< "$existing_labels"
+        fi
+
+        local options
+        if [[ -n "$available_labels" ]]; then
+            options=">> Done adding labels"$'\n'">> Add new label"$'\n'"$available_labels"
+        else
+            options=">> Done adding labels"$'\n'">> Add new label"
+        fi
+        if [[ -n "$prev_labels_display" && "$offered_prev" == "false" ]]; then
+            options="${prev_labels_display}"$'\n'"${options}"
+        fi
+
+        # Select label using fzf
+        local selected
+        selected=$(printf "%s" "$options" | fzf --prompt="Select label: " --height=15 --no-info --header="Select existing label or add new")
+
+        if [[ -n "$selected" ]]; then
+            local label=""
+
+            if [[ -n "$prev_labels_display" && "$selected" == "$prev_labels_display" ]]; then
+                # Seed current selection with the previous labels and continue
+                # the loop; the entry is suppressed on subsequent iterations.
+                local _prev_split=()
+                IFS=',' read -ra _prev_split <<< "$prev_labels_csv"
+                for _pl in "${_prev_split[@]}"; do
+                    if [[ -n "$_pl" ]]; then
+                        selected_labels+=("$_pl")
+                        success "Added label: $_pl"
+                    fi
+                done
+                offered_prev=true
+                continue
+            elif [[ "$selected" == ">> Done adding labels" ]]; then
+                break
+            elif [[ "$selected" == ">> Add new label" ]]; then
+                local new_label
+                read -erp "Enter new label: " new_label
+                if [[ -n "$new_label" ]]; then
+                    label=$(sanitize_label "$new_label") || true
+                    if [[ -n "$label" ]]; then
+                        add_label_to_file "$label"
+                    else
+                        warn "'$new_label' is not a valid label (no usable characters, or a word YAML reads as a non-string such as on / null / 010)"
+                    fi
+                fi
+            else
+                label="$selected"
+            fi
+
+            if [[ -n "$label" ]]; then
+                selected_labels+=("$label")
+                success "Added label: $label"
+            fi
+        fi
+
+        # Show current selection
+        if [[ ${#selected_labels[@]} -gt 0 ]]; then
+            info "Current labels: ${selected_labels[*]}"
+        fi
+
+        # Ask to continue or done
+        local continue_choice
+        continue_choice=$(printf "Add another label\nDone with labels" | fzf --prompt="Continue? " --height=8 --no-info)
+
+        if [[ "$continue_choice" == "Done with labels" ]] || [[ -z "$continue_choice" ]]; then
+            break
+        fi
+    done
+
+    # Set result in global variable (normalized; see _set_selected_labels).
+    _set_selected_labels ${selected_labels[@]+"${selected_labels[@]}"}
+
+    # Re-enable exit-on-error
+    set -e
+}
+
+# _set_selected_labels [<label>...] -- set SELECTED_LABELS to the normalized CSV
+# of the picker's selection, warning about any dropped token. This normalizes the
+# WHOLE selection because two picker routes replay stored values without
+# sanitize_label: the "previous task" labels from userconfig.yaml, and an
+# existing labels.txt entry. A legacy vocabulary may hold a word YAML misreads
+# (`on`, `null`, `010`). This is the one point every route passes through before
+# set_last_used_labels and the unquoted draft writer see the value.
+_set_selected_labels() {
+    SELECTED_LABELS=""
+    (( $# > 0 )) || return 0
+    local csv dropped
+    csv="$(IFS=','; printf '%s' "$*")"
+    dropped=$(normalize_labels_csv "$csv" 2>&1 >/dev/null)
+    SELECTED_LABELS=$(normalize_labels_csv "$csv" 2>/dev/null)
+    if [[ -n "$dropped" ]]; then
+        warn "dropped invalid label(s): ${dropped#DROPPED:}"
+    fi
+    return 0
+}
+
+select_dependencies() {
+    local parent_num="${1:-}"  # Optional: parent task number for child tasks
+
+    local tasks
+    # Use --status all to show all tasks for dependency selection
+    tasks=$("$SCRIPT_DIR/aitask_ls.sh" -v -s all 99 2>/dev/null || echo "")
+
+    # If creating a child task, also list siblings at the top
+    local siblings=""
+    if [[ -n "$parent_num" ]]; then
+        local child_dir="$TASK_DIR/t${parent_num}"
+        if [[ -d "$child_dir" ]]; then
+            for f in "$child_dir"/t${parent_num}_*_*.md; do
+                [[ -e "$f" ]] || continue
+                local child_id
+                child_id=$(basename "$f" | grep -oE "^t${parent_num}_[0-9]+")
+                local child_name
+                child_name=$(basename "$f" .md)
+                if [[ -n "$siblings" ]]; then
+                    siblings="${siblings}"$'\n'"${child_name} (sibling)"
+                else
+                    siblings="${child_name} (sibling)"
+                fi
+            done
+        fi
+    fi
+
+    if [[ -z "$tasks" && -z "$siblings" ]]; then
+        echo ""
+        return
+    fi
+
+    # Build options list
+    local options="None - no dependencies"
+    if [[ -n "$siblings" ]]; then
+        options="${options}"$'\n'"${siblings}"
+    fi
+    if [[ -n "$tasks" ]]; then
+        options="${options}"$'\n'"${tasks}"
+    fi
+
+    local selected
+    selected=$(echo "$options" | fzf --multi --prompt="Dependencies (Tab to select): " --height=15 --no-info --header="Select task dependencies (Tab=select, Enter=confirm)")
+
+    # Check if "None" was selected or nothing selected
+    if [[ -z "$selected" ]] || echo "$selected" | grep -q "^None"; then
+        echo ""
+        return
+    fi
+
+    # Extract task IDs from selected lines
+    # For siblings: t1_2_name (sibling) -> t1_2
+    # For regular: t10_name.md [...] -> 10
+    local deps=""
+    while IFS= read -r line; do
+        if echo "$line" | grep -q "(sibling)"; then
+            # Extract child task ID (e.g., t1_2)
+            local child_id
+            child_id=$(echo "$line" | grep -oE "^t[0-9]+_[0-9]+")
+            if [[ -n "$child_id" ]]; then
+                deps="${deps:+$deps,}$child_id"
+            fi
+        else
+            # Extract regular task number
+            local task_num
+            task_num=$(echo "$line" | grep -oE '^t[0-9]+' | sed 's/t//')
+            if [[ -n "$task_num" ]]; then
+                deps="${deps:+$deps,}$task_num"
+            fi
+        fi
+    done <<< "$selected"
+
+    echo "$deps"
+}
+
+select_archived_task_ref() {
+    local lines selected path
+    lines=$("$SCRIPT_DIR/aitask_query_files.sh" recent-archived 999 2>/dev/null || true)
+
+    if [[ -z "$lines" ]] || [[ "$lines" == "NO_RECENT_ARCHIVED" ]]; then
+        warn "No archived tasks found." >&2
+        echo ""
+        return
+    fi
+
+    local rows
+    rows=$(echo "$lines" | awk -F'|' '
+        /^RECENT_ARCHIVED:/ {
+            sub(/^RECENT_ARCHIVED:/, "", $1)
+            printf "%s    [%s] %s (%s)\n", $1, $2, $4, $3
+        }')
+
+    selected=$(echo "$rows" | fzf --prompt="Archived task: " --height=20 --no-info \
+        --header="Select archived task to reference (Esc to cancel)" \
+        --preview 'head -80 {1}' --preview-window=right:60% \
+        2>/dev/null || echo "")
+
+    if [[ -z "$selected" ]]; then
+        echo ""
+        return
+    fi
+
+    path=$(echo "$selected" | awk '{print $1}')
+    echo "$path"
+}
+
+# Cross-repo variant: select an archived task from the registered project
+# named by $1 (the active xdeprepo). Echoes `<xdeprepo>#<id>` (e.g.
+# `aitasks_mobile#42_3`) on selection, empty on cancel / no results.
+# Preview is omitted because the path lives in the cross-repo project root
+# and would resolve incorrectly from this shell's pwd.
+select_cross_repo_archived_task_ref() {
+    local xdeprepo="$1"
+    [[ -n "$xdeprepo" ]] || { echo ""; return; }
+
+    local lines rows selected path id basename_f
+    lines=$("$SCRIPT_DIR/aitask_query_files.sh" --project "$xdeprepo" recent-archived 999 2>/dev/null || true)
+
+    if [[ -z "$lines" ]] || [[ "$lines" == "NO_RECENT_ARCHIVED" ]]; then
+        warn "No archived tasks found in cross-repo project '$xdeprepo'." >&2
+        echo ""
+        return
+    fi
+
+    rows=$(echo "$lines" | awk -F'|' '
+        /^RECENT_ARCHIVED:/ {
+            sub(/^RECENT_ARCHIVED:/, "", $1)
+            printf "%s    [%s] %s (%s)\n", $1, $2, $4, $3
+        }')
+
+    selected=$(echo "$rows" | fzf --prompt="Archived task ($xdeprepo): " --height=20 --no-info \
+        --header="Select cross-repo archived task to reference (Esc to cancel)" \
+        2>/dev/null || echo "")
+
+    if [[ -z "$selected" ]]; then
+        echo ""
+        return
+    fi
+
+    path=$(echo "$selected" | awk '{print $1}')
+    basename_f=$(basename "$path" .md)
+    # Strip the leading `t` and the trailing `_<slug>` to land on the bare id.
+    # e.g. `t832_1_xdeps_parser_and_validation` → `832_1`.
+    id=$(echo "$basename_f" | sed -E 's/^t([0-9]+(_[0-9]+)?).*/\1/')
+    if [[ -z "$id" ]] || [[ "$id" == "$basename_f" ]]; then
+        warn "Could not extract task ID from '$basename_f' — skipping insert." >&2
+        echo ""
+        return
+    fi
+    echo "${xdeprepo}#${id}"
+}
+
+# --- Step 3: Task Name ---
+
+sanitize_name() {
+    local name="$1"
+    # Convert to lowercase, replace spaces with underscores, remove special chars
+    echo "$name" | tr '[:upper:]' '[:lower:]' | tr ' ' '_' | tr -cd 'a-z0-9_' | sed 's/__*/_/g' | sed 's/^_//;s/_$//' | cut -c1-60
+}
+
+get_task_name() {
+    local name predesc=""
+    read -erp "Task name (short, will be sanitized): " name
+
+    # Detect if user accidentally entered a description as the task name
+    if [[ ${#name} -gt 50 ]]; then
+        warn "You entered a long text (${#name} chars). Is this part of the task description?"
+        local choice
+        choice=$(echo -e "Yes, it's a description\nNo, it's the task name" | fzf --prompt="Long input: " --height=5 --no-info)
+        if [[ "$choice" == "Yes, it's a description" ]]; then
+            echo "No problem, I'll keep it for the description. What should be the actual task name?" >&2
+            predesc="$name"
+            read -erp "Task name (short, will be sanitized): " name
+        fi
+    fi
+
+    local sanitized
+    sanitized=$(sanitize_name "$name")
+
+    # Default to unnamed_task if empty
+    [[ -z "$sanitized" ]] && sanitized="unnamed_task"
+
+    # Output: line 1 = sanitized name, line 2 = predesc text (empty if none)
+    echo "$sanitized"
+    echo "$predesc"
+}
+
+# --- Step 4-5: Task Definition Loop ---
+
+get_task_definition() {
+    local task_desc="${1:-}"
+    # Optional cross-repo project name. When non-empty, two extra menu
+    # items are offered in the file/task reference loop: cross-repo
+    # archived task ref and cross-repo file ref. Both insert into the
+    # description body using the documented notation
+    # (<project>#<id> for tasks, <project>:<relative/path> for files);
+    # neither pollutes `file_references:` (consistent with the local
+    # archived-task-ref precedent).
+    local xdeprepo="${2:-}"
+    local xdeprepo_root=""
+    if [[ -n "$xdeprepo" ]]; then
+        local resolve_out
+        resolve_out=$("$SCRIPT_DIR/aitask_project_resolve.sh" "$xdeprepo" 2>/dev/null || true)
+        if [[ "$resolve_out" == RESOLVED:* ]]; then
+            xdeprepo_root="${resolve_out#RESOLVED:}"
+        else
+            warn "Cross-repo project '$xdeprepo' did not resolve cleanly ($resolve_out) — cross-repo reference items disabled." >&2
+            xdeprepo=""
+        fi
+    fi
+
+    if [[ -n "$task_desc" ]]; then
+        info "Pre-populated description with your earlier text. You can add more or finish." >&2
+    fi
+
+    # Track file refs across all outer rounds (for structured file_references output)
+    local -a all_file_refs=()
+    if [[ ${#BATCH_FILE_REFS[@]} -gt 0 ]]; then
+        all_file_refs=("${BATCH_FILE_REFS[@]}")
+        info "Pre-populated file references: ${all_file_refs[*]}" >&2
+    fi
+
+    while true; do
+        # Step 4: Get description block
+        echo "" >&2
+        read -erp "Enter description (or press Enter to skip): " desc_block
+
+        if [[ -n "$desc_block" ]]; then
+            if [[ -n "$task_desc" ]]; then
+                # Add blank line before new description block
+                task_desc="$task_desc
+
+$desc_block"
+            else
+                task_desc="$desc_block"
+            fi
+        fi
+
+        # Step 5: Optional file references loop
+        local -a current_round_refs=()
+        while true; do
+            local add_file
+            local menu_opts="Add file reference\nAdd archived task reference"
+            if [[ -n "$xdeprepo" ]]; then
+                menu_opts="${menu_opts}\nAdd cross-repo file reference (from ${xdeprepo})\nAdd cross-repo archived task reference (from ${xdeprepo})"
+            fi
+            menu_opts="${menu_opts}\nDone with files"
+            if [[ ${#current_round_refs[@]} -gt 0 ]]; then
+                # Insert Remove option just before Done
+                menu_opts="${menu_opts%\\nDone with files}\nRemove reference\nDone with files"
+            fi
+            add_file=$(echo -e "$menu_opts" | fzf --prompt="Add reference? " --height=10 --no-info)
+
+            if [[ "$add_file" == "Done with files" ]] || [[ -z "$add_file" ]]; then
+                break
+            elif [[ "$add_file" == "Add archived task reference" ]]; then
+                local selected_archived
+                selected_archived=$(select_archived_task_ref)
+                if [[ -n "$selected_archived" ]]; then
+                    if [[ -n "$task_desc" ]]; then
+                        task_desc="$task_desc
+$selected_archived"
+                    else
+                        task_desc="$selected_archived"
+                    fi
+                    # Track in current_round_refs so the in-round Remove
+                    # affordance can drop it. Deliberately NOT added to
+                    # all_file_refs — archived task references stay inline
+                    # in the description only, not in file_references:.
+                    current_round_refs+=("$selected_archived")
+                    success "Added archived ref: $selected_archived" >&2
+                fi
+                continue
+            elif [[ "$add_file" == "Add cross-repo archived task reference (from ${xdeprepo})" ]]; then
+                local selected_xr_task
+                selected_xr_task=$(select_cross_repo_archived_task_ref "$xdeprepo")
+                if [[ -n "$selected_xr_task" ]]; then
+                    if [[ -n "$task_desc" ]]; then
+                        task_desc="$task_desc
+$selected_xr_task"
+                    else
+                        task_desc="$selected_xr_task"
+                    fi
+                    current_round_refs+=("$selected_xr_task")
+                    success "Added cross-repo task ref: $selected_xr_task" >&2
+                fi
+                continue
+            elif [[ "$add_file" == "Add cross-repo file reference (from ${xdeprepo})" ]]; then
+                local selected_xr_file rel_path
+                # fzf walker rooted in the cross-repo project so paths are
+                # relative to that root; compose <xdeprepo>:<relative-path>.
+                selected_xr_file=$(cd "$xdeprepo_root" && fzf --prompt="Select file from ${xdeprepo}: " \
+                    --height=20 --preview 'head -50 {}' \
+                    --walker=file,hidden --walker-skip=.git,node_modules,build < /dev/tty 2>/dev/null || echo "")
+                if [[ -n "$selected_xr_file" ]]; then
+                    rel_path="${selected_xr_file#./}"
+                    local xr_ref="${xdeprepo}:${rel_path}"
+                    if [[ -n "$task_desc" ]]; then
+                        task_desc="$task_desc
+$xr_ref"
+                    else
+                        task_desc="$xr_ref"
+                    fi
+                    # Inline only — NOT added to all_file_refs (same precedent
+                    # as cross-repo archived task refs above).
+                    current_round_refs+=("$xr_ref")
+                    success "Added cross-repo file ref: $xr_ref" >&2
+                fi
+                continue
+            elif [[ "$add_file" == "Remove reference" ]]; then
+                # Let user pick which file ref to remove
+                local remove_file
+                remove_file=$(printf '%s\n' "${current_round_refs[@]}" | fzf --prompt="Remove which file? " --height=12 --no-info)
+
+                if [[ -n "$remove_file" ]]; then
+                    # Remove from task_desc (the file path is on its own line)
+                    task_desc=$(echo "$task_desc" | grep -vxF "$remove_file")
+                    # Remove from tracking array
+                    local -a new_refs=()
+                    local ref
+                    for ref in "${current_round_refs[@]}"; do
+                        [[ "$ref" != "$remove_file" ]] && new_refs+=("$ref")
+                    done
+                    current_round_refs=("${new_refs[@]}")
+                    # Also remove from the persistent all_file_refs list
+                    local -a new_all=()
+                    for ref in "${all_file_refs[@]}"; do
+                        [[ "$ref" != "$remove_file" ]] && new_all+=("$ref")
+                    done
+                    all_file_refs=("${new_all[@]}")
+                    success "Removed: $remove_file" >&2
+                fi
+                continue
+            fi
+
+            # Use fzf's built-in file walker for interactive fuzzy finding
+            # Redirect from /dev/tty so fzf can detect TTY inside subshell
+            local selected_file
+            selected_file=$(fzf --prompt="Select file: " --height=20 --preview 'head -50 {}' --walker=file,hidden --walker-skip=.git,node_modules,build < /dev/tty 2>/dev/null || echo "")
+
+            if [[ -n "$selected_file" ]]; then
+                if [[ -n "$task_desc" ]]; then
+                    task_desc="$task_desc
+$selected_file"
+                else
+                    task_desc="$selected_file"
+                fi
+                current_round_refs+=("$selected_file")
+                all_file_refs+=("$selected_file")
+                success "Added: $selected_file" >&2
+            fi
+        done
+
+        # Ask to continue with more description
+        local continue_choice
+        continue_choice=$(echo -e "Add more description\nDone - create task" | fzf --prompt="Continue? " --height=8 --no-info)
+
+        if [[ "$continue_choice" == "Done - create task" ]] || [[ -z "$continue_choice" ]]; then
+            break
+        fi
+    done
+
+    # Output task_desc followed by marker line and structured file refs.
+    # The caller (run_draft_interactive) splits on __FILE_REFS_MARKER__.
+    echo "$task_desc"
+    echo "__FILE_REFS_MARKER__"
+    local ref
+    for ref in "${all_file_refs[@]}"; do
+        echo "$ref"
+    done
+}
+
+# --- Step 6: Create Task File ---
+
+get_timestamp() {
+    date '+%Y-%m-%d %H:%M'
+}
+
+# Deduplicate a bash array of file-reference strings by exact-string match,
+# preserving order of first occurrence. Prints them NEWLINE-separated: an entry
+# may legally contain a comma ("a,b.py"), so a comma-joined carrier would split
+# it. format_yaml_path_list consumes this form.
+dedup_file_refs() {
+    local -n arr_ref=$1
+    local -A seen=()
+    local -a unique=()
+    local item
+    for item in "${arr_ref[@]}"; do
+        if [[ -z "${seen[$item]:-}" ]]; then
+            seen[$item]=1
+            unique+=("$item")
+        fi
+    done
+    [[ ${#unique[@]} -gt 0 ]] || return 0
+    printf '%s\n' "${unique[@]}"
+}
+
+# run_auto_merge_if_needed <new_id> <new_file>
+#
+# After a task has been created + committed, scan the task's file_references
+# frontmatter for paths that match any existing pending task via
+# aitask_find_by_file.sh. If matches are found, honor --auto-merge by
+# delegating to the aitask_fold_* scripts; otherwise warn and skip.
+#
+# This helper is only invoked from the --batch --commit paths. It is a
+# no-op for any of these conditions:
+#   - the new task has no file_references
+#   - no pending tasks reference any of those paths
+#   - BATCH_AUTO_MERGE is false AND there are matches (warn + skip)
+run_auto_merge_if_needed() {
+    local new_id="$1"
+    local new_file="$2"
+    new_id="${new_id#t}"
+
+    [[ -f "$new_file" ]] || return 0
+
+    # Collect distinct path-only portions from the new task's file_references.
+    # Read with an explicit status check: auto-merge is best-effort, so an
+    # unreadable field skips it with a warning rather than reading as "no refs".
+    local -a paths=()
+    local -A seen_paths=()
+    local entry entry_path refs_out refs_rc=0
+    refs_out="$(get_file_references "$new_file")" || refs_rc=$?
+    if [[ $refs_rc -ne 0 ]]; then
+        warn "auto-merge skipped: file_references of $new_file could not be read (status $refs_rc)" >&2
+        return 0
+    fi
+    while IFS= read -r entry; do
+        [[ -z "$entry" ]] && continue
+        entry_path="${entry%%:*}"
+        [[ -z "$entry_path" ]] && continue
+        if [[ -z "${seen_paths[$entry_path]:-}" ]]; then
+            seen_paths[$entry_path]=1
+            paths+=("$entry_path")
+        fi
+    done <<< "$refs_out"
+
+    [[ ${#paths[@]} -eq 0 ]] && return 0
+
+    # Union candidate task IDs across all paths, dedup by id, exclude new_id.
+    local -A cand_seen=()
+    local -a cand_ids=()
+    local -a cand_files=()
+    local -A cand_paths_by_id=()
+    local p find_out line tid tfile
+    for p in "${paths[@]}"; do
+        find_out=$("$SCRIPT_DIR/aitask_find_by_file.sh" "$p" 2>/dev/null || true)
+        [[ -z "$find_out" ]] && continue
+        while IFS= read -r line; do
+            [[ "$line" == TASK:* ]] || continue
+            tid="${line#TASK:}"
+            tfile="${tid#*:}"
+            tid="${tid%%:*}"
+            [[ -z "$tid" ]] && continue
+            [[ "$tid" == "$new_id" ]] && continue
+            if [[ -z "${cand_seen[$tid]:-}" ]]; then
+                cand_seen[$tid]=1
+                cand_ids+=("$tid")
+                cand_files+=("$tfile")
+                cand_paths_by_id[$tid]="$p"
+            fi
+        done <<< "$find_out"
+    done
+
+    [[ ${#cand_ids[@]} -eq 0 ]] && return 0
+
+    if [[ "$BATCH_AUTO_MERGE" != true && "$BATCH_MODE" != true && -t 0 ]]; then
+        info "Found ${#cand_ids[@]} pending task(s) that already reference this file:"
+        local prompt_i
+        for ((prompt_i = 0; prompt_i < ${#cand_ids[@]}; prompt_i++)); do
+            info "  - t${cand_ids[$prompt_i]} (${cand_paths_by_id[${cand_ids[$prompt_i]}]}) → ${cand_files[$prompt_i]}"
+        done
+        local merge_choice
+        merge_choice=$(printf 'Yes, fold them into this task\nNo, keep separate\n' \
+            | fzf --prompt="Auto-merge? " --height=6 --no-info \
+                  --header="Fold ${#cand_ids[@]} matching task(s) into t${new_id}") || true
+        if [[ "$merge_choice" == Yes* ]]; then
+            BATCH_AUTO_MERGE=true
+        fi
+    fi
+
+    if [[ "$BATCH_AUTO_MERGE" != true ]]; then
+        warn "Found ${#cand_ids[@]} pending task(s) that already reference this file:"
+        local i
+        for ((i = 0; i < ${#cand_ids[@]}; i++)); do
+            warn "  - t${cand_ids[$i]} (${cand_paths_by_id[${cand_ids[$i]}]}) → ${cand_files[$i]}"
+        done
+        warn "Auto-merge skipped (pass --auto-merge to fold them into this task)."
+        return 0
+    fi
+
+    # Validate the candidate set. Exclude-self is belt + braces.
+    local validate_out
+    validate_out=$("$SCRIPT_DIR/aitask_fold_validate.sh" --exclude-self "$new_id" "${cand_ids[@]}" 2>/dev/null || true)
+
+    local -a valid_ids=()
+    local -a valid_files=()
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        case "$line" in
+            VALID:*)
+                local rest="${line#VALID:}"
+                local vid="${rest%%:*}"
+                local vfile="${rest#*:}"
+                valid_ids+=("$vid")
+                valid_files+=("$vfile")
+                ;;
+            INVALID:*)
+                local rest="${line#INVALID:}"
+                local iid="${rest%%:*}"
+                local ireason="${rest#*:}"
+                warn "Auto-merge: skipping t${iid} (${ireason})"
+                ;;
+        esac
+    done <<< "$validate_out"
+
+    [[ ${#valid_ids[@]} -eq 0 ]] && return 0
+
+    info "Auto-merging ${#valid_ids[@]} task(s) into t${new_id}..."
+
+    # Body merge: fold_content → update --desc-file -
+    "$SCRIPT_DIR/aitask_fold_content.sh" "$new_file" "${valid_files[@]}" \
+        | "$SCRIPT_DIR/aitask_update.sh" --batch "$new_id" --desc-file - --silent >/dev/null
+
+    # Mark + commit: fold_mark
+    "$SCRIPT_DIR/aitask_fold_mark.sh" --commit-mode fresh "$new_id" "${valid_ids[@]}" >/dev/null
+
+    local joined=""
+    local vid
+    for vid in "${valid_ids[@]}"; do
+        if [[ -n "$joined" ]]; then
+            joined="${joined}, t${vid}"
+        else
+            joined="t${vid}"
+        fi
+    done
+    success "Folded ${joined} into t${new_id}"
+}
+
+create_task_file() {
+    local task_num="$1"
+    local task_name="$2"
+    local priority="$3"
+    local effort="$4"
+    local deps="$5"
+    local description="$6"
+    local issue_type="$7"
+    local status="$8"
+    local labels="$9"
+    local assigned_to="${10:-}"
+    local issue="${11:-}"
+    local pull_request="${12:-}"
+    local contributor="${13:-}"
+    local contributor_email="${14:-}"
+    local file_references="${15:-}"
+    local verifies="${16:-}"
+    # premise_baseline (t1663_3): the value resolve_premise_seed() decided --
+    # the creation-time seed, an explicit --premise-baseline, or "" for none.
+    local premise_baseline="${17:-}"
+
+    local filename="t${task_num}_${task_name}.md"
+    local filepath="$TASK_DIR/$filename"
+
+    local timestamp
+    timestamp=$(get_timestamp)
+
+    local deps_yaml
+    deps_yaml=$(format_yaml_list "$deps")
+
+    local labels_yaml
+    labels_yaml=$(format_yaml_list "$labels")
+
+    # Create the file with YAML front matter
+    # The body is a renderer for ait_atomic_render (lib/atomic_write.sh):
+    # it is staged beside the target and renamed into place, so a scan of
+    # aitasks/*.md never catches the new file at zero bytes. Renderer
+    # contract: must NOT rely on `set -e` (the calling context disables it).
+    # Every command here is an `echo` or a `[[ ]]` test, whose only failure
+    # mode is a broken output fd -- which fails the trailing `echo` too. Any
+    # command added here that can fail on its own needs `|| return 1`.
+    _ait_create_task_file_body() {
+        echo "---"
+        echo "priority: $priority"
+        echo "effort: $effort"
+        echo "depends: $deps_yaml"
+        # Cross-repo fields. As of t832_10, `xdeprepo:` may appear alone
+        # (intent-only mode); `xdeps:` still requires `xdeprepo:`
+        # (enforced by validate_xdeps_pair).
+        if [[ -n "${BATCH_XDEPS:-}" ]]; then
+            local xdeps_yaml
+            xdeps_yaml=$(format_yaml_list "$BATCH_XDEPS")
+            echo "xdeps: $xdeps_yaml"
+        fi
+        if [[ -n "${BATCH_XDEPREPO:-}" ]]; then
+            echo "xdeprepo: $BATCH_XDEPREPO"
+        fi
+        echo "issue_type: $issue_type"
+        echo "status: $status"
+        echo "labels: $labels_yaml"
+        # Only write gates if present (opt-in declared gate set; read from the
+        # batch global, mirroring xdeps/xdeprepo above). t635_1.
+        if [[ -n "${BATCH_GATES:-}" ]]; then
+            local gates_yaml
+            gates_yaml=$(format_yaml_list "$BATCH_GATES")
+            echo "gates: $gates_yaml"
+        fi
+        # Only write also_blocks_dependents if present (per-task extra unblock
+        # gates; augments registry blocks_dependents defaults). t635_3.
+        if [[ -n "${BATCH_ALSO_BLOCKS_DEPENDENTS:-}" ]]; then
+            local abd_yaml
+            abd_yaml=$(format_yaml_list "$BATCH_ALSO_BLOCKS_DEPENDENTS")
+            echo "also_blocks_dependents: $abd_yaml"
+        fi
+        # Only write verifies if present
+        if [[ -n "$verifies" ]]; then
+            local verifies_yaml
+            verifies_yaml=$(format_yaml_list "$verifies")
+            echo "verifies: $verifies_yaml"
+        fi
+        # Only write file_references if present
+        if [[ -n "$file_references" ]]; then
+            local file_refs_yaml
+            file_refs_yaml=$(format_yaml_path_list "$file_references") || return 1
+            echo "file_references: $file_refs_yaml"
+        fi
+        # Only write premise_baseline if present (t1663_3). Right after the
+        # scope lines it is seeded from; the serializer emits it verbatim.
+        if [[ -n "$premise_baseline" ]]; then
+            echo "premise_baseline: $premise_baseline"
+        fi
+        # Only write assigned_to if present
+        if [[ -n "$assigned_to" ]]; then
+            echo "assigned_to: $assigned_to"
+        fi
+        # Only write anchor (topic group key) if present
+        if [[ -n "$RESOLVED_ANCHOR" ]]; then
+            echo "anchor: $RESOLVED_ANCHOR"
+        fi
+        # Only write followup_kind (auto-spawned follow-up provenance) if present
+        if [[ -n "$BATCH_FOLLOWUP_KIND" ]]; then
+            echo "followup_kind: $BATCH_FOLLOWUP_KIND"
+        fi
+        # Only write issue if present
+        if [[ -n "$issue" ]]; then
+            echo "issue: $issue"
+        fi
+        if [[ -n "$pull_request" ]]; then
+            echo "pull_request: $pull_request"
+        fi
+        if [[ -n "$contributor" ]]; then
+            echo "contributor: $contributor"
+        fi
+        if [[ -n "$contributor_email" ]]; then
+            echo "contributor_email: $contributor_email"
+        fi
+        echo "created_at: $timestamp"
+        echo "updated_at: $timestamp"
+        echo "---"
+        echo ""
+        echo "$description"
+    }
+    ait_atomic_render "$filepath" _ait_create_task_file_body \
+        || die "could not write task file: $filepath"
+
+    echo "$filepath"
+}
+
+# commit_task() was removed in t1599_4. It was unreachable: the interactive flow
+# creates a DRAFT and commits nothing, and both committing menu branches route to
+# finalize_draft(). Keeping it would have meant carrying a fifth unconditional
+# labels.txt staging site plus a revival hazard -- it establishes no per-invocation
+# state, so a future caller would have inherited whatever AIT_LABELS_ADDED an
+# earlier registration left behind. Any revived commit path must build its own
+# _stage_labels from its own registration call, as finalize_draft does.
+
+# --- Batch Mode ---
+
+run_batch_mode() {
+    # --premise-baseline is a creation input of --commit only. A finalize seeds
+    # from the draft's own fields, and a draft is never seeded; refusing here,
+    # before either finalize branch returns, keeps the flag from being silently
+    # ignored.
+    if [[ "$BATCH_PREMISE_BASELINE_SET" == true \
+          && ( "$BATCH_COMMIT" != true || "$BATCH_FINALIZE_ALL" == true || -n "$BATCH_FINALIZE" ) ]]; then
+        die "--premise-baseline requires --commit and cannot be combined with --finalize/--finalize-all (drafts are never seeded)"
+    fi
+
+    # Handle finalize operations first (don't require --name/--desc)
+    if [[ "$BATCH_FINALIZE_ALL" == true ]]; then
+        finalize_all_drafts "$BATCH_SILENT"
+        return
+    fi
+
+    if [[ -n "$BATCH_FINALIZE" ]]; then
+        local draft_path
+        # Accept either just filename or full path
+        if [[ -f "$BATCH_FINALIZE" ]]; then
+            draft_path="$BATCH_FINALIZE"
+        elif [[ -f "$DRAFT_DIR/$BATCH_FINALIZE" ]]; then
+            draft_path="$DRAFT_DIR/$BATCH_FINALIZE"
+        else
+            die "Draft file not found: $BATCH_FINALIZE"
+        fi
+        finalize_draft "$draft_path" "$BATCH_SILENT"
+        return
+    fi
+
+    # Regular task creation - ensure task directory exists
+    mkdir -p "$TASK_DIR"
+
+    # Validate required fields
+    [[ -z "$BATCH_NAME" ]] && die "Batch mode requires --name"
+
+    # Handle description from file
+    if [[ -n "$BATCH_DESC_FILE" ]]; then
+        if [[ "$BATCH_DESC_FILE" == "-" ]]; then
+            BATCH_DESC=$(cat)
+        else
+            [[ -f "$BATCH_DESC_FILE" ]] || die "Description file not found: $BATCH_DESC_FILE"
+            BATCH_DESC=$(cat "$BATCH_DESC_FILE")
+        fi
+    fi
+
+    [[ -z "$BATCH_DESC" ]] && die "Batch mode requires --desc or --desc-file"
+
+    # Validate enum values
+    is_valid_task_level "$BATCH_PRIORITY" \
+        || die "Invalid priority: $BATCH_PRIORITY (must be high, medium, or low)"
+
+    is_valid_task_level "$BATCH_EFFORT" \
+        || die "Invalid effort: $BATCH_EFFORT (must be low, medium, or high)"
+
+    validate_task_type "$BATCH_TYPE"
+
+    # Keep only gates a manual_verification task can reach (it skips Steps 6-8,
+    # so planning/review gates like risk_evaluated would block archival forever).
+    # No-op for every other issue_type. See filter_gates_for_issue_type (t1156).
+    if [[ -n "$BATCH_GATES" ]]; then
+        local _gate_stripped
+        _gate_stripped=$(filter_gates_for_issue_type "$BATCH_TYPE" "$BATCH_GATES" 2>&1 >/dev/null)
+        BATCH_GATES=$(filter_gates_for_issue_type "$BATCH_TYPE" "$BATCH_GATES" 2>/dev/null)
+        [[ -n "$_gate_stripped" ]] && info "manual_verification: dropped unreachable gate(s): ${_gate_stripped#STRIPPED:} (recorded in planning/review steps this task type skips)"
+    fi
+
+    case "$BATCH_STATUS" in
+        Ready|Editing|Implementing|Postponed) ;;
+        *) die "Invalid status: $BATCH_STATUS (must be Ready, Editing, Implementing, or Postponed)" ;;
+    esac
+
+    # Validate cross-repo dependency pair (xdeps + xdeprepo): both-or-neither,
+    # repo must resolve, IDs must exist cross-repo. Normalize empty strings.
+    validate_xdeps_pair
+
+    # Validate --followup-kind (t1468_1) BEFORE any file is written, so an
+    # invalid value never produces a partial task. REJECT, never coerce: the
+    # value is provenance identity, and the vocabulary is framework-semantic
+    # (lib/followup_kinds.py), not user-extensible like labels/task_types.
+    if [[ -n "$BATCH_FOLLOWUP_KIND" ]]; then
+        if ! is_valid_followup_kind "$BATCH_FOLLOWUP_KIND"; then
+            die "Invalid followup_kind: $BATCH_FOLLOWUP_KIND (must be one of: $(followup_kinds_pipe 2>/dev/null | tr '|' ' '))"
+        fi
+        # Cross-field invariant: the manual_verification KIND requires the
+        # manual_verification TYPE, so a task can never show the MV glyph while
+        # taking the bug/feature workflow. The converse is NOT required -- an MV
+        # task may legitimately be a carry_over.
+        enforce_manual_verification_kind_invariant "$BATCH_TYPE" "$BATCH_FOLLOWUP_KIND"
+    fi
+
+    # Validate --premise-baseline (t1663_3) BEFORE the id claim and the label
+    # registration, so a rejection burns no id and writes nothing. Grammar only
+    # (premise_baseline_canonical): the flag carries an inherited value, which may
+    # name a commit a history rewrite removed.
+    if [[ "$BATCH_PREMISE_BASELINE_SET" == true && -n "$BATCH_PREMISE_BASELINE" ]]; then
+        local _pb_canon
+        if ! _pb_canon="$(premise_baseline_canonical "$BATCH_PREMISE_BASELINE")"; then
+            die "Invalid --premise-baseline value: '$BATCH_PREMISE_BASELINE' (expected '<full 40- or 64-hex commit id> @ YYYY-MM-DD HH:MM', or \"\" for none)"
+        fi
+        BATCH_PREMISE_BASELINE="$_pb_canon"
+    fi
+
+    # Resolve the topic-anchor (--anchor/--followup-of/--parent) into
+    # RESOLVED_ANCHOR before any file is created; validates the target exists.
+    resolve_anchor
+
+    # Sanitize task name
+    local task_name
+    task_name=$(sanitize_name "$BATCH_NAME")
+    [[ -z "$task_name" ]] && task_name="unnamed_task"
+
+    # Normalize --labels before anything is written, so the task frontmatter and
+    # aitasks/metadata/labels.txt can never disagree. Pure (no file write): an
+    # abandoned draft must not leave its labels behind in the vocabulary.
+    # Policy for tokens that sanitize to nothing (e.g. "!!!") is warn-and-drop:
+    # exit 0, a stderr warning, and the label simply does not appear.
+    if [[ -n "$BATCH_LABELS" ]]; then
+        local _label_dropped
+        _label_dropped=$(normalize_labels_csv "$BATCH_LABELS" 2>&1 >/dev/null)
+        BATCH_LABELS=$(normalize_labels_csv "$BATCH_LABELS" 2>/dev/null)
+        [[ -n "$_label_dropped" ]] && warn "dropped invalid label(s): ${_label_dropped#DROPPED:}"
+    fi
+
+    local filepath
+    local task_id
+
+    if [[ "$BATCH_COMMIT" == true ]]; then
+        # BEFORE the label registration below, and so before acquire_child_lock /
+        # claim_unique_parent_id: refusing after the claim would still burn the
+        # id, which is finding 7's whole shape (t1725_2).
+        assert_task_data_writable
+
+        # Claim the parent id BEFORE the label registration below. add_label_to_file
+        # writes labels.txt to disk immediately (lib/task_utils.sh), so a claim
+        # failure after it aborted with the shared vocabulary already appended -- a
+        # task-less label the user never asked for. Rolling back is NOT the
+        # alternative: restoring the file wholesale would clobber a concurrent
+        # session's append, which is the t1662 hazard. Claiming first makes the
+        # "nothing is written" guarantee literally true -- resolve_anchor,
+        # sanitize_name and normalize_labels_csv are all read-only, the last
+        # explicitly so (t1755).
+        #
+        # What this does NOT buy: a label-write failure now burns an id, where
+        # before it burned nothing. That is the cheaper direction -- a burned id is
+        # self-healing (`aitask_claim_id.sh --resync`), a vocabulary entry for a
+        # task that does not exist is user-visible garbage -- and a local disk write
+        # fails far more rarely than a git-backed counter claim.
+        local claimed_id="" claim_rc=0
+        if [[ -z "$BATCH_PARENT" ]]; then
+            claimed_id=$(claim_unique_parent_id false) || claim_rc=$?
+            if (( claim_rc != 0 )); then
+                die "Task ID claim failed (see the error above); no task was created."
+            fi
+        fi
+
+        # Register new labels in the vocabulary BEFORE the parent/child split, so
+        # labels.txt rides in the very same task-creation commit when -- and only
+        # when -- this invocation actually appended to it.
+        # >&2 is load-bearing: info() writes to stdout, and --silent promises
+        # exactly one stdout line that callers parse.
+        #
+        # ONE gate shared by both commit sites below: they are both downstream of
+        # this single registration, in this same scope (t1599_4 / t1662).
+        local _stage_labels=false
+        if [[ -n "$BATCH_LABELS" ]]; then
+            add_labels_csv_to_file "$BATCH_LABELS"
+            if (( ${#AIT_LABELS_ADDED[@]} > 0 )); then
+                _stage_labels=true
+                info "Added to label vocabulary: $(IFS=','; echo "${AIT_LABELS_ADDED[*]}")" >&2
+            fi
+        fi
+
+        # --commit: auto-finalize immediately (claims real ID, requires network)
+        if [[ -n "$BATCH_PARENT" ]]; then
+            # Child task: create directly (parent ID is already unique)
+            # Lock to prevent parallel races on child number assignment
+            acquire_child_lock "$BATCH_PARENT"
+            trap '_child_lock_exit_trap' EXIT
+            ait_archive_rearm_exit_trap
+
+            local parent_file
+            parent_file=$(get_parent_task_file "$BATCH_PARENT")
+            if [[ -z "$parent_file" || ! -f "$parent_file" ]]; then
+                # About to die: a release failure already warned, and the die
+                # status must carry THIS message.
+                release_child_lock "$BATCH_PARENT" || true
+                trap - EXIT
+                ait_archive_rearm_exit_trap
+                die "Parent task t$BATCH_PARENT not found"
+            fi
+
+            local child_num
+            child_num=$(get_next_child_number "$BATCH_PARENT")
+
+            # Add default sibling dependency unless --no-sibling-dep
+            if [[ "$BATCH_NO_SIBLING_DEP" != true && "$child_num" -gt 1 ]]; then
+                local prev_sibling="t${BATCH_PARENT}_$((child_num - 1))"
+                if [[ -n "$BATCH_DEPS" ]]; then
+                    BATCH_DEPS="$prev_sibling,$BATCH_DEPS"
+                else
+                    BATCH_DEPS="$prev_sibling"
+                fi
+            fi
+
+            local deduped_file_refs
+            deduped_file_refs=$(dedup_file_refs BATCH_FILE_REFS)
+            # Seed on exactly the two inputs whose lines the serializer writes.
+            if [[ -n "$deduped_file_refs" || -n "$BATCH_VERIFIES" ]]; then
+                resolve_premise_seed true
+            else
+                resolve_premise_seed false
+            fi
+            filepath=$(create_child_task_file "$BATCH_PARENT" "$child_num" "$task_name" \
+                "$BATCH_PRIORITY" "$BATCH_EFFORT" "$BATCH_DEPS" "$BATCH_DESC" \
+                "$BATCH_TYPE" "$BATCH_STATUS" "$BATCH_LABELS" "$BATCH_ISSUE" \
+                "$BATCH_PULL_REQUEST" "$BATCH_CONTRIBUTOR" "$BATCH_CONTRIBUTOR_EMAIL" \
+                "$deduped_file_refs" "$BATCH_VERIFIES" "$PREMISE_SEED")
+
+            task_id="t${BATCH_PARENT}_${child_num}"
+            update_parent_children_to_implement "$BATCH_PARENT" "$task_id"
+
+            local humanized_name
+            humanized_name=$(echo "$task_name" | tr '_' ' ')
+            local -a commit_paths=( "$filepath" )
+            [[ -n "$parent_file" ]] && commit_paths+=( "$parent_file" )
+            if [[ "$_stage_labels" == true ]]; then
+                commit_paths+=( "$LABELS_FILE" )
+            fi
+            local crc=0
+            task_git_commit_scoped "ait: Add child task ${task_id}: ${humanized_name}" \
+                "${commit_paths[@]}" || crc=$?
+            local committed=true
+            if [[ "$crc" -eq 2 ]]; then
+                warn "nothing to commit for ${task_id}"
+            elif [[ "$crc" -ne 0 ]]; then
+                warn_task_written_not_committed "${task_id}"
+                committed=false
+            fi
+
+            # Skipped when uncommitted; release_child_lock_checked + `trap - EXIT`
+            # below still run, which is what the removed die used to reach via
+            # _child_lock_exit_trap.
+            $committed && run_auto_merge_if_needed "${BATCH_PARENT}_${child_num}" "$filepath"
+
+            release_child_lock_checked "$BATCH_PARENT"
+            trap - EXIT
+            ait_archive_rearm_exit_trap
+        else
+            # Parent task: $claimed_id was claimed above, before the label
+            # registration, so a failed claim leaves the vocabulary untouched.
+            local deduped_file_refs
+            deduped_file_refs=$(dedup_file_refs BATCH_FILE_REFS)
+            # Seed on exactly the two inputs whose lines the serializer writes.
+            if [[ -n "$deduped_file_refs" || -n "$BATCH_VERIFIES" ]]; then
+                resolve_premise_seed true
+            else
+                resolve_premise_seed false
+            fi
+            filepath=$(create_task_file "$claimed_id" "$task_name" "$BATCH_PRIORITY" "$BATCH_EFFORT" \
+                "$BATCH_DEPS" "$BATCH_DESC" "$BATCH_TYPE" "$BATCH_STATUS" "$BATCH_LABELS" "$BATCH_ASSIGNED_TO" "$BATCH_ISSUE" \
+                "$BATCH_PULL_REQUEST" "$BATCH_CONTRIBUTOR" "$BATCH_CONTRIBUTOR_EMAIL" \
+                "$deduped_file_refs" "$BATCH_VERIFIES" "$PREMISE_SEED")
+
+            if [[ -n "$BATCH_ASSIGNED_TO" ]]; then
+                add_email_to_file "$BATCH_ASSIGNED_TO"
+            fi
+
+            task_id="t${claimed_id}"
+
+            local humanized_name
+            humanized_name=$(echo "$task_name" | tr '_' ' ')
+            local -a commit_paths=( "$filepath" )
+            if [[ "$_stage_labels" == true ]]; then
+                commit_paths+=( "$LABELS_FILE" )
+            fi
+            local crc=0
+            task_git_commit_scoped "ait: Add task ${task_id}: ${humanized_name}" \
+                "${commit_paths[@]}" || crc=$?
+            local committed=true
+            if [[ "$crc" -eq 2 ]]; then
+                warn "nothing to commit for ${task_id}"
+            elif [[ "$crc" -ne 0 ]]; then
+                warn_task_written_not_committed "${task_id}"
+                committed=false
+            fi
+
+            $committed && run_auto_merge_if_needed "$claimed_id" "$filepath"
+        fi
+    else
+        # Default: create as draft in aitasks/new/ (no network needed)
+        local deduped_file_refs
+        deduped_file_refs=$(dedup_file_refs BATCH_FILE_REFS)
+        filepath=$(create_draft_file "$task_name" "$BATCH_PRIORITY" "$BATCH_EFFORT" \
+            "$BATCH_DEPS" "$BATCH_DESC" "$BATCH_TYPE" "$BATCH_STATUS" "$BATCH_LABELS" \
+            "$BATCH_ASSIGNED_TO" "$BATCH_ISSUE" "$BATCH_PARENT" \
+            "$BATCH_PULL_REQUEST" "$BATCH_CONTRIBUTOR" "$BATCH_CONTRIBUTOR_EMAIL" \
+            "$deduped_file_refs" "$BATCH_VERIFIES")
+    fi
+
+    # Output
+    if [[ "$BATCH_SILENT" == true ]]; then
+        echo "$filepath"
+    else
+        echo "Created: $filepath"
+    fi
+}
+
+# --- Main ---
+
+main() {
+    # Cross-repo redirect (t826_1): if `--project <name>` appears, resolve
+    # the name to a sibling aitasks project root, then re-exec that
+    # project's own aitask_create.sh with `--project <name>` stripped. The
+    # forwarded invocation keeps all other flags intact (`--batch`,
+    # `--parent`, `--name`, etc.). Requires `--batch`. In `--silent` mode,
+    # rewrite the target-relative created path to an absolute path so callers
+    # invoking from another repo can use the result directly.
+    local project_name=""
+    local has_batch=false
+    local project_silent=false
+    local forwarded=()
+    local _i=0
+    local _argv=("$@")
+    while [[ $_i -lt ${#_argv[@]} ]]; do
+        case "${_argv[$_i]}" in
+            --project)
+                project_name="${_argv[$_i+1]:-}"
+                [[ -n "$project_name" ]] || die "--project requires a value"
+                _i=$((_i + 2))
+                ;;
+            --batch)
+                has_batch=true
+                forwarded+=("${_argv[$_i]}")
+                _i=$((_i + 1))
+                ;;
+            --parent|-P)
+                forwarded+=("${_argv[$_i]}" "${_argv[$_i+1]:-}")
+                _i=$((_i + 2))
+                ;;
+            --silent)
+                project_silent=true
+                forwarded+=("${_argv[$_i]}")
+                _i=$((_i + 1))
+                ;;
+            *)
+                forwarded+=("${_argv[$_i]}")
+                _i=$((_i + 1))
+                ;;
+        esac
+    done
+
+    if [[ -n "$project_name" ]]; then
+        [[ "$has_batch" == true ]]  || die "--project requires --batch"
+
+        local resolved
+        resolved=$("$SCRIPT_DIR/aitask_project_resolve.sh" "$project_name")
+        case "$resolved" in
+            RESOLVED:*)
+                local root="${resolved#RESOLVED:}"
+                local target_script="$root/.aitask-scripts/aitask_create.sh"
+                [[ -x "$target_script" ]] || die "Resolved $project_name → $root, but $target_script is missing or not executable"
+                if [[ "$project_silent" == true ]]; then
+                    local target_out target_rc
+                    set +e
+                    target_out=$(cd "$root" && "$target_script" "${forwarded[@]}")
+                    target_rc=$?
+                    set -e
+                    if [[ "$target_rc" -ne 0 ]]; then
+                        [[ -n "$target_out" ]] && printf '%s\n' "$target_out"
+                        exit "$target_rc"
+                    fi
+                    if [[ "$target_out" == /* ]]; then
+                        printf '%s\n' "$target_out"
+                    else
+                        printf '%s/%s\n' "$root" "$target_out"
+                    fi
+                    exit 0
+                else
+                    cd "$root"
+                    exec "$target_script" "${forwarded[@]}"
+                fi
+                ;;
+            STALE:*)
+                die "Project '$project_name' is registered but its path is stale: ${resolved#STALE:}"
+                ;;
+            NOT_FOUND:*)
+                die "Project '$project_name' is not registered. Run \`cd /path/to/$project_name && ait projects add\`."
+                ;;
+            *)
+                die "Resolver returned unexpected output: $resolved"
+                ;;
+        esac
+    fi
+
+    parse_args "$@"
+
+    # --premise-baseline is a --batch --commit creation input only, and is
+    # validated in run_batch_mode. Refuse it BEFORE the mode split: the
+    # interactive flow never reaches that validation, and its finalize would
+    # otherwise commit an unvalidated value (e.g. a symbolic "HEAD", which the
+    # reader rejects, silently disabling the check).
+    if [[ "$BATCH_PREMISE_BASELINE_SET" == true && "$BATCH_MODE" != true ]]; then
+        die "--premise-baseline requires --batch --commit (it is an internal creation input; drafts are never seeded)"
+    fi
+
+    # Handle batch mode
+    if [[ "$BATCH_MODE" == true ]]; then
+        run_batch_mode
+        return
+    fi
+
+    info "=== AI Task Creator ==="
+    echo ""
+
+    # Check terminal capabilities (warn on incapable terminals)
+    ait_warn_if_incapable_terminal
+
+    # Check dependencies
+    command -v fzf &>/dev/null || die "fzf is required but not installed"
+
+    # Ensure task directory and metadata directory exist
+    mkdir -p "$TASK_DIR"
+    mkdir -p "$DRAFT_DIR"
+    mkdir -p "$(dirname "$LABELS_FILE")"
+
+    # Step 0: Check for existing drafts
+    local draft_list
+    draft_list=$(list_drafts 2>/dev/null || true)
+
+    if [[ -n "$draft_list" ]]; then
+        info "Found draft task(s) in $DRAFT_DIR/:"
+        echo "$draft_list" | while IFS= read -r line; do
+            echo "  $line"
+        done
+        echo ""
+
+        local draft_action
+        local draft_options
+        draft_options=$(echo -e "Create new task\n$(echo "$draft_list" | sed 's/ - .*//')" | \
+            fzf --prompt="Select draft or create new: " --height=15 --no-info \
+            --header="Manage drafts or create a new task")
+
+        if [[ "$draft_action" == "Create new task" ]] || [[ -z "$draft_options" ]]; then
+            : # Fall through to creation flow below
+        elif [[ "$draft_options" == "Create new task" ]]; then
+            : # Fall through to creation flow below
+        else
+            # User selected a draft
+            local selected_draft="$draft_options"
+            local draft_path="$DRAFT_DIR/$selected_draft"
+
+            if [[ ! -f "$draft_path" ]]; then
+                warn "Draft not found: $draft_path"
+            else
+                local manage_action
+                manage_action=$(echo -e "Continue editing\nFinalize (assign real ID & commit)\nDelete draft\nBack to creation" | \
+                    fzf --prompt="What to do with this draft? " --height=10 --no-info)
+
+                case "$manage_action" in
+                    "Continue editing")
+                        ${EDITOR:-vim} "$draft_path"
+                        success "Draft updated: $draft_path"
+                        return
+                        ;;
+                    "Finalize"*)
+                        finalize_draft "$draft_path"
+                        return
+                        ;;
+                    "Delete draft")
+                        rm -f "$draft_path"
+                        success "Draft deleted: $selected_draft"
+                        return
+                        ;;
+                    "Back to creation"|"")
+                        : # Fall through to creation flow
+                        ;;
+                esac
+            fi
+        fi
+    fi
+
+    # Step 1a: Ask if this should be a child task
+    info "Select parent task (or None for standalone task)..."
+    local parent_num
+    parent_num=$(select_parent_task)
+
+    local is_child_task=false
+
+    if [[ -n "$parent_num" ]]; then
+        is_child_task=true
+        info "Creating child task of parent t$parent_num (ID assigned on finalization)"
+    else
+        info "Creating standalone task (ID assigned on finalization)"
+    fi
+    echo ""
+
+    # Step 2: Get metadata
+    info "Select task metadata..."
+
+    local priority
+    priority=$(select_priority)
+    [[ -z "$priority" ]] && die "Priority selection cancelled"
+
+    local effort
+    effort=$(select_effort)
+    [[ -z "$effort" ]] && die "Effort selection cancelled"
+
+    local issue_type
+    issue_type=$(select_issue_type)
+    [[ -z "$issue_type" ]] && issue_type="feature"
+
+    local status
+    status=$(select_status)
+    [[ -z "$status" ]] && status="Ready"
+
+    get_labels_interactive
+    local labels="$SELECTED_LABELS"
+    set_last_used_labels "$labels"
+
+    local deps
+    deps=$(select_dependencies "$parent_num")
+
+    # Cross-repo project pick (sets xdeprepo: in the draft frontmatter).
+    # Empty means single-repo task.
+    local xdeprepo
+    xdeprepo=$(select_xdeprepo)
+
+    echo ""
+    info "Priority: $priority, Effort: $effort, Issue: $issue_type, Status: $status"
+    info "Dependencies: ${deps:-None}, Labels: ${labels:-None}, Cross-repo: ${xdeprepo:-None}"
+    echo ""
+
+    # Step 3: Get task name
+    local name_result task_name predesc_text
+    name_result=$(get_task_name)
+    task_name=$(head -1 <<< "$name_result")
+    predesc_text=$(sed '1d' <<< "$name_result")
+
+    info "Draft filename: draft_*_${task_name}.md"
+    echo ""
+
+    # Step 4-5: Get task definition
+    info "Enter task definition..."
+    local raw_definition task_desc
+    raw_definition=$(get_task_definition "$predesc_text" "$xdeprepo")
+
+    # Split the raw output at the __FILE_REFS_MARKER__ line: the portion
+    # above is the description body; the portion below is one file ref per line.
+    task_desc=$(sed '/^__FILE_REFS_MARKER__$/,$d' <<< "$raw_definition")
+    local -a collected_refs=()
+    while IFS= read -r _ref_line; do
+        [[ -n "$_ref_line" ]] && collected_refs+=("$_ref_line")
+    done < <(sed '1,/^__FILE_REFS_MARKER__$/d' <<< "$raw_definition")
+    local deduped_file_refs
+    deduped_file_refs=$(dedup_file_refs collected_refs)
+
+    if [[ -z "$task_desc" ]]; then
+        die "Task definition cannot be empty"
+    fi
+
+    # Step 6: Create draft file
+    local filepath
+    filepath=$(create_draft_file "$task_name" "$priority" "$effort" "$deps" \
+        "$task_desc" "$issue_type" "$status" "$labels" "" "" \
+        "$([[ "$is_child_task" == true ]] && echo "$parent_num" || echo "")" \
+        "" "" "" "$deduped_file_refs" "" "$xdeprepo")
+
+    success "Draft created: $filepath"
+    echo ""
+
+    # Step 7: Summary
+    echo ""
+    echo "================================"
+    success "Draft task created!"
+    echo "================================"
+    echo "  Filename:      $filepath"
+    echo "  Priority:      $priority"
+    echo "  Effort:        $effort"
+    echo "  Issue Type:    $issue_type"
+    echo "  Status:        $status"
+    echo "  Dependencies:  ${deps:-None}"
+    echo "  Labels:        ${labels:-None}"
+    echo "  Cross-repo:    ${xdeprepo:-None}"
+    if [[ "$is_child_task" == true ]]; then
+        echo "  Parent task:   t$parent_num"
+    fi
+    echo ""
+    info "Note: This is a draft. Real task ID will be assigned on finalization."
+    echo ""
+
+    # Step 8: View/edit/finalize options
+    while true; do
+        local post_action
+        post_action=$(echo -e "Finalize now (assign ID & commit)\nShow draft\nOpen in editor\nSave as draft (done)" | \
+            fzf --prompt="What next? " --height=10 --no-info)
+
+        case "$post_action" in
+            "Finalize now"*)
+                finalize_draft "$filepath"
+                return
+                ;;
+            "Show draft")
+                echo ""
+                echo "--- Contents of $filepath ---"
+                cat "$filepath"
+                echo "--- End of file ---"
+                echo ""
+                ;;
+            "Open in editor")
+                ${EDITOR:-vim} "$filepath"
+                ;;
+            "Save as draft"*|"")
+                info "Draft saved. Finalize later with: ait create (interactive) or --batch --finalize"
+                return
+                ;;
+        esac
+    done
+}
+
+main "$@"

@@ -1,0 +1,5400 @@
+#!/usr/bin/env python3
+"""aitasks Settings TUI — centralized config viewer/editor.
+
+Browse and edit all aitasks configuration: code agent defaults, board
+settings, model lists, and execution profiles.
+"""
+from __future__ import annotations
+
+import copy
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+from collections.abc import Callable
+from datetime import date, datetime
+from pathlib import Path
+
+import yaml
+from rich.markup import escape
+
+# Add .aitask-scripts/lib to path for config_utils
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+# Add .aitask-scripts to path for sibling packages (e.g. brainstorm)
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from module_shadow_guard import assert_lib_not_shadowed  # noqa: E402
+assert_lib_not_shadowed(Path(__file__).resolve().parent.parent / "lib")
+from tui_switcher import TuiSwitcherMixin  # noqa: E402
+from shortcuts_mixin import ShortcutsMixin, render_label_cfg  # noqa: E402
+from agent_launch_utils import (  # noqa: E402
+    PROJECT_GROUP_UNGROUPED_LABEL,
+    detect_git_tuis,
+    validate_project_group_slug,
+)
+
+import fuzzy_filter  # noqa: E402
+import keybinding_registry  # noqa: E402
+import shortcut_persist  # noqa: E402
+import shortcut_scopes  # noqa: E402
+from shortcut_editor_modal import ShortcutEditorModal  # noqa: E402
+
+from agent_model_picker import (  # noqa: E402
+    AgentModelPickerScreen,
+    FuzzySelect,
+    LaunchModePickerScreen,
+    MODEL_FILES,
+    _bucket_avg,
+    _format_op_stats,
+)
+from model_stats_windows import (  # noqa: E402
+    resolve_windows,
+    stats_key_for_operation,
+)
+
+from config_utils import (  # noqa: E402
+    EXPORT_EXTENSION,
+    ConfigImportPartialError,
+    _load_json,
+    deep_merge,
+    export_all_configs,
+    import_all_configs,
+    load_yaml_config,
+    local_path_for,
+    metadata_dir,
+    save_local_config,
+    save_project_config,
+    save_yaml_config,
+    split_config,
+    validate_export_bundle,
+)
+from guarded_dismiss import GuardedModalScreen  # noqa: E402
+from launch_modes import DEFAULT_LAUNCH_MODE, normalize_launch_mode  # noqa: E402
+import model_supersession as ms  # noqa: E402
+from metadata_commit import commit_metadata, remedy_command  # noqa: E402
+
+from textual import on, work  # noqa: E402
+from textual.app import App, ComposeResult  # noqa: E402
+from textual.binding import Binding  # noqa: E402
+from textual.containers import Container, Horizontal, Vertical, VerticalScroll  # noqa: E402
+from textual.message import Message  # noqa: E402
+from textual.screen import ModalScreen  # noqa: E402
+from textual.worker import get_current_worker  # noqa: E402
+from textual.widgets import (  # noqa: E402
+    Button,
+    DataTable,
+    Footer,
+    Header,
+    Input,
+    Label,
+    Static,
+    TabbedContent,
+    TabPane,
+    TextArea,
+)
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+METADATA_DIR = metadata_dir()
+CODEAGENT_CONFIG = METADATA_DIR / "codeagent_config.json"
+BOARD_CONFIG = METADATA_DIR / "board_config.json"
+PROJECT_CONFIG = METADATA_DIR / "project_config.yaml"
+PROFILES_DIR = METADATA_DIR / "profiles"
+LOCAL_PROFILES_DIR = PROFILES_DIR / "local"
+#: Which code-agent models supersede which (t1910). Module-level so tests can
+#: point the Agent Defaults tab at a fixture table.
+SUPERSESSION_TABLE = ms.DEFAULT_TABLE_PATH
+
+def _repo_rel(path) -> str:
+    """Repo-relative form of a metadata path, for the commit helper.
+
+    `metadata_dir()` is already relative in the normal case; a `TASK_DIR`
+    override may make it absolute, and the helper's scope check is
+    repo-relative. Falls back to the path as given when it lies outside the
+    cwd — the helper then refuses it, which is the fail-closed outcome.
+    """
+    p = Path(path)
+    if not p.is_absolute():
+        return str(p)
+    try:
+        return str(p.relative_to(Path.cwd()))
+    except ValueError:
+        return str(p)
+
+
+# The board_config.json layer split lives in lib/board_columns.py so the board,
+# this TUI and the headless writer share one definition (t1377_3). Aliased to the
+# names save_board() already uses, so that call site is untouched.
+from board_columns import PROJECT_KEYS as _BOARD_PROJECT_KEYS  # noqa: E402
+from board_columns import USER_KEYS as _BOARD_USER_KEYS  # noqa: E402
+
+DEFAULT_REFRESH_OPTIONS = ["0", "1", "2", "5", "10", "15", "30"]
+
+from profile_editor import (  # noqa: E402
+    PROFILE_FIELD_INFO,
+    PROFILE_SCHEMA,
+    CycleField,
+    ConfigRow,
+    EditStringScreen,
+    collect_profile_values,
+    compose_profile_fields,
+)
+
+# Operation descriptions shown in the Agent Defaults tab
+OPERATION_DESCRIPTIONS: dict[str, str] = {
+    "pick": "Model used for picking and implementing tasks (used when launching tasks from the Board TUI)",
+    "explain": "Model used for explaining/documenting code (used when running explain from the Code Browser TUI)",
+    "batch-review": "Model used for batch code review operations",
+    "qa": "Model used for QA analysis on completed tasks (used when launching QA from the Code Browser TUI history screen)",
+    "raw": "Model used for direct/ad-hoc code agent invocations (passthrough mode)",
+    "explore": "Model used for interactive codebase exploration (launched via TUI switcher shortcut 'x')",
+    "shadow": "Model used for the shadow companion agent (launched from minimonitor with 'e' to explain/interrogate a followed agent's output)",
+    "discuss": "Model used for the brainstorm discuss agent (launched from the brainstorm TUI to compare, explain, question and risk-check proposals — advisory only)",
+    "sitrep": "Model used for the sitrep steward agent (opened with `ait sitrep` in its own window; keeps the repository's todo list — advisory only, Claude Code only)",
+    "relations": "Model used by the background task-relations analysis (headless, read-only; runs only when `ait relations enable` is on — Claude Code only)",
+    "obsolescence": "Model reserved for the backlog obsolescence assessment of the task-relations layer (headless, read-only — Claude Code only)",
+    "brainstorm-explorer": "Model for exploring solution space in brainstorming sessions",
+    "brainstorm-comparator": "Model for comparing and analyzing design proposals",
+    "brainstorm-synthesizer": "Model for merging and synthesizing design proposals",
+    "brainstorm-initializer": "Model for reformatting imported markdown proposals into the n000_init root node",
+    "brainstorm-module_decomposer": "Model for forking module subgraph roots from a proposal",
+    "brainstorm-module_merger": "Model for merging a module subgraph up into an ancestor node",
+    "brainstorm-module_syncer": "Model for pulling a linked module's as-implemented design back into the graph",
+    "brainstorm-explorer-launch-mode": "Default launch mode (headless | interactive) for the explorer brainstorm agent type",
+    "brainstorm-comparator-launch-mode": "Default launch mode (headless | interactive) for the comparator brainstorm agent type",
+    "brainstorm-synthesizer-launch-mode": "Default launch mode (headless | interactive) for the synthesizer brainstorm agent type",
+    "brainstorm-initializer-launch-mode": "Default launch mode (headless | interactive) for the initializer brainstorm agent type",
+    "brainstorm-module_decomposer-launch-mode": "Default launch mode (headless | interactive) for the module decomposer brainstorm agent type",
+    "brainstorm-module_merger-launch-mode": "Default launch mode (headless | interactive) for the module merger brainstorm agent type",
+    "brainstorm-module_syncer-launch-mode": "Default launch mode (headless | interactive) for the module syncer brainstorm agent type",
+}
+
+# Config file descriptions shown during import
+CONFIG_FILE_DESCRIPTIONS: dict[str, str] = {
+    "board_config.json": "Board columns and display settings (shared/project)",
+    "board_config.local.json": "Board user preferences (auto-refresh, sync)",
+    "codeagent_config.json": "Default AI models per operation (shared/project)",
+    "codeagent_config.local.json": "User-specific AI model overrides",
+    "models_claudecode.json": "Claude Code model list and verification scores",
+    "models_codex.json": "Codex CLI model list and verification scores",
+    "models_opencode.json": "OpenCode model list and verification scores",
+}
+
+# Export subset categories: label -> patterns. The "Shortcuts" category uses a
+# sentinel pattern ("__shortcuts__") that `_handle_export` detects and converts
+# into `include_shortcuts=True` (shortcuts are not a metadata *file*, they are a
+# subtree of userconfig.yaml — see config_utils.export_all_configs).
+EXPORT_CATEGORIES: dict[str, list[str]] = {
+    "Agent defaults": ["*_config.json", "*_config.local.json"],
+    "Model configs": ["models_*.json", "models_*.local.json"],
+    "Shortcuts": ["__shortcuts__"],
+}
+
+# Sentinel pattern marking the shortcuts export category (not a glob).
+_SHORTCUTS_EXPORT_SENTINEL = "__shortcuts__"
+
+
+# Tab-switch action_id -> TabPane id. The KEY for each action comes from the
+# keybinding registry (default declared in SettingsApp.BINDINGS), so users can
+# rebind tab switching in the Shortcuts editor and the footer hint follows
+# automatically (see _tab_switch_hint). Insertion order drives the hint order
+# (a/b/c/g/k/m/p/s/t by default).
+# Agent Defaults row-id prefix -> supersession layer name (model_supersession
+# LAYERS), and that layer's label as the tab shows it.
+_AGENT_ROW_LAYERS = {"agent_proj_": "project", "agent_user_": "local"}
+_AGENT_LAYER_LABELS = {"project": "project", "local": "user"}
+
+_TAB_SWITCH_ACTIONS = {
+    "switch_tab_agent": "tab_agent",
+    "switch_tab_board": "tab_board",
+    "switch_tab_project": "tab_project",
+    "switch_tab_project_groups": "tab_project_groups",
+    "switch_tab_artifacts": "tab_artifacts",
+    "switch_tab_models": "tab_models",
+    "switch_tab_profiles": "tab_profiles",
+    "switch_tab_shortcuts": "tab_shortcuts",
+    "switch_tab_tmux": "tab_tmux",
+}
+
+PROJECT_CONFIG_SCHEMA: dict[str, dict[str, str]] = {
+    "codeagent_coauthor_domain": {
+        "summary": "Email domain used for custom code-agent commit coauthors",
+        "type": "string",
+        "detail": (
+            "Stored in aitasks/metadata/project_config.yaml and shared with the team. "
+            "The task workflow uses it to build code-agent coauthor emails such as "
+            "codex_gpt5_3codex@aitasks.io."
+        ),
+    },
+    "verify_build": {
+        "summary": "Build verification command(s) run after implementation",
+        "type": "string_or_list",
+        "detail": (
+            "Accepts a single shell command string or a YAML list of commands. "
+            "Leave blank to disable build verification for task-workflow, "
+            "aitask-pickrem, and aitask-pickweb."
+        ),
+    },
+    "test_command": {
+        "summary": "Test command(s) for QA analysis (used by /aitask-qa)",
+        "type": "string_or_list",
+        "detail": (
+            "Shell command(s) used by /aitask-qa to run project tests. "
+            "Accepts a single string or YAML list. Leave blank for auto-detection."
+        ),
+    },
+    "lint_command": {
+        "summary": "Lint command(s) for QA analysis (used by /aitask-qa)",
+        "type": "string_or_list",
+        "detail": (
+            "Shell command(s) used by /aitask-qa to lint changed files. "
+            "Accepts a single string or YAML list. Leave blank to skip."
+        ),
+    },
+    "resource_admission_command": {
+        "summary": "Command asked whether the host can afford to start implementing",
+        "type": "string",
+        "detail": (
+            "Consulted by task-workflow Step 7, after the plan is approved and "
+            "before any branch or worktree is cut. Exit 0 admits; exit 2 defers "
+            "the task, which returns to Ready keeping its approved plan; any "
+            "other exit is an error that also defers. A refusal reason is taken "
+            "from an 'ADMISSION_REASON: <text>' line the command prints. "
+            "Leave blank to disable — unset means the step does nothing at all. "
+            "One command only (unlike verify_build), so a project needing "
+            "several probes points this at one wrapper script."
+        ),
+    },
+    "learn_skill_authoring_guide": {
+        "summary": "Skill-authoring guide applied by /aitask-learn-skill",
+        "type": "string",
+        "detail": (
+            "Path to the skill-authoring best-practices guide that "
+            "/aitask-learn-skill (generate.md) applies when writing a generated "
+            "skill. Leave blank to use the generic guide installed by ait setup "
+            "(aireviewguides/aiagents/skill_authoring_best_practices.md). Never "
+            "point this at aidocs/framework/skill_authoring_conventions.md — those "
+            "framework-internal conventions must not be adopted by a user's own skill."
+        ),
+    },
+    "release_publication_workflow": {
+        "summary": "Release workflow that must succeed before release notices post",
+        "type": "string",
+        "detail": (
+            "GitHub Actions workflow file name (e.g. release.yml). 'ait release-notify' "
+            "posts 'Released in <tag>' comments only after this workflow's run for the "
+            "tag and its commit concluded success. GitHub only: set on a GitLab project "
+            "it blocks posting. Leave blank to skip the workflow check."
+        ),
+    },
+    "release_publication_assets": {
+        "summary": "Release assets that must be published before release notices post",
+        "type": "string_or_list",
+        "detail": (
+            "Asset-name templates, a string or a YAML list. Only {tag} and {version} "
+            "(the tag without a leading v) may appear, e.g. myapp-{tag}.tar.gz. Every "
+            "name must be an uploaded, non-empty release asset before 'ait "
+            "release-notify' posts. Leave blank to require none."
+        ),
+    },
+    "release_publication_checksum_manifests": {
+        "summary": "Checksum manifests whose listed files must all be published",
+        "type": "string_or_list",
+        "detail": (
+            "Globs of sha256sum manifests among the release assets, e.g. "
+            "*_SHA256SUMS.txt. Each matching manifest is downloaded, and every file it "
+            "lists must itself be a published asset before 'ait release-notify' posts. "
+            "Leave blank to check none."
+        ),
+    },
+    "release_notify_host": {
+        "summary": "The one machine that posts release notices",
+        "type": "string",
+        "detail": (
+            "Compared byte-for-byte with `hostname`. 'ait release-notify' refuses to "
+            "post on any other machine, and when this is blank. There is no automatic "
+            "failover: to move it, make sure no run is in progress on the old machine, "
+            "change this value, then run './ait sync' on both machines."
+        ),
+    },
+    "default_profiles": {
+        "summary": "Default execution profile for each skill",
+        "type": "mapping",
+        "detail": (
+            "Maps skill names to profile names (without .yaml). "
+            "Valid skills: pick, fold, review, pr-import, revert, explore, pickrem, pickweb, qa, shadow, brainstorm-discuss, sitrep. "
+            "Any other key is shown read-only and preserved on save (the profile "
+            "resolver reads it, so it must not be dropped) — edit it in the YAML. "
+            "Users can override in userconfig.yaml. The --profile argument overrides both."
+        ),
+    },
+}
+
+VALID_PROFILE_SKILLS = {
+    "pick", "fold", "review", "pr-import", "revert",
+    "explore", "pickrem", "pickweb", "qa", "shadow",
+    "brainstorm-discuss", "sitrep",
+}
+
+TMUX_CONFIG_SCHEMA: dict[str, dict[str, str]] = {
+    "default_session": {
+        "summary": "Default tmux session name",
+        "detail": (
+            "Session name used when creating new tmux sessions "
+            "from agent launch dialog (default: aitasks)"
+        ),
+        "type": "string",
+        "default": "aitasks",
+    },
+    "default_split": {
+        "summary": "Default pane split direction",
+        "detail": (
+            "Split direction when creating new pane in existing window: "
+            "horizontal or vertical (default: horizontal)"
+        ),
+        "type": "enum",
+        "options": "horizontal,vertical",
+        "default": "horizontal",
+    },
+    "prefer_tmux": {
+        "summary": "Prefer tmux tab in launch dialogs",
+        "detail": (
+            "When enabled, agent launch dialogs (pick, explain, QA, create) "
+            "will start with the tmux tab pre-selected instead of the "
+            "terminal tab (default: false)"
+        ),
+        "type": "bool",
+        "default": "false",
+    },
+    "git_tui": {
+        "summary": "Git management TUI",
+        "detail": (
+            "External git TUI to integrate in the TUI switcher (j/g shortcut). "
+            "Only one instance runs per tmux session. "
+            "Set to 'none' to disable."
+        ),
+        "type": "enum",
+        "options": "lazygit,gitui,tig,none",
+        "default": "none",
+    },
+    "shadow_same_window": {
+        "summary": "Spawn shadow agent in the same window",
+        "detail": (
+            "When enabled, the shadow companion agent (minimonitor 'e') opens "
+            "as a new pane in the followed agent's tmux window. When disabled, "
+            "it opens in a separate window (default: true)"
+        ),
+        "type": "bool",
+        "default": "true",
+    },
+    "shadow_pane_width": {
+        "summary": "Width (cols) of the shadow agent pane",
+        "detail": (
+            "Column width for the shadow companion pane spawned next to the "
+            "followed agent by minimonitor 'e' when shadow_same_window is "
+            "enabled (default: 60)"
+        ),
+        "type": "int",
+        "default": "60",
+    },
+    "scratchpad_position": {
+        "summary": "Scratchpad pane above or below the agent",
+        "detail": (
+            "Where minimonitor 'o' places the scratchpad notes pane: in a "
+            "vertical split of the followed agent's pane, above (top) or below "
+            "(bottom) it. An invalid value falls back to bottom "
+            "(default: bottom)"
+        ),
+        "type": "enum",
+        "options": "top,bottom",
+        "default": "bottom",
+    },
+    "scratchpad_height": {
+        "summary": "Height (rows) of the scratchpad pane",
+        "detail": (
+            "Row height of the scratchpad notes pane minimonitor 'o' opens "
+            "next to the followed agent. A value that is not a whole number "
+            ">= 1 falls back to the default (default: 12)"
+        ),
+        "type": "int",
+        "default": "12",
+    },
+}
+
+#: Branch the Artifacts tab offers when gitbranch is selected with no branch
+#: configured yet (matches the seeded project_config.yaml example).
+ARTIFACTS_GITBRANCH_DEFAULT_BRANCH = "aitask-artifacts"
+
+# Keys of the `artifacts:` block the Artifacts tab edits. Every validation rule
+# (adapter names, branch names, required backend settings) lives in
+# lib/artifact_registry.py and is reached through SettingsApp._run_artifact_registry;
+# nothing here re-encodes it.
+ARTIFACTS_CONFIG_SCHEMA: dict[str, dict[str, str]] = {
+    "default_backend": {
+        "summary": "Backend new artifacts are stored in",
+        "detail": (
+            "artifacts.default_backend in project_config.yaml. 'local' (the "
+            "default when unset) stores blobs on the task-data branch; "
+            "'gitbranch' stores them on a dedicated branch of their own. A "
+            "non-local default must be configured under artifacts.backends — "
+            "Save refuses one the artifact registry would reject."
+        ),
+        "type": "enum",
+        "default": "local",
+    },
+    "backends.gitbranch.branch": {
+        "summary": "Branch the gitbranch backend stores blobs on",
+        "detail": (
+            "artifacts.backends.gitbranch.branch. Must be a plain branch name "
+            "and never a code or framework branch (main, master, aitask-data, "
+            "aitask-locks, aitask-ids). The branch is created by the first "
+            "artifact write, or by 'ait artifact init-store gitbranch'. "
+            "Changing it once a store exists needs 'ait artifact "
+            "gitbranch-migrate --from <old> --to <new>'."
+        ),
+        "type": "string",
+        "default": ARTIFACTS_GITBRANCH_DEFAULT_BRANCH,
+    },
+}
+
+
+def _format_yaml_value(value) -> str:
+    """Render a YAML value into a compact single-line editor string."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    return yaml.safe_dump(
+        value, default_flow_style=True, sort_keys=False, allow_unicode=True,
+    ).strip()
+
+
+def _format_yaml_block(value) -> str:
+    """Render a YAML list into the readable block form the editor shows."""
+    return yaml.safe_dump(
+        value, default_flow_style=False, sort_keys=False, allow_unicode=True,
+    ).strip()
+
+
+_BLOCK_LIST_OPENER = re.compile(r"^-(\s|$)")
+
+
+def _looks_like_block_list(text: str) -> bool:
+    """True when text's first content line opens a YAML block sequence.
+
+    Block form is UNAMBIGUOUS -- no shell command opens a line with `- ` -- so
+    a block edit is taken as a list whatever its spelling: quoted items,
+    trailing comments and re-indentation all stay lists. Only FLOW form is
+    ambiguous with a command, and only that goes through _list_if_canonical.
+
+    The decision is made on the FIRST content line, not on any line: a
+    multi-line scalar whose continuation happens to start with `- ` is not a
+    block list.
+    """
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        return bool(_BLOCK_LIST_OPENER.match(stripped))
+    return False
+
+
+def _list_if_canonical(text: str, renderer):
+    """The list `text` is the canonical `renderer` output for -- else None.
+
+    THE single list-intent test, shared by the project-config save path and
+    both directions of the multi-line command editor. Parsing alone is not
+    enough: `[ -f Makefile ]` is a shell test command and a perfectly good
+    verify_build, yet it parses to the list ['-f Makefile']. It is only a LIST
+    if the text is byte-for-byte what we would have written for that list --
+    which it is not, since we render `[-f Makefile]`. Provenance, not
+    intent-guessing: every list reaching these call sites was rendered by
+    _format_yaml_value.
+
+    ONLY for FLOW-form text, where the ambiguity actually lives. A block-form
+    edit (`- item` lines) is unambiguous and is handled by
+    _looks_like_block_list instead -- canonicality there would reject a
+    perfectly good `- "make build"`.
+    """
+    try:
+        parsed = yaml.safe_load(text)
+    except yaml.YAMLError:
+        return None
+    if isinstance(parsed, list) and renderer(parsed) == text.strip():
+        return parsed
+    return None
+
+
+def _coerce_project_config_value(key: str, raw_value: str):
+    """Turn a Project Config editor string into the value that is stored.
+
+    raw_value arrives ALREADY TRIMMED by the caller (see
+    save_project_settings) and is otherwise stored EXACTLY as given -- no
+    re-parsing, no re-rendering. Only a key the schema declares
+    `string_or_list` may become a list, and only when _list_if_canonical says
+    raw_value IS the canonical flow rendering of one.
+
+    Re-parsing a string-typed key as a YAML document is what stored
+    `sh -c "echo ADMISSION_REASON: x; exit 2"` as a nested mapping, which the
+    admission hook then read as "not configured" -- a silent admit for a
+    project that had configured a hook (t1672).
+    """
+    if PROJECT_CONFIG_SCHEMA.get(key, {}).get("type") != "string_or_list":
+        return raw_value
+    parsed = _list_if_canonical(raw_value, _format_yaml_value)
+    return raw_value if parsed is None else parsed
+
+
+def _safe_id(name: str) -> str:
+    """Sanitize a string for use as a Textual widget ID."""
+    return name.replace(".", "_").replace(" ", "_").replace("-", "_")
+
+
+_SETTINGS_DIR = Path(__file__).resolve().parent
+ARTIFACT_REGISTRY = _SETTINGS_DIR.parent / "lib" / "artifact_registry.py"
+ARTIFACT_CLI = _SETTINGS_DIR.parent / "aitask_artifact.sh"
+_BUILD_VERIFY_DOCS = "https://aitasks.io/docs/skills/aitask-pick/build-verification/"
+
+
+def _load_command_presets(key: str) -> list[dict]:
+    """Load presets for a command-type config key (verify_build, test_command, lint_command)."""
+    presets_file = _SETTINGS_DIR / f"{key}_presets.yaml"
+    if not presets_file.is_file():
+        return []
+    try:
+        with open(presets_file, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+        if isinstance(data, dict) and "presets" in data:
+            return data["presets"]
+    except Exception:
+        pass
+    return []
+
+
+def _match_preset_name(raw_value: str, presets: list[dict]) -> str | None:
+    """Return preset name if raw_value matches a preset's value, else None."""
+    if not raw_value or not presets:
+        return None
+    try:
+        parsed = yaml.safe_load(raw_value)
+    except yaml.YAMLError:
+        parsed = raw_value
+    for preset in presets:
+        pval = preset["value"]
+        if parsed == pval:
+            return preset["name"]
+    return None
+
+
+def _normalize_model_id(cli_id: str) -> str:
+    """Strip provider/ prefix from cli_id for all_providers grouping."""
+    if "/" in cli_id:
+        return cli_id.split("/", 1)[1]
+    return cli_id
+
+
+def _aggregate_verifiedstats(
+    all_models: dict[str, dict], target_cli_id: str,
+    today: date | None = None,
+) -> dict[str, dict]:
+    """Aggregate verifiedstats across all providers for the same underlying LLM.
+
+    Returns {operation: {all_time: {runs, score_sum}, month: {...},
+    prev_month: {...}, week: {...}}}. Each provider's dated buckets are first
+    resolved against `today` (default: the wall clock) by model_stats_windows,
+    so a bucket no run has rolled over yet counts under the month it really
+    holds, or not at all. The resolved windows all carry the current periods,
+    so they simply sum, and `_format_op_stats` reads the result unchanged.
+    """
+    norm = _normalize_model_id(target_cli_id)
+    result: dict[str, dict] = {}
+    for _provider, pdata in all_models.items():
+        for m in pdata.get("models", []):
+            if _normalize_model_id(m.get("cli_id", "")) != norm:
+                continue
+            vs = m.get("verifiedstats", {})
+            for op, buckets in vs.items():
+                if not isinstance(buckets, dict):
+                    continue
+                windows = resolve_windows(buckets, today)
+                if op not in result:
+                    result[op] = {"all_time": {"runs": 0, "score_sum": 0}}
+                    for win in ("month", "prev_month", "week"):
+                        result[op][win] = {
+                            "period": windows[win]["period"],
+                            "runs": 0, "score_sum": 0,
+                        }
+                agg = result[op]
+                # all_time: always sum
+                at = buckets.get("all_time", {})
+                agg["all_time"]["runs"] += at.get("runs", 0)
+                agg["all_time"]["score_sum"] += at.get("score_sum", 0)
+                for win in ("month", "prev_month", "week"):
+                    agg[win]["runs"] += windows[win]["runs"]
+                    agg[win]["score_sum"] += windows[win]["score_sum"]
+    return result
+
+
+# ---------------------------------------------------------------------------
+# ConfigManager
+# ---------------------------------------------------------------------------
+class ConfigReadError(ValueError):
+    """A config file exists but could not be read or parsed.
+
+    Carries the offending path so the caller can name it; subclasses
+    ValueError so existing `(OSError, ValueError)` handlers still match.
+    """
+
+    def __init__(self, path, cause):
+        self.path = Path(path)
+        self.cause = cause
+        super().__init__(f"{path}: {cause}")
+
+
+def _read_config(path, reader):
+    """Run `reader()`, re-raising any read/parse failure as ConfigReadError(path)."""
+    try:
+        return reader()
+    except (OSError, ValueError, yaml.YAMLError) as exc:
+        raise ConfigReadError(path, exc) from exc
+
+
+class ConfigStaleError(ConfigReadError):
+    """A write was refused: this config was written but not re-read since.
+
+    Memory is then behind disk, and every writer builds its payload from
+    memory — writing again would silently undo the earlier write.
+    """
+
+
+#: Keys a Settings reader indexes as a container, per JSON config: a layer may
+#: omit one, but one it sets must have this shape (t1945). (container, item).
+#: Only keys a reader depends on — rejecting any other shape would turn a
+#: working boot into a refusal (`column_order` is never read here).
+_CODEAGENT_LAYER_SHAPE = {"defaults": (dict, None)}
+_BOARD_LAYER_SHAPE = {"columns": (list, dict), "settings": (dict, None)}
+
+_JSON_TYPE_NAMES = {dict: "object", list: "array", str: "string",
+                    bool: "boolean", int: "number", float: "number",
+                    type(None): "null"}
+
+
+def _json_type(value) -> str:
+    return _JSON_TYPE_NAMES.get(type(value), type(value).__name__)
+
+
+def _check_layer_shape(path, data: dict, shape: dict) -> None:
+    """Raise ConfigReadError(path) when a key a reader depends on is mistyped."""
+    for key, (kind, item_kind) in shape.items():
+        if key not in data:
+            continue
+        value = data[key]
+        if not isinstance(value, kind):
+            raise ConfigReadError(path, f"'{key}' must be a JSON "
+                                  f"{_JSON_TYPE_NAMES[kind]}, got {_json_type(value)}")
+        if item_kind is not None:
+            for i, item in enumerate(value):
+                if not isinstance(item, item_kind):
+                    raise ConfigReadError(
+                        path, f"'{key}[{i}]' must be a JSON "
+                        f"{_JSON_TYPE_NAMES[item_kind]}, got {_json_type(item)}")
+
+
+def _read_json_layer(path, shape: dict | None = None) -> dict:
+    """Read one JSON config layer ({} when absent); it must be an object.
+
+    With `shape`, the keys it names must also have their declared shape.
+    Validating each layer is enough for the merge: `deep_merge` takes a key
+    from the last layer that sets it, else from correctly shaped defaults.
+    """
+    data = _read_config(path, lambda: _load_json(Path(path)))
+    if not isinstance(data, dict):
+        raise ConfigReadError(path, f"expected a JSON object, got {type(data).__name__}")
+    if shape:
+        _check_layer_shape(path, data, shape)
+    return data
+
+
+def _merge_layers(defaults: dict, project: dict, local: dict) -> dict:
+    """defaults <- project <- local, exactly as `load_layered_config` merges.
+
+    Merging layers already read (instead of calling `load_layered_config`,
+    which reads both files again) keeps a failure attributed to the file that
+    actually failed.
+    """
+    result = copy.deepcopy(defaults)
+    if project:
+        result = deep_merge(result, project)
+    if local:
+        result = deep_merge(result, local)
+    return result
+
+
+# Per-family readers: each reads and validates its files, raises
+# ConfigReadError naming the file that failed, and assigns nothing. Each JSON
+# layer is read once, on its own, so a failure names the file that failed.
+def _read_codeagent_layers():
+    """(merged, project, local) for codeagent_config, each layer validated."""
+    project = _read_json_layer(CODEAGENT_CONFIG, _CODEAGENT_LAYER_SHAPE)
+    local = _read_json_layer(local_path_for(str(CODEAGENT_CONFIG)),
+                             _CODEAGENT_LAYER_SHAPE)
+    return _merge_layers({"defaults": {}}, project, local), project, local
+
+
+def _read_board_layers():
+    """(merged, project, local) for board_config, each layer validated."""
+    defaults = {
+        "columns": [],
+        "column_order": [],
+        "settings": {"auto_refresh_minutes": 0},
+    }
+    project = _read_json_layer(BOARD_CONFIG, _BOARD_LAYER_SHAPE)
+    local = _read_json_layer(local_path_for(str(BOARD_CONFIG)), _BOARD_LAYER_SHAPE)
+    return _merge_layers(defaults, project, local), project, local
+
+
+def _read_project_config() -> dict:
+    """project_config.yaml (project-scoped only)."""
+    return _read_config(PROJECT_CONFIG, lambda: load_yaml_config(PROJECT_CONFIG))
+
+
+#: Config families a write can leave memory behind on (see ConfigManager).
+#: `project` is project_config.yaml, written by both the Project and Tmux tabs.
+_FAMILIES = ("codeagent", "board", "project", "profiles")
+
+
+class ConfigManager:
+    """Load and save all aitasks config files.
+
+    Every project-layer save COMMITS the file it wrote (t1677). `aitasks/metadata`
+    files have no derivable task id, so `ait sync` refuses to attribute them and
+    nothing else was committing them — an ownerless dirty config became a
+    permanent rebase deferral. A Settings save is an explicit user-initiated
+    action, which is exactly the carve-out
+    `aidocs/framework/tui_conventions.md` allows; user-layer (`*.local.json`)
+    saves still commit nothing, and nothing here ever pushes.
+
+    The commit lives in these methods rather than at their call sites so a ninth
+    caller cannot forget it. `on_commit` keeps the manager Textual-free:
+    `SettingsApp` wires it to a notifier once.
+
+    Refresh latch (t1945): every writer builds its payload from memory, so when
+    a write landed (or may have) and the re-read after it failed, memory is
+    behind disk and a second write would undo the first. Re-reads that follow a
+    write go through `refresh_after_write` / `refresh_all_after_write`, which
+    latch the family on failure; the writers refuse a latched family before
+    touching disk; only a successful re-read of that family releases it.
+    """
+
+    def __init__(self):
+        #: Called with (CommitResult, paths) after every project-layer commit
+        #: attempt. Set by SettingsApp; None in headless use.
+        self.on_commit = None
+        #: Families written but not successfully re-read since (see above).
+        self._unrefreshed: set[str] = set()
+        self.codeagent: dict = {}
+        self.codeagent_project: dict = {}
+        self.codeagent_local: dict = {}
+        self.board: dict = {}
+        self.board_project: dict = {}
+        self.board_local: dict = {}
+        self.project_config: dict = {}
+        self.models: dict[str, dict] = {}
+        self.profiles: dict[str, dict] = {}
+        self.profile_layers: dict[str, str] = {}  # filename -> "project" | "user"
+        self.load_all()
+
+    def load_all(self):
+        """Re-read every config from disk, all or nothing.
+
+        Raises ConfigReadError naming the unreadable or malformed file (bad
+        JSON/YAML, a non-object root, or a mistyped key a reader depends on)
+        and then leaves the in-memory state exactly as it was — the caller
+        reports. Success releases every refresh latch.
+        """
+        codeagent, codeagent_project, codeagent_local = _read_codeagent_layers()
+        board, board_project, board_local = _read_board_layers()
+        project_config = _read_project_config()
+
+        # Model files (read-only)
+        all_models = {}
+        for provider, path in MODEL_FILES.items():
+            try:
+                data = _load_json(path)
+            except (OSError, ValueError):
+                # An unreadable registry must not keep Settings from opening:
+                # that provider just has no models here. The Agent Defaults
+                # tab's superseded-model check names the file in a warning.
+                continue
+            models = data.get("models") if isinstance(data, dict) else None
+            if not isinstance(models, list):
+                continue  # wrong shape: every reader assumes a model list
+            # Keep only entry dicts; readers call .get() on each entry.
+            all_models[provider] = {
+                **data, "models": [m for m in models if isinstance(m, dict)]}
+
+        # Every read succeeded: only now replace the in-memory state.
+        self.codeagent, self.codeagent_project, self.codeagent_local = (
+            codeagent, codeagent_project, codeagent_local)
+        self.board, self.board_project, self.board_local = (
+            board, board_project, board_local)
+        self.project_config = project_config
+        self.models = all_models
+
+        # Profiles (never raises: an unreadable profile is skipped)
+        self.load_profiles()
+        self._unrefreshed.clear()
+
+    def reload_codeagent(self):
+        """Re-read the code-agent layers from disk, all or nothing.
+
+        Raises ConfigReadError (a ValueError) naming the unreadable or
+        malformed layer and then leaves the in-memory state exactly as it
+        was — the caller reports.
+        """
+        (self.codeagent, self.codeagent_project,
+         self.codeagent_local) = _read_codeagent_layers()
+        self._unrefreshed.discard("codeagent")
+
+    def reload_board(self):
+        """Re-read the board layers from disk, all or nothing (as above)."""
+        self.board, self.board_project, self.board_local = _read_board_layers()
+        self._unrefreshed.discard("board")
+
+    def reload_project_config(self):
+        """Re-read project_config.yaml from disk, all or nothing (as above)."""
+        self.project_config = _read_project_config()
+        self._unrefreshed.discard("project")
+
+    def refresh_after_write(self, family: str) -> None:
+        """Re-read `family` after a write that landed or may have.
+
+        On any failure the family is latched — memory is behind disk — and
+        the exception propagates for the caller to report.
+        """
+        reload = {"codeagent": self.reload_codeagent,
+                  "board": self.reload_board,
+                  "project": self.reload_project_config}[family]
+        try:
+            reload()
+        except Exception:
+            self._unrefreshed.add(family)
+            raise
+
+    def refresh_all_after_write(self) -> None:
+        """`load_all` after a write to any family (an import); latch all on failure."""
+        try:
+            self.load_all()
+        except Exception:
+            self._unrefreshed.update(_FAMILIES)
+            raise
+
+    def needs_reload(self, family: str) -> bool:
+        """True while `family` was written but not successfully re-read since."""
+        return family in self._unrefreshed
+
+    def _require_refreshed(self, family: str, path) -> None:
+        """Writer backstop: refuse, before touching disk, a latched family."""
+        if family in self._unrefreshed:
+            raise ConfigStaleError(path, "written earlier but not re-read since; "
+                                   "reload (r) before saving again")
+
+    def load_profiles(self):
+        self.profiles = {}
+        self.profile_layers = {}
+        # Project profiles first
+        if PROFILES_DIR.is_dir():
+            for f in sorted(PROFILES_DIR.glob("*.yaml")):
+                if f.parent.name == "local":
+                    continue  # skip local/ subdir
+                try:
+                    with open(f, "r", encoding="utf-8") as fh:
+                        data = yaml.safe_load(fh)
+                    if isinstance(data, dict):
+                        self.profiles[f.name] = data
+                        self.profile_layers[f.name] = "project"
+                except Exception:
+                    pass
+        # User (local) profiles — override project profiles with same name
+        if LOCAL_PROFILES_DIR.is_dir():
+            for f in sorted(LOCAL_PROFILES_DIR.glob("*.yaml")):
+                try:
+                    with open(f, "r", encoding="utf-8") as fh:
+                        data = yaml.safe_load(fh)
+                    if isinstance(data, dict):
+                        self.profiles[f.name] = data
+                        self.profile_layers[f.name] = "user"
+                except Exception:
+                    pass
+
+    def _commit(self, paths, *, allow_new: bool = False):
+        """Commit project-layer paths this save just wrote, then report.
+
+        `allow_new` must always be DERIVED from an existence check taken before
+        the write — it means "I created this file", never "creation is allowed
+        here". A hard-coded True is a standing relaxation that lets a later edit
+        add a stray local file to the data branch without anyone noticing.
+        """
+        result = commit_metadata(paths, allow_new=allow_new)
+        if self.on_commit is not None:
+            self.on_commit(result, paths)
+        return result
+
+    def save_codeagent(self, project_data: dict, local_data: dict):
+        self._require_refreshed("codeagent", CODEAGENT_CONFIG)
+        save_project_config(str(CODEAGENT_CONFIG), project_data)
+        if local_data:
+            save_local_config(str(local_path_for(str(CODEAGENT_CONFIG))), local_data)
+        else:
+            # Remove local file if empty
+            lp = local_path_for(str(CODEAGENT_CONFIG))
+            if lp.is_file():
+                lp.unlink()
+        return self._commit([_repo_rel(CODEAGENT_CONFIG)])
+
+    def _codeagent_layer_path(self, layer: str) -> Path:
+        if layer == "project":
+            return Path(CODEAGENT_CONFIG)
+        return local_path_for(str(CODEAGENT_CONFIG))
+
+    def save_codeagent_layer(self, layer: str, data: dict):
+        """Write ONE code-agent layer; only the project layer is committed.
+
+        Unlike `save_codeagent`, the other layer's file is neither rewritten nor
+        removed, and a per-user write attempts no commit at all. No refresh
+        latch here: its one caller, `switch_codeagent_default`, builds `data`
+        from a fresh read of the file, never from memory.
+        """
+        if layer == "project":
+            save_project_config(str(CODEAGENT_CONFIG), data)
+            return self._commit([_repo_rel(CODEAGENT_CONFIG)])
+        save_local_config(str(self._codeagent_layer_path("local")), data)
+        return None
+
+    def switch_codeagent_default(self, layer: str, key: str,
+                                 old_value: str, new_value: str):
+        """Replace `old_value` with `new_value` for `key` in one layer.
+
+        Re-reads the layer file immediately before writing and builds the update
+        from that fresh content, so edits made elsewhere since the tab was drawn
+        survive. Returns `(status, detail)`:
+        `("switched", CommitResult | None)`, `("changed", current_value)` when
+        the op no longer holds `old_value`, `("unreadable", reason)`, or
+        `("write_failed", reason)` when the write itself raised.
+        """
+        path = self._codeagent_layer_path(layer)
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except FileNotFoundError:
+            return "unreadable", f"{path} does not exist"
+        except (OSError, ValueError) as exc:
+            return "unreadable", f"{path}: {exc}"
+        defaults = data.get("defaults") if isinstance(data, dict) else None
+        if not isinstance(defaults, dict):
+            return "unreadable", f"{path} has no 'defaults' object"
+        current = defaults.get(key)
+        if current != old_value:
+            return "changed", current
+        defaults[key] = new_value
+        try:
+            result = self.save_codeagent_layer(layer, data)
+        except OSError as exc:
+            # The atomic write normally leaves the original intact, but this
+            # cannot prove it; the caller re-reads the file to show the truth.
+            return "write_failed", f"{path}: {exc}"
+        return "switched", result
+
+    def save_board(self, merged: dict):
+        self._require_refreshed("board", BOARD_CONFIG)
+        project_data, user_data = split_config(
+            merged, project_keys=_BOARD_PROJECT_KEYS, user_keys=_BOARD_USER_KEYS
+        )
+        save_project_config(str(BOARD_CONFIG), project_data)
+        if user_data:
+            save_local_config(str(local_path_for(str(BOARD_CONFIG))), user_data)
+        return self._commit([_repo_rel(BOARD_CONFIG)])
+
+    def save_project_settings(self, data: dict):
+        self._require_refreshed("project", PROJECT_CONFIG)
+        save_yaml_config(str(PROJECT_CONFIG), data)
+        return self._commit([_repo_rel(PROJECT_CONFIG)])
+
+    def save_profile(self, filename: str, data: dict, layer: str = "project"):
+        if layer == "user":
+            LOCAL_PROFILES_DIR.mkdir(parents=True, exist_ok=True)
+            path = LOCAL_PROFILES_DIR / filename
+        else:
+            PROFILES_DIR.mkdir(parents=True, exist_ok=True)
+            path = PROFILES_DIR / filename
+        self._require_refreshed("profiles", path)
+        # Captured BEFORE the write: this method both updates and CREATES (the
+        # "+ Add new profile" flow reaches it with a project-layer name that does
+        # not exist yet), and only the writer can tell the two apart.
+        is_new = not path.exists()
+        with open(path, "w", encoding="utf-8") as f:
+            yaml.dump(data, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
+        self.profiles[filename] = data
+        self.profile_layers[filename] = layer
+        # Synchronously refresh every rendered skill closure for this
+        # profile so the on-disk view matches the saved YAML immediately.
+        # The renderer's atomic per-file overwrite keeps any currently-open
+        # SKILL.md handles in active agent sessions valid (Unix inode
+        # semantics); deleting the dirs would not have that guarantee.
+        try:
+            subprocess.run(
+                ["./.aitask-scripts/aitask_skill_rerender.sh",
+                 Path(filename).stem],
+                check=False, capture_output=True, text=True, timeout=60,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        # A user-layer profile lives under profiles/local/, which is gitignored,
+        # so this comes back SKIPPED and commits nothing — no branch needed.
+        return self._commit([_repo_rel(path)], allow_new=is_new)
+
+    def delete_profile(self, filename: str):
+        """Delete a profile file from disk (handles both layers)."""
+        layer = self.profile_layers.get(filename, "project")
+        if layer == "user":
+            path = LOCAL_PROFILES_DIR / filename
+        else:
+            path = PROFILES_DIR / filename
+        self._require_refreshed("profiles", path)
+        if path.is_file():
+            path.unlink()
+        self.profiles.pop(filename, None)
+        self.profile_layers.pop(filename, None)
+        # Commit LAST, and after the in-memory maps are updated: this returns,
+        # so anything placed below it would never run.
+        #
+        # A tracked file removed from disk is a dirty DELETION, and
+        # `commit -o -- <path>` records it. A never-committed new profile
+        # deleted again is simply NOCHANGE, which is correct.
+        return self._commit([_repo_rel(path)])
+
+
+# ---------------------------------------------------------------------------
+# Modal Screens
+# ---------------------------------------------------------------------------
+class ExportScreen(ModalScreen):
+    """Modal for exporting configs with directory and subset selection."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel", show=False)]
+
+    def compose(self) -> ComposeResult:
+        with Container(id="import_dialog"):
+            yield Label("Export Config Bundle", id="import_title")
+            yield Label("Output directory:", classes="edit-label")
+            yield Input(value=".", placeholder="directory path", id="export_dir")
+            yield Label("Select categories to export:", classes="edit-label")
+            for cat_name in EXPORT_CATEGORIES:
+                yield CycleField(cat_name, ["yes", "no"], "yes",
+                                 cat_name, id=f"cf_exp_{cat_name.replace(' ', '_').lower()}")
+            with Horizontal(id="edit_buttons"):
+                yield Button("Export", variant="success", id="btn_export_ok")
+                yield Button("Cancel", variant="default", id="btn_export_cancel")
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self.do_export()
+
+    @on(Button.Pressed, "#btn_export_ok")
+    def do_export(self):
+        directory = self.query_one("#export_dir", Input).value.strip() or "."
+        patterns: list[str] = []
+        for cat_name, cat_patterns in EXPORT_CATEGORIES.items():
+            widget_id = f"cf_exp_{cat_name.replace(' ', '_').lower()}"
+            try:
+                cf = self.query_one(f"#{widget_id}", CycleField)
+                if cf.current_value == "yes":
+                    patterns.extend(cat_patterns)
+            except Exception:
+                patterns.extend(cat_patterns)
+        self.dismiss({"directory": directory, "patterns": patterns})
+
+    @on(Button.Pressed, "#btn_export_cancel")
+    def do_cancel(self):
+        self.dismiss(None)
+
+    def action_cancel(self):
+        self.dismiss(None)
+
+
+def _scan_export_files() -> list[dict]:
+    """Scan CWD for aitasks export bundles (.aitcfg.json and legacy .json)."""
+    found: list[dict] = []
+    seen: set[str] = set()
+    cwd = Path.cwd()
+
+    # New extension
+    for p in sorted(cwd.glob(f"*{EXPORT_EXTENSION}"), reverse=True):
+        if p.name not in seen:
+            seen.add(p.name)
+            found.append({"path": str(p), "name": p.name, "ext": "aitcfg"})
+
+    # Legacy pattern
+    for p in sorted(cwd.glob("aitasks_config_export_*.json"), reverse=True):
+        if p.name not in seen and not p.name.endswith(EXPORT_EXTENSION):
+            seen.add(p.name)
+            found.append({"path": str(p), "name": p.name, "ext": "legacy"})
+
+    return found
+
+
+class ImportScreen(ModalScreen):
+    """Two-step modal for importing config: file selection then per-file selection."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel", show=False)]
+
+    def __init__(self):
+        super().__init__()
+        self._bundle: dict | None = None
+        self._bundle_path: str = ""
+
+    def compose(self) -> ComposeResult:
+        with Container(id="import_dialog"):
+            # Step 1: File selection
+            with Container(id="import_step1"):
+                yield Label("Import Config Bundle", id="import_title")
+                discovered = _scan_export_files()
+                if discovered:
+                    yield Label("[dim]Discovered export files:[/dim]", classes="edit-label")
+                    for i, f in enumerate(discovered[:8]):
+                        tag = " [dim](legacy)[/dim]" if f["ext"] == "legacy" else ""
+                        yield Button(
+                            f"{f['name']}{tag}",
+                            variant="default",
+                            id=f"btn_discovered_{i}",
+                        )
+                    yield Label("")
+                yield Label("Or enter file path manually:", classes="edit-label")
+                yield Input(
+                    placeholder=f"path/to/export{EXPORT_EXTENSION}",
+                    id="import_path",
+                )
+                with Horizontal(id="edit_buttons"):
+                    yield Button("Next", variant="success", id="btn_import_next")
+                    yield Button("Cancel", variant="default", id="btn_import_cancel")
+
+            # Step 2: Per-file selection (hidden initially)
+            with Container(id="import_step2"):
+                yield Label("Select files to import:", id="import_step2_title")
+                yield VerticalScroll(id="import_file_list")
+                yield CycleField(
+                    "Overwrite existing", ["no", "yes"], "no",
+                    "overwrite", id="cf_overwrite",
+                )
+                with Horizontal(id="import_step2_buttons"):
+                    yield Button("Import", variant="success", id="btn_import_ok")
+                    yield Button("Back", variant="default", id="btn_import_back")
+                    yield Button("Cancel", variant="default", id="btn_import_cancel2")
+
+        # Store discovered files for button click lookup
+        self._discovered = _scan_export_files()
+
+    def on_mount(self):
+        self.query_one("#import_step2").display = False
+
+    @on(Button.Pressed)
+    def handle_button(self, event: Button.Pressed):
+        btn_id = event.button.id or ""
+        if btn_id.startswith("btn_discovered_"):
+            idx = int(btn_id.split("_")[-1])
+            if idx < len(self._discovered):
+                inp = self.query_one("#import_path", Input)
+                inp.value = self._discovered[idx]["path"]
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if self.query_one("#import_step1").display:
+            self.do_next()
+
+    @on(Button.Pressed, "#btn_import_next")
+    def do_next(self):
+        path = self.query_one("#import_path", Input).value.strip()
+        if not path:
+            self.notify("Please enter or select a file path", severity="warning")
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                bundle = json.load(f)
+        except FileNotFoundError:
+            self.notify(f"File not found: {path}", severity="error")
+            return
+        except json.JSONDecodeError as exc:
+            self.notify(f"Invalid JSON: {exc}", severity="error")
+            return
+
+        warnings = validate_export_bundle(bundle)
+        if any("Missing 'files'" in w for w in warnings):
+            self.notify("Invalid bundle: missing 'files' key", severity="error")
+            return
+
+        self._bundle = bundle
+        self._bundle_path = path
+        self._populate_file_list(bundle)
+        self.query_one("#import_step1").display = False
+        self.query_one("#import_step2").display = True
+
+    def _populate_file_list(self, bundle: dict):
+        container = self.query_one("#import_file_list", VerticalScroll)
+        container.remove_children()
+
+        meta = bundle.get("_export_meta", {})
+        meta_info = f"[dim]Bundle v{meta.get('version', '?')} — "
+        meta_info += f"exported {meta.get('exported_at', 'unknown')[:19]} — "
+        meta_info += f"{meta.get('file_count', '?')} files[/dim]"
+        container.mount(Label(meta_info))
+        container.mount(Label(""))
+
+        warnings = validate_export_bundle(bundle)
+        if warnings:
+            for w in warnings:
+                container.mount(Label(f"[yellow]Warning: {w}[/yellow]"))
+            container.mount(Label(""))
+
+        files = bundle.get("files", {})
+        for name, data in files.items():
+            if isinstance(data, dict) and "_error" in data:
+                container.mount(Label(f"[red]  {name} — export error, skipped[/red]"))
+                continue
+
+            desc = CONFIG_FILE_DESCRIPTIONS.get(name, "Configuration file")
+            exists = (METADATA_DIR / name).exists()
+            status = "[yellow](exists — will overwrite)[/yellow]" if exists else "[green](new)[/green]"
+
+            container.mount(CycleField(
+                name, ["yes", "no"], "yes", name,
+                id=f"cf_imp_{name.replace('.', '_')}",
+            ))
+            container.mount(Label(f"[dim]    {desc} {status}[/dim]"))
+
+        # Shortcuts are a distinct top-level bundle member (merged into
+        # userconfig.yaml), not a file under `files`. Surface it as its own
+        # selectable entry so the unified Import screen can include/exclude it.
+        shortcuts = bundle.get("shortcuts")
+        if isinstance(shortcuts, dict) and shortcuts:
+            container.mount(CycleField(
+                "shortcuts", ["yes", "no"], "yes", "shortcuts",
+                id="cf_imp_shortcuts",
+            ))
+            container.mount(Label(
+                "[dim]    Customized keybindings — merged into userconfig.yaml "
+                "(email/labels preserved)[/dim]"
+            ))
+
+    @on(Button.Pressed, "#btn_import_ok")
+    def do_import(self):
+        if not self._bundle:
+            return
+        overwrite = self.query_one("#cf_overwrite", CycleField).current_value == "yes"
+        selected: list[str] = []
+        for name in self._bundle.get("files", {}):
+            widget_id = f"cf_imp_{name.replace('.', '_')}"
+            try:
+                cf = self.query_one(f"#{widget_id}", CycleField)
+                if cf.current_value == "yes":
+                    selected.append(name)
+            except Exception:
+                selected.append(name)
+        shortcuts = self._bundle.get("shortcuts")
+        if isinstance(shortcuts, dict) and shortcuts:
+            try:
+                cf = self.query_one("#cf_imp_shortcuts", CycleField)
+                if cf.current_value == "yes":
+                    selected.append("shortcuts")
+            except Exception:
+                selected.append("shortcuts")
+        self.dismiss({
+            "path": self._bundle_path,
+            "overwrite": overwrite,
+            "selected_files": selected,
+        })
+
+    @on(Button.Pressed, "#btn_import_back")
+    def do_back(self):
+        self.query_one("#import_step1").display = True
+        self.query_one("#import_step2").display = False
+
+    @on(Button.Pressed, "#btn_import_cancel")
+    @on(Button.Pressed, "#btn_import_cancel2")
+    def do_cancel(self):
+        self.dismiss(None)
+
+    def action_cancel(self):
+        self.dismiss(None)
+
+
+class EditVerifyBuildScreen(ModalScreen):
+    """Modal for editing verify_build with multi-line TextArea and preset support."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel", show=False)]
+
+    def __init__(self, key: str, current_value: str, presets: list[dict] | None = None):
+        super().__init__()
+        self.key = key
+        self.current_value = current_value
+        self.presets = presets or []
+
+    @staticmethod
+    def _to_block_yaml(value: str) -> str:
+        """Expand a canonical flow list into block style for editing.
+
+        Only a value that IS the canonical flow rendering of a list is
+        expanded. A command that merely parses as one -- `[ -f Makefile ]` --
+        is left alone: expanding it to `- -f Makefile` would make the next
+        save persist a list, so a stored command would become a list purely by
+        being looked at (t1672).
+        """
+        if not value:
+            return ""
+        parsed = _list_if_canonical(value, _format_yaml_value)
+        return value if parsed is None else _format_yaml_block(parsed)
+
+    @staticmethod
+    def _to_compact_yaml(text: str) -> str:
+        """Convert edited text back to compact storage format.
+
+        Block form is unambiguous list intent, so it is accepted whatever its
+        spelling -- quoted items, trailing comments, re-indentation. (YAML
+        comments are dropped, as safe_load drops them; the commands survive.)
+        Flow form is ambiguous with a shell command, so it must be the
+        canonical rendering to count as a list.
+
+        Everything else is returned as the ORIGINAL text. Returning the
+        YAML-decoded scalar instead used to strip shell-significant quoting --
+        `"$HOME/with space/run"` became `$HOME/with space/run`, which word-
+        splits when run -- and needed no edit to fire, since opening the
+        editor and saving was enough (t1672).
+        """
+        text = text.strip()
+        if not text:
+            return ""
+        if _looks_like_block_list(text):
+            try:
+                parsed = yaml.safe_load(text)
+            except yaml.YAMLError:
+                return text
+            return _format_yaml_value(parsed) if isinstance(parsed, list) else text
+        parsed = _list_if_canonical(text, _format_yaml_value)
+        return text if parsed is None else _format_yaml_value(parsed)
+
+    def compose(self) -> ComposeResult:
+        display_value = self._to_block_yaml(self.current_value)
+        with Container(id="edit_dialog"):
+            yield Label(f"Edit: [bold]{self.key}[/bold]", id="edit_title")
+            yield Label(
+                "[dim]Enter a single command string, or a YAML list "
+                "(one command per line, prefix each with '- ')[/dim]",
+                classes="section-hint",
+            )
+            yield TextArea(display_value, id="edit_textarea", language="yaml")
+            with Horizontal(id="edit_buttons"):
+                if self.presets:
+                    yield Button("Load Preset", variant="primary", id="btn_load_preset")
+                yield Button("Save", variant="success", id="btn_edit_ml_save")
+                yield Button("Cancel", variant="default", id="btn_edit_ml_cancel")
+
+    @on(Button.Pressed, "#btn_edit_ml_save")
+    def do_save(self):
+        text = self.query_one("#edit_textarea", TextArea).text
+        value = self._to_compact_yaml(text)
+        self.dismiss({"key": self.key, "value": value})
+
+    @on(Button.Pressed, "#btn_edit_ml_cancel")
+    def do_cancel(self):
+        self.dismiss(None)
+
+    @on(Button.Pressed, "#btn_load_preset")
+    def do_load_preset(self):
+        self.app.push_screen(
+            VerifyBuildPresetScreen(self.presets),
+            callback=self._handle_preset_selected,
+        )
+
+    def _handle_preset_selected(self, result):
+        if result is None:
+            return
+        value = result["value"]
+        if isinstance(value, list):
+            text = yaml.safe_dump(value, default_flow_style=False).strip()
+        else:
+            text = str(value)
+        self.query_one("#edit_textarea", TextArea).load_text(text)
+
+    def action_cancel(self):
+        self.dismiss(None)
+
+
+class VerifyBuildPresetScreen(ModalScreen):
+    """Modal for selecting a verify_build preset with fuzzy search and preview."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel", show=False)]
+
+    def __init__(self, presets: list[dict]):
+        super().__init__()
+        self.presets = presets
+        self._preset_map = {p["name"]: p for p in presets}
+
+    def compose(self) -> ComposeResult:
+        options = [
+            {
+                "value": p["name"],
+                "display": p["name"],
+                "description": p.get("description", ""),
+            }
+            for p in self.presets
+        ]
+        with Container(id="picker_dialog"):
+            yield Label("Select Build Preset", id="picker_title")
+            yield FuzzySelect(
+                options, placeholder="Type to filter presets...",
+                id="preset_picker",
+            )
+            yield Static("", id="preset_preview")
+
+    def on_mount(self):
+        if self.presets:
+            self._show_preview(self.presets[0]["name"])
+
+    def _show_preview(self, name: str):
+        preset = self._preset_map.get(name)
+        if not preset:
+            return
+        value = preset["value"]
+        if isinstance(value, list):
+            formatted = yaml.safe_dump(value, default_flow_style=False).strip()
+        else:
+            formatted = str(value)
+        try:
+            preview = self.query_one("#preset_preview", Static)
+            preview.update(f"[bold]Preview:[/bold]\n[dim]{formatted}[/dim]")
+        except Exception:
+            pass
+
+    def on_fuzzy_select_highlighted(self, event: FuzzySelect.Highlighted):
+        self._show_preview(event.value)
+
+    def on_fuzzy_select_selected(self, event: FuzzySelect.Selected):
+        preset = self._preset_map.get(event.value)
+        if preset:
+            self.dismiss(preset)
+
+    def on_fuzzy_select_cancelled(self, event: FuzzySelect.Cancelled):
+        self.dismiss(None)
+
+    def action_cancel(self):
+        self.dismiss(None)
+
+
+class ProfilePickerScreen(ModalScreen):
+    """Modal for selecting an execution profile name via fuzzy search."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel", show=False)]
+
+    def __init__(self, skill: str, current: str, profile_names: list[str]):
+        super().__init__()
+        self.skill = skill
+        self.current = current
+        self.profile_names = profile_names
+
+    def compose(self) -> ComposeResult:
+        options = [
+            {"value": "", "display": "<not set>", "description": "Remove default profile"},
+        ]
+        for name in self.profile_names:
+            options.append({"value": name, "display": name, "description": ""})
+        with Container(id="picker_dialog"):
+            yield Label(
+                f"Default profile for [bold]{self.skill}[/bold]"
+                f"  (current: {self.current or '<not set>'})",
+                id="picker_title",
+            )
+            yield FuzzySelect(
+                options, placeholder="Type to filter profiles...",
+                id="profile_picker",
+            )
+
+    def on_fuzzy_select_selected(self, event: FuzzySelect.Selected):
+        self.dismiss({"key": self.skill, "value": event.value})
+
+    def on_fuzzy_select_cancelled(self, event: FuzzySelect.Cancelled):
+        self.dismiss(None)
+
+    def action_cancel(self):
+        self.dismiss(None)
+
+
+class NewProfileScreen(ModalScreen):
+    """Modal for creating a new profile based on an existing one."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel", show=False)]
+
+    def __init__(self, existing_profiles: list[str]):
+        super().__init__()
+        self.existing_profiles = existing_profiles
+
+    def compose(self) -> ComposeResult:
+        with Container(id="edit_dialog"):
+            yield Label("Create New Profile", id="edit_title")
+            yield Label("Profile filename (without .yaml):", classes="edit-label")
+            yield Input(placeholder="my-profile", id="new_profile_name")
+            yield Label("Profile scope:", classes="edit-label")
+            yield CycleField(
+                "Scope", ["project", "user"], "project",
+                "profile_scope", id="cf_profile_scope",
+            )
+            yield Label(
+                "[dim]project = git-tracked, shared  |  "
+                "user = local-only, gitignored[/dim]",
+                classes="section-hint",
+            )
+            base_options = list(self.existing_profiles) + ["(empty)"]
+            yield Label("Base on existing profile:", classes="edit-label")
+            yield CycleField(
+                "Base profile", base_options,
+                base_options[0] if base_options else "(empty)",
+                "base_profile", id="cf_base_profile",
+            )
+            with Horizontal(id="edit_buttons"):
+                yield Button("Create", variant="success", id="btn_new_profile_ok")
+                yield Button("Cancel", variant="default", id="btn_new_profile_cancel")
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self.do_create()
+
+    @on(Button.Pressed, "#btn_new_profile_ok")
+    def do_create(self):
+        name = self.query_one("#new_profile_name", Input).value.strip()
+        base = self.query_one("#cf_base_profile", CycleField).current_value
+        scope = self.query_one("#cf_profile_scope", CycleField).current_value
+        if not name:
+            return
+        if not name.endswith(".yaml"):
+            name = name + ".yaml"
+        self.dismiss({"filename": name, "base": base, "layer": scope})
+
+    @on(Button.Pressed, "#btn_new_profile_cancel")
+    def do_cancel(self):
+        self.dismiss(None)
+
+    def action_cancel(self):
+        self.dismiss(None)
+
+
+class AssignGroupScreen(ModalScreen):
+    """Assign/change a repo's project-group: either PICK an existing group from
+    the list, or CREATE a new one by typing a slug. A typed slug is validated
+    with the shared `validate_project_group_slug` BEFORE the screen dismisses,
+    so an invalid value never reaches the `ait projects group set` subprocess.
+    (A picked existing group is already a validated slug.)"""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel", show=False)]
+
+    DEFAULT_CSS = """
+    AssignGroupScreen FuzzySelect { height: auto; max-height: 12; }
+    AssignGroupScreen FuzzySelect VerticalScroll { height: auto; max-height: 8; }
+    AssignGroupScreen FuzzyOption { height: 1; width: 100%; padding: 0 1; }
+    """
+
+    def __init__(self, repo: str, current: str, groups: list[str]):
+        super().__init__()
+        self.repo = repo
+        self.current = current
+        self.groups = groups
+
+    def compose(self) -> ComposeResult:
+        with Container(id="edit_dialog"):
+            yield Label(
+                f"Set group for [bold]{self.repo}[/bold]  "
+                f"(current: {self.current or '(ungrouped)'})",
+                id="edit_title",
+            )
+            if self.groups:
+                yield Label(
+                    "Type to filter an existing group, or type a new slug to "
+                    "create one — Enter accepts:",
+                    classes="edit-label",
+                )
+                options = [
+                    {"value": g, "display": g, "description": ""}
+                    for g in self.groups
+                ]
+                yield FuzzySelect(
+                    options, placeholder="existing group, or new slug…",
+                    id="assign_group_select", allow_create=True,
+                )
+            else:
+                yield Label(
+                    "New group slug (creates the group): "
+                    "lowercase, ^[a-z0-9][a-z0-9_-]*$",
+                    classes="edit-label",
+                )
+                yield Input(placeholder="team_a", id="assign_group_input")
+            yield Label("", id="assign_group_error", classes="section-hint")
+            with Horizontal(id="edit_buttons"):
+                yield Button("Set group", variant="success", id="btn_assign_group_ok")
+                yield Button("Cancel", variant="default", id="btn_assign_group_cancel")
+
+    def on_fuzzy_select_selected(self, event) -> None:
+        # An existing group was picked — it is already a validated slug.
+        self.dismiss({"repo": self.repo, "group": event.value})
+
+    def on_fuzzy_select_created(self, event) -> None:
+        # A new slug was typed (no existing match) — validate before accepting.
+        self._accept_new(event.value)
+
+    def on_fuzzy_select_cancelled(self, event) -> None:
+        # Escape inside the filter cancels the whole dialog (parity with the
+        # other pickers).
+        self.dismiss(None)
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id == "assign_group_input":
+            self._accept_new(event.value.strip())
+
+    @on(Button.Pressed, "#btn_assign_group_ok")
+    def _on_ok(self) -> None:
+        # Route the button through the SAME accept path as the Enter key, so
+        # mouse and keyboard behave identically (pick highlighted, else create).
+        if self.groups:
+            self.query_one("#assign_group_select", FuzzySelect).accept()
+        else:
+            self._accept_new(self.query_one("#assign_group_input", Input).value.strip())
+
+    def _accept_new(self, slug: str) -> None:
+        err = self.query_one("#assign_group_error", Label)
+        if not slug:
+            err.update(
+                "[red]Type an existing group, or a new slug to create.[/red]")
+            return
+        ok, reason = validate_project_group_slug(slug)
+        if not ok:
+            err.update(f"[red]Invalid slug: {reason}[/red]")
+            return
+        self.dismiss({"repo": self.repo, "group": slug})
+
+    @on(Button.Pressed, "#btn_assign_group_cancel")
+    def _on_cancel(self) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class RenameGroupScreen(ModalScreen):
+    """Rename an existing project-group. The new slug is validated before the
+    screen dismisses; renaming into an existing slug merges the two groups."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel", show=False)]
+
+    def __init__(self, groups: list[str]):
+        super().__init__()
+        self.groups = groups
+
+    def compose(self) -> ComposeResult:
+        with Container(id="edit_dialog"):
+            yield Label("Rename project-group", id="edit_title")
+            yield Label("Group to rename:", classes="edit-label")
+            yield CycleField(
+                "Group", self.groups, self.groups[0],
+                "rename_old_group", id="cf_rename_old_group",
+            )
+            yield Label(
+                "New slug (^[a-z0-9][a-z0-9_-]*$; merges if it already exists):",
+                classes="edit-label",
+            )
+            yield Input(placeholder="new_group", id="rename_group_input")
+            yield Label("", id="rename_group_error", classes="section-hint")
+            with Horizontal(id="edit_buttons"):
+                yield Button("Rename", variant="success", id="btn_rename_group_ok")
+                yield Button("Cancel", variant="default", id="btn_rename_group_cancel")
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self._do_rename()
+
+    @on(Button.Pressed, "#btn_rename_group_ok")
+    def _on_ok(self) -> None:
+        self._do_rename()
+
+    def _do_rename(self) -> None:
+        old = self.query_one("#cf_rename_old_group", CycleField).current_value
+        new = self.query_one("#rename_group_input", Input).value.strip()
+        err = self.query_one("#rename_group_error", Label)
+        if not new:
+            err.update("[red]Enter the new slug, or Cancel.[/red]")
+            return
+        ok, reason = validate_project_group_slug(new)
+        if not ok:
+            err.update(f"[red]Invalid slug: {reason}[/red]")
+            return
+        self.dismiss({"old": old, "new": new})
+
+    @on(Button.Pressed, "#btn_rename_group_cancel")
+    def _on_cancel(self) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class EditArtifactBranchScreen(GuardedModalScreen):
+    """Edit the gitbranch artifact branch. A non-empty name is validated before
+    the screen dismisses, so a rejected branch never reaches the pane; an empty
+    value dismisses (clearing is legal — the save path decides whether the
+    resulting config is acceptable)."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel", show=False)]
+
+    def __init__(self, key: str, current_value: str,
+                 validate: Callable[[str], str | None]):
+        super().__init__()
+        self.key = key
+        self.current_value = current_value
+        self._validate = validate
+
+    def compose(self) -> ComposeResult:
+        with Container(id="edit_dialog"):
+            yield Label(f"Edit: [bold]{self.key}[/bold]", id="edit_title")
+            yield Label(
+                "Branch name (empty clears it; main, master and the aitask-* "
+                "framework branches are refused):",
+                classes="edit-label",
+            )
+            yield Input(value=self.current_value, id="edit_branch_input")
+            yield Label("", id="edit_branch_error", classes="section-hint")
+            with Horizontal(id="edit_buttons"):
+                yield Button("Save", variant="success", id="btn_edit_branch_save")
+                yield Button("Cancel", variant="default", id="btn_edit_branch_cancel")
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self._do_save()
+
+    @on(Button.Pressed, "#btn_edit_branch_save")
+    def _on_save(self) -> None:
+        self._do_save()
+
+    def _do_save(self) -> None:
+        value = self.query_one("#edit_branch_input", Input).value
+        if value:
+            why = self._validate(value)
+            if why:
+                self.query_one("#edit_branch_error", Label).update(
+                    f"[red]{escape(why)}[/red]")
+                return
+        self.dismiss({"key": self.key, "value": value})
+
+    @on(Button.Pressed, "#btn_edit_branch_cancel")
+    def _on_cancel(self) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class DeleteProfileConfirmScreen(ModalScreen):
+    """Confirmation dialog to delete a profile."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel", show=False)]
+
+    def __init__(self, profile_name: str, filename: str):
+        super().__init__()
+        self.profile_name = profile_name
+        self.filename = filename
+
+    def compose(self) -> ComposeResult:
+        with Container(id="edit_dialog"):
+            yield Label(
+                f"Delete profile [bold]{self.profile_name}[/bold] "
+                f"({self.filename})?\nThis cannot be undone.",
+                id="edit_title",
+            )
+            with Horizontal(id="edit_buttons"):
+                yield Button("Delete", variant="error", id="btn_del_profile_ok")
+                yield Button("Cancel", variant="default", id="btn_del_profile_cancel")
+
+    @on(Button.Pressed, "#btn_del_profile_ok")
+    def do_delete(self):
+        self.dismiss(True)
+
+    @on(Button.Pressed, "#btn_del_profile_cancel")
+    def do_cancel(self):
+        self.dismiss(False)
+
+    def action_cancel(self):
+        self.dismiss(False)
+
+
+class SaveProfileConfirmScreen(ModalScreen):
+    """Confirmation dialog before saving a profile."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel", show=False)]
+
+    def __init__(self, profile_name: str, filename: str):
+        super().__init__()
+        self.profile_name = profile_name
+        self.filename = filename
+
+    def compose(self) -> ComposeResult:
+        with Container(id="edit_dialog"):
+            yield Label(
+                f"Save profile [bold]{self.profile_name}[/bold]?",
+                id="edit_title",
+            )
+            with Horizontal(id="edit_buttons"):
+                # No separate "Save and Commit": since t1677 a save IS the
+                # commit, because a project profile nothing commits is an
+                # ownerless dirty file that blocks task-data sync.
+                yield Button("Save", variant="success", id="btn_save_profile_ok")
+                yield Button(
+                    "Cancel", variant="default", id="btn_save_profile_cancel",
+                )
+
+    @on(Button.Pressed, "#btn_save_profile_ok")
+    def do_save(self):
+        self.dismiss("save")
+
+    @on(Button.Pressed, "#btn_save_profile_cancel")
+    def do_cancel(self):
+        self.dismiss(None)
+
+    def action_cancel(self):
+        self.dismiss(None)
+
+
+class ResetShortcutsConfirmScreen(ModalScreen):
+    """Confirm clearing all shortcut overrides for a scope. Mirrors
+    SaveProfileConfirmScreen — reuses the app-level #edit_dialog CSS."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel", show=False)]
+
+    def __init__(self, scope: str):
+        super().__init__()
+        self.scope = scope
+
+    def compose(self) -> ComposeResult:
+        with Container(id="edit_dialog"):
+            yield Label(
+                f"Reset all [bold]{self.scope}[/bold] shortcuts to defaults?",
+                id="edit_title",
+            )
+            yield Label(
+                "[dim]Clears your custom keys for this scope. "
+                "Applies after the affected TUI is restarted.[/dim]",
+                classes="section-hint",
+            )
+            with Horizontal(id="edit_buttons"):
+                yield Button("Reset", variant="error", id="btn_sc_reset_ok")
+                yield Button("Cancel", variant="default", id="btn_sc_reset_cancel")
+
+    @on(Button.Pressed, "#btn_sc_reset_ok")
+    def do_reset(self):
+        self.dismiss(True)
+
+    @on(Button.Pressed, "#btn_sc_reset_cancel")
+    def do_cancel(self):
+        self.dismiss(False)
+
+    def action_cancel(self):
+        self.dismiss(False)
+
+
+class SupersededSwitchScreen(GuardedModalScreen):
+    """Enter on a superseded Agent Defaults row: switch, pick another, or cancel.
+
+    Dismisses with "switch", "pick", or None. The caller binds the exact
+    (current, target) pair this dialog displayed, so a table change while it is
+    open cannot turn "switch to X" into a write of Y.
+    """
+
+    DEFAULT_CSS = """
+    #ss_dialog {
+        width: 70%;
+        height: auto;
+        background: $surface;
+        border: thick $accent;
+        padding: 1 2;
+    }
+    #ss_dialog Label { width: 100%; }
+    /* Stacked, full-width buttons: three side by side overflow the dialog at
+       80 columns (the last one is drawn outside it, yet still focusable). */
+    #ss_buttons { margin-top: 1; height: auto; }
+    #ss_buttons Button { width: 100%; margin: 0 0 1 0; }
+    """
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel", show=False)]
+
+    def __init__(self, operation: str, layer_label: str, current: str,
+                 target: str, kept: bool):
+        super().__init__()
+        self.operation = operation
+        self.layer_label = layer_label
+        self.current = current
+        self.target = target
+        self.kept = kept
+
+    def compose(self) -> ComposeResult:
+        with Container(id="ss_dialog"):
+            yield Label(
+                f"[bold]{escape(self.operation)}[/bold] ({self.layer_label}) uses "
+                f"[#FFB86C]{escape(self.current)}[/], which is superseded by "
+                f"[#50FA7B]{escape(self.target)}[/].",
+                id="ss_title",
+            )
+            if self.kept:
+                yield Label(
+                    "[dim]You kept the current model when "
+                    "'ait codeagent check-superseded' offered this switch.[/dim]",
+                    id="ss_kept",
+                )
+            with Vertical(id="ss_buttons"):
+                yield Button(f"Switch to {self.target}", variant="primary",
+                             id="btn_ss_switch")
+                yield Button("Choose another model…", id="btn_ss_pick")
+                yield Button("Cancel", id="btn_ss_cancel")
+
+    @on(Button.Pressed, "#btn_ss_switch")
+    def do_switch(self):
+        self.dismiss("switch")
+
+    @on(Button.Pressed, "#btn_ss_pick")
+    def do_pick(self):
+        self.dismiss("pick")
+
+    @on(Button.Pressed, "#btn_ss_cancel")
+    def do_cancel(self):
+        self.dismiss(None)
+
+    def action_cancel(self):
+        self.dismiss(None)
+
+
+class LintResultsScreen(ModalScreen):
+    """Read-only list of shortcut coherence warnings. Self-contained CSS
+    because it needs a scrollable list layout not present in the app CSS."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel", show=False)]
+
+    DEFAULT_CSS = """
+    LintResultsScreen { align: center middle; }
+    LintResultsScreen #lint_dialog {
+        width: 70%;
+        height: auto;
+        max-height: 70%;
+        background: $surface;
+        border: thick $accent;
+        padding: 1 2;
+    }
+    LintResultsScreen #lint_list {
+        height: auto;
+        max-height: 18;
+        padding: 0 1;
+    }
+    LintResultsScreen #lint_buttons { padding: 1 0 0 0; height: auto; }
+    LintResultsScreen #lint_buttons Button { margin: 0 1; }
+    """
+
+    def __init__(self, warnings: list[str]):
+        super().__init__()
+        self._warnings = warnings
+
+    def compose(self) -> ComposeResult:
+        with Container(id="lint_dialog"):
+            yield Label("Shortcut coherence warnings", id="edit_title")
+            with VerticalScroll(id="lint_list"):
+                for w in self._warnings:
+                    yield Label(f"• {w}")
+            with Horizontal(id="lint_buttons"):
+                yield Button("Close", variant="primary", id="btn_lint_close")
+
+    @on(Button.Pressed, "#btn_lint_close")
+    def do_close(self):
+        self.dismiss(None)
+
+    def action_cancel(self):
+        self.dismiss(None)
+
+
+# ---------------------------------------------------------------------------
+# Main App
+# ---------------------------------------------------------------------------
+class SettingsApp(TuiSwitcherMixin, ShortcutsMixin, App):
+    """aitasks Settings TUI."""
+
+    _shortcuts_scope = "settings"
+
+    CSS = """
+    /* Tab panes */
+    TabPane { padding: 1 2; }
+
+    /* Config rows */
+    ConfigRow { height: 1; width: 100%; padding: 0 1; }
+    .superseded-note { width: 100%; height: auto; padding: 0 1 0 4; }
+    .superseded-note-user { padding: 0 1 0 9; }
+    ConfigRow.row-focused { background: $primary 20%; }
+
+    /* Cycle fields */
+    CycleField { height: 1; width: 100%; padding: 0 1; }
+    CycleField.cycle-focused { background: $primary 20%; }
+
+    /* Section headers */
+    .section-header {
+        text-style: bold;
+        padding: 1 0 0 1;
+        color: $accent;
+    }
+    .section-hint {
+        padding: 0 0 0 3;
+        color: $text-muted;
+    }
+
+    /* Model rows */
+    .model-row { height: auto; padding: 0 2; }
+    .model-header { text-style: bold underline; padding: 0 2; }
+
+    /* Profile section */
+    .profile-header {
+        text-style: bold;
+        padding: 1 0 0 1;
+        color: #50FA7B;
+    }
+    .profile-sep { color: $text-muted; padding: 0 1; }
+
+    /* Execution Profiles tab: non-scrolling shell, params scroll fills the
+       middle, selector/search/buttons stay fixed (mirrors the Shortcuts tab).
+       The inner panes are re-created (with a fresh repop-counter suffix) on
+       every repopulation, so they are styled by class, not by fixed id. */
+    #profiles_content { height: 1fr; }
+    .profiles-params { height: 1fr; }
+    .profiles-search { margin: 0 1; }
+
+    /* Modal dialogs */
+    #edit_dialog, #import_dialog, #picker_dialog {
+        width: 65%;
+        height: auto;
+        max-height: 70%;
+        background: $surface;
+        border: thick $accent;
+        padding: 1 2;
+    }
+    .edit-label { padding: 1 0 0 1; }
+    #edit_buttons { padding: 1 0 0 0; height: auto; }
+    #edit_buttons Button { margin: 0 1; }
+    #picker_step_label { padding: 0 0 1 1; color: $accent; }
+
+    /* Buttons in tabs */
+    .tab-buttons { padding: 1 0 0 0; height: auto; }
+    .tab-buttons Button { margin: 0 1; }
+
+    /* FuzzySelect */
+    FuzzySelect { height: auto; max-height: 20; }
+    FuzzySelect VerticalScroll { height: auto; max-height: 15; }
+    FuzzyOption { height: 1; width: 100%; padding: 0 1; }
+
+    /* Import step containers */
+    #import_step2 { height: auto; }
+    #import_step2_buttons { padding: 1 0 0 0; height: auto; }
+    #import_step2_buttons Button { margin: 0 1; }
+    #import_file_list { height: auto; max-height: 15; padding: 0 1; }
+
+    /* Operation descriptions */
+    .op-desc { padding: 0 0 0 5; height: 1; }
+
+    /* Shortcuts tab: table fills, buttons sit at the bottom; the table scrolls
+       itself so the outer container must not add a second scrollbar. */
+    #shortcuts_content { height: 1fr; }
+    #shortcuts_table { height: 1fr; }
+    /* Filter box: an accent rounded border + titled label so it reads as its
+       own search field rather than blending into the dim hint text above it. */
+    #shortcuts_search {
+        border: round $accent;
+        border-title-color: $accent;
+        height: 3;
+        margin-bottom: 1;
+    }
+
+    /* Verify build multi-line editor */
+    #edit_textarea { height: 10; min-height: 5; max-height: 15; }
+
+    /* Preset preview */
+    #preset_preview {
+        padding: 1 2;
+        height: auto;
+        max-height: 8;
+        background: $surface-darken-1;
+        border: tall $accent;
+        margin: 1 0 0 0;
+    }
+    """
+
+    TITLE = "aitasks settings"
+
+    BINDINGS = [
+        *TuiSwitcherMixin.SWITCHER_BINDINGS,
+        *ShortcutsMixin.SHORTCUTS_MIXIN_BINDINGS,
+        Binding("q", "quit", "Quit"),
+        Binding("e", "export_configs", "Export"),
+        Binding("i", "import_configs", "Import"),
+        Binding("r", "reload_configs", "Reload"),
+        # Shortcuts-tab actions — gated to that tab by check_action (so they only
+        # fire there). show=False: these belong to the tab's on-screen buttons
+        # (whose labels carry the key via render_label), not the global footer.
+        # (Export/import of shortcuts is handled by the general e/i actions —
+        # the bundle's "Shortcuts" category — so the tab has no dedicated
+        # export/import buttons.)
+        Binding("d", "sc_reset", "Reset scope", show=False),
+        Binding("l", "sc_lint", "Lint", show=False),
+        # Execution Profiles tab actions — gated to that tab by check_action.
+        # show=False: the keys live on the tab's on-screen buttons (whose labels
+        # carry the key via render_label_cfg), not the global footer.
+        Binding("w", "profile_save", "Save profile", show=False),
+        Binding("v", "profile_revert", "Revert profile", show=False),
+        Binding("x", "profile_delete", "Delete profile", show=False),
+        # Project Groups tab actions — gated to that tab by check_action (so
+        # they only fire there) and inert while a modal owns the screen.
+        # show=False: the keys live on the tab's on-screen buttons (whose labels
+        # carry the key via render_label_cfg), not the global footer.
+        Binding("h", "pg_assign", "Assign group", show=False),
+        Binding("u", "pg_clear", "Clear group", show=False),
+        Binding("n", "pg_rename", "Rename group", show=False),
+        Binding("y", "pg_sync", "Sync groups", show=False),
+        Binding("f", "pg_refresh", "Refresh groups", show=False),
+        # Agent Defaults tab — gated to that tab by check_action, and yields to
+        # any existing user binding on the same key (see _switch_key_state).
+        # show=False: the key lives in the tab's section-hint footer.
+        Binding("o", "agent_switch_superseded", "Switch to newer model", show=False),
+        # Tab switching — registry-backed (scope "settings") so the keys are
+        # rebindable in the Shortcuts editor and the per-tab footer hints derive
+        # from them (_tab_switch_hint). show=False: they belong to the manually
+        # rendered section-hint footers, not the global footer. Inert while a
+        # modal owns the screen (gated in check_action).
+        Binding("a", "switch_tab_agent", "Agent tab", show=False),
+        Binding("b", "switch_tab_board", "Board tab", show=False),
+        Binding("c", "switch_tab_project", "Project tab", show=False),
+        Binding("g", "switch_tab_project_groups", "Project Groups tab", show=False),
+        Binding("k", "switch_tab_artifacts", "Artifacts tab", show=False),
+        Binding("m", "switch_tab_models", "Models tab", show=False),
+        Binding("p", "switch_tab_profiles", "Profiles tab", show=False),
+        Binding("s", "switch_tab_shortcuts", "Shortcuts tab", show=False),
+        Binding("t", "switch_tab_tmux", "Tmux tab", show=False),
+    ]
+
+    _SHORTCUT_TAB_ACTIONS = frozenset({"sc_reset", "sc_lint"})
+    _PROFILE_TAB_ACTIONS = frozenset(
+        {"profile_save", "profile_revert", "profile_delete"}
+    )
+    _PROJECT_GROUPS_TAB_ACTIONS = frozenset(
+        {"pg_assign", "pg_clear", "pg_rename", "pg_sync", "pg_refresh"}
+    )
+    _AGENT_TAB_ACTIONS = frozenset({"agent_switch_superseded"})
+
+    def check_action(self, action: str, parameters):
+        """Gate the sc_* / profile_* / pg_* bindings to their owning tab."""
+        # Tab-switch and tab-scoped action keys are inert while a modal owns the
+        # screen — typing in a dialog must not switch the background tab or
+        # mutate the registry (parity with the former on_key modal guard). A
+        # focused Input already swallows letter keys, so the in-field case needs
+        # no extra guard here.
+        if isinstance(self.screen, ModalScreen):
+            if (action in _TAB_SWITCH_ACTIONS
+                    or action in self._PROJECT_GROUPS_TAB_ACTIONS
+                    or action in self._AGENT_TAB_ACTIONS):
+                return None
+        if action in self._AGENT_TAB_ACTIONS:
+            try:
+                if self.query_one(TabbedContent).active != "tab_agent":
+                    return None  # inert on other tabs
+            except Exception:
+                return None
+            if self._switch_key_state()[1]:
+                return None  # a user binding owns this key; let it fire
+        if action in self._SHORTCUT_TAB_ACTIONS:
+            try:
+                if self.query_one(TabbedContent).active != "tab_shortcuts":
+                    return None  # hide from footer on other tabs
+            except Exception:
+                return None
+        if action in self._PROFILE_TAB_ACTIONS:
+            try:
+                if self.query_one(TabbedContent).active != "tab_profiles":
+                    return None  # inert on other tabs
+            except Exception:
+                return None
+        if action in self._PROJECT_GROUPS_TAB_ACTIONS:
+            try:
+                if self.query_one(TabbedContent).active != "tab_project_groups":
+                    return None  # inert on other tabs
+            except Exception:
+                return None
+        return True
+
+    def __init__(self):
+        super().__init__()
+        self.current_tui_name = "settings"
+        self.config_mgr = ConfigManager()
+        # One wiring point for every project-layer commit the manager makes, so
+        # ConfigManager itself stays Textual-free (t1677).
+        self.config_mgr.on_commit = self._notify_commit
+        self._profile_id_map: dict[str, str] = {}  # safe_id -> filename
+        self._selected_profile: str | None = None  # currently selected profile filename
+        self._expanded_field: str | None = None  # field key with expanded description
+        self._profiles_focus_target: str | None = None  # widget ID to focus after repop
+        # Profiles tab: index of (group_header_label, [[key, field_widget, hint_label], ...])
+        # built from the flat compose_profile_fields() stream — drives the
+        # name-only search filter. Search text persists across param re-renders.
+        self._profile_groups: list = []
+        self._profile_search_text: str = ""
+        self._editing_layer: str = "project"  # track which layer is being edited
+        self._editing_project_key: str | None = None
+        self._repop_counter: int = 0  # ensures unique widget IDs across repopulations
+        self._tmux_tab_rc: int = 0  # counter snapshot for tmux tab widgets
+        self._artifacts_tab_rc: int = 0  # counter snapshot for artifacts tab widgets
+        # Bumped by every artifacts save; an apply result from an older one is dropped.
+        self._fetch_exclusion_gen: int = 0
+        self._profiles_tab_rc: int = 0  # counter snapshot for profiles tab widgets
+        self._shortcuts_swept: bool = False  # global scope sweep runs once
+        self._shortcuts_query: str = ""  # fuzzy filter for the Shortcuts tab
+        # Agent Defaults: (layer, op) -> (current, target) as last rendered, so
+        # the `o` switch acts on exactly what the note showed.
+        self._displayed_offers: dict[tuple[str, str], tuple[str, str]] = {}
+        self._kept_path: str | None = None
+        self._kept_path_resolved: bool = False
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        # Each tab title carries its (registry-resolved) switch shortcut via
+        # self.label(), so the active key is visible on the tab itself and
+        # tracks user rebinds. Textual ignores TabbedContent's positional
+        # titles when TabPane children are composed (see TabbedContent.compose),
+        # so the TabPane title is the single source of truth — no positional
+        # titles are passed.
+        with TabbedContent():
+            with TabPane(self.label("switch_tab_agent", "Agent Defaults"), id="tab_agent"):
+                yield VerticalScroll(id="agent_content")
+            with TabPane(self.label("switch_tab_board", "Board"), id="tab_board"):
+                yield VerticalScroll(id="board_content")
+            with TabPane(self.label("switch_tab_project", "Project Config"), id="tab_project"):
+                yield VerticalScroll(id="project_content")
+            with TabPane(self.label("switch_tab_project_groups", "Project Groups"), id="tab_project_groups"):
+                # Non-scrolling shell: the inner DataTable scrolls itself.
+                yield Vertical(id="project_groups_content")
+            with TabPane(self.label("switch_tab_tmux", "Tmux"), id="tab_tmux"):
+                yield VerticalScroll(id="tmux_content")
+            with TabPane(self.label("switch_tab_artifacts", "Artifacts"), id="tab_artifacts"):
+                yield VerticalScroll(id="artifacts_content")
+            with TabPane(self.label("switch_tab_models", "Models"), id="tab_models"):
+                yield VerticalScroll(id="models_content")
+            with TabPane(self.label("switch_tab_profiles", "Execution Profiles"), id="tab_profiles"):
+                # Non-scrolling shell: the selector + search + buttons stay fixed
+                # while only the inner params VerticalScroll scrolls.
+                yield Vertical(id="profiles_content")
+            with TabPane(self.label("switch_tab_shortcuts", "Shortcuts"), id="tab_shortcuts"):
+                # Non-scrolling: the inner DataTable scrolls itself, so an outer
+                # VerticalScroll would produce a redundant second scrollbar.
+                yield Vertical(id="shortcuts_content")
+        yield Footer()
+
+    def on_mount(self):
+        self._populate_agent_tab()
+        self._populate_board_tab()
+        self._populate_project_tab()
+        self._populate_project_groups_tab()
+        self._populate_tmux_tab()
+        self._populate_artifacts_tab()
+        self._populate_models_tab()
+        self._populate_profiles_tab()
+        self._populate_shortcuts_tab()
+
+    # -------------------------------------------------------------------
+    # Navigation helpers
+    # -------------------------------------------------------------------
+    def _nav_vertical(self, direction: str) -> None:
+        """Move focus between focusable widgets in the active tab."""
+        try:
+            tabbed = self.query_one(TabbedContent)
+            active_pane_id = tabbed.active
+            pane = self.query_one(f"#{active_pane_id}", TabPane)
+        except Exception:
+            return
+        # Exclude VerticalScroll containers — they are focusable by default
+        # but have no visual indicator and steal focus from actual widgets.
+        # `focusable` (not `can_focus`) also skips disabled widgets (e.g. the
+        # Save/Revert buttons when a profile has no unsaved changes) and
+        # search-filtered fields whose `display` is off.
+        focusable = [
+            w for w in pane.query("*")
+            if w.focusable and not isinstance(w, VerticalScroll)
+        ]
+        if not focusable:
+            return
+        focused = self.focused
+        # A focused DataTable navigates its own rows until a boundary, then
+        # hands off to the surrounding focus chain (tab title above / buttons
+        # below), matching the up/down "move between options" convention.
+        if isinstance(focused, DataTable) and focused in focusable:
+            if direction == "down" and focused.cursor_row < focused.row_count - 1:
+                focused.move_cursor(row=focused.cursor_row + 1)
+                return
+            if direction == "up" and focused.cursor_row > 0:
+                focused.move_cursor(row=focused.cursor_row - 1)
+                return
+            # At a boundary: fall through to inter-widget navigation below.
+        if focused in focusable:
+            idx = focusable.index(focused)
+            if direction == "up" and idx > 0:
+                focusable[idx - 1].focus()
+            elif direction == "up" and idx == 0:
+                # Return focus to the tab bar
+                try:
+                    tabbed.query_one("Tabs").focus()
+                except Exception:
+                    pass
+            elif direction == "down" and idx < len(focusable) - 1:
+                focusable[idx + 1].focus()
+        else:
+            if direction == "down":
+                focusable[0].focus()
+            else:
+                focusable[-1].focus()
+
+    def _focus_first_in_tab(self, tab_id: str) -> None:
+        """Focus the first focusable widget in the given tab pane."""
+        try:
+            # Shortcuts tab: land on the table (table-first nav convention); the
+            # filter box above it is reachable via ↑ or a click.
+            if tab_id == "tab_shortcuts":
+                self.query_one("#shortcuts_table", DataTable).focus()
+                return
+            pane = self.query_one(f"#{tab_id}", TabPane)
+            focusable = [
+                w for w in pane.query("*")
+                if w.focusable and not isinstance(w, VerticalScroll)
+            ]
+            if focusable:
+                focusable[0].focus()
+            else:
+                self.query_one(TabbedContent).query_one("Tabs").focus()
+        except Exception:
+            pass
+
+    def _switch_to_tab(self, tab_id: str) -> None:
+        """Activate ``tab_id`` and settle focus.
+
+        Immediately moves focus to the tab bar to prevent Textual from
+        reverting the switch (happens when the previously focused widget becomes
+        hidden and the new tab has no focusable content, e.g. the Models tab),
+        then lands focus on the tab's first focusable widget after refresh.
+        """
+        try:
+            tabbed = self.query_one(TabbedContent)
+            tabbed.active = tab_id
+            tabbed.query_one("Tabs").focus()
+            self.call_after_refresh(self._focus_first_in_tab, tab_id)
+        except Exception:
+            pass
+
+    # Tab-switch actions. Distinct action_ids (one per tab) so each key is
+    # independently rebindable in the Shortcuts editor; all delegate to the
+    # shared _switch_to_tab helper.
+    def action_switch_tab_agent(self) -> None:
+        self._switch_to_tab("tab_agent")
+
+    def action_switch_tab_board(self) -> None:
+        self._switch_to_tab("tab_board")
+
+    def action_switch_tab_project(self) -> None:
+        self._switch_to_tab("tab_project")
+
+    def action_switch_tab_project_groups(self) -> None:
+        self._switch_to_tab("tab_project_groups")
+
+    def action_switch_tab_models(self) -> None:
+        self._switch_to_tab("tab_models")
+
+    def action_switch_tab_profiles(self) -> None:
+        self._switch_to_tab("tab_profiles")
+
+    def action_switch_tab_shortcuts(self) -> None:
+        self._switch_to_tab("tab_shortcuts")
+
+    def action_switch_tab_tmux(self) -> None:
+        self._switch_to_tab("tab_tmux")
+
+    def action_switch_tab_artifacts(self) -> None:
+        self._switch_to_tab("tab_artifacts")
+
+    def _tab_switch_hint(self) -> str:
+        """Footer hint listing the live tab-switch keys (registry-derived).
+
+        Resolves each tab-switch action's current key from the keybinding
+        registry, so the hint auto-includes every tab key and reflects user
+        rebinds instead of drifting from a hardcoded literal.
+        """
+        keys = [
+            keybinding_registry.resolve_key(self._shortcuts_scope, action_id)
+            for action_id in _TAB_SWITCH_ACTIONS
+        ]
+        return "/".join(k for k in keys if k) + ": switch tabs"
+
+    # -------------------------------------------------------------------
+    # Key handling
+    # -------------------------------------------------------------------
+    def on_key(self, event) -> None:
+        # Guard: don't intercept keys when a modal is active
+        if isinstance(self.screen, ModalScreen):
+            return
+
+        focused = self.focused
+
+        # Tab / Shift+Tab cycle focus between the Execution Profiles panes.
+        # Handled before the Input guard so Tab can leave the search box too.
+        if event.key in ("tab", "shift+tab"):
+            try:
+                if self.query_one(TabbedContent).active == "tab_profiles":
+                    self._cycle_profile_pane(-1 if event.key == "shift+tab" else 1)
+                    event.prevent_default()
+                    event.stop()
+                    return
+            except Exception:
+                pass
+
+        # The Shortcuts-tab filter box joins the vertical focus chain: ↓ drops
+        # into the table, ↑ returns to the tab bar. Other keys fall through to
+        # the Input guard below, so typing still filters.
+        if isinstance(focused, Input) and focused.id == "shortcuts_search":
+            if event.key == "down":
+                self.query_one("#shortcuts_table", DataTable).focus()
+                event.prevent_default()
+                event.stop()
+                return
+            if event.key == "up":
+                self.query_one(TabbedContent).query_one("Tabs").focus()
+                event.prevent_default()
+                event.stop()
+                return
+
+        # Guard: skip all custom handling when an Input has focus
+        if isinstance(focused, Input):
+            return
+
+        # Tab switching (a/b/c/m/p/s/t) is handled by the registry-backed
+        # switch_tab_* bindings + action_switch_tab_* methods, not here.
+
+        # Up/Down navigation within active tab. _nav_vertical moves the focused
+        # DataTable's row cursor internally and hands off to the tab title / next
+        # widget at the table's boundaries (keeps the settings nav convention).
+        if event.key in ("up", "down"):
+            self._nav_vertical(event.key)
+            event.prevent_default()
+            event.stop()
+            return
+
+        # Enter: open editors for ConfigRow widgets
+        if event.key == "enter" and isinstance(focused, ConfigRow):
+            fid = focused.id or ""
+
+            # Agent Defaults rows (project or user)
+            if fid.startswith("agent_proj_") or fid.startswith("agent_user_"):
+                key = focused.row_key
+                current_val = focused.raw_value
+                self._editing_layer = (
+                    "project" if fid.startswith("agent_proj_") else "user"
+                )
+                if "brainstorm_launch_" in fid:
+                    # Launch mode picker for brainstorm-<type>-launch-mode rows
+                    project_defaults = self.config_mgr.codeagent_project.get(
+                        "defaults", {}
+                    )
+                    if current_val == "(inherits project)":
+                        current_mode = str(project_defaults.get(key, DEFAULT_LAUNCH_MODE))
+                    else:
+                        current_mode = current_val
+                    current_mode = normalize_launch_mode(current_mode)
+                    self.push_screen(
+                        LaunchModePickerScreen(key, current_mode),
+                        callback=self._handle_launch_mode_pick,
+                    )
+                    event.prevent_default()
+                    event.stop()
+                    return
+                layer = "project" if fid.startswith("agent_proj_") else "local"
+                offers, _ = self._supersession_state()
+                entry = offers.get((layer, key))
+                if entry is not None:
+                    offer, kept = entry
+                    shown = (f"{offer.agent}/{offer.old}", f"{offer.agent}/{offer.new}")
+                    self.push_screen(
+                        SupersededSwitchScreen(
+                            key, _AGENT_LAYER_LABELS[layer], shown[0], shown[1], kept,
+                        ),
+                        callback=lambda choice, ly=layer, k=key, sh=shown, cv=current_val:
+                            self._handle_superseded_choice(choice, ly, k, sh, cv),
+                    )
+                    event.prevent_default()
+                    event.stop()
+                    return
+                self._open_agent_model_picker(key, current_val)
+                event.prevent_default()
+                event.stop()
+                return
+
+            # Default profiles per-skill editing
+            if fid.startswith("project_dp_"):
+                skill = focused.row_key
+                current = focused.raw_value or ""
+                profile_names = sorted(
+                    pdata.get("name", fn.removesuffix(".yaml"))
+                    for fn, pdata in self.config_mgr.profiles.items()
+                )
+                self._editing_project_row_id = focused.id
+                self.push_screen(
+                    ProfilePickerScreen(skill, current, profile_names),
+                    callback=self._handle_default_profile_pick,
+                )
+                event.prevent_default()
+                event.stop()
+                return
+
+            # Tmux config editing
+            if fid.startswith("tmux_cfg_"):
+                self._editing_tmux_row_id = focused.id
+                self.push_screen(
+                    EditStringScreen(focused.row_key, focused.raw_value),
+                    callback=self._handle_tmux_config_edit,
+                )
+                event.prevent_default()
+                event.stop()
+                return
+
+            # Artifacts config editing (branch validated before dismiss)
+            if fid.startswith("artifacts_cfg_"):
+                self._editing_artifacts_row_id = focused.id
+                self.push_screen(
+                    EditArtifactBranchScreen(
+                        focused.row_key, focused.raw_value,
+                        self._artifact_ref_error,
+                    ),
+                    callback=self._handle_artifacts_config_edit,
+                )
+                event.prevent_default()
+                event.stop()
+                return
+
+            # Project config editing
+            if fid.startswith("project_cfg_"):
+                self._editing_project_key = focused.row_key
+                self._editing_project_row_id = focused.id
+                if focused.row_key in ("verify_build", "test_command", "lint_command"):
+                    presets = _load_command_presets(focused.row_key)
+                    self.push_screen(
+                        EditVerifyBuildScreen(
+                            focused.row_key, focused.raw_value, presets=presets,
+                        ),
+                        callback=self._handle_project_config_edit,
+                    )
+                else:
+                    self.push_screen(
+                        EditStringScreen(focused.row_key, focused.raw_value),
+                        callback=self._handle_project_config_edit,
+                    )
+                event.prevent_default()
+                event.stop()
+                return
+
+            # Profile string/int editing
+            if fid.startswith("profile_str_") or fid.startswith("profile_int_"):
+                parts = fid.split("__", 1)
+                if len(parts) == 2:
+                    safe_fn_with_rc = parts[1]
+                    # Strip _N repop counter suffix
+                    last_underscore = safe_fn_with_rc.rfind("_")
+                    if last_underscore > 0:
+                        safe_fn = safe_fn_with_rc[:last_underscore]
+                    else:
+                        safe_fn = safe_fn_with_rc
+                    profile_filename = self._profile_id_map.get(safe_fn, safe_fn)
+                    key = focused.row_key
+                    value = focused.value
+                    self.push_screen(
+                        EditStringScreen(key, value),
+                        callback=lambda result, pf=profile_filename:
+                            self._handle_profile_string_edit(result, pf),
+                    )
+                    event.prevent_default()
+                    event.stop()
+                    return
+
+        # ?: toggle field detail on profile fields
+        if event.key == "question_mark" and (
+            isinstance(focused, CycleField) or isinstance(focused, ConfigRow)
+        ):
+            fid = focused.id or ""
+            if fid.startswith("profile_") and "__" in fid:
+                if isinstance(focused, CycleField):
+                    field_key = focused.field_key
+                elif isinstance(focused, ConfigRow):
+                    field_key = focused.row_key
+                else:
+                    field_key = None
+                if field_key and field_key in PROFILE_FIELD_INFO:
+                    if self._expanded_field == field_key:
+                        self._expanded_field = None
+                    else:
+                        self._expanded_field = field_key
+                    # Compute the new widget ID after repopulation
+                    sel = self._selected_profile or ""
+                    sf = _safe_id(sel)
+                    next_rc = self._repop_counter + 1
+                    ktype = PROFILE_SCHEMA.get(field_key, ("", None))[0]
+                    if ktype == "string":
+                        new_wid = f"profile_str_{field_key}__{sf}_{next_rc}"
+                    elif ktype == "int":
+                        new_wid = f"profile_int_{field_key}__{sf}_{next_rc}"
+                    else:
+                        new_wid = f"profile_{field_key}__{sf}_{next_rc}"
+                    self._populate_profiles_tab(focus_widget_id=new_wid)
+                    event.prevent_default()
+                    event.stop()
+                    return
+
+        # d/Delete: clear user override on agent user rows
+        if event.key in ("d", "delete") and isinstance(focused, ConfigRow):
+            fid = focused.id or ""
+            if fid.startswith("agent_user_"):
+                key = focused.row_key
+                self._clear_user_override(key)
+                event.prevent_default()
+                event.stop()
+                return
+
+    # -------------------------------------------------------------------
+    # Agent Defaults tab
+    # -------------------------------------------------------------------
+    def _get_verified_label(self, operation: str, agent_model: str) -> str:
+        """Return a verified score label for an agent/model/operation combo."""
+        if "/" not in agent_model:
+            return ""
+        agent, model_name = agent_model.split("/", 1)
+        provider_data = self.config_mgr.models.get(agent, {})
+        # The counters live under the skill name the launched skill records
+        # with (batch-review -> review), not always under the operation key.
+        stats_key = stats_key_for_operation(operation)
+        for m in provider_data.get("models", []):
+            if m.get("name") == model_name:
+                # Try verifiedstats first for richer display
+                vs = m.get("verifiedstats", {})
+                op_buckets = vs.get(stats_key, {})
+                at = op_buckets.get("all_time", {})
+                if at.get("runs", 0) > 0:
+                    detail = _format_op_stats(op_buckets, compact=True)
+                    return f" [dim][{detail}][/dim]"
+                # Fall back to flat verified dict
+                verified = m.get("verified", {})
+                op_score = verified.get(stats_key, 0)
+                if op_score:
+                    return f" [dim][score: {op_score}][/dim]"
+                elif stats_key in verified:
+                    return " [dim](not verified)[/dim]"
+                return ""
+        return ""
+
+    def _get_all_providers_label(self, operation: str, agent_model: str) -> str:
+        """Return all_providers aggregated label if it differs from provider-specific."""
+        if "/" not in agent_model:
+            return ""
+        agent, model_name = agent_model.split("/", 1)
+        provider_data = self.config_mgr.models.get(agent, {})
+        stats_key = stats_key_for_operation(operation)
+        cli_id = ""
+        provider_runs = 0
+        for m in provider_data.get("models", []):
+            if m.get("name") == model_name:
+                cli_id = m.get("cli_id", "")
+                vs = m.get("verifiedstats", {})
+                at = vs.get(stats_key, {}).get("all_time", {})
+                provider_runs = at.get("runs", 0)
+                break
+        if not cli_id:
+            return ""
+        agg = _aggregate_verifiedstats(self.config_mgr.models, cli_id)
+        op_agg = agg.get(stats_key, {})
+        agg_at = op_agg.get("all_time", {})
+        agg_runs = agg_at.get("runs", 0)
+        if agg_runs <= 0 or agg_runs == provider_runs:
+            return ""  # no cross-provider data
+        detail = _format_op_stats(op_agg, compact=True)
+        return f" [dim]all providers: {detail}[/dim]"
+
+    def _collect_non_default_skill_stats(self) -> dict[str, list[dict]]:
+        """Collect verified stats for skills not in the operation defaults.
+
+        Returns {skill_name: [{agent, model, score, detail}, ...]} with at most
+        3 entries per skill, sorted by all-time average score descending.
+        """
+        project_defaults = self.config_mgr.codeagent_project.get("defaults", {})
+        local_defaults = self.config_mgr.codeagent_local.get("defaults", {})
+        default_keys = (
+            set(OPERATION_DESCRIPTIONS.keys())
+            | set(project_defaults.keys())
+            | set(local_defaults.keys())
+        )
+        # An operation's counters may be recorded under another skill name
+        # (batch-review -> review). Those are shown under the operation, so
+        # they are not a "skill without defaults".
+        default_keys |= {stats_key_for_operation(k) for k in default_keys}
+
+        skill_candidates: dict[str, list[dict]] = {}
+
+        for agent, pdata in self.config_mgr.models.items():
+            for m in pdata.get("models", []):
+                if m.get("status", "active") == "unavailable":
+                    continue
+                name = m.get("name", "?")
+                vs = m.get("verifiedstats", {})
+                for skill, buckets in vs.items():
+                    if skill in default_keys:
+                        continue
+                    if not isinstance(buckets, dict):
+                        continue
+                    at = buckets.get("all_time", {})
+                    runs = at.get("runs", 0)
+                    if runs <= 0:
+                        continue
+                    detail = _format_op_stats(buckets, compact=True)
+                    if skill not in skill_candidates:
+                        skill_candidates[skill] = []
+                    skill_candidates[skill].append({
+                        "agent": agent,
+                        "model": name,
+                        "score": _bucket_avg(at),
+                        "detail": detail,
+                    })
+
+        result: dict[str, list[dict]] = {}
+        for skill in sorted(skill_candidates.keys()):
+            entries = skill_candidates[skill]
+            entries.sort(key=lambda c: (-c["score"], c["agent"], c["model"]))
+            result[skill] = entries[:3]
+        return result
+
+    def _populate_agent_tab(self):
+        from brainstorm.brainstorm_crew import BRAINSTORM_AGENT_TYPES
+
+        container = self.query_one("#agent_content", VerticalScroll)
+        container.remove_children()
+
+        # Increment counter to ensure unique widget IDs (remove_children is async)
+        self._repop_counter += 1
+        rc = self._repop_counter
+
+        container.mount(Label("Default Code Agents for Skills", classes="section-header"))
+        container.mount(Label(
+            "[dim]Each operation shows the shared [#50FA7B]project[/] setting "
+            "and your local [#FFB86C]user[/] preference below it.[/dim]",
+            classes="section-hint",
+        ))
+
+        project_defaults = self.config_mgr.codeagent_project.get("defaults", {})
+        local_defaults = self.config_mgr.codeagent_local.get("defaults", {})
+
+        # Superseded model defaults (t1921): one note line under each marked
+        # row — ConfigRow is one row high, so a suffix on its value would be
+        # clipped first at narrow widths.
+        superseded, sup_warnings = self._supersession_state()
+        self._displayed_offers = {
+            lk: (f"{o.agent}/{o.old}", f"{o.agent}/{o.new}")
+            for lk, (o, _kept) in superseded.items()
+        }
+        switch_key, shadowed_by = self._switch_key_state()
+        switch_keys = "Enter" if shadowed_by or not switch_key else f"{switch_key}/Enter"
+        for msg in sup_warnings:
+            container.mount(Static(
+                f"[yellow]Superseded-model check: {escape(msg)}[/yellow]",
+                classes="superseded-note",
+            ))
+        pending = sum(1 for _o, kept in superseded.values() if not kept)
+        if pending:
+            container.mount(Static(
+                f"[#FFB86C]{pending} default(s) use a superseded model[/] "
+                f"[dim]— {switch_keys} on a \u26a0 row to switch[/dim]",
+                classes="superseded-note",
+            ))
+
+        def _mount_superseded_note(layer: str, op: str) -> None:
+            entry = superseded.get((layer, op))
+            if entry is not None:
+                classes = "superseded-note"
+                if layer == "local":
+                    classes += " superseded-note-user"  # align under the └ row
+                container.mount(Static(
+                    self._superseded_note(entry[0], entry[1], switch_keys),
+                    classes=classes,
+                ))
+
+        # Collect all operation keys (union, preserving order)
+        all_keys = list(dict.fromkeys(
+            list(project_defaults.keys()) + list(local_defaults.keys())
+        ))
+
+        launch_mode_emitted: set[str] = set()
+
+        def _emit_launch_mode_rows(atype: str) -> None:
+            if atype in launch_mode_emitted:
+                return
+            launch_mode_emitted.add(atype)
+            lm_key = f"brainstorm-{atype}-launch-mode"
+            framework_default = BRAINSTORM_AGENT_TYPES.get(atype, {}).get(
+                "launch_mode", DEFAULT_LAUNCH_MODE
+            )
+            proj_lm = project_defaults.get(lm_key)
+            local_lm = local_defaults.get(lm_key)
+
+            if proj_lm is not None:
+                proj_raw_lm = str(proj_lm)
+                proj_display_lm = proj_raw_lm
+            else:
+                proj_raw_lm = framework_default
+                proj_display_lm = f"{framework_default}  [dim](framework default)[/dim]"
+            launch_label = f"brainstorm-{atype} launch_mode"
+            container.mount(ConfigRow(
+                launch_label, proj_display_lm,
+                config_layer="project", row_key=lm_key,
+                id=f"agent_proj_brainstorm_launch_{atype}_{rc}",
+                raw_value=proj_raw_lm,
+                extra_indent=4,
+            ))
+
+            if local_lm is not None:
+                user_raw_lm = str(local_lm)
+                user_display_lm = user_raw_lm
+            else:
+                user_raw_lm = "(inherits project)"
+                user_display_lm = user_raw_lm
+            container.mount(ConfigRow(
+                launch_label, user_display_lm,
+                config_layer="user", row_key=lm_key,
+                id=f"agent_user_brainstorm_launch_{atype}_{rc}",
+                subordinate=True,
+                raw_value=user_raw_lm,
+                extra_indent=4,
+            ))
+
+            desc_lm = OPERATION_DESCRIPTIONS.get(lm_key, "")
+            if desc_lm:
+                container.mount(Label(
+                    f"    [dim italic]{desc_lm}[/dim italic]", classes="op-desc",
+                ))
+
+        brainstorm_header_shown = False
+        for key in all_keys:
+            # Skip launch-mode keys — they render under their paired agent-string row
+            if key.endswith("-launch-mode"):
+                continue
+
+            # Skip orphaned brainstorm agent types no longer in
+            # BRAINSTORM_AGENT_TYPES (a removed op can leave a stale key in
+            # either config layer) — they would otherwise render as dead orphan
+            # rows for ops that no longer exist. Mirrors the launch-mode filter
+            # below at the paired-row emission.
+            if key.startswith("brainstorm-") and \
+                    key[len("brainstorm-"):] not in BRAINSTORM_AGENT_TYPES:
+                continue
+
+            # Insert brainstorm section header before first brainstorm key
+            if key.startswith("brainstorm-") and not brainstorm_header_shown:
+                container.mount(Label(""))  # spacer
+                container.mount(Label(
+                    "Default Code Agents for Brainstorming",
+                    classes="section-header",
+                ))
+                container.mount(Label(
+                    "[dim]Models used by brainstorm agent types "
+                    "during design exploration.[/dim]",
+                    classes="section-hint",
+                ))
+                brainstorm_header_shown = True
+
+            sk = _safe_id(key)
+
+            # Project row
+            proj_val = project_defaults.get(key, "(not set)")
+            proj_raw = str(proj_val)
+            proj_display = proj_raw
+            if proj_val and proj_val != "(not set)":
+                proj_display += self._get_verified_label(key, proj_raw)
+            container.mount(ConfigRow(
+                key, proj_display, config_layer="project", row_key=key,
+                id=f"agent_proj_{sk}_{rc}",
+                raw_value=proj_raw,
+            ))
+            _mount_superseded_note("project", key)
+
+            # User row (subordinate, indented under project row)
+            if key in local_defaults:
+                user_raw = str(local_defaults[key])
+                user_val = user_raw + self._get_verified_label(key, user_raw)
+            else:
+                user_raw = "(inherits project)"
+                user_val = user_raw
+            container.mount(ConfigRow(
+                key, user_val, config_layer="user", row_key=key,
+                id=f"agent_user_{sk}_{rc}",
+                subordinate=True,
+                raw_value=user_raw,
+            ))
+            _mount_superseded_note("local", key)
+
+            # All-providers hint (show for the effective model)
+            effective_model = (
+                str(local_defaults[key]) if key in local_defaults
+                else proj_raw if proj_val and proj_val != "(not set)" else ""
+            )
+            if effective_model:
+                ap_label = self._get_all_providers_label(key, effective_model)
+                if ap_label:
+                    container.mount(Label(ap_label, classes="op-desc"))
+
+            # Operation description
+            desc = OPERATION_DESCRIPTIONS.get(key, "")
+            if desc:
+                container.mount(Label(
+                    f"[dim italic]{desc}[/dim italic]", classes="op-desc",
+                ))
+
+            # Paired launch_mode rows for brainstorm agent types
+            if key.startswith("brainstorm-") and key in (
+                f"brainstorm-{t}" for t in BRAINSTORM_AGENT_TYPES
+            ):
+                atype = key[len("brainstorm-"):]
+                _emit_launch_mode_rows(atype)
+
+        # Safety-net: emit launch_mode rows for brainstorm types that have a
+        # launch_mode override in config but no agent_string in either layer.
+        for atype in BRAINSTORM_AGENT_TYPES:
+            if atype in launch_mode_emitted:
+                continue
+            lm_key = f"brainstorm-{atype}-launch-mode"
+            if lm_key not in project_defaults and lm_key not in local_defaults:
+                continue
+            if not brainstorm_header_shown:
+                container.mount(Label(""))  # spacer
+                container.mount(Label(
+                    "Default Code Agents for Brainstorming",
+                    classes="section-header",
+                ))
+                container.mount(Label(
+                    "[dim]Models used by brainstorm agent types "
+                    "during design exploration.[/dim]",
+                    classes="section-hint",
+                ))
+                brainstorm_header_shown = True
+            # Synthetic agent-string row pair so the launch_mode pair has
+            # a visual parent.
+            synth_key = f"brainstorm-{atype}"
+            sk = _safe_id(synth_key)
+            container.mount(ConfigRow(
+                synth_key, "(not set)", config_layer="project", row_key=synth_key,
+                id=f"agent_proj_{sk}_{rc}",
+                raw_value="(not set)",
+            ))
+            container.mount(ConfigRow(
+                synth_key, "(inherits project)", config_layer="user", row_key=synth_key,
+                id=f"agent_user_{sk}_{rc}",
+                subordinate=True,
+                raw_value="(inherits project)",
+            ))
+            desc = OPERATION_DESCRIPTIONS.get(synth_key, "")
+            if desc:
+                container.mount(Label(
+                    f"[dim italic]{desc}[/dim italic]", classes="op-desc",
+                ))
+            _emit_launch_mode_rows(atype)
+
+        # --- Verified Skill Stats (non-default skills) ---
+        skill_stats = self._collect_non_default_skill_stats()
+        if skill_stats:
+            container.mount(Label(""))  # visual spacer
+            container.mount(Label(
+                "Verified Skill Stats [dim](read-only)[/dim]",
+                classes="section-header",
+            ))
+            container.mount(Label(
+                "[dim]Skills without defaults that have verified stats. "
+                "Top 3 agent/model combos by score.[/dim]",
+                classes="section-hint",
+            ))
+            for skill, entries in skill_stats.items():
+                container.mount(Label(
+                    f"  [bold]{skill}[/bold]",
+                    classes="model-row",
+                ))
+                for entry in entries:
+                    agent_model = f"{entry['agent']}/{entry['model']}"
+                    detail = entry["detail"]
+                    container.mount(Label(
+                        f"      {agent_model}  [dim]{detail}[/dim]",
+                        classes="op-desc",
+                    ))
+
+        if shadowed_by:
+            switch_hint = (f"Enter on a \u26a0 row: switch superseded "
+                           f"({switch_key} is bound to {escape(shadowed_by)})")
+        elif switch_key:
+            switch_hint = f"{switch_key}: switch superseded"
+        else:
+            switch_hint = "Enter on a \u26a0 row: switch superseded"
+        container.mount(Label(
+            "[dim]Enter: edit  |  d: remove local preference  |  "
+            f"{switch_hint}  |  "
+            f"\u2191\u2193: navigate  |  {self._tab_switch_hint()}[/dim]",
+            classes="section-hint",
+        ))
+
+    # --- superseded model defaults (t1921) ------------------------------
+    def _supersession_state(self):
+        """Offers for the in-memory code-agent layers, plus warnings.
+
+        Returns `(offers, warnings)` with `offers[(layer, op)] = (Offer, kept)`.
+        Never raises: a malformed table or registry only yields warnings. The
+        keep memory written by `ait codeagent check-superseded` is read, never
+        written.
+        """
+        try:
+            table = ms.load_table(SUPERSESSION_TABLE)
+        except (OSError, ms.SupersessionError) as exc:
+            return {}, [f"supersession table unreadable: {exc}"]
+        registries, warnings = ms.load_registries(str(METADATA_DIR))
+        kept, kept_warnings = ms.load_kept(self._kept_memory_path())
+        warnings = warnings + kept_warnings
+        offers = {}
+        layers = (("project", self.config_mgr.codeagent_project),
+                  ("local", self.config_mgr.codeagent_local))
+        for layer, data in layers:
+            defaults = data.get("defaults") if isinstance(data, dict) else None
+            if not isinstance(defaults, dict):
+                continue
+            # Launch modes are not agent strings; find_offers would report each
+            # one as a malformed value.
+            agent_defaults = {k: v for k, v in defaults.items()
+                              if not k.endswith("-launch-mode")}
+            found, layer_warnings = ms.find_offers(layer, agent_defaults, table, registries)
+            warnings.extend(layer_warnings)
+            for offer in found:
+                for op in offer.ops:
+                    offers[(layer, op)] = (offer, ms.is_kept(kept, offer))
+        return offers, warnings
+
+    def _kept_memory_path(self):
+        """The clone's keep-memory path, discovered once (it runs git).
+
+        Only the location is cached; the file itself is re-read on every check
+        so a `check-superseded` answer given meanwhile is still picked up.
+        """
+        if not self._kept_path_resolved:
+            self._kept_path = ms.kept_path(Path.cwd())
+            self._kept_path_resolved = True
+        return self._kept_path
+
+    def _switch_key_state(self):
+        """`(key, shadowed_by)` for the superseded-switch action.
+
+        A newly introduced default key must not take an existing user binding
+        away: if the user has bound another settings/shared action to the same
+        key (and has not rebound the switch itself), that binding keeps the key
+        and `shadowed_by` names it — the switch stays reachable through Enter.
+        """
+        action = "agent_switch_superseded"
+        scope = self._shortcuts_scope
+        key = keybinding_registry.resolve_key(scope, action)
+        overrides = keybinding_registry.load_user_overrides()
+        if key is None or action in overrides.get(scope, {}):
+            return key, None
+        for row_scope, other, _default, label in keybinding_registry.iter_scope_bindings(scope):
+            if row_scope not in (scope, "shared") or other == action:
+                continue
+            if other not in overrides.get(row_scope, {}):
+                continue
+            if keybinding_registry.resolve_key(row_scope, other) == key:
+                return key, label or other
+        return key, None
+
+    def _superseded_note(self, offer, kept: bool, switch_keys: str) -> str:
+        target = f"{offer.agent}/{offer.new}"
+        if kept:
+            return (f"[dim]superseded by {target} (kept via check-superseded) "
+                    f"— {switch_keys}: switch[/dim]")
+        return (f"[#FFB86C]⚠ superseded by {target}[/] "
+                f"[dim]— {switch_keys}: switch[/dim]")
+
+    def _open_agent_model_picker(self, key: str, current_val: str) -> None:
+        current_agent, current_model = "", ""
+        if "/" in current_val and current_val != "(inherits project)":
+            current_agent, current_model = current_val.split("/", 1)
+        self.push_screen(
+            AgentModelPickerScreen(
+                key, current_agent, current_model,
+                all_models=self.config_mgr.models,
+            ),
+            callback=self._handle_agent_pick,
+        )
+
+    def _handle_superseded_choice(self, choice, layer: str, key: str,
+                                  shown: tuple[str, str], current_val: str) -> None:
+        if choice == "switch":
+            self._switch_superseded(layer, key, shown)
+        elif choice == "pick":
+            self._editing_layer = "project" if layer == "project" else "user"
+            self._open_agent_model_picker(key, current_val)
+
+    def _focused_agent_row(self):
+        """`(layer, key)` for a focused agent-string row, else None."""
+        focused = self.focused
+        if not isinstance(focused, ConfigRow):
+            return None
+        fid = focused.id or ""
+        if "brainstorm_launch_" in fid:
+            return None
+        for prefix, layer in _AGENT_ROW_LAYERS.items():
+            if fid.startswith(prefix):
+                return layer, focused.row_key
+        return None
+
+    def action_agent_switch_superseded(self) -> None:
+        row = self._focused_agent_row()
+        if row is None:
+            self.notify("Select a model row on Agent Defaults", severity="warning")
+            return
+        layer, key = row
+        self._switch_superseded(layer, key, self._displayed_offers.get((layer, key)))
+
+    def _switch_superseded(self, layer: str, key: str, expected) -> None:
+        """Switch `key` in `layer` from `expected[0]` to `expected[1]`.
+
+        `expected` is the pair the user was shown. The switch happens only if a
+        fresh read of both layers still offers exactly that pair, and the writer
+        re-checks the op's value on disk before writing.
+        """
+        label = _AGENT_LAYER_LABELS[layer]
+        try:
+            self.config_mgr.reload_codeagent()
+        except (OSError, ValueError) as exc:
+            self.notify(f"Cannot read code-agent config: {exc} — nothing switched",
+                        severity="error", timeout=10)
+            return
+        offers, _ = self._supersession_state()
+        entry = offers.get((layer, key))
+        if entry is None or expected is None:
+            self.notify(f"{key}: no superseded model in the {label} layer",
+                        severity="warning")
+            self._populate_agent_tab()
+            return
+        offer = entry[0]
+        fresh = (f"{offer.agent}/{offer.old}", f"{offer.agent}/{offer.new}")
+        if fresh != tuple(expected):
+            self.notify(
+                f"{key}: the offer changed to {fresh[0]} → {fresh[1]} since it "
+                "was shown — nothing switched; review the refreshed row",
+                severity="warning", timeout=10)
+            self._populate_agent_tab()
+            return
+        status, detail = self.config_mgr.switch_codeagent_default(
+            layer, key, fresh[0], fresh[1])
+        if status == "unreadable":
+            self.notify(f"Cannot read {detail} — nothing switched",
+                        severity="error", timeout=10)
+            return
+        try:
+            if status in ("switched", "write_failed"):
+                # The write landed (or may have): a failed re-read latches the
+                # family so no later save is built on the pre-switch memory.
+                self.config_mgr.refresh_after_write("codeagent")
+            else:
+                self.config_mgr.reload_codeagent()
+        except (OSError, ValueError) as exc:
+            if status == "write_failed":
+                self.notify(
+                    f"Could not write {detail} — the switch may not have been saved, "
+                    f"and the tab could not refresh: {exc}. The display still shows "
+                    "the last config it could read.", severity="error", timeout=10)
+            elif status == "switched":
+                self.notify(
+                    f"Switched {key} ({label}) to {fresh[1]}, but the tab could not "
+                    f"refresh: {exc}. The display still shows the last config it "
+                    "could read — fix the file, then press r to reload.",
+                    severity="error", timeout=10)
+            else:
+                self.notify(
+                    f"{key} changed on disk — not switched; the tab could not "
+                    f"refresh: {exc}", severity="error", timeout=10)
+            return
+        if status == "switched":
+            self.notify(f"Switched {key} ({label}) to {fresh[1]}")
+        elif status == "changed":
+            self.notify(f"{key} changed on disk to {detail} — not switched",
+                        severity="warning")
+        else:  # write_failed, refreshed from disk
+            self.notify(f"Could not write {detail} — the switch may not have been "
+                        "saved; the tab now shows what is on disk",
+                        severity="error", timeout=10)
+        self._populate_agent_tab()
+        row_id = (f"agent_{'proj' if layer == 'project' else 'user'}_"
+                  f"{_safe_id(key)}_{self._repop_counter}")
+
+        def _refocus() -> None:
+            try:
+                self.query_one(f"#{row_id}").focus()
+            except Exception:
+                pass
+
+        self.call_after_refresh(_refocus)
+
+    def _handle_agent_pick(self, result):
+        if result is None:
+            return
+        key = result["key"]
+        value = result["value"]
+        layer = self._editing_layer
+        if not self._may_save("codeagent"):
+            return
+
+        # Deep copies: the payload must not share the loaded layers' nested
+        # `defaults`, or a failed refresh would leave memory half-edited.
+        if layer == "user":
+            local_data = copy.deepcopy(self.config_mgr.codeagent_local)
+            if "defaults" not in local_data:
+                local_data["defaults"] = {}
+            local_data["defaults"][key] = value
+            self.config_mgr.save_codeagent(
+                self.config_mgr.codeagent_project, local_data,
+            )
+        else:
+            project_data = copy.deepcopy(self.config_mgr.codeagent_project)
+            if "defaults" not in project_data:
+                project_data["defaults"] = {}
+            project_data["defaults"][key] = value
+            local_data = copy.deepcopy(self.config_mgr.codeagent_local)
+            if "defaults" in local_data and key in local_data["defaults"]:
+                del local_data["defaults"][key]
+                if not local_data["defaults"]:
+                    del local_data["defaults"]
+            self.config_mgr.save_codeagent(project_data, local_data)
+
+        done = f"Saved {key} = {value} ({layer})"
+        if self._refresh_after_save("codeagent", done):
+            self._populate_agent_tab()
+            self.notify(done)
+
+    def _handle_launch_mode_pick(self, result):
+        if result is None:
+            return
+        key = result["key"]
+        value = result["value"]
+        layer = self._editing_layer
+        if not self._may_save("codeagent"):
+            return
+
+        # Deep copies: the payload must not share the loaded layers' nested
+        # `defaults`, or a failed refresh would leave memory half-edited.
+        if layer == "user":
+            local_data = copy.deepcopy(self.config_mgr.codeagent_local)
+            if "defaults" not in local_data:
+                local_data["defaults"] = {}
+            local_data["defaults"][key] = value
+            self.config_mgr.save_codeagent(
+                self.config_mgr.codeagent_project, local_data,
+            )
+        else:
+            project_data = copy.deepcopy(self.config_mgr.codeagent_project)
+            if "defaults" not in project_data:
+                project_data["defaults"] = {}
+            project_data["defaults"][key] = value
+            local_data = copy.deepcopy(self.config_mgr.codeagent_local)
+            if "defaults" in local_data and key in local_data["defaults"]:
+                del local_data["defaults"][key]
+                if not local_data["defaults"]:
+                    del local_data["defaults"]
+            self.config_mgr.save_codeagent(project_data, local_data)
+
+        done = f"Saved {key} = {value} ({layer})"
+        if self._refresh_after_save("codeagent", done):
+            self._populate_agent_tab()
+            self.notify(done)
+
+    def _clear_user_override(self, key: str):
+        """Remove a user-level override for an operation."""
+        if not self._may_save("codeagent"):
+            return
+        local_data = copy.deepcopy(self.config_mgr.codeagent_local)
+        if "defaults" in local_data and key in local_data["defaults"]:
+            del local_data["defaults"][key]
+            if not local_data["defaults"]:
+                del local_data["defaults"]
+            self.config_mgr.save_codeagent(
+                self.config_mgr.codeagent_project, local_data,
+            )
+            done = f"Cleared user override for {key}"
+            if self._refresh_after_save("codeagent", done):
+                self._populate_agent_tab()
+                self.notify(done)
+        else:
+            self.notify(f"No user override to clear for {key}", severity="warning")
+
+    # -------------------------------------------------------------------
+    # Board tab
+    # -------------------------------------------------------------------
+    def _populate_board_tab(self):
+        container = self.query_one("#board_content", VerticalScroll)
+        container.remove_children()
+
+        # Increment counter to ensure unique widget IDs (remove_children is async)
+        self._repop_counter += 1
+        rc = self._repop_counter
+
+        # Columns (read-only)
+        container.mount(Label("Columns [dim](read-only — edit via board TUI)[/dim]",
+                              classes="section-header"))
+        columns = self.board_columns
+        for col in columns:
+            cid = col.get("id", "?")
+            title = col.get("title", "?")
+            color = col.get("color", "?")
+            container.mount(Static(f"    {cid}: {title}  ({color})", classes="model-row"))
+
+        # User settings (editable)
+        container.mount(Label("User Settings", classes="section-header"))
+
+        settings = self.config_mgr.board.get("settings", {})
+        current_refresh = str(settings.get("auto_refresh_minutes", 0))
+        if current_refresh not in DEFAULT_REFRESH_OPTIONS:
+            current_refresh = "0"
+        container.mount(CycleField("Auto-refresh (min)", DEFAULT_REFRESH_OPTIONS,
+                                   current_refresh, "auto_refresh_minutes",
+                                   id=f"board_cf_refresh_{rc}"))
+        container.mount(Label("  [dim]0 = disabled[/dim]", classes="section-hint"))
+
+        current_sync = "yes" if settings.get("sync_on_refresh", False) else "no"
+        container.mount(CycleField("Sync on refresh", ["no", "yes"], current_sync,
+                                   "sync_on_refresh", id=f"board_cf_sync_{rc}"))
+        container.mount(Label("  [dim]Push/pull task data on each auto-refresh[/dim]",
+                              classes="section-hint"))
+
+        hbox = Horizontal(classes="tab-buttons")
+        container.mount(hbox)
+        hbox.mount(Button("Save Board Settings", variant="success",
+                          id=f"btn_board_save_{rc}"))
+        hbox.mount(Button("Revert Board Settings", variant="warning",
+                          id=f"btn_board_revert_{rc}"))
+
+        container.mount(Label(
+            "[dim]\u2191\u2193: navigate  |  \u25c0\u25b6: cycle options  "
+            f"|  {self._tab_switch_hint()}[/dim]",
+            classes="section-hint",
+        ))
+
+    @property
+    def board_columns(self) -> list:
+        return self.config_mgr.board.get("columns", [])
+
+    def save_board_settings(self):
+        if not self._may_save("board"):
+            return
+        container = self.query_one("#board_content", VerticalScroll)
+        cycle_fields = list(container.query(CycleField))
+        refresh_field = next(cf for cf in cycle_fields if cf.field_key == "auto_refresh_minutes")
+        sync_field = next(cf for cf in cycle_fields if cf.field_key == "sync_on_refresh")
+
+        # Deep copy: the payload must not share the loaded `settings` mapping.
+        merged = copy.deepcopy(self.config_mgr.board)
+        if "settings" not in merged:
+            merged["settings"] = {}
+        merged["settings"]["auto_refresh_minutes"] = int(refresh_field.current_value)
+        merged["settings"]["sync_on_refresh"] = sync_field.current_value == "yes"
+
+        self.config_mgr.save_board(merged)
+        if self._refresh_after_save("board", "Board settings saved"):
+            self.notify("Board settings saved")
+
+    def _revert_board_settings(self):
+        """Revert board settings to their on-disk state."""
+        if self._refresh_for_revert(self.config_mgr.reload_board):
+            self._populate_board_tab()
+            self.notify("Board settings reverted")
+
+    # -------------------------------------------------------------------
+    # Project Config tab (editable)
+    # -------------------------------------------------------------------
+    def _populate_project_tab(self):
+        container = self.query_one("#project_content", VerticalScroll)
+        container.remove_children()
+
+        self._repop_counter += 1
+        rc = self._repop_counter
+
+        container.mount(Label("Project Config", classes="section-header"))
+        container.mount(Label(
+            "[dim]Edit shared values stored in aitasks/metadata/project_config.yaml. "
+            "These settings are git-tracked and apply to the full project.[/dim]",
+            classes="section-hint",
+        ))
+
+        dp_values = self.config_mgr.project_config.get("default_profiles")
+        if not isinstance(dp_values, dict):
+            dp_values = {}
+        for key, info in PROJECT_CONFIG_SCHEMA.items():
+            if key == "default_profiles":
+                # Render as section header + individual skill rows
+                container.mount(Label(
+                    f"  [bold]default_profiles:[/bold]", classes="section-hint",
+                ))
+                container.mount(Label(
+                    f"      [dim]{info['summary']}[/dim]",
+                    classes="section-hint",
+                ))
+                for skill in sorted(VALID_PROFILE_SKILLS):
+                    profile_name = dp_values.get(skill, "")
+                    display = profile_name or "(not set)"
+                    container.mount(ConfigRow(
+                        skill, display, config_layer="project", row_key=skill,
+                        id=f"project_dp_{_safe_id(skill)}_{rc}",
+                        raw_value=profile_name,
+                    ))
+                # Keys the schema does not know about are preserved on save but
+                # have no editable row — surface them so they are not invisible.
+                # A plain Label (no widget id) is deliberate: _safe_id() only
+                # maps ". -" to "_", so rendering arbitrary YAML keys as
+                # ConfigRows risks an id collision (unknown "pr_import" vs known
+                # "pr-import") or an invalid id, either of which crashes the tab.
+                # str() per key before sorting/joining: YAML mapping keys need
+                # not be strings (an unquoted `42:` parses to int, `true:` to
+                # bool), and a mixed int/str set is unsortable. This normalizes
+                # for DISPLAY only — dp_values, and so the saved mapping, keeps
+                # each key's original type.
+                unknown = sorted(
+                    str(k) for k in dp_values if k not in VALID_PROFILE_SKILLS
+                )
+                if unknown:
+                    container.mount(Label(
+                        "      [dim]preserved, not editable here "
+                        f"(unrecognized skill): {escape(', '.join(unknown))}[/dim]",
+                        classes="section-hint",
+                    ))
+                continue
+            raw_value = self.config_mgr.project_config.get(key)
+            formatted = _format_yaml_value(raw_value)
+            display_value = formatted or "(not set)"
+            if key in ("verify_build", "test_command", "lint_command") and raw_value is not None:
+                cmd_presets = _load_command_presets(key)
+                preset_name = _match_preset_name(formatted, cmd_presets)
+                if preset_name:
+                    display_value = f"{display_value}  [dim](preset: {preset_name})[/dim]"
+            container.mount(ConfigRow(
+                key, display_value, config_layer="project", row_key=key,
+                id=f"project_cfg_{_safe_id(key)}_{rc}",
+                raw_value=formatted,
+            ))
+            container.mount(Label(
+                f"      [dim]{info['summary']}[/dim]",
+                classes="section-hint",
+            ))
+            if key == "verify_build":
+                container.mount(Label(
+                    f"      [dim]Docs: {_BUILD_VERIFY_DOCS}[/dim]",
+                    classes="section-hint",
+                ))
+
+        hbox = Horizontal(classes="tab-buttons")
+        container.mount(hbox)
+        hbox.mount(Button("Save Project Config", variant="success",
+                          id=f"btn_project_save_{rc}"))
+        hbox.mount(Button("Revert Project Config", variant="warning",
+                          id=f"btn_project_revert_{rc}"))
+
+        container.mount(Label(
+            f"[dim]Enter: edit  |  ↑↓: navigate  |  {self._tab_switch_hint()}[/dim]",
+            classes="section-hint",
+        ))
+
+    def save_project_settings(self):
+        if not self._may_save("project"):
+            return
+        container = self.query_one("#project_content", VerticalScroll)
+        rows = list(container.query(ConfigRow))
+
+        data = dict(self.config_mgr.project_config)
+
+        # Collect default_profiles from individual skill rows. Seed from the
+        # existing config so keys with no rendered row (skills absent from
+        # VALID_PROFILE_SKILLS — hand-authored YAML, or a skill whose profile
+        # key landed before the schema knew about it) are preserved instead of
+        # silently dropped; the rendered rows overwrite only their own keys.
+        # dict() copies: `data` above is a shallow copy of project_config, so
+        # mutating the fetched sub-dict in place would mutate the loaded config.
+        existing_dp = self.config_mgr.project_config.get("default_profiles")
+        dp = dict(existing_dp) if isinstance(existing_dp, dict) else {}
+        for row in rows:
+            if not row.id or not row.id.startswith("project_dp_"):
+                continue
+            val = (row.raw_value or "").strip()
+            if val:
+                dp[row.row_key] = val
+            else:
+                # Blanking a rendered row clears that key — with the map now
+                # pre-seeded, this removal must be explicit.
+                dp.pop(row.row_key, None)
+        if dp:
+            data["default_profiles"] = dp
+        else:
+            data.pop("default_profiles", None)
+
+        for row in rows:
+            if not row.id or not row.id.startswith("project_cfg_"):
+                continue
+            key = row.row_key
+            raw_value = row.raw_value.strip()
+            if not raw_value:
+                data.pop(key, None)
+                continue
+            # Stored as typed (surrounding whitespace trimmed above); only a
+            # `string_or_list` key whose text is a canonical flow list becomes
+            # a list. The former blanket yaml.safe_load() re-parsed every
+            # value as a YAML document, so any command containing `: ` was
+            # stored as a nested mapping (t1672).
+            data[key] = _coerce_project_config_value(key, raw_value)
+
+        self.config_mgr.save_project_settings(data)
+        if self._refresh_after_save("project", "Project config saved"):
+            self._populate_project_tab()
+            self.notify("Project config saved")
+
+    def _revert_project_settings(self):
+        if self._refresh_for_revert(self.config_mgr.reload_project_config):
+            self._populate_project_tab()
+            self.notify("Project config reverted")
+
+    def _handle_project_config_edit(self, result):
+        if result is None:
+            return
+        key = result["key"]
+        value = result["value"]
+
+        row_id = getattr(self, "_editing_project_row_id", None)
+        if not row_id:
+            rc = self._repop_counter
+            row_id = f"project_cfg_{_safe_id(key)}_{rc}"
+        try:
+            row = self.query_one(f"#{row_id}", ConfigRow)
+            row.raw_value = value
+            display = _format_yaml_value(value) or "(not set)"
+            if key in ("verify_build", "test_command", "lint_command") and value:
+                presets = _load_command_presets(key)
+                preset_name = _match_preset_name(value, presets)
+                if preset_name:
+                    display = f"{display}  [dim](preset: {preset_name})[/dim]"
+            row.value = display
+            row.refresh()
+            self.notify(f"Updated {key} — press Save to persist")
+        except Exception as exc:
+            self.notify(f"Could not update {key}: {exc}", severity="error")
+
+    def _handle_default_profile_pick(self, result):
+        if result is None:
+            return
+        skill = result["key"]
+        profile_name = result["value"]
+
+        row_id = getattr(self, "_editing_project_row_id", None)
+        if not row_id:
+            rc = self._repop_counter
+            row_id = f"project_dp_{_safe_id(skill)}_{rc}"
+        try:
+            row = self.query_one(f"#{row_id}", ConfigRow)
+            row.raw_value = profile_name
+            row.value = profile_name or "(not set)"
+            row.refresh()
+            self.notify(f"Updated {skill} — press Save to persist")
+        except Exception as exc:
+            self.notify(f"Could not update {skill}: {exc}", severity="error")
+
+    # -------------------------------------------------------------------
+    # Tmux tab (editable — writes to project_config.yaml tmux: section)
+    # -------------------------------------------------------------------
+    # -------------------------------------------------------------------
+    # Project Groups tab — per-user registry membership editor.
+    # All mutations shell out to `ait projects group …` (the single
+    # registry-writer authority, t1025_1 D5); the TUI never writes
+    # projects.yaml directly and never imports a Python writer.
+    # -------------------------------------------------------------------
+    def _run_projects_group(self, *args: str) -> tuple[int, str, str]:
+        """Run `ait projects group <args>` and return (rc, stdout, stderr).
+
+        Never raises — a launch/timeout failure is reported as a non-zero rc.
+        Relies on the cwd being the repo root (the ``ait`` dispatcher cds there
+        before launching the settings TUI), matching the other subprocess sites.
+        """
+        try:
+            proc = subprocess.run(
+                ["./ait", "projects", "group", *args],
+                capture_output=True, text=True, timeout=30,
+            )
+            return proc.returncode, proc.stdout, proc.stderr
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return 1, "", str(exc)
+
+    @staticmethod
+    def _parse_group_list(text: str) -> list[tuple[str, str, str]]:
+        """Parse `ait projects group list` into (repo, group, status) rows.
+
+        Group headers are unindented ``slug:`` lines (the ``(ungrouped)`` bucket
+        maps to an empty group string); members are indented, optionally with a
+        trailing ``[STATUS]`` (e.g. ``[STALE]``).
+        """
+        rows: list[tuple[str, str, str]] = []
+        current = ""  # "" == the ungrouped bucket
+        for line in text.splitlines():
+            if not line.strip():
+                continue
+            if not line[0].isspace():
+                header = line.rstrip()
+                if header.endswith(":"):
+                    label = header[:-1]
+                    current = "" if label == PROJECT_GROUP_UNGROUPED_LABEL else label
+                continue
+            member = line.strip()
+            status = ""
+            if member.endswith("]") and "[" in member:
+                idx = member.rfind("[")
+                status = member[idx + 1:-1]
+                member = member[:idx].strip()
+            rows.append((member, current, status))
+        return rows
+
+    def _populate_project_groups_tab(self):
+        container = self.query_one("#project_groups_content", Vertical)
+
+        # Build the static chrome once; on repopulate just refresh the rows
+        # (re-mounting a fixed-id DataTable races remove_children — clear in
+        # place instead, mirroring _populate_shortcuts_tab).
+        try:
+            table = self.query_one("#project_groups_table", DataTable)
+        except Exception:
+            container.remove_children()
+            container.mount(Label("Project Groups", classes="section-header"))
+            container.mount(Label(
+                "[dim]Group your registered repos for two-axis TUI navigation. "
+                "Membership lives in the per-user registry "
+                "(~/.config/aitasks/projects.yaml) and is edited by running "
+                "`ait projects group …` — never by writing the file directly.\n"
+                "↑↓ select a project, then Enter (or the buttons below) to "
+                "Assign/change its group — pick an existing one or type a new "
+                "slug to create it. Clear ungroups it, Rename renames every "
+                "member, Sync backfills groups from repo configs.[/dim]",
+                classes="section-hint",
+            ))
+            table = DataTable(
+                id="project_groups_table", cursor_type="row", zebra_stripes=True,
+            )
+            container.mount(table)
+            table.add_columns("Project", "Group", "Status")
+            container.mount(Horizontal(
+                Button(render_label_cfg("Assign / change", "h"), id="btn_pg_assign"),
+                Button(render_label_cfg("Clear group", "u"), id="btn_pg_clear"),
+                Button(render_label_cfg("Rename group", "n"), id="btn_pg_rename"),
+                Button(render_label_cfg("Sync from configs", "y"), id="btn_pg_sync"),
+                Button(render_label_cfg("Refresh", "f"), id="btn_pg_refresh"),
+                classes="tab-buttons",
+            ))
+            container.mount(Label(
+                f"[dim]{self._tab_switch_hint()}[/dim]",
+                classes="section-hint",
+            ))
+
+        table.clear()  # keeps columns
+        rc, out, err = self._run_projects_group("list")
+        if rc != 0:
+            self._pg_rows = []
+            table.add_row("(error)", "", ((err or out).strip()[:60] or "list failed"))
+            return
+        rows = self._parse_group_list(out)
+        self._pg_rows = rows
+        if not rows:
+            table.add_row("(no registered projects)", "", "")
+            return
+        for repo, group, status in rows:
+            table.add_row(
+                repo, group or PROJECT_GROUP_UNGROUPED_LABEL, status,
+            )
+
+    def _pg_selected(self) -> tuple[str, str] | None:
+        """Return (repo, group) for the cursor row, or None for an empty table
+        or a placeholder row."""
+        try:
+            idx = self.query_one("#project_groups_table", DataTable).cursor_row
+        except Exception:
+            return None
+        rows = getattr(self, "_pg_rows", [])
+        if idx is None or idx < 0 or idx >= len(rows):
+            return None
+        repo, group, _status = rows[idx]
+        return repo, group
+
+    def _pg_notify_and_refresh(self, rc: int, out: str, err: str, success_msg: str):
+        if rc == 0:
+            self.notify(success_msg)
+        else:
+            self.notify(
+                ((err or out).strip()[:200] or "Operation failed"),
+                severity="error", timeout=8,
+            )
+        self._populate_project_groups_tab()
+
+    def _pg_assign(self):
+        sel = self._pg_selected()
+        if not sel:
+            self.notify("Select a project row first.", severity="warning")
+            return
+        repo, group = sel
+        groups = sorted({g for _repo, g, _status in getattr(self, "_pg_rows", []) if g})
+        self.push_screen(
+            AssignGroupScreen(repo, group, groups),
+            callback=self._handle_pg_assign,
+        )
+
+    def _handle_pg_assign(self, result):
+        if not result:
+            return
+        rc, out, err = self._run_projects_group("set", result["repo"], result["group"])
+        self._pg_notify_and_refresh(
+            rc, out, err, f"Set {result['repo']} → {result['group']}")
+
+    def _pg_clear(self):
+        sel = self._pg_selected()
+        if not sel:
+            self.notify("Select a project row first.", severity="warning")
+            return
+        repo, group = sel
+        if not group:
+            self.notify(f"{repo} is already ungrouped.", severity="information")
+            return
+        rc, out, err = self._run_projects_group("unset", repo)
+        self._pg_notify_and_refresh(rc, out, err, f"Cleared group of {repo}")
+
+    def _pg_rename(self):
+        groups = sorted({g for _repo, g, _status in getattr(self, "_pg_rows", []) if g})
+        if not groups:
+            self.notify("No project-groups to rename yet.", severity="warning")
+            return
+        self.push_screen(
+            RenameGroupScreen(groups),
+            callback=self._handle_pg_rename,
+        )
+
+    def _handle_pg_rename(self, result):
+        if not result:
+            return
+        rc, out, err = self._run_projects_group("rename", result["old"], result["new"])
+        self._pg_notify_and_refresh(
+            rc, out, err, f"Renamed {result['old']} → {result['new']}")
+
+    def _pg_sync(self):
+        rc, out, err = self._run_projects_group("sync")
+        self._pg_notify_and_refresh(
+            rc, out, err, (out.strip() or "Synced groups from repo configs"))
+
+    # Keybinding actions for the Project Groups tab — gated to the tab (and
+    # inert under a modal) by check_action; thin wrappers over the button
+    # handlers so key and click share one path.
+    def action_pg_assign(self) -> None:
+        self._pg_assign()
+
+    def action_pg_clear(self) -> None:
+        self._pg_clear()
+
+    def action_pg_rename(self) -> None:
+        self._pg_rename()
+
+    def action_pg_sync(self) -> None:
+        self._pg_sync()
+
+    def action_pg_refresh(self) -> None:
+        self._populate_project_groups_tab()
+
+    def _populate_tmux_tab(self):
+        container = self.query_one("#tmux_content", VerticalScroll)
+        container.remove_children()
+
+        self._repop_counter += 1
+        rc = self._repop_counter
+        self._tmux_tab_rc = rc
+
+        container.mount(Label("Tmux Settings", classes="section-header"))
+        container.mount(Label(
+            "[dim]Configure tmux defaults for agent launch dialogs. "
+            "Stored in aitasks/metadata/project_config.yaml under the tmux: section.[/dim]",
+            classes="section-hint",
+        ))
+
+        tmux = self.config_mgr.project_config.get("tmux")
+        if not isinstance(tmux, dict):
+            tmux = {}
+
+        for key, info in TMUX_CONFIG_SCHEMA.items():
+            stype = info.get("type", "string")
+            current = tmux.get(key)
+
+            if stype in ("string", "int"):
+                display = str(current) if current is not None else info["default"]
+                container.mount(ConfigRow(
+                    key, display, config_layer="project", row_key=key,
+                    id=f"tmux_cfg_{_safe_id(key)}_{rc}",
+                    raw_value=display,
+                ))
+            elif stype == "enum":
+                options = info["options"].split(",")
+                if key == "git_tui":
+                    installed = detect_git_tuis()
+                    if installed:
+                        options = installed + ["none"]
+                cur_val = str(current) if current is not None else info["default"]
+                if cur_val not in options:
+                    cur_val = info["default"]
+                container.mount(CycleField(
+                    key, options, cur_val, field_key=key,
+                    id=f"tmux_cycle_{_safe_id(key)}_{rc}",
+                ))
+            elif stype == "bool":
+                cur_val = str(current).lower() if current is not None else info["default"]
+                if cur_val not in ("true", "false"):
+                    cur_val = info["default"]
+                container.mount(CycleField(
+                    key, ["false", "true"], cur_val, field_key=key,
+                    id=f"tmux_cycle_{_safe_id(key)}_{rc}",
+                ))
+
+            container.mount(Label(
+                f"      [dim]{info['summary']}[/dim]",
+                classes="section-hint",
+            ))
+
+        hbox = Horizontal(classes="tab-buttons")
+        container.mount(hbox)
+        hbox.mount(Button("Save Tmux Settings", variant="success",
+                          id=f"btn_tmux_save_{rc}"))
+        hbox.mount(Button("Revert Tmux Settings", variant="warning",
+                          id=f"btn_tmux_revert_{rc}"))
+
+        container.mount(Label(
+            f"[dim]Enter: edit  |  ←→: cycle  |  ↑↓: navigate  |  {self._tab_switch_hint()}[/dim]",
+            classes="section-hint",
+        ))
+
+    def save_tmux_settings(self):
+        if not self._may_save("project"):
+            return
+        container = self.query_one("#tmux_content", VerticalScroll)
+        tmux_data: dict = {}
+        rc = self._tmux_tab_rc
+
+        for key, info in TMUX_CONFIG_SCHEMA.items():
+            stype = info.get("type", "string")
+
+            if stype == "string":
+                widget_id = f"tmux_cfg_{_safe_id(key)}_{rc}"
+                try:
+                    row = self.query_one(f"#{widget_id}", ConfigRow)
+                    val = (row.raw_value or "").strip()
+                    if val:
+                        tmux_data[key] = val
+                except Exception:
+                    pass
+            elif stype == "int":
+                widget_id = f"tmux_cfg_{_safe_id(key)}_{rc}"
+                try:
+                    row = self.query_one(f"#{widget_id}", ConfigRow)
+                    val = (row.raw_value or "").strip()
+                    if val:
+                        try:
+                            tmux_data[key] = int(val)
+                        except ValueError:
+                            tmux_data[key] = int(info["default"])
+                except Exception:
+                    pass
+            elif stype in ("enum", "bool"):
+                widget_id = f"tmux_cycle_{_safe_id(key)}_{rc}"
+                try:
+                    field = self.query_one(f"#{widget_id}", CycleField)
+                    val = field.current_value
+                    if stype == "bool":
+                        tmux_data[key] = val == "true"
+                    else:
+                        tmux_data[key] = val
+                except Exception:
+                    pass
+
+        data = dict(self.config_mgr.project_config)
+        if tmux_data:
+            existing_tmux = dict(data.get("tmux") or {})
+            existing_tmux.update(tmux_data)
+            data["tmux"] = existing_tmux
+        else:
+            existing_tmux = dict(data.get("tmux") or {})
+            for key in TMUX_CONFIG_SCHEMA:
+                existing_tmux.pop(key, None)
+            if existing_tmux:
+                data["tmux"] = existing_tmux
+            else:
+                data.pop("tmux", None)
+        self.config_mgr.save_project_settings(data)
+        if self._refresh_after_save("project", "Tmux settings saved"):
+            self._populate_tmux_tab()
+            self.notify("Tmux settings saved")
+
+    def _revert_tmux_settings(self):
+        if self._refresh_for_revert(self.config_mgr.reload_project_config):
+            self._populate_tmux_tab()
+            self.notify("Tmux settings reverted")
+
+    def _handle_tmux_config_edit(self, result):
+        if result is None:
+            return
+        key = result["key"]
+        value = result["value"]
+
+        row_id = getattr(self, "_editing_tmux_row_id", None)
+        if not row_id:
+            rc = self._tmux_tab_rc
+            row_id = f"tmux_cfg_{_safe_id(key)}_{rc}"
+        try:
+            row = self.query_one(f"#{row_id}", ConfigRow)
+            row.raw_value = value
+            row.value = value or "(not set)"
+            row.refresh()
+            self.notify(f"Updated {key} — press Save to persist")
+        except Exception as exc:
+            self.notify(f"Could not update {key}: {exc}", severity="error")
+
+    # -------------------------------------------------------------------
+    # Artifacts tab (editable — writes to project_config.yaml artifacts: section)
+    # Every rule about what the section may contain is asked of
+    # lib/artifact_registry.py through _run_artifact_registry; the pane only
+    # assembles the candidate config and refuses to save one the registry
+    # rejects.
+    # -------------------------------------------------------------------
+    def _run_artifact_registry(self, *args: str,
+                               config: str | None = None) -> tuple[int, str, str]:
+        """Run `artifact_registry.py --config <config> <args>`.
+
+        Returns (rc, stdout, stderr) and never raises — a launch/timeout
+        failure is reported as a non-zero rc. `config` defaults to the
+        project config; the save path passes a temporary candidate instead.
+        """
+        try:
+            proc = subprocess.run(
+                [sys.executable, str(ARTIFACT_REGISTRY), "--config",
+                 config or str(PROJECT_CONFIG), *args],
+                capture_output=True, text=True, timeout=30,
+            )
+            return proc.returncode, proc.stdout, proc.stderr
+        except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+            # ValueError: an argument the OS cannot carry (an embedded NUL in
+            # a value read from YAML) — refused like any other failure.
+            return 1, "", f"cannot run the artifact registry: {exc}"
+
+    FETCH_EXCLUSION_TIMEOUT = 30  # seconds before the CLI is killed
+
+    def _run_fetch_exclusion(
+            self, cancelled: Callable[[], bool] = lambda: False,
+    ) -> tuple[int, str, str]:
+        """Run `aitask_artifact.sh fetch-exclusion apply` (t2099).
+
+        Keeps routine fetches off the gitbranch store after the branch config
+        changed. Returns (rc, stdout, stderr) and never raises.
+
+        Runs in the fetch-exclusion worker thread (t2125) and polls `cancelled`,
+        so app exit never waits on the CLI. A cancelled run is abandoned, never
+        killed: the CLI rewrites remote.<r>.* in several git-config steps, and
+        stopping it part-way could leave them half rewritten. Its output goes to
+        unlinked temp files rather than pipes, so an abandoned child neither
+        blocks on a full pipe nor dies of SIGPIPE once nobody reads it.
+        """
+        try:
+            with tempfile.TemporaryFile("w+") as out_f, \
+                    tempfile.TemporaryFile("w+") as err_f:
+                proc = subprocess.Popen(
+                    [str(ARTIFACT_CLI), "fetch-exclusion", "apply"],
+                    stdin=subprocess.DEVNULL, stdout=out_f, stderr=err_f,
+                )
+                deadline = time.monotonic() + self.FETCH_EXCLUSION_TIMEOUT
+                while True:
+                    try:
+                        rc = proc.wait(timeout=0.1)
+                        break
+                    except subprocess.TimeoutExpired:
+                        if cancelled():
+                            return 1, "", "fetch-exclusion update abandoned"
+                        if time.monotonic() >= deadline:
+                            proc.kill()
+                            proc.wait()
+                            return 1, "", (
+                                "cannot run the fetch-exclusion update: timed "
+                                f"out after {self.FETCH_EXCLUSION_TIMEOUT}s")
+                out_f.seek(0)
+                err_f.seek(0)
+                return rc, out_f.read(), err_f.read()
+        except (OSError, ValueError) as exc:
+            # ValueError: an undecodable output byte (UnicodeDecodeError).
+            return 1, "", f"cannot run the fetch-exclusion update: {exc}"
+
+    def _retire_fetch_exclusion(self) -> None:
+        """Invalidate any in-flight apply: its result describes an older save."""
+        self._fetch_exclusion_gen += 1
+        self.workers.cancel_group(self, "fetch_exclusion")
+
+    def _apply_fetch_exclusion(self) -> None:
+        """Re-apply the exclusion off the event loop (t2125): the CLI waits up
+        to 10s on a repository-wide lock, and the UI must not freeze meanwhile."""
+        self._fetch_exclusion_worker(self._fetch_exclusion_gen)
+
+    @work(thread=True, exclusive=True, group="fetch_exclusion")
+    def _fetch_exclusion_worker(self, gen: int) -> None:
+        worker = get_current_worker()
+        rc, out, err = self._run_fetch_exclusion(lambda: worker.is_cancelled)
+        if not worker.is_cancelled:  # superseded, or the app is exiting
+            self.call_from_thread(self._on_fetch_exclusion, gen, rc, out, err)
+
+    def _on_fetch_exclusion(self, gen: int, rc: int, out: str, err: str) -> None:
+        if gen != self._fetch_exclusion_gen:  # a newer save retired this run
+            return
+        if rc != 0:
+            detail = err.strip().splitlines()[-1] if err.strip() else "see 'ait artifact fetch-exclusion apply'"
+            self.notify(
+                "Routine-fetch exclusion for the gitbranch store not updated: "
+                f"{escape(detail)}. Re-run: ait artifact fetch-exclusion apply",
+                severity="warning", timeout=15)
+        elif "FETCH_EXCLUSION:CHANGED" in out.splitlines():
+            self.notify("Routine fetches now skip the gitbranch store branch")
+
+    @staticmethod
+    def _registry_message(stderr: str, fallback: str) -> str:
+        msg = stderr.strip().removeprefix("artifact_registry.py: ").strip()
+        return msg or fallback
+
+    @staticmethod
+    def _artifacts_sections(config: dict) -> tuple[dict, dict, dict, str | None]:
+        """Return (artifacts, backends, gitbranch, error) from a project config.
+
+        An absent (or null) level reads as {}. A level that is present but not a
+        mapping is never coerced: `error` names its dotted path, and all three
+        sections come back empty so the pane can still render defaults.
+        """
+        sections: list[dict] = []
+        node = config
+        for path in ("artifacts", "artifacts.backends",
+                     "artifacts.backends.gitbranch"):
+            value = node.get(path.rsplit(".", 1)[-1])
+            if value is None:
+                value = {}
+            elif not isinstance(value, dict):
+                return {}, {}, {}, (
+                    f"{path} is a {type(value).__name__}, not a mapping — fix "
+                    f"{PROJECT_CONFIG.name} by hand, then press r to reload")
+            sections.append(value)
+            node = value
+        return sections[0], sections[1], sections[2], None
+
+    def _artifact_adapters(self) -> list[str]:
+        """Every available adapter (`adapters`, not `list`: on a fresh project
+        `list` names only `local`, so gitbranch could never be selected to
+        create its own first configuration)."""
+        rc, out, err = self._run_artifact_registry("adapters")
+        names = [line.strip() for line in out.splitlines() if line.strip()]
+        if rc != 0 or not names:
+            self.notify(
+                "Could not list artifact backends — "
+                f"{escape(self._registry_message(err, 'no output'))}",
+                severity="error", timeout=10)
+            return ["local"]
+        return names
+
+    def _artifact_ref_error(self, branch: str) -> str | None:
+        """Why the registry rejects `branch` as the gitbranch branch, or None."""
+        rc, _out, err = self._run_artifact_registry("validate-ref", branch)
+        if rc == 0:
+            return None
+        return self._registry_message(err, f"branch {branch!r} was rejected")
+
+    def _artifacts_candidate_error(self, data: dict, default: str) -> str | None:
+        """Ask the registry whether the config about to be saved is usable.
+
+        `default-backend` checks the default is registered and has an adapter;
+        it does not check the backend's required settings (a `dir` entry with
+        no path, or a relative one, passes it), so a non-local default is also
+        run through `backend-env`, which does.
+        """
+        try:
+            fd, tmp = tempfile.mkstemp(prefix="ait_artifacts_", suffix=".yaml")
+        except OSError as exc:
+            return f"could not stage the config for checking: {exc}"
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                yaml.safe_dump(data, f, sort_keys=False, allow_unicode=True)
+            checks = [("default-backend",)]
+            if default != "local":
+                checks.append(("backend-env", default))
+            for args in checks:
+                rc, _out, err = self._run_artifact_registry(*args, config=tmp)
+                if rc != 0:
+                    msg = self._registry_message(
+                        err, f"the artifact registry rejected {' '.join(args)}")
+                    return msg.replace(tmp, PROJECT_CONFIG.name)
+            return None
+        except (OSError, yaml.YAMLError) as exc:
+            return f"could not stage the config for checking: {exc}"
+        finally:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+    def _artifacts_widgets(self) -> tuple[CycleField, ConfigRow] | None:
+        rc = self._artifacts_tab_rc
+        try:
+            return (
+                self.query_one(f"#artifacts_cycle_default_backend_{rc}", CycleField),
+                self.query_one(f"#artifacts_cfg_gitbranch_branch_{rc}", ConfigRow),
+            )
+        except Exception:
+            return None
+
+    def _populate_artifacts_tab(self):
+        container = self.query_one("#artifacts_content", VerticalScroll)
+        container.remove_children()
+
+        self._repop_counter += 1
+        rc = self._repop_counter
+        self._artifacts_tab_rc = rc
+
+        container.mount(Label("Artifact Storage", classes="section-header"))
+        container.mount(Label(
+            "[dim]Where `ait artifact` stores blobs. Stored in "
+            "aitasks/metadata/project_config.yaml under the artifacts: section. "
+            "The gitbranch store is created by the first artifact write, or by "
+            "'ait artifact init-store gitbranch'.[/dim]",
+            classes="section-hint",
+        ))
+        container.mount(Label(
+            "[dim]Saving rewrites project_config.yaml without its comments — "
+            "including the seeded artifacts: documentation block — as the "
+            "Project Config and Tmux tabs already do.[/dim]",
+            classes="section-hint",
+        ))
+
+        artifacts, _backends, gitbranch, error = self._artifacts_sections(
+            self.config_mgr.project_config)
+        if error:
+            container.mount(Label(
+                f"[red]{escape(error)}. Save is refused until then.[/red]",
+                classes="section-hint",
+            ))
+
+        info = ARTIFACTS_CONFIG_SCHEMA["default_backend"]
+        current = artifacts.get("default_backend")
+        current = str(current) if current is not None else info["default"]
+        options = self._artifact_adapters()
+        if current not in options:
+            # Show what the file says; Save lets the registry judge it.
+            options = [current] + options
+        container.mount(CycleField(
+            "default_backend", options, current, field_key="default_backend",
+            id=f"artifacts_cycle_default_backend_{rc}",
+        ))
+        container.mount(Label(
+            f"      [dim]{info['summary']}[/dim]", classes="section-hint",
+        ))
+
+        info = ARTIFACTS_CONFIG_SCHEMA["backends.gitbranch.branch"]
+        branch = gitbranch.get("branch")
+        branch = "" if branch is None else str(branch)
+        container.mount(ConfigRow(
+            "gitbranch branch", escape(branch) or "(not set)",
+            config_layer="project", row_key="backends.gitbranch.branch",
+            id=f"artifacts_cfg_gitbranch_branch_{rc}", raw_value=branch,
+        ))
+        container.mount(Label(
+            f"      [dim]{info['summary']}. Changing it once a store exists "
+            "needs 'ait artifact gitbranch-migrate --from <old> --to "
+            "<new>'.[/dim]",
+            classes="section-hint",
+        ))
+
+        hbox = Horizontal(classes="tab-buttons")
+        container.mount(hbox)
+        hbox.mount(Button("Save Artifact Settings", variant="success",
+                          id=f"btn_artifacts_save_{rc}"))
+        hbox.mount(Button("Revert Artifact Settings", variant="warning",
+                          id=f"btn_artifacts_revert_{rc}"))
+
+        container.mount(Label(
+            f"[dim]Enter: edit  |  ←→: cycle  |  ↑↓: navigate  |  {self._tab_switch_hint()}[/dim]",
+            classes="section-hint",
+        ))
+
+    def _on_artifacts_backend_changed(self, value: str) -> None:
+        """Selecting gitbranch with no branch fills in the default branch (in
+        the pane only), so a Save writes both the default and its backend."""
+        if value != "gitbranch":
+            return
+        widgets = self._artifacts_widgets()
+        if widgets is None or widgets[1].raw_value:
+            return
+        row = widgets[1]
+        row.raw_value = ARTIFACTS_GITBRANCH_DEFAULT_BRANCH
+        row.value = ARTIFACTS_GITBRANCH_DEFAULT_BRANCH
+        row.refresh()
+        self.notify(
+            f"gitbranch needs a branch — set to {ARTIFACTS_GITBRANCH_DEFAULT_BRANCH}; "
+            "press Save to persist")
+
+    def save_artifacts_settings(self):
+        if not self._may_save("project"):
+            return
+        widgets = self._artifacts_widgets()
+        if widgets is None:
+            self.notify("Not saved — the Artifacts tab is not rendered.",
+                        severity="error")
+            return
+        default = widgets[0].current_value
+        # The raw value: validate-ref judges it exactly as activation does.
+        branch = widgets[1].raw_value or ""
+
+        artifacts, backends, gitbranch, error = self._artifacts_sections(
+            self.config_mgr.project_config)
+        # Every interpolated message below is escaped: registry messages quote
+        # the rejected value, which comes straight from the YAML file.
+        if error:
+            self.notify(f"Not saved — {escape(error)}.", severity="error",
+                        timeout=10)
+            return
+        if branch:
+            why = self._artifact_ref_error(branch)
+            if why:
+                self.notify(f"Not saved — {escape(why)}", severity="error",
+                            timeout=10)
+                return
+        elif default == "gitbranch":
+            self.notify("Not saved — the gitbranch backend needs a branch: set "
+                        "one, or pick another default backend.",
+                        severity="error", timeout=10)
+            return
+
+        # Copies of the existing sections, so keys the pane does not render
+        # (other backends, unknown siblings) survive the save.
+        data = dict(self.config_mgr.project_config)
+        artifacts = dict(artifacts)
+        backends = dict(backends)
+        gitbranch = dict(gitbranch)
+        old_branch = gitbranch.get("branch")
+        if branch:
+            gitbranch["branch"] = branch
+        else:
+            gitbranch.pop("branch", None)
+        if gitbranch:
+            backends["gitbranch"] = gitbranch
+        else:
+            backends.pop("gitbranch", None)
+        if backends:
+            artifacts["backends"] = backends
+        else:
+            artifacts.pop("backends", None)
+        if default != ARTIFACTS_CONFIG_SCHEMA["default_backend"]["default"]:
+            artifacts["default_backend"] = default
+        else:
+            artifacts.pop("default_backend", None)
+        if artifacts:
+            data["artifacts"] = artifacts
+        else:
+            data.pop("artifacts", None)
+
+        why = self._artifacts_candidate_error(data, default)
+        if why:
+            self.notify(f"Not saved — {escape(why)}", severity="error",
+                        timeout=10)
+            return
+
+        self.config_mgr.save_project_settings(data)
+        # Retire on every save, not only when a new apply starts: a save that
+        # clears the branch launches nothing, yet a pending apply from an
+        # earlier branch save must not toast after it.
+        self._retire_fetch_exclusion()
+        if self._refresh_after_save("project", "Artifact settings saved"):
+            self._populate_artifacts_tab()
+            self.notify("Artifact settings saved")
+        if branch:
+            self._apply_fetch_exclusion()
+        if old_branch not in (None, "") and branch and str(old_branch) != branch:
+            old, new = escape(str(old_branch)), escape(branch)
+            self.notify(
+                f"gitbranch branch changed from {old} to {new}. If a store "
+                "already exists, artifact operations refuse until it is "
+                f"migrated: ait artifact gitbranch-migrate --from {old} "
+                f"--to {new}",
+                severity="warning", timeout=15)
+
+    def _revert_artifacts_settings(self):
+        if self._refresh_for_revert(self.config_mgr.reload_project_config):
+            self._populate_artifacts_tab()
+            self.notify("Artifact settings reverted")
+
+    def _handle_artifacts_config_edit(self, result):
+        if result is None:
+            return
+        key = result["key"]
+        value = result["value"]
+
+        row_id = getattr(self, "_editing_artifacts_row_id", None)
+        if not row_id:
+            row_id = f"artifacts_cfg_gitbranch_branch_{self._artifacts_tab_rc}"
+        try:
+            row = self.query_one(f"#{row_id}", ConfigRow)
+            row.raw_value = value
+            row.value = escape(value) or "(not set)"
+            row.refresh()
+            self.notify(f"Updated {key} — press Save to persist")
+        except Exception as exc:
+            self.notify(f"Could not update {key}: {escape(str(exc))}",
+                        severity="error")
+
+    # -------------------------------------------------------------------
+    # Models tab (read-only)
+    # -------------------------------------------------------------------
+    def _populate_models_tab(self):
+        container = self.query_one("#models_content", VerticalScroll)
+        container.remove_children()
+
+        if not self.config_mgr.models:
+            container.mount(Label("No model files found.", classes="section-header"))
+            container.mount(Label(
+                f"[dim]\u2191\u2193: navigate  |  {self._tab_switch_hint()}[/dim]",
+                classes="section-hint",
+            ))
+            return
+
+        for provider, data in sorted(self.config_mgr.models.items()):
+            container.mount(Label(f"{provider.capitalize()} Models",
+                                  classes="section-header"))
+            models = data.get("models", [])
+            if not models:
+                container.mount(Static("    (no models)", classes="model-row"))
+                continue
+
+            # Header
+            container.mount(Static(
+                f"    {'Name':<16} {'CLI ID':<30} {'Status':<12} {'Notes'}",
+                classes="model-header",
+            ))
+
+            for m in models:
+                name = m.get("name", "?")
+                cli_id = m.get("cli_id", "?")
+                notes = m.get("notes", "")
+                status = m.get("status", "active")
+                # Build rich score string from verifiedstats or verified
+                vs = m.get("verifiedstats", {})
+                score_parts = []
+                for op, buckets in vs.items():
+                    if not isinstance(buckets, dict):
+                        continue
+                    detail = _format_op_stats(buckets, compact=False)
+                    if detail:
+                        score_parts.append(f"{op}: {detail}")
+                if not score_parts:
+                    # Fall back to flat verified dict
+                    verified = m.get("verified", {})
+                    for k, v in verified.items():
+                        if v:
+                            score_parts.append(f"{k}: {v}")
+                score_str = (
+                    f"  [dim]{' | '.join(score_parts)}[/dim]"
+                    if score_parts else ""
+                )
+                if status == "unavailable":
+                    container.mount(Static(
+                        f"    [dim]{name:<16} {cli_id:<30} {'[UNAVAIL]':<12} {notes}{score_str}[/dim]",
+                        classes="model-row",
+                    ))
+                else:
+                    container.mount(Static(
+                        f"    {name:<16} {cli_id:<30} {'active':<12} {notes}{score_str}",
+                        classes="model-row",
+                    ))
+                # All-providers summary if model is shared across providers
+                if cli_id != "?":
+                    agg = _aggregate_verifiedstats(
+                        self.config_mgr.models, cli_id,
+                    )
+                    # Check if agg has more runs than this provider alone
+                    provider_total = sum(
+                        vs.get(op, {}).get("all_time", {}).get("runs", 0)
+                        for op in agg
+                    )
+                    agg_total = sum(
+                        agg[op].get("all_time", {}).get("runs", 0)
+                        for op in agg
+                    )
+                    if agg_total > 0 and agg_total > provider_total:
+                        agg_parts = []
+                        for op, buckets in agg.items():
+                            detail = _format_op_stats(buckets, compact=False)
+                            if detail:
+                                agg_parts.append(f"{op}: {detail}")
+                        if agg_parts:
+                            container.mount(Static(
+                                f"    [dim]  all providers: "
+                                f"{' | '.join(agg_parts)}[/dim]",
+                                classes="model-row",
+                            ))
+
+        container.mount(Label(""))
+        container.mount(Label(
+            "[dim]Model lists are managed by 'ait codeagent refresh'. "
+            "Edit model files directly for manual changes.[/dim]",
+            classes="section-hint",
+        ))
+        container.mount(Label(
+            f"[dim]\u2191\u2193: navigate  |  {self._tab_switch_hint()}[/dim]",
+            classes="section-hint",
+        ))
+
+    # -------------------------------------------------------------------
+    # Profiles tab (editable)
+    # -------------------------------------------------------------------
+    def _populate_profiles_tab(self, focus_widget_id: str | None = None):
+        container = self.query_one("#profiles_content", Vertical)
+        container.remove_children()
+
+        self._profile_id_map = {}
+        self._profile_groups = []
+        self._repop_counter += 1
+        rc = self._repop_counter
+        self._profiles_tab_rc = rc
+        self._profiles_focus_target = focus_widget_id
+
+        # --- Explanation ---
+        container.mount(Label("Execution Profiles", classes="section-header"))
+        container.mount(Label(
+            "[dim]Execution profiles pre-answer workflow questions to reduce "
+            "interactive prompts.\n"
+            "Used by: aitask-pick, aitask-explore, aitask-pickrem, "
+            "aitask-pickweb, task-workflow\n\n"
+            "Project-scoped profiles are git-tracked and shared with all users — "
+            "changes affect everyone.\n"
+            "User-scoped profiles (in profiles/local/) are gitignored and override "
+            "project profiles with the same name.[/dim]",
+            classes="section-hint",
+        ))
+
+        profiles = self.config_mgr.profiles
+        if not profiles:
+            container.mount(Label(
+                "[dim]No profiles found in aitasks/metadata/profiles/[/dim]",
+                classes="section-hint",
+            ))
+            # rc-suffixed: remove_children() is deferred, so a fixed id would
+            # collide with the not-yet-removed copy on repop (e.g. `r` reload).
+            container.mount(Button(
+                "Create New Profile", variant="primary",
+                id=f"btn_profile_add_new_{rc}",
+            ))
+            container.mount(Label(
+                f"[dim]\u2191\u2193: navigate  |  {self._tab_switch_hint()}[/dim]",
+                classes="section-hint",
+            ))
+            return
+
+        # --- Profile selector ---
+        profile_filenames = sorted(profiles.keys())
+        selector_options = profile_filenames + ["+ Add new profile"]
+
+        if self._selected_profile and self._selected_profile in profiles:
+            current_selection = self._selected_profile
+        else:
+            current_selection = profile_filenames[0]
+            self._selected_profile = current_selection
+
+        container.mount(CycleField(
+            "Profile", selector_options, current_selection,
+            "profile_selector", id=f"cf_profile_selector_{rc}",
+        ))
+
+        if current_selection == "+ Add new profile":
+            container.mount(Label(
+                "[dim]Use \u25c0\u25b6 to select a profile or "
+                "choose '+ Add new profile'[/dim]",
+                classes="section-hint",
+            ))
+            container.mount(Label(
+                "[dim]\u2191\u2193: navigate  |  \u25c0\u25b6: cycle options  "
+                f"|  {self._tab_switch_hint()}[/dim]",
+                classes="section-hint",
+            ))
+            return
+
+        # --- Profile detail area ---
+        data = profiles[current_selection]
+        safe_fn = _safe_id(current_selection)
+        self._profile_id_map[safe_fn] = current_selection
+        profile_name = data.get("name", current_selection)
+        layer = self.config_mgr.profile_layers.get(current_selection, "project")
+        if layer == "user":
+            file_display = f"local/{current_selection}"
+            scope_hint = "[dim](user-scoped, local only)[/dim]"
+        else:
+            file_display = current_selection
+            scope_hint = "[dim](project-scoped, shared with team)[/dim]"
+
+        container.mount(Label(
+            f"Editing: [bold]{profile_name}[/bold] "
+            f"[dim]({file_display})[/dim]  {scope_hint}",
+            classes="profile-header",
+        ))
+
+        # --- Search pane (fixed): name-only filter over the params below ---
+        # Fixed-id widgets mounted directly into `container` would collide with
+        # the not-yet-removed previous copies on repop (remove_children() is
+        # deferred), so the repop counter suffixes their ids; CSS targets them
+        # by class.
+        container.mount(Input(
+            placeholder="Filter parameters by name…",
+            id=f"profiles_search_{rc}",
+            classes="profiles-search",
+            value=self._profile_search_text,
+        ))
+
+        # --- Params pane (scrolls): grouped fields from the shared renderer.
+        # Walk the flat widget stream to build a group/field index so the
+        # search filter can toggle widget visibility in place (without
+        # unmounting — see _apply_profile_filter). ---
+        params = VerticalScroll(
+            id=f"profiles_params_scroll_{rc}", classes="profiles-params",
+        )
+        container.mount(params)
+        cur_fields = None       # field list for the current group
+        last_field = None       # most-recent [key, widget, hint] awaiting its hint
+        for w in compose_profile_fields(
+            data,
+            id_prefix=f"{safe_fn}_{rc}",
+            expanded_field=self._expanded_field,
+        ):
+            params.mount(w)
+            if isinstance(w, Label) and "section-header" in w.classes:
+                cur_fields = []
+                self._profile_groups.append((w, cur_fields))
+                last_field = None
+            elif isinstance(w, (CycleField, ConfigRow)):
+                fkey = getattr(w, "field_key", None) or getattr(w, "row_key", "")
+                if cur_fields is not None:
+                    last_field = [fkey, w, None]
+                    cur_fields.append(last_field)
+            elif isinstance(w, Label) and "section-hint" in w.classes:
+                if last_field is not None:
+                    last_field[2] = w
+                    last_field = None
+
+        # --- Button pane (fixed, pinned to the bottom) ---
+        # Profile name is shown in the "Editing:" header above, so the buttons
+        # carry only the action + its shortcut key (w / v / x).
+        hbox = Horizontal(classes="tab-buttons", id=f"profiles_buttons_{rc}")
+        container.mount(hbox)
+        hbox.mount(Button(
+            render_label_cfg("Save", "w"), variant="success",
+            id=f"btn_profile_save__{safe_fn}",
+        ))
+        hbox.mount(Button(
+            render_label_cfg("Revert", "v"), variant="warning",
+            id=f"btn_profile_revert__{safe_fn}",
+        ))
+        hbox.mount(Button(
+            render_label_cfg("Delete", "x"), variant="error",
+            id=f"btn_profile_delete__{safe_fn}",
+        ))
+
+        container.mount(Label(
+            "[dim]\u2191\u2193: navigate  |  \u25c0\u25b6: cycle options  "
+            "|  Tab: switch pane  |  Enter: edit strings  |  ?: field details  "
+            f"|  w/v/x: save/revert/delete  |  {self._tab_switch_hint()}[/dim]",
+            classes="section-hint",
+        ))
+
+        # Re-apply any active filter and the dirty-state button gating once the
+        # widgets have mounted.
+        self.call_after_refresh(self._apply_profile_filter, self._profile_search_text)
+        self.call_after_refresh(self._update_profile_button_states)
+
+        # Restore focus after repopulation
+        if self._profiles_focus_target:
+            target_id = self._profiles_focus_target
+            self._profiles_focus_target = None
+            self.call_after_refresh(self._focus_widget_by_id, target_id)
+
+    def _focus_widget_by_id(self, widget_id: str) -> None:
+        """Focus a widget by ID after refresh completes."""
+        try:
+            widget = self.query_one(f"#{widget_id}")
+            if widget.can_focus:
+                widget.focus()
+        except Exception:
+            pass
+
+    def _apply_profile_filter(self, text: str) -> None:
+        """Show only params whose field name matches `text` (case-insensitive).
+
+        Toggles `display` on the field widget + its hint label, and hides a
+        group header when none of its fields survive. Hidden widgets stay in the
+        DOM (queryable by `collect_profile_values`), so in-progress edits to a
+        filtered-out field are preserved on Save.
+        """
+        q = (text or "").strip().lower()
+        for header, fields in self._profile_groups:
+            any_vis = False
+            for entry in fields:
+                key, fw, hint = entry[0], entry[1], entry[2]
+                vis = True if not q else (q in key.lower())
+                fw.display = vis
+                if hint is not None:
+                    hint.display = vis
+                any_vis = any_vis or vis
+            header.display = any_vis
+
+    @on(Input.Changed)
+    def _on_profiles_search_changed(self, event: Input.Changed) -> None:
+        # The search box id is repop-counter-suffixed, so match by prefix.
+        if (event.input.id or "").startswith("profiles_search"):
+            self._profile_search_text = event.value
+            self._apply_profile_filter(event.value)
+
+    def _profile_is_dirty(self, filename: str | None) -> bool:
+        """True if the on-screen field values differ from the stored profile."""
+        if not filename or filename not in self.config_mgr.profiles:
+            return False
+        base = self.config_mgr.profiles.get(filename, {})
+        try:
+            data, _ = collect_profile_values(
+                self.query_one, base,
+                id_prefix=f"{_safe_id(filename)}_{self._profiles_tab_rc}",
+            )
+        except Exception:
+            return False
+        return data != base
+
+    def _update_profile_button_states(self) -> None:
+        """Disable Save/Revert when the profile has no unsaved changes."""
+        fn = self._selected_profile
+        if not fn or fn == "+ Add new profile":
+            return
+        dirty = self._profile_is_dirty(fn)
+        safe_fn = _safe_id(fn)
+        for prefix in ("btn_profile_save__", "btn_profile_revert__"):
+            try:
+                self.query_one(f"#{prefix}{safe_fn}", Button).disabled = not dirty
+            except Exception:
+                pass
+
+    def _cycle_profile_pane(self, direction: int) -> None:
+        """Move focus between the four Execution Profiles panes with Tab."""
+        rc = self._profiles_tab_rc
+        anchors: list = []  # (pane_id, widget)
+        try:
+            anchors.append(
+                ("selector",
+                 self.query_one(f"#cf_profile_selector_{rc}", CycleField))
+            )
+        except Exception:
+            pass
+        try:
+            anchors.append(
+                ("search", self.query_one(f"#profiles_search_{rc}", Input))
+            )
+        except Exception:
+            pass
+        params_scroll = None
+        try:
+            params_scroll = self.query_one(
+                f"#profiles_params_scroll_{rc}", VerticalScroll
+            )
+            for w in params_scroll.query("*"):
+                # `focusable` (not `can_focus`) so filtered-out / disabled
+                # widgets are skipped — a disabled widget's focus() is a no-op.
+                if w.focusable and not isinstance(w, VerticalScroll):
+                    anchors.append(("params", w))
+                    break
+        except Exception:
+            pass
+        buttons_box = None
+        try:
+            buttons_box = self.query_one(f"#profiles_buttons_{rc}", Horizontal)
+            for w in buttons_box.query(Button):
+                # Skip disabled Save/Revert (focus() on a disabled widget is a
+                # no-op) — land on the first focusable button (e.g. Delete).
+                if w.focusable:
+                    anchors.append(("buttons", w))
+                    break
+        except Exception:
+            pass
+        if not anchors:
+            return
+        focused = self.focused
+        cur = -1
+        for i, (_pane, widget) in enumerate(anchors):
+            if focused is widget:
+                cur = i
+                break
+        if cur < 0 and focused is not None:
+            ancestors = list(getattr(focused, "ancestors", []))
+            for i, (pane, _widget) in enumerate(anchors):
+                if pane == "params" and params_scroll in ancestors:
+                    cur = i
+                    break
+                if pane == "buttons" and buttons_box in ancestors:
+                    cur = i
+                    break
+        if cur < 0:
+            anchors[0][1].focus()
+            return
+        nxt = (cur + direction) % len(anchors)
+        anchors[nxt][1].focus()
+
+    def action_profile_save(self) -> None:
+        fn = self._selected_profile
+        if not fn or fn == "+ Add new profile" or fn not in self.config_mgr.profiles:
+            return
+        if not self._profile_is_dirty(fn):
+            self.notify("No changes to save")
+            return
+        data = self.config_mgr.profiles.get(fn, {})
+        profile_name = data.get("name", fn)
+        self.push_screen(
+            SaveProfileConfirmScreen(profile_name, fn),
+            callback=lambda result, f=fn: self._handle_save_profile(result, f),
+        )
+
+    def action_profile_revert(self) -> None:
+        fn = self._selected_profile
+        if not fn or fn == "+ Add new profile" or fn not in self.config_mgr.profiles:
+            return
+        if not self._profile_is_dirty(fn):
+            self.notify("No changes to revert")
+            return
+        self._revert_profile(fn)
+
+    def action_profile_delete(self) -> None:
+        fn = self._selected_profile
+        if not fn or fn == "+ Add new profile" or fn not in self.config_mgr.profiles:
+            return
+        data = self.config_mgr.profiles.get(fn, {})
+        profile_name = data.get("name", fn)
+        self.push_screen(
+            DeleteProfileConfirmScreen(profile_name, fn),
+            callback=lambda confirmed, f=fn:
+                self._handle_delete_profile(bool(confirmed), f),
+        )
+
+    @on(CycleField.Changed)
+    def on_cycle_field_changed(self, event: CycleField.Changed):
+        if (event.field.id or "").startswith("artifacts_cycle_"):
+            self._on_artifacts_backend_changed(event.value)
+            return
+        if event.field.field_key != "profile_selector":
+            # A profile parameter field changed — refresh Save/Revert gating.
+            if (event.field.id or "").startswith("profile_"):
+                self._update_profile_button_states()
+            return
+        new_value = event.value
+        if new_value == "+ Add new profile":
+            existing = sorted(self.config_mgr.profiles.keys())
+            self.push_screen(
+                NewProfileScreen(existing),
+                callback=self._handle_new_profile,
+            )
+        else:
+            self._selected_profile = new_value
+            self._expanded_field = None
+            rc = self._repop_counter + 1  # next repop counter
+            self._populate_profiles_tab(
+                focus_widget_id=f"cf_profile_selector_{rc}",
+            )
+
+    @on(Button.Pressed)
+    def on_button_pressed(self, event: Button.Pressed):
+        btn_id = event.button.id or ""
+        if btn_id.startswith("btn_profile_save__"):
+            safe_fn = btn_id.replace("btn_profile_save__", "")
+            filename = self._profile_id_map.get(safe_fn, safe_fn)
+            data = self.config_mgr.profiles.get(filename, {})
+            profile_name = data.get("name", filename)
+            self.push_screen(
+                SaveProfileConfirmScreen(profile_name, filename),
+                callback=lambda result, fn=filename:
+                    self._handle_save_profile(result, fn),
+            )
+        elif btn_id.startswith("btn_profile_delete__"):
+            safe_fn = btn_id.replace("btn_profile_delete__", "")
+            filename = self._profile_id_map.get(safe_fn, safe_fn)
+            data = self.config_mgr.profiles.get(filename, {})
+            profile_name = data.get("name", filename)
+            self.push_screen(
+                DeleteProfileConfirmScreen(profile_name, filename),
+                callback=lambda confirmed, fn=filename:
+                    self._handle_delete_profile(bool(confirmed), fn),
+            )
+        elif btn_id.startswith("btn_profile_revert__"):
+            safe_fn = btn_id.replace("btn_profile_revert__", "")
+            filename = self._profile_id_map.get(safe_fn, safe_fn)
+            self._revert_profile(filename)
+        elif btn_id.startswith("btn_board_save"):
+            self.save_board_settings()
+        elif btn_id.startswith("btn_board_revert"):
+            self._revert_board_settings()
+        elif btn_id.startswith("btn_project_save"):
+            self.save_project_settings()
+        elif btn_id.startswith("btn_project_revert"):
+            self._revert_project_settings()
+        elif btn_id.startswith("btn_tmux_save"):
+            self.save_tmux_settings()
+        elif btn_id.startswith("btn_tmux_revert"):
+            self._revert_tmux_settings()
+        elif btn_id.startswith("btn_artifacts_save"):
+            self.save_artifacts_settings()
+        elif btn_id.startswith("btn_artifacts_revert"):
+            self._revert_artifacts_settings()
+        elif btn_id.startswith("btn_profile_add_new"):
+            existing = sorted(self.config_mgr.profiles.keys())
+            self.push_screen(
+                NewProfileScreen(existing),
+                callback=self._handle_new_profile,
+            )
+        elif btn_id == "btn_sc_reset":
+            self.action_sc_reset()
+        elif btn_id == "btn_sc_lint":
+            self.action_sc_lint()
+        elif btn_id == "btn_pg_assign":
+            self._pg_assign()
+        elif btn_id == "btn_pg_clear":
+            self._pg_clear()
+        elif btn_id == "btn_pg_rename":
+            self._pg_rename()
+        elif btn_id == "btn_pg_sync":
+            self._pg_sync()
+        elif btn_id == "btn_pg_refresh":
+            self._populate_project_groups_tab()
+
+    def _save_profile(self, filename: str):
+        if not self._may_save("profiles"):
+            return
+        base = dict(self.config_mgr.profiles.get(filename, {}))
+        safe_fn = _safe_id(filename)
+        rc = self._profiles_tab_rc
+
+        data, errors = collect_profile_values(
+            self.query_one, base, id_prefix=f"{safe_fn}_{rc}",
+        )
+        for msg in errors:
+            self.notify(msg, severity="error")
+
+        layer = self.config_mgr.profile_layers.get(filename, "project")
+        self.config_mgr.save_profile(filename, data, layer=layer)
+        self.notify(f"Profile '{filename}' saved")
+        self._maybe_rerender_pickrem(filename)
+
+    def _maybe_rerender_pickrem(self, filename: str) -> None:
+        """Auto-render aitask-pickrem when a headless profile is saved.
+
+        TODO(t777_29): generalize — read `headless: true` flag from profile YAML
+        and `prerender_for_headless` marker from each skill's j2 frontmatter.
+        Currently hardcoded to `remote.yaml` × `aitask-pickrem`.
+        """
+        if filename != "remote.yaml":
+            return
+        template_path = Path(".claude/skills/aitask-pickrem/SKILL.md.j2")
+        if not template_path.exists():
+            return
+        rendered_paths: list[str] = []
+        for agent in ("claude", "codex", "opencode"):
+            proc = subprocess.run(
+                [
+                    "./.aitask-scripts/aitask_skill_render.sh",
+                    "aitask-pickrem", "--profile", "remote",
+                    "--agent", agent, "--force",
+                ],
+                capture_output=True, text=True,
+            )
+            if proc.returncode != 0:
+                self.notify(
+                    f"Auto-rerender of aitask-pickrem failed for agent={agent}: "
+                    f"{(proc.stderr or proc.stdout).strip()[:200]}",
+                    severity="warning", timeout=8,
+                )
+                return
+            rendered_paths.extend(self._pickrem_rendered_paths(agent))
+        if rendered_paths:
+            subprocess.run(
+                ["git", "add", "--", *rendered_paths],
+                capture_output=True, text=True,
+            )
+            self.notify(
+                f"Re-rendered aitask-pickrem (remote × 3 agents) and "
+                f"staged {len(rendered_paths)} file(s).",
+                severity="information", timeout=5,
+            )
+
+    def _pickrem_rendered_paths(self, agent: str) -> list[str]:
+        root_map = {
+            "claude":   ".claude/skills",
+            "codex":    ".agents/skills",
+            "opencode": ".opencode/skills",
+        }
+        root = Path(root_map[agent]) / "aitask-pickrem-remote-"
+        if not root.exists():
+            return []
+        return [str(p) for p in root.rglob("*.md")]
+
+    def _handle_save_profile(self, result: str | None, filename: str):
+        if result is None:
+            return
+        # The commit is ConfigManager.save_profile's own, path-scoped through
+        # aitask_metadata_commit.sh. The former "save_commit" branch ran a
+        # pathspec-less `git commit`, which took the WHOLE shared .aitask-data
+        # index and could carry another session's staged work under this
+        # message — the swallow t1599 exists to eliminate.
+        self._save_profile(filename)
+
+    def _revert_profile(self, filename: str):
+        """Revert a profile to its on-disk state, discarding unsaved changes."""
+        layer = self.config_mgr.profile_layers.get(filename, "project")
+        if layer == "user":
+            path = LOCAL_PROFILES_DIR / filename
+        else:
+            path = PROFILES_DIR / filename
+        if not path.is_file():
+            self.notify(f"Profile file not found: {filename}", severity="error")
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = yaml.safe_load(fh)
+            if isinstance(data, dict):
+                self.config_mgr.profiles[filename] = data
+        except Exception as exc:
+            self.notify(f"Failed to reload {filename}: {exc}", severity="error")
+            return
+        self._populate_profiles_tab()
+        self.notify(f"Reverted '{filename}' to saved state")
+
+    def _handle_new_profile(self, result):
+        if result is not None and not self._may_save("profiles"):
+            result = None  # refused: restore the selection as on cancel
+        if result is None:
+            # User cancelled — re-select previous profile
+            if self._selected_profile == "+ Add new profile":
+                profiles = sorted(self.config_mgr.profiles.keys())
+                self._selected_profile = profiles[0] if profiles else None
+            self._populate_profiles_tab()
+            return
+
+        filename = result["filename"]
+        base = result["base"]
+        layer = result.get("layer", "project")
+
+        if filename in self.config_mgr.profiles:
+            self.notify(f"Profile '{filename}' already exists", severity="error")
+            self._populate_profiles_tab()
+            return
+
+        if base and base != "(empty)" and base in self.config_mgr.profiles:
+            new_data = dict(self.config_mgr.profiles[base])
+        else:
+            new_data = {}
+
+        new_data["name"] = filename.replace(".yaml", "")
+        new_data["description"] = ""
+
+        self.config_mgr.save_profile(filename, new_data, layer=layer)
+        self._selected_profile = filename
+        self.config_mgr.load_profiles()
+        self._populate_profiles_tab()
+        self.notify(f"Created {layer} profile '{filename}' (based on {base})")
+
+    def _handle_delete_profile(self, confirmed: bool, filename: str):
+        if not confirmed or not self._may_save("profiles"):
+            return
+        self.config_mgr.delete_profile(filename)
+        remaining = sorted(self.config_mgr.profiles.keys())
+        self._selected_profile = remaining[0] if remaining else None
+        self._populate_profiles_tab()
+        self.notify(f"Deleted profile '{filename}'")
+
+    def _handle_profile_string_edit(self, result, profile_filename: str):
+        if result is None:
+            return
+        key = result["key"]
+        value = result["value"]
+
+        rc = self._profiles_tab_rc
+        ktype = PROFILE_SCHEMA.get(key, ("string", None))[0]
+        prefix = "profile_int_" if ktype == "int" else "profile_str_"
+        widget_id = f"{prefix}{key}__{_safe_id(profile_filename)}_{rc}"
+        try:
+            row = self.query_one(f"#{widget_id}", ConfigRow)
+            row.value = value
+            row.refresh()
+        except Exception:
+            pass
+        self._update_profile_button_states()
+        self.notify(f"Updated {key} — press Save to persist")
+
+    # -------------------------------------------------------------------
+    # Actions: Export, Import, Reload
+    # -------------------------------------------------------------------
+    # -------------------------------------------------------------------
+    # Shortcuts tab
+    # -------------------------------------------------------------------
+    def _populate_shortcuts_tab(self):
+        # Register every TUI's bindings (this is a settings-only process, so
+        # other Apps are never instantiated to register themselves). The sweep
+        # re-executes module bodies (under a private probe name, so canonical
+        # sys.modules entries are untouched), so run it once — _DEFAULTS
+        # persists for the process lifetime. Fail-soft.
+        if not self._shortcuts_swept:
+            try:
+                shortcut_scopes.register_all_known_bindings()
+            except Exception:
+                pass
+            self._shortcuts_swept = True
+
+        container = self.query_one("#shortcuts_content", Vertical)
+
+        # Build the static chrome once; on repopulate just refresh the table
+        # rows. (Re-mounting a fixed-id DataTable races remove_children, which is
+        # deferred — clearing rows in place avoids the DuplicateIds error.)
+        # Layout order: header, hint, table (fills), buttons (pinned to bottom).
+        try:
+            table = self.query_one("#shortcuts_table", DataTable)
+        except Exception:
+            container.remove_children()
+            container.mount(Label("Customizable Shortcuts", classes="section-header"))
+            container.mount(Label(
+                "[dim]Keybindings for every aitasks TUI. ↑↓ select a row, "
+                "Enter edits it; the buttons below (and their parenthesized "
+                "shortcut keys) reset the selected row's scope or lint cross-TUI "
+                "coherence. Export/import shortcuts via the general Export (e) / "
+                "Import (i) — they include the Shortcuts category.\n"
+                "Changes are saved to userconfig.yaml and apply after the "
+                "affected TUI is restarted.[/dim]",
+                classes="section-hint",
+            ))
+            search = Input(
+                placeholder="Type to filter…", id="shortcuts_search",
+            )
+            search.border_title = "Filter"
+            container.mount(search)
+            table = DataTable(
+                id="shortcuts_table", cursor_type="row", zebra_stripes=True,
+            )
+            container.mount(table)
+            table.add_columns(
+                "Scope", "Action", "Current", "Default", "Label", "Origin",
+            )
+            container.mount(Horizontal(
+                Button(render_label_cfg("Reset scope", "d"), id="btn_sc_reset"),
+                Button(render_label_cfg("Lint coherence", "l"), id="btn_sc_lint"),
+                classes="tab-buttons",
+            ))
+
+        table.clear()  # keeps columns
+        overrides = keybinding_registry.load_user_overrides()
+        # Resolve current keys up front so the fuzzy filter can match on them.
+        rows = [
+            (
+                scope, action_id, default_key, label,
+                keybinding_registry.resolve_key(scope, action_id) or default_key,
+                "user" if action_id in overrides.get(scope, {}) else "default",
+            )
+            for scope, action_id, default_key, label
+            in keybinding_registry.iter_all_bindings()
+        ]
+        rows = fuzzy_filter.rank(
+            self._shortcuts_query, rows,
+            key=lambda r: f"{r[1]} {r[3]} {r[4]} {r[2]} {r[0]}",
+        )
+        for scope, action_id, default_key, label, current, origin in rows:
+            table.add_row(
+                scope, action_id, current, default_key, label, origin,
+                key=f"{scope}\x00{action_id}",
+            )
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id != "shortcuts_search":
+            return
+        self._shortcuts_query = event.value
+        self._populate_shortcuts_tab()
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        if event.data_table.id == "project_groups_table":
+            # Enter on a project row opens its Assign/change dialog — the row's
+            # primary action (parity with the Shortcuts table's row-edit).
+            self._pg_assign()
+            return
+        if event.data_table.id != "shortcuts_table":
+            return
+        try:
+            row = event.data_table.get_row(event.row_key)
+            scope = str(row[0])
+        except Exception:
+            return
+        self.push_screen(
+            ShortcutEditorModal(scope=scope),
+            callback=self._handle_shortcut_edit,
+        )
+
+    def _handle_shortcut_edit(self, _result):
+        keybinding_registry.refresh_all()
+        self._populate_shortcuts_tab()
+
+    def _reset_selected_shortcut_scope(self):
+        try:
+            table = self.query_one("#shortcuts_table", DataTable)
+            row = table.get_row_at(table.cursor_row)
+            scope = str(row[0])
+        except Exception:
+            self.notify("Select a shortcut row first", severity="warning")
+            return
+        self.push_screen(
+            ResetShortcutsConfirmScreen(scope),
+            callback=lambda confirmed, s=scope: self._handle_reset_scope(
+                bool(confirmed), s,
+            ),
+        )
+
+    def _handle_reset_scope(self, confirmed: bool, scope: str):
+        if not confirmed:
+            return
+        shortcut_persist.reset_scope(scope)
+        keybinding_registry.refresh_all()
+        self._populate_shortcuts_tab()
+        self.notify(
+            f"Reset '{scope}' shortcuts to defaults — "
+            "restart the affected TUI to apply."
+        )
+
+    def _lint_shortcuts(self):
+        warnings = keybinding_registry.coherence_lint()
+        if not warnings:
+            self.notify("No coherence issues")
+            return
+        self.push_screen(LintResultsScreen(warnings))
+
+    def action_sc_reset(self):
+        self._reset_selected_shortcut_scope()
+
+    def action_sc_lint(self):
+        self._lint_shortcuts()
+
+    def action_export_configs(self):
+        self.push_screen(ExportScreen(), callback=self._handle_export)
+
+    def _handle_export(self, result):
+        if result is None:
+            return
+        try:
+            directory = result.get("directory", ".")
+            raw_patterns = result.get("patterns") or []
+            include_shortcuts = _SHORTCUTS_EXPORT_SENTINEL in raw_patterns
+            file_patterns = [
+                p for p in raw_patterns if p != _SHORTCUTS_EXPORT_SENTINEL
+            ]
+            # Nothing selected at all → None (export-all default). A selection
+            # that resolves to only shortcuts → [] (shortcuts-only bundle).
+            patterns = None if not raw_patterns else file_patterns
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            out_path = os.path.join(
+                directory, f"aitasks_config_export_{timestamp}{EXPORT_EXTENSION}",
+            )
+            bundle = export_all_configs(
+                out_path, str(METADATA_DIR),
+                patterns=patterns, include_shortcuts=include_shortcuts,
+            )
+            count = bundle.get("_export_meta", {}).get("file_count", 0)
+            self.notify(f"Exported {count} item(s) to {out_path}")
+        except Exception as exc:
+            self.notify(f"Export failed: {exc}", severity="error")
+
+    def action_import_configs(self):
+        self.push_screen(ImportScreen(), callback=self._handle_import)
+
+    def _refresh_after_save(self, family: str, done: str) -> bool:
+        """Re-read `family` after a save already landed; report, never raise.
+
+        On failure the manager has latched the family, so the message says
+        both that the save landed and that further saves are refused.
+        """
+        try:
+            self.config_mgr.refresh_after_write(family)
+        except ConfigReadError as exc:
+            self.notify(f"{done}, but re-reading the config failed — {exc}. The "
+                        "loaded config could not be refreshed, and further "
+                        "saves here are refused until it is re-read: fix the "
+                        "file, then press r to reload.",
+                        severity="error", timeout=10)
+            return False
+        return True
+
+    def _refresh_for_revert(self, reload) -> bool:
+        """Re-read one family for a revert; report, never raise."""
+        try:
+            reload()
+        except ConfigReadError as exc:
+            self.notify(f"Cannot revert — {exc}. Kept the config already "
+                        "loaded; fix the file, then press r to reload.",
+                        severity="error", timeout=10)
+            return False
+        return True
+
+    def _may_save(self, family: str) -> bool:
+        """Refuse, before building any payload, a save on a latched family."""
+        if not self.config_mgr.needs_reload(family):
+            return True
+        self.notify("Not saved — this config was written earlier but could not "
+                    "be re-read since, so this edit would be built on stale "
+                    "data. Fix the file, then press r to reload.",
+                    severity="error", timeout=10)
+        return False
+
+    def _reload_all_configs(self, *, after_write: bool = False) -> bool:
+        """Re-read every config from disk and repopulate the tabs.
+
+        All or nothing: an unreadable file is reported and the config and tabs
+        already loaded are kept. Returns False in that case. `after_write`
+        (an import just wrote files) also latches every family on failure, so
+        no later save is built on the memory the import left behind.
+        """
+        try:
+            if after_write:
+                self.config_mgr.refresh_all_after_write()
+            else:
+                self.config_mgr.load_all()
+        except ConfigReadError as exc:
+            self.notify(f"Cannot reload configs — {exc}. Kept the config "
+                        "already loaded; fix the file, then press r to reload.",
+                        severity="error", timeout=10)
+            return False
+        self._populate_agent_tab()
+        self._populate_board_tab()
+        self._populate_project_tab()
+        self._populate_project_groups_tab()
+        self._populate_tmux_tab()
+        self._populate_artifacts_tab()
+        self._populate_models_tab()
+        self._populate_profiles_tab()
+        keybinding_registry.refresh_all()
+        self._populate_shortcuts_tab()
+        return True
+
+    def _notify_commit(self, result, paths):
+        """Surface the outcome of a project-layer metadata commit.
+
+        A swallowed failure is the whole defect: the config edit landed but
+        nothing committed it, and an ownerless dirty file blocks task-data sync
+        until a human clears it. So a failure always names the remedy.
+        `nochange` / `skipped` are silent — a user-layer save committing nothing
+        is the designed outcome, not news.
+        """
+        if result.status == "committed":
+            self.notify(result.subject or "Committed config change")
+        elif result.status in ("failed", "refused"):
+            self.notify(
+                f"Config saved but NOT committed ({result.detail}). "
+                f"Clear it with: {remedy_command(paths, allow_new=result.allow_new)}",
+                severity="error", timeout=10,
+            )
+
+    def _import_commit_paths(self, written):
+        """Repo-relative metadata paths for the names import_all_configs wrote.
+
+        Filtered to entries that are real files: the returned list also carries
+        the literal `"shortcuts"` marker when a shortcuts subtree was merged
+        into `userconfig.yaml`, and that names no file at all — passing it would
+        make the helper refuse the whole batch and commit nothing.
+        """
+        return [_repo_rel(METADATA_DIR / name) for name in written
+                if (METADATA_DIR / name).is_file()]
+
+    def _commit_imported(self, written, pre_existing):
+        """Commit what the import wrote, PARTITIONED by pre-import existence.
+
+        `allow_new` is derived, never hard-coded: an import legitimately
+        introduces a config the project did not have, but passing the flag
+        unconditionally would let a later change add a stray local file to the
+        data branch unnoticed.
+
+        It is also a PER-PATH permission -- "I created this" -- so one boolean
+        for the whole batch is not enough. An import that creates one config
+        while overwriting a pre-existing *untracked* one would then admit both,
+        publishing the second instead of refusing it (t1677 review). Committing
+        the two subsets separately keeps each path's admission its own.
+        """
+        paths = self._import_commit_paths(written)
+        if not paths:
+            return
+        created = [p for p in paths if p not in pre_existing]
+        updated = [p for p in paths if p in pre_existing]
+        for subset, allow_new in ((created, True), (updated, False)):
+            if subset:
+                self._notify_commit(
+                    commit_metadata(subset, allow_new=allow_new), subset
+                )
+
+    def _handle_import(self, result):
+        if result is None:
+            return
+        # Snapshot BEFORE the import so `allow_new` reflects what this
+        # invocation actually created.
+        pre_existing = {_repo_rel(q) for q in METADATA_DIR.glob("*")}
+        try:
+            written = import_all_configs(
+                result["path"], str(METADATA_DIR),
+                overwrite=result.get("overwrite", False),
+                selected_files=result.get("selected_files"),
+            )
+            self._reload_all_configs(after_write=True)
+            self._commit_imported(written, pre_existing)
+            self.notify(f"Imported {len(written)} item(s)")
+        except ConfigImportPartialError as exc:
+            # Some files were committed before the failure. Reloading is
+            # mandatory here: keeping the in-memory config would re-render state
+            # that no longer matches disk, and a later save would write it back.
+            self._reload_all_configs(after_write=True)
+            # The files that DID land still need an owner — a partial import is
+            # exactly the state that would otherwise sit dirty forever.
+            self._commit_imported(exc.written, pre_existing)
+            self.notify(
+                f"Import partially applied — {len(exc.written)} item(s) "
+                f"written ({', '.join(exc.written)}) before failing: {exc.cause}",
+                severity="error",
+            )
+        except Exception as exc:
+            self.notify(f"Import failed: {exc}", severity="error")
+
+    def action_reload_configs(self):
+        if self._reload_all_configs():
+            self.notify("Configs reloaded from disk")
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    try:
+        app = SettingsApp()
+    except ConfigReadError as exc:
+        print(f"Cannot start Settings — {exc}", file=sys.stderr)
+        sys.exit(1)
+    app.run()

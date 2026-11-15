@@ -1,0 +1,3177 @@
+#!/usr/bin/env python3
+"""agent_sessions.py - lock-free primitive for the framework session store (t1705_2).
+
+One machine-wide record per code agent, across every aitasks tmux session and
+project, plus the lifecycle state machine the freeze engine (t1705_4), the
+restore coordinator (t1705_5), the viewer (t1705_6) and the monitors (t1705_7)
+all drive. The store lives at ``~/.config/aitasks/agent_sessions.json``
+(override with ``AITASKS_AGENT_SESSIONS_FILE``); captures live under
+``~/.config/aitasks/frozen/<id>/`` (override with ``AITASKS_FROZEN_DIR``).
+
+Mirrored 1:1 on ``lib/agent_marks.py`` / ``aitask_agent_marks.sh``: this module
+is the lock-free primitive and ``aitask_agent_sessions.sh`` is the SOLE writer,
+holding the ``registry_lock.sh`` mutex around a read-modify-write. Readers (the
+TUIs) read the JSON directly with no lock: every write lands via ``os.replace``,
+so a reader always observes one whole generation.
+
+THIS MODULE NEVER TOUCHES TMUX. It imports no tmux and spawns no process other
+than the read-only `ps` / `lsof` probes that stand in for `/proc` on macOS
+(t2048, :func:`_run_probe`). The
+pane->record join (``@aitask_record``) is stamped by the *caller* -- the
+SessionStart hook (t1705_3) and the freeze engine (t1705_4) -- immediately after
+a successful ``UPSERTED:`` line, using ``ait_stamp_record`` in
+``lib/agent_sessions.sh``. See that helper; the split is deliberate, because
+``tests/test_no_raw_tmux.sh`` permits raw ``tmux`` only from the two gateways.
+
+Transitions are PURE: ``(store, args) -> (store', wire_line)``. They never read
+or write the file; the shell wrapper does load -> transition -> dump and prints
+the wire line. That is what lets the whole state machine be tested with no
+filesystem and no tmux.
+"""
+from __future__ import annotations
+
+import errno
+import hashlib
+import json
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import atomic_write  # noqa: E402
+
+SESSIONS_ENV = "AITASKS_AGENT_SESSIONS_FILE"
+DEFAULT_SESSIONS_PATH = "~/.config/aitasks/agent_sessions.json"
+FROZEN_DIR_ENV = "AITASKS_FROZEN_DIR"
+DEFAULT_FROZEN_DIR = "~/.config/aitasks/frozen"
+#: Documented TEST SEAM. Production never sets it; see :func:`standin_command`.
+STANDIN_CMD_ENV = "AITASKS_FROZEN_STANDIN_CMD"
+
+SCHEMA_VERSION = 1
+OLDEST_READABLE_VERSION = 1
+
+STATE_LIVE = "live"
+STATE_FREEZING = "freezing"
+STATE_FROZEN = "frozen"
+STATE_RESTORING = "restoring"
+STATE_ABORTING = "aborting"
+STATES = (STATE_LIVE, STATE_FREEZING, STATE_FROZEN, STATE_RESTORING, STATE_ABORTING)
+
+#: States mid-transaction. Never relocated by an unstamped caller, never purged
+#: by liveness -- only `aitask_frozen.sh reconcile` resolves them.
+TRANSITIONAL_STATES = (STATE_FREEZING, STATE_RESTORING, STATE_ABORTING)
+
+RESTORE_MODES = ("resume", "repick")
+
+_FILE_MODE = 0o600
+_DIR_MODE = 0o700
+
+#: Seconds before an operation lease with a dead owner may be taken over.
+STALE_OP_GRACE_DEFAULT = 60.0
+
+#: Canonical record id / operation nonce: 8 lowercase hex, from os.urandom(4).
+#:
+#: Format is load-bearing, not cosmetic (t1705_2 A9). Both values escape into
+#: `capture_dir()` -- whose `drop` deletes the tree -- and into
+#: `standin_command()`, whose output is handed to `respawn-pane` as a SHELL
+#: COMMAND STRING. A `../` or a quote in either would escape the frozen root or
+#: inject into the respawn. `os.urandom(4).hex()` can only ever emit this shape,
+#: so anything else means a hand-edited store or a hostile pane option.
+_ID_RE = re.compile(r"[0-9a-f]{8}")
+
+_TS_FMT = "%Y-%m-%dT%H:%M:%SZ"
+
+_AGENT_STRING_RE = re.compile(r"([a-z]+)/[a-z0-9_]+")
+#: An agent KIND on its own (t2109): the kind part of the same grammar.
+_AGENT_KIND_RE = re.compile(r"[a-z]+")
+
+
+class MalformedSessionsError(Exception):
+    """The store is corrupt or unreadable. Maps to wrapper exit 4."""
+
+
+class TransitionRefused(Exception):
+    """Illegal (state, verb) pair. Maps to wrapper exit 5; nothing is written."""
+
+
+class NonceMismatch(Exception):
+    """A leased verb carried the wrong nonce. Maps to wrapper exit 6."""
+
+
+class SessionMismatch(Exception):
+    """A `resume` ack reported a different session id. Maps to wrapper exit 7.
+
+    The store has ALREADY persisted ``last_error`` when this is raised -- the
+    hook has no return channel to the detached coordinator, so the record is
+    the channel.
+    """
+
+
+class LeaseHeld(Exception):
+    """A live lease blocks the take-over. Maps to wrapper exit 8."""
+
+
+class HarvestRequired(Exception):
+    """`drop` of a record whose capture text was never harvested (t2175_2).
+    Maps to wrapper exit 9; nothing is written and the capture survives."""
+
+
+# --- schema -----------------------------------------------------------------
+
+
+@dataclass
+class SessionRecord:
+    """One code agent. See the t1705 pinned schema; field names match it 1:1."""
+
+    id: str
+    root: str
+    window: str
+    window_slot: int = 0
+    pane_id: str = ""
+    pane_pid: int = 0
+    session: str = ""
+    operation: str = ""
+    task_id: str = ""
+    agent_string: str = ""
+    agent_kind: str = ""
+    codeagent_session_id: str = ""
+    transcript_path: str = ""
+    started_at: str = ""
+    state: str = STATE_LIVE
+    state_at: str = ""
+    op_nonce: str = ""
+    op_owner_pid: int = 0
+    op_started_at: str = ""
+    frozen_at: str = ""
+    capture_ansi: str = ""
+    capture_txt: str = ""
+    capture_lines: int = 0
+    last_phase: str = ""
+    standin_pid: int = 0
+    launch_pid: int = 0
+    restore_attempts: int = 0
+    restore_mode: str = ""
+    ack: str = ""
+    last_error: str = ""
+
+    @property
+    def key(self) -> tuple[str, str, int]:
+        return (self.root, self.window, self.window_slot)
+
+
+@dataclass
+class SessionsFile:
+    version: int = SCHEMA_VERSION
+    sessions: list[SessionRecord] = field(default_factory=list)
+
+    def by_id(self, record_id: str) -> SessionRecord | None:
+        for rec in self.sessions:
+            if rec.id == record_id:
+                return rec
+        return None
+
+    def at(self, root: str, window: str) -> list[SessionRecord]:
+        """Every record sharing a ``(root, window)``, in slot order."""
+        return sorted(
+            (r for r in self.sessions if r.root == root and r.window == window),
+            key=lambda r: r.window_slot,
+        )
+
+
+def _empty() -> SessionsFile:
+    return SessionsFile(version=SCHEMA_VERSION, sessions=[])
+
+
+# --- paths / identity -------------------------------------------------------
+
+
+def valid_id(value: object) -> bool:
+    """True for a canonical 8-hex record id / nonce.
+
+    An EMPTY string is never a valid id, but IS a valid *empty nonce* (meaning
+    "no lease") -- callers that accept the empty form check for it explicitly.
+    """
+    return isinstance(value, str) and _ID_RE.fullmatch(value) is not None
+
+
+def sessions_path(path: str | os.PathLike | None = None) -> Path:
+    """Resolve the store path: explicit arg > ``$AITASKS_AGENT_SESSIONS_FILE`` >
+    default. Not ``realpath``-ed here -- :func:`dump` does that at the write
+    site, and a caller may legitimately point at a symlink."""
+    if path is not None:
+        return Path(path)
+    env = os.environ.get(SESSIONS_ENV)
+    if env:
+        return Path(env)
+    return Path(os.path.expanduser(DEFAULT_SESSIONS_PATH))
+
+
+def frozen_root() -> Path:
+    """Directory holding every record's capture files."""
+    env = os.environ.get(FROZEN_DIR_ENV)
+    if env:
+        return Path(env)
+    return Path(os.path.expanduser(DEFAULT_FROZEN_DIR))
+
+
+def record_key(root: str | os.PathLike, window: str, slot: int = 0) -> tuple[str, str, int]:
+    """Canonical identity for an agent slot.
+
+    ``realpath`` is applied on BOTH the write and the read side: a record
+    written from a symlinked checkout must match a read that resolved the real
+    path, and vice versa. Canonicalizing on only one side is the classic way two
+    spellings of the same repo end up with two independent records.
+    """
+    return (os.path.realpath(str(root)), window, int(slot))
+
+
+def capture_dir(record_id: str) -> Path:
+    """The capture directory for a record, guaranteed to sit under the root.
+
+    The containment assertion is defence in depth, not belt-and-braces: `drop`
+    and `freeze-abort` both DELETE this directory, so an id that escaped the
+    boundary checks would delete outside the frozen root. `_parse` and the CLI
+    both validate ids, and this is the third and last line (t1705_2 A9).
+    """
+    if not valid_id(record_id):
+        raise ValueError(f"not a canonical record id: {record_id!r}")
+    root = Path(os.path.realpath(frozen_root()))
+    candidate = root / record_id
+    resolved = os.path.realpath(candidate)
+    if resolved != str(root) and not resolved.startswith(str(root) + os.sep):
+        raise ValueError(f"capture dir escapes {root}: {resolved}")
+    return candidate
+
+
+def ensure_capture_dir(record_id: str) -> Path:
+    """Create the capture directory 0700.
+
+    ``makedirs(mode=)`` is masked by the umask, so the mode is set explicitly
+    afterwards -- the same trap :func:`dump` avoids for the store file.
+    """
+    d = capture_dir(record_id)
+    d.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(d, _DIR_MODE)
+    except OSError:
+        pass
+    return d
+
+
+#: The sitrep harvest receipt sits beside the text capture
+#: (`<capture.txt>.harvested`) and dies with it. Written by
+#: `aitask_sitrep_harvest.sh` (lib/sitrep_harvest.py RECEIPT_SUFFIX must match).
+HARVEST_RECEIPT_SUFFIX = ".harvested"
+#: The receipt's certification version (t2175_6; lib/sitrep_harvest.py
+#: HARVEST_CERT must match, tested). A cert-2 receipt is issued only after the
+#: harvest's confidence check, with uncertain output preserved for review; an
+#: older receipt (no `cert=` line) authorises no deletion until re-harvested.
+HARVEST_RECEIPT_CERT = 2
+
+
+def capture_harvested(rec: "SessionRecord") -> bool:
+    """May this record's capture text be deleted? (t2175_2)
+
+    True when there is no text to lose (no `capture_txt`, a missing or empty
+    file) or when the sitrep harvest receipt names the CURRENT text's sha256 --
+    a re-freeze that rewrites capture.txt invalidates an older receipt -- AND
+    carries certification `cert=HARVEST_RECEIPT_CERT` (t2175_6): a legacy
+    receipt from before the confidence check certified output that may still
+    need review, so it authorises nothing until a current harvest runs. An
+    unreadable capture or receipt fails closed (False). A file read and a hash,
+    with no lock and no subprocess, so the destructive routes that consult it
+    (`drop`, `purge`) stay within their callers' time budgets.
+    """
+    txt = rec.capture_txt
+    if not txt:
+        return True
+    try:
+        with open(txt, "rb") as fh:
+            data = fh.read()
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    if not data:
+        return True
+    want = f"sha256={hashlib.sha256(data).hexdigest()}"
+    try:
+        with open(txt + HARVEST_RECEIPT_SUFFIX, "r", encoding="utf-8") as fh:
+            receipt = fh.read().splitlines()
+    except (OSError, UnicodeDecodeError):
+        return False
+    return want in receipt and f"cert={HARVEST_RECEIPT_CERT}" in receipt
+
+
+def remove_captures(record_id: str) -> None:
+    """Best-effort removal of a record's capture directory."""
+    try:
+        shutil.rmtree(capture_dir(record_id))
+    except (OSError, ValueError):
+        pass
+
+
+def standin_command(record_id: str) -> str:
+    """The command a frozen pane's stand-in viewer runs.
+
+    ``AITASKS_FROZEN_STANDIN_CMD`` is a documented TEST SEAM so a suite can
+    swap in a harmless process; production never sets it.
+    """
+    if not valid_id(record_id):
+        raise ValueError(f"not a canonical record id: {record_id!r}")
+    override = os.environ.get(STANDIN_CMD_ENV)
+    if override:
+        return override
+    return f"ait frozenagent --record {record_id}"
+
+
+#: What a viewer says when it dispatches a restore for a record whose agent
+#: string is unknown (t1850). The wrapper then resolves the project's default.
+UNKNOWN_MODEL_NOTE = "original model unknown — restoring with the default model"
+
+
+def unknown_model_note(agent_string: str | None) -> str:
+    """:data:`UNKNOWN_MODEL_NOTE` when ``agent_string`` names no agent, else "".
+
+    Shown at DISPATCH time: a successful restore replaces the viewer that asked
+    for it, so a note shown after the restore would have nowhere to go.
+    """
+    return "" if agent_kind_of(agent_string) else UNKNOWN_MODEL_NOTE
+
+
+def agent_kind_of(agent_string: str | None) -> str:
+    """Derive the agent kind from an agent string, non-fatally.
+
+    ``lib/agent_string.sh::parse_agent_string`` is bash-only and ``die``s on a
+    malformed value; there is no Python equivalent. Deliberately NOT validated
+    against ``SUPPORTED_AGENTS``: the field is display-only, and the store must
+    not reject a record because a new agent shipped (t1705_2 A5).
+    """
+    m = _AGENT_STRING_RE.fullmatch(agent_string or "")
+    return m.group(1) if m else ""
+
+
+# --- timestamps -------------------------------------------------------------
+
+
+def _now() -> float:
+    return datetime.now(timezone.utc).timestamp()
+
+
+def _iso(epoch: float | None = None) -> str:
+    if epoch is None:
+        epoch = _now()
+    return datetime.fromtimestamp(epoch, timezone.utc).strftime(_TS_FMT)
+
+
+def _epoch(iso: str) -> float:
+    """Epoch seconds for an ISO stamp; 0.0 for an empty or unparseable one."""
+    if not iso:
+        return 0.0
+    try:
+        return datetime.strptime(iso, _TS_FMT).replace(tzinfo=timezone.utc).timestamp()
+    except ValueError:
+        return 0.0
+
+
+# --- liveness predicates ----------------------------------------------------
+
+
+def _pid_alive(pid: int) -> bool:
+    """Is ``pid`` running?
+
+    Fail-closed: only ``ESRCH`` proves death. ``EPERM`` means the process
+    exists but belongs to someone else, and any other error is unverifiable --
+    both are treated as ALIVE, because wrongly declaring a live coordinator
+    dead lets reconcile seize its work.
+    """
+    if not pid or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError as exc:
+        if exc.errno == errno.ESRCH:
+            return False
+        return True
+    return True
+
+
+# --- serialization ----------------------------------------------------------
+
+
+def _need_str(entry: dict, name: str, *, allow_empty: bool = True) -> str:
+    value = entry.get(name, "")
+    if not isinstance(value, str):
+        raise MalformedSessionsError(f"bad {name!r} in entry: {entry!r}")
+    if not allow_empty and not value:
+        raise MalformedSessionsError(f"empty {name!r} in entry: {entry!r}")
+    return value
+
+
+def _need_ts(entry: dict, name: str) -> str:
+    """A timestamp field: empty, or exactly the canonical ``_TS_FMT``.
+
+    "Non-empty" is not enough, because :func:`_epoch` maps an unparseable stamp
+    to ``0.0`` -- so a lease carrying ``op_started_at="not-a-timestamp"`` would
+    load fine and then read as *stale* on the very first check, since a grace
+    measured from epoch 0 has always elapsed. Reconcile would then take over an
+    operation a live coordinator still owns. That is the same fail-open shape as
+    a zero ``op_owner_pid`` (A13), reached through a different field, so it fails
+    closed the same way.
+
+    Applied to EVERY timestamp field rather than only the load-bearing one: they
+    are all written by :func:`_iso`, which emits nothing else, so any other value
+    is a hand-edit; and ``state_at`` feeds the restore-ack grace in the
+    coordinator (§C/§D), so the "display only" fields are not a stable category
+    to carve out.
+    """
+    value = _need_str(entry, name)
+    if value:
+        try:
+            datetime.strptime(value, _TS_FMT)
+        except ValueError as exc:
+            raise MalformedSessionsError(
+                f"bad {name!r} (want {_TS_FMT}): {value!r} in entry: {entry!r}"
+            ) from exc
+    return value
+
+
+def _need_int(entry: dict, name: str) -> int:
+    value = entry.get(name, 0)
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise MalformedSessionsError(f"bad {name!r} in entry: {entry!r}")
+    return value
+
+
+def _parse(text: str) -> SessionsFile:
+    """Parse store JSON, raising :class:`MalformedSessionsError` on anything odd."""
+    try:
+        data = json.loads(text)
+    except ValueError as exc:
+        raise MalformedSessionsError(f"invalid JSON: {exc}") from exc
+    if not isinstance(data, dict):
+        raise MalformedSessionsError("top level is not an object")
+
+    version = data.get("version")
+    if not isinstance(version, int) or isinstance(version, bool):
+        raise MalformedSessionsError(f"missing or non-integer version: {version!r}")
+    if version > SCHEMA_VERSION or version < OLDEST_READABLE_VERSION:
+        raise MalformedSessionsError(
+            f"unsupported store version {version} "
+            f"(readable: {OLDEST_READABLE_VERSION}..{SCHEMA_VERSION})"
+        )
+
+    raw = data.get("sessions")
+    if not isinstance(raw, list):
+        raise MalformedSessionsError("'sessions' is not a list")
+
+    records: list[SessionRecord] = []
+    seen: set[str] = set()
+    for entry in raw:
+        if not isinstance(entry, dict):
+            raise MalformedSessionsError(f"session entry is not an object: {entry!r}")
+
+        rid = entry.get("id")
+        if not valid_id(rid):
+            raise MalformedSessionsError(f"bad 'id' in entry: {entry!r}")
+        # First spelling wins; a duplicate is not a corruption.
+        if rid in seen:
+            continue
+        seen.add(rid)
+
+        root = _need_str(entry, "root", allow_empty=False)
+        window = _need_str(entry, "window", allow_empty=False)
+
+        state = entry.get("state", STATE_LIVE)
+        # A PRESENT but unrecognised state is corruption, not a default: every
+        # transition branches on it, so silently defaulting would move a frozen
+        # agent back into the live population.
+        if state not in STATES:
+            raise MalformedSessionsError(f"bad 'state' in entry: {entry!r}")
+
+        nonce = entry.get("op_nonce", "")
+        # "" is the legal EMPTY nonce (no lease); anything else must be canonical.
+        if nonce != "" and not valid_id(nonce):
+            raise MalformedSessionsError(f"bad 'op_nonce' in entry: {entry!r}")
+
+        owner_pid = _need_int(entry, "op_owner_pid")
+        if owner_pid < 0:
+            raise MalformedSessionsError(f"negative 'op_owner_pid': {entry!r}")
+
+        # The lease is a TRIPLE, written and cleared as a unit by `_mint_lease`
+        # / `_clear_lease`. A half-set lease is corruption, not a tolerable
+        # oddity: `_lease_stale` is `grace elapsed AND owner dead`, and both
+        # broken halves collapse it to "stale" -- an `op_owner_pid` of 0 is
+        # never alive, and an empty `op_started_at` epochs to 0.0 so the grace
+        # is always long past. Either way a record that is genuinely leased
+        # reads as free, and reconcile steals an operation from a live
+        # coordinator. That is the A7 failure reached through the store rather
+        # than through the wrapper, so it fails closed here too.
+        started = _need_ts(entry, "op_started_at")
+        leased = (nonce != "", owner_pid != 0, started != "")
+        if len(set(leased)) != 1:
+            raise MalformedSessionsError(
+                "incoherent lease (op_nonce / op_owner_pid / op_started_at must "
+                f"be all set or all empty) in entry: {entry!r}"
+            )
+
+        restore_mode = _need_str(entry, "restore_mode")
+        if restore_mode and restore_mode not in RESTORE_MODES:
+            raise MalformedSessionsError(f"bad 'restore_mode' in entry: {entry!r}")
+
+        records.append(
+            SessionRecord(
+                id=rid,
+                # Canonicalize on read too: an entry hand-edited with a
+                # symlinked path must still match a strictly-resolved lookup.
+                root=os.path.realpath(root),
+                window=window,
+                window_slot=_need_int(entry, "window_slot"),
+                pane_id=_need_str(entry, "pane_id"),
+                pane_pid=_need_int(entry, "pane_pid"),
+                session=_need_str(entry, "session"),
+                operation=_need_str(entry, "operation"),
+                task_id=_need_str(entry, "task_id"),
+                agent_string=_need_str(entry, "agent_string"),
+                agent_kind=_need_str(entry, "agent_kind"),
+                codeagent_session_id=_need_str(entry, "codeagent_session_id"),
+                transcript_path=_need_str(entry, "transcript_path"),
+                started_at=_need_ts(entry, "started_at"),
+                state=state,
+                state_at=_need_ts(entry, "state_at"),
+                op_nonce=nonce,
+                op_owner_pid=owner_pid,
+                op_started_at=started,
+                frozen_at=_need_ts(entry, "frozen_at"),
+                capture_ansi=_need_str(entry, "capture_ansi"),
+                capture_txt=_need_str(entry, "capture_txt"),
+                capture_lines=_need_int(entry, "capture_lines"),
+                last_phase=_need_str(entry, "last_phase"),
+                standin_pid=_need_int(entry, "standin_pid"),
+                launch_pid=_need_int(entry, "launch_pid"),
+                restore_attempts=_need_int(entry, "restore_attempts"),
+                restore_mode=restore_mode,
+                ack=_need_str(entry, "ack"),
+                last_error=_need_str(entry, "last_error"),
+            )
+        )
+    return SessionsFile(version=SCHEMA_VERSION, sessions=records)
+
+
+def load(path: str | os.PathLike | None = None) -> SessionsFile:
+    """Read the store, raising on corruption. **The write path uses this.**
+
+    A missing or empty file is not corruption -- it is an empty store, which is
+    exactly what the first-ever upsert should build on.
+    """
+    target = sessions_path(path)
+    try:
+        text = target.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return _empty()
+    except IsADirectoryError as exc:
+        raise MalformedSessionsError(f"{target} is a directory") from exc
+    except OSError as exc:
+        raise MalformedSessionsError(f"cannot read {target}: {exc}") from exc
+    if not text.strip():
+        return _empty()
+    return _parse(text)
+
+
+def load_safe(path: str | os.PathLike | None = None) -> SessionsFile:
+    """Read the store, never raising. **The TUI read path uses this.**"""
+    try:
+        return load(path)
+    except (MalformedSessionsError, OSError):
+        return _empty()
+
+
+def _target_mode(path: str) -> int:
+    """Preserve an existing file's mode; default to 0600 for a new store.
+
+    NOT ``atomic_write.target_mode``: that one defaults to ``0o666 & ~umask``
+    for a file that does not exist yet, which would land the first-ever store
+    at 0644 under the default umask. This store holds transcript paths and
+    codeagent session ids (t1705_2 A2).
+    """
+    try:
+        return stat.S_IMODE(os.stat(path).st_mode)
+    except OSError:
+        return _FILE_MODE
+
+
+def dump(sf: SessionsFile, path: str | os.PathLike | None = None) -> None:
+    """Atomically replace the store, preserving 0600.
+
+    ``atomic_write.prepare`` stages a temp beside the target and ``commit``
+    renames it, so a concurrent reader never sees a partial file. The mode is
+    set on the TEMP, before the rename -- there is no window in which the store
+    is world-readable.
+    """
+    resolved = os.path.realpath(sessions_path(path))
+    mode = _target_mode(resolved)
+    payload = {
+        "version": SCHEMA_VERSION,
+        "sessions": [
+            {
+                "id": r.id,
+                "root": r.root,
+                "window": r.window,
+                "window_slot": r.window_slot,
+                "pane_id": r.pane_id,
+                "pane_pid": r.pane_pid,
+                "session": r.session,
+                "operation": r.operation,
+                "task_id": r.task_id,
+                "agent_string": r.agent_string,
+                "agent_kind": r.agent_kind,
+                "codeagent_session_id": r.codeagent_session_id,
+                "transcript_path": r.transcript_path,
+                "started_at": r.started_at,
+                "state": r.state,
+                "state_at": r.state_at,
+                "op_nonce": r.op_nonce,
+                "op_owner_pid": r.op_owner_pid,
+                "op_started_at": r.op_started_at,
+                "frozen_at": r.frozen_at,
+                "capture_ansi": r.capture_ansi,
+                "capture_txt": r.capture_txt,
+                "capture_lines": r.capture_lines,
+                "last_phase": r.last_phase,
+                "standin_pid": r.standin_pid,
+                "launch_pid": r.launch_pid,
+                "restore_attempts": r.restore_attempts,
+                "restore_mode": r.restore_mode,
+                "ack": r.ack,
+                "last_error": r.last_error,
+            }
+            for r in sorted(sf.sessions, key=lambda r: r.key)
+        ],
+    }
+    text = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    tmp = atomic_write.prepare(resolved, lambda fh: fh.write(text))
+    try:
+        os.chmod(tmp, mode)
+    except BaseException:
+        atomic_write.discard(tmp)
+        raise
+    atomic_write.commit(tmp, resolved)
+
+
+# --- lease ------------------------------------------------------------------
+
+
+def _mint_nonce() -> str:
+    return os.urandom(4).hex()
+
+
+def _stale_op_grace() -> float:
+    """The lease grace, with a TEST-ONLY override (t1705_4).
+
+    ``AITASKS_STALE_OP_GRACE`` is honoured **only** under
+    ``AITASKS_TEST_MODE=1``, and only for a positive float. Without the seam the
+    live lease-takeover cases would have to sleep past
+    ``STALE_OP_GRACE_DEFAULT`` (60 s) twice per run; with it they finish in
+    seconds. Gating on the test-mode flag is what stops a stray env var in a
+    developer's shell from reconfiguring a real coordinator's lease.
+
+    This shortens only the TIMER half of :func:`_lease_stale`. The liveness half
+    is deliberately untouched: the rule is ``grace elapsed AND owner dead``, and
+    a shortened grace must never become a way to seize a live owner.
+    """
+    if os.environ.get("AITASKS_TEST_MODE") != "1":
+        return STALE_OP_GRACE_DEFAULT
+    raw = os.environ.get("AITASKS_STALE_OP_GRACE", "")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return STALE_OP_GRACE_DEFAULT
+    # Non-positive would make every lease instantly stale, which is the one
+    # value a test could set by accident and never notice.
+    return value if value > 0 else STALE_OP_GRACE_DEFAULT
+
+
+def _lease_stale(rec: SessionRecord, now: float, pid_alive=None) -> bool:
+    """True when a lease may be taken over: grace elapsed AND owner gone.
+
+    Both terms matter. The grace alone would let reconcile seize a slow but
+    healthy coordinator; the pid alone would let it seize one that had only
+    just started. This is also why ``op_owner_pid`` must be the COORDINATOR's
+    pid and never the ephemeral wrapper's -- with an always-dead pid the
+    conjunction collapses to a bare timer (t1705_2 A7).
+    """
+    alive = pid_alive or _pid_alive
+    if not rec.op_nonce:
+        return True  # no lease at all
+    if _epoch(rec.op_started_at) + _stale_op_grace() >= now:
+        return False
+    return not alive(rec.op_owner_pid)
+
+
+def _require_nonce(rec: SessionRecord, nonce: str) -> None:
+    if not nonce or nonce != rec.op_nonce:
+        raise NonceMismatch(f"NONCE_MISMATCH:{rec.id}")
+
+
+def _require_state(rec: SessionRecord, verb: str, *legal: str) -> None:
+    if rec.state not in legal:
+        raise TransitionRefused(f"TRANSITION_REFUSED:{rec.id}|{rec.state}|{verb}")
+
+
+def _require_record(sf: SessionsFile, record_id: str) -> SessionRecord:
+    if not valid_id(record_id):
+        raise ValueError(f"not a canonical record id: {record_id!r}")
+    rec = sf.by_id(record_id)
+    if rec is None:
+        raise MalformedSessionsError(f"no such record: {record_id}")
+    return rec
+
+
+def _mint_lease(rec: SessionRecord, owner_pid: int, now: float) -> str:
+    nonce = _mint_nonce()
+    rec.op_nonce = nonce
+    rec.op_owner_pid = int(owner_pid)
+    rec.op_started_at = _iso(now)
+    return nonce
+
+
+def _clear_lease(rec: SessionRecord) -> None:
+    rec.op_nonce = ""
+    rec.op_owner_pid = 0
+    rec.op_started_at = ""
+
+
+def _set_state(rec: SessionRecord, state: str, now: float) -> None:
+    rec.state = state
+    rec.state_at = _iso(now)
+
+
+def _set_location(rec: SessionRecord, pane: str, pane_pid: int) -> None:
+    rec.pane_id = pane
+    rec.pane_pid = int(pane_pid)
+
+
+def _drop_captures(rec: SessionRecord) -> None:
+    """Delete a record's captures and forget their paths.
+
+    Only a VERIFIED restore may call this (a hook ack, a late hook ack, or a
+    rollout confirm). A liveness-only confirm keeps them, which is what stops a
+    malformed resume that starts a fresh session from destroying the only copy.
+    """
+    remove_captures(rec.id)
+    rec.capture_ansi = ""
+    rec.capture_txt = ""
+    rec.capture_lines = 0
+
+
+# --- upsert: identity + conflict policy -------------------------------------
+
+#: Refusal reason per selected state (t1705_2 A4 / plan §C2). A record is
+#: SELECTED by `--id` or by pane identity; one that merely shares
+#: `(root, window)` is not a candidate and falls through to the create rules.
+_UPSERT_REFUSALS = {
+    STATE_FREEZING: "freezing_unacknowledged",
+    STATE_RESTORING: "restoring_unacknowledged",
+    STATE_ABORTING: "aborting_unacknowledged",
+    STATE_FROZEN: "frozen",
+}
+
+
+def _next_slot(sf: SessionsFile, root: str, window: str) -> int:
+    used = {r.window_slot for r in sf.at(root, window)}
+    slot = 0
+    while slot in used:
+        slot += 1
+    return slot
+
+
+def _apply_upsert_fields(
+    rec: SessionRecord,
+    *,
+    session=None,
+    session_id=None,
+    transcript=None,
+    agent_string=None,
+    agent_kind=None,
+    operation=None,
+    task_id=None,
+    clear_session_id=False,
+) -> None:
+    """Apply the optional descriptive fields. ``None`` means "not supplied".
+
+    For ``agent_string`` a blank means "not supplied" too (t1802). A caller
+    sends one when it CANNOT name the agent: the hook, for an agent started by
+    hand outside the wrapper, a legacy launch, or a restored record whose stored
+    string is malformed (the restore coordinator delivers
+    ``AITASK_AGENT_STRING`` only for a well-formed one); and the freeze engine's
+    fallback upsert, which never knows it. Taking the blank as a value would
+    overwrite a good stored string, re-derive ``agent_kind`` as "", and send the
+    next restore to the project's default agent.
+
+    ``session_id`` follows the same rule (t1807). The freeze engine's fallback
+    upsert sends the pane's ``@aitask_agent_session``, which is unset until the
+    SessionStart hook stamps it, and ``upsert`` still selects an existing record
+    by pane identity -- so a freeze that raced the hook would blank a good
+    stored id and the next restore would fail ``no_session``. The restore
+    acknowledgement is unaffected: ``upsert`` compares ``session_id or ""``
+    against the stored id BEFORE calling this, so a blank there is still a
+    mismatch.
+
+    Because a blank can no longer clear, DELIBERATE invalidation needs its own
+    word: ``clear_session_id`` (t1804). The freeze engine sets it when it has
+    positive evidence that the pane's live process is not in the recorded
+    conversation, and it drops the transcript path with the id -- the two are
+    one fact ("which conversation this record points at"), and a path without
+    an id is a dangling reference. An accidental blank and a deliberate clear
+    are then impossible to confuse, which is what keeps t1807's guarantee.
+
+    ``agent_kind`` is the kind of the agent whose CURRENT session the record
+    holds, and only as far as some call proved it (t2109). Three rules:
+
+    * an agent string decides it, as it always did;
+    * a bare ``agent_kind`` -- the hook's transcript-shape evidence for an agent
+      started by hand -- sets it and never touches a stored agent string. An
+      explicit identity is preserved even when the evidence disagrees with it,
+      and that disagreement stays visible for the restore to refuse;
+    * a NEW session id that arrives with neither clears it. Evidence belongs
+      to the session it came with: a claude record's old kind, or its
+      preserved string, must not vouch for an unidentified replacement, or a
+      restore would launch `claude --resume <someone else's id>`. Re-reporting
+      the SAME id without evidence changes nothing, as for the string.
+    """
+    new_session = (bool(session_id) and not clear_session_id
+                   and session_id != rec.codeagent_session_id)
+    if session is not None:
+        rec.session = session
+    if session_id:
+        rec.codeagent_session_id = session_id
+    if transcript is not None:
+        rec.transcript_path = transcript
+    if agent_string:
+        rec.agent_string = agent_string
+        rec.agent_kind = agent_kind_of(agent_string) or agent_kind or ""
+    elif agent_kind:
+        rec.agent_kind = agent_kind
+    elif new_session:
+        rec.agent_kind = ""
+    if operation is not None:
+        rec.operation = operation
+    if task_id is not None:
+        rec.task_id = task_id
+    # Last, so an explicit clear is never re-filled by a value in the same call.
+    if clear_session_id:
+        rec.codeagent_session_id = ""
+        rec.transcript_path = ""
+
+
+def _restore_ack_kind(rec: SessionRecord, agent_kind: str | None) -> str | None:
+    """The kind a verified restore ack reports, given what the ack itself sent.
+
+    The ack's process is the one the restore LAUNCHED (nonce, or launch pid for
+    a late ack), and the launch ran the record's own agent string when it had
+    one -- `agent_restore` resumes with it and re-picks with it. So an ack that
+    lost its environment still reports a session of that string's kind, and a
+    re-pick's new session keeps its record resumable (t1802's defensive layer,
+    under t2109's evidence rule). With no stored string the launch ran a
+    project default, whose kind nothing here knows: no evidence.
+    """
+    return agent_kind or agent_kind_of(rec.agent_string) or None
+
+
+def _follow_window(sf: SessionsFile, rec: SessionRecord, croot: str,
+                   window: str) -> None:
+    """Make ``rec``'s ``(root, window)`` follow the window its pane is in now.
+
+    `id` is the PRIMARY KEY and rule 1 says a renamed window keeps its record --
+    but "keeps" only holds if the record's own `(root, window)` follows the
+    rename. Left stale, the very next liveness purge sees a window that no
+    longer exists, drops the record as `dead_window`, and the agent silently
+    becomes unfreezable and unrestorable. The slot is re-allocated when the
+    pair actually changes, since the old slot number means nothing under the
+    new key.
+
+    A gone-pane restore is the same case (t2040): its new window can carry a
+    suffixed name. Only SETTLED-record callers use this. An in-grace restore
+    ack can fire before the coordinator renames the window away from its
+    attempt name.
+    """
+    if (rec.root, rec.window) == (croot, window):
+        return
+    others = [r for r in sf.at(croot, window) if r.id != rec.id]
+    used = {r.window_slot for r in others}
+    slot = 0
+    while slot in used:
+        slot += 1
+    rec.root = croot
+    rec.window = window
+    rec.window_slot = slot
+
+
+def _late_restore_ack_ok(
+    rec: SessionRecord, pane: str, pane_pid: int, session_id: str | None
+) -> bool:
+    """May a late restore ack on a `live` record upgrade it to verified (t2040)?
+
+    Only a liveness confirm has anything to upgrade, and the ack must provably
+    come from the process THIS restore launched. The nonce cannot show that any
+    more: `restore-confirm` cleared it with the lease. ``launch_pid`` can.
+    `restore-launched` recorded it under the nonce, `restore-begin` zeroes it for
+    every attempt, and an ordinary upsert that moves the record to another
+    session zeroes it too (see `upsert`). So a matching pid in the recorded pane
+    is the attempt's own agent, still in the session it was restored into.
+
+    The session must then agree exactly as for an in-grace ack. In `resume` mode
+    it must equal the stored id. In `repick` mode any reported id is adopted.
+    """
+    if rec.ack != "liveness" or not rec.launch_pid:
+        return False
+    if rec.launch_pid != int(pane_pid) or rec.pane_id != pane:
+        return False
+    if rec.restore_mode == "resume":
+        return bool(session_id) and session_id == rec.codeagent_session_id
+    return bool(session_id)
+
+
+def upsert(
+    sf: SessionsFile,
+    *,
+    root: str,
+    window: str,
+    pane: str,
+    pane_pid: int,
+    id: str | None = None,
+    session: str | None = None,
+    session_id: str | None = None,
+    transcript: str | None = None,
+    agent_string: str | None = None,
+    agent_kind: str | None = None,
+    operation: str | None = None,
+    task_id: str | None = None,
+    restore_of: str | None = None,
+    nonce: str | None = None,
+    now: float | None = None,
+    pane_alive=None,
+    clear_session_id: bool = False,
+) -> tuple[SessionsFile, str]:
+    """The ONLY creator of records. See the pinned conflict policy.
+
+    Resolution order for a caller without ``restore_of``:
+
+    1. ``id`` (from ``@aitask_record`` on the caller's pane) -> that record,
+       whatever its ``(root, window)``: a renamed window keeps its record.
+    2. Else, among the ``(root, window)`` records, the one whose ``pane_id`` is
+       the caller's pane, else the ``live`` ones whose ``pane_pid`` is dead.
+       EXACTLY ONE -> the same agent slot, relocated. MORE THAN ONE -> fail
+       closed and create beside them (``ambiguous_relocation``); nothing on the
+       caller's side can tell two pre-restart agents apart, so guessing would
+       silently adopt the wrong record.
+    3. Else -> create beside the existing records (``created_slot<N>``).
+    4. Else -> create (``created``).
+    """
+    now = _now() if now is None else now
+    alive = pane_alive or _pid_alive
+    croot = os.path.realpath(root)
+
+    # A restore ack asserts WHICH session came back; clearing that assertion in
+    # the same breath is incoherent, and the comparison below would read the
+    # clear as a session mismatch and abort a legitimate restore. Refuse it
+    # rather than pick an interpretation.
+    if clear_session_id and restore_of is not None:
+        raise ValueError("--clear-session-id cannot be combined with --restore-of")
+
+    # An agent kind is EVIDENCE about the session this call reports (t2109).
+    # Malformed, or contradicted by the agent string sent beside it, it is a
+    # caller bug: refused before anything is touched.
+    if agent_kind:
+        if not _AGENT_KIND_RE.fullmatch(agent_kind):
+            raise ValueError(f"malformed --agent-kind: {agent_kind!r}")
+        named = agent_kind_of(agent_string)
+        if named and named != agent_kind:
+            raise ValueError(
+                f"--agent-kind {agent_kind} contradicts --agent-string {agent_string}")
+
+    # --- the restore acknowledgement ----------------------------------------
+    if restore_of is not None:
+        rec = _require_record(sf, restore_of)
+        if rec.state == STATE_LIVE:
+            # A LATE ack (t2040): the restore this process came from has already
+            # settled. Interactive codex fires SessionStart only at its first
+            # turn, so a resumed codex usually acks long after the grace. It is
+            # never refused: either it upgrades a liveness confirm to verified,
+            # or it is an ordinary upsert, so `/new` and every later
+            # SessionStart in the process keep updating the record.
+            if _late_restore_ack_ok(rec, pane, pane_pid, session_id):
+                _apply_upsert_fields(
+                    rec,
+                    session=session,
+                    session_id=session_id,
+                    transcript=transcript,
+                    agent_string=agent_string,
+                    agent_kind=_restore_ack_kind(rec, agent_kind),
+                    operation=operation,
+                    task_id=task_id,
+                )
+                _follow_window(sf, rec, croot, window)
+                _set_location(rec, pane, pane_pid)
+                rec.ack = "hook"
+                rec.last_error = ""
+                _drop_captures(rec)
+                return sf, f"UPSERTED:{rec.id}|restored_late"
+            # Otherwise an ORDINARY upsert. When it comes from the restored
+            # record's own pane and the pane carries no stamp, the restore
+            # target IS its identity. A gone-pane restore lands in a NEW window
+            # with no `@aitask_record`, possibly under a suffixed name (the
+            # original was taken). Selecting by that window would find nothing
+            # and create a second record for the same agent. Through the id,
+            # the ordinary rules below update it and follow the new window
+            # name. From any other pane, the target says nothing about the
+            # caller and is dropped.
+            if id is None and pane and rec.pane_id == pane:
+                id = rec.id
+            restore_of = None
+            nonce = None
+        else:
+            _require_state(rec, "upsert", STATE_RESTORING)
+            _require_nonce(rec, nonce or "")
+            if rec.restore_mode == "resume" and (session_id or "") != rec.codeagent_session_id:
+                # The hook has no return channel to the detached coordinator, so
+                # the RECORD is the channel: persist, then raise. Both the
+                # coordinator and reconcile read `last_error` for the current
+                # nonce and take the abort branch, never the liveness fallback.
+                rec.last_error = f"{rec.op_nonce}:session_mismatch"
+                raise SessionMismatch(f"RESTORE_SESSION_MISMATCH:{rec.id}")
+            _apply_upsert_fields(
+                rec,
+                session=session,
+                session_id=session_id,
+                transcript=transcript,
+                agent_string=agent_string,
+                agent_kind=_restore_ack_kind(rec, agent_kind),
+                operation=operation,
+                task_id=task_id,
+            )
+            _set_location(rec, pane, pane_pid)
+            _set_state(rec, STATE_LIVE, now)
+            rec.ack = "hook"
+            rec.last_error = ""
+            # Captures are deleted ONLY on a verified ack (this hook ack, a late
+            # one, or a rollout confirm). A liveness-only confirm keeps them.
+            _drop_captures(rec)
+            _clear_lease(rec)
+            return sf, f"UPSERTED:{rec.id}|restored"
+
+    # --- selection ----------------------------------------------------------
+    selected: SessionRecord | None = None
+    if id is not None:
+        selected = _require_record(sf, id)
+    else:
+        siblings = sf.at(croot, window)
+        by_pane = [r for r in siblings if pane and r.pane_id == pane]
+        if by_pane:
+            selected = by_pane[0]
+        else:
+            dead = [r for r in siblings if r.state == STATE_LIVE and not alive(r.pane_pid)]
+            if len(dead) == 1:
+                selected = dead[0]
+            elif len(dead) > 1:
+                # Fail closed on relocation: two agents shared this window
+                # before a server restart and nothing distinguishes them. The
+                # stale records are left for the liveness purge, never guessed.
+                rec = _create(
+                    sf, croot, window, pane, pane_pid, now,
+                    session=session, session_id=session_id, transcript=transcript,
+                    agent_string=agent_string, agent_kind=agent_kind,
+                    operation=operation, task_id=task_id,
+                )
+                return sf, f"UPSERTED:{rec.id}|created_slot{rec.window_slot}|ambiguous_relocation"
+
+    if selected is not None:
+        if selected.state != STATE_LIVE:
+            reason = _UPSERT_REFUSALS[selected.state]
+            return sf, f"UPSERT_REFUSED:{selected.id}|{reason}"
+        stored_session = selected.codeagent_session_id
+        _apply_upsert_fields(
+            selected,
+            session=session,
+            session_id=session_id,
+            transcript=transcript,
+            agent_string=agent_string,
+            agent_kind=agent_kind,
+            operation=operation,
+            task_id=task_id,
+            clear_session_id=clear_session_id,
+        )
+        if selected.codeagent_session_id != stored_session:
+            # The pane moved to another conversation, so close the late-ack
+            # window (t2040). Without this, a late hook reporting B after a
+            # liveness confirm of A adopts B, and a second B would then match
+            # the MUTATED stored id and delete A's captures. A's session was
+            # never verified. `launch_pid` has no other consumer on a live
+            # record, and `restore-begin` zeroes it again anyway.
+            selected.launch_pid = 0
+        _follow_window(sf, selected, croot, window)
+        _set_location(selected, pane, pane_pid)
+        return sf, f"UPSERTED:{selected.id}|updated"
+
+    # --- create -------------------------------------------------------------
+    existing = sf.at(croot, window)
+    rec = _create(
+        sf, croot, window, pane, pane_pid, now,
+        session=session, session_id=session_id, transcript=transcript,
+        agent_string=agent_string, agent_kind=agent_kind,
+        operation=operation, task_id=task_id,
+    )
+    if existing:
+        return sf, f"UPSERTED:{rec.id}|created_slot{rec.window_slot}"
+    return sf, f"UPSERTED:{rec.id}|created"
+
+
+def _create(
+    sf: SessionsFile,
+    croot: str,
+    window: str,
+    pane: str,
+    pane_pid: int,
+    now: float,
+    **fields,
+) -> SessionRecord:
+    rec = SessionRecord(
+        id=_mint_nonce(),
+        root=croot,
+        window=window,
+        window_slot=_next_slot(sf, croot, window),
+        pane_id=pane,
+        pane_pid=int(pane_pid),
+        state=STATE_LIVE,
+        state_at=_iso(now),
+        started_at=_iso(now),
+    )
+    _apply_upsert_fields(rec, **fields)
+    sf.sessions.append(rec)
+    return rec
+
+
+# --- transitions ------------------------------------------------------------
+
+
+def freeze_begin(
+    sf: SessionsFile,
+    record_id: str,
+    *,
+    capture_ansi: str,
+    capture_txt: str,
+    lines: int,
+    phase: str = "",
+    owner_pid: int,
+    now: float | None = None,
+) -> tuple[SessionsFile, str]:
+    """live -> freezing. Mints the lease."""
+    now = _now() if now is None else now
+    rec = _require_record(sf, record_id)
+    _require_state(rec, "freeze-begin", STATE_LIVE)
+    rec.capture_ansi = capture_ansi
+    rec.capture_txt = capture_txt
+    rec.capture_lines = int(lines)
+    rec.last_phase = phase
+    _set_state(rec, STATE_FREEZING, now)
+    nonce = _mint_lease(rec, owner_pid, now)
+    return sf, f"FREEZING:{rec.id}|{nonce}"
+
+
+def freeze_commit(
+    sf: SessionsFile,
+    record_id: str,
+    *,
+    nonce: str,
+    pane: str,
+    pane_pid: int,
+    now: float | None = None,
+) -> tuple[SessionsFile, str]:
+    """freezing -> frozen. Records the stand-in's location; clears the lease."""
+    now = _now() if now is None else now
+    rec = _require_record(sf, record_id)
+    _require_state(rec, "freeze-commit", STATE_FREEZING)
+    _require_nonce(rec, nonce)
+    _set_location(rec, pane, pane_pid)
+    rec.standin_pid = int(pane_pid)
+    rec.frozen_at = _iso(now)
+    _set_state(rec, STATE_FROZEN, now)
+    _clear_lease(rec)
+    return sf, f"FROZEN:{rec.id}"
+
+
+def freeze_abort(
+    sf: SessionsFile, record_id: str, *, nonce: str, now: float | None = None
+) -> tuple[SessionsFile, str]:
+    """freezing -> live. Captures are deleted: the agent never left."""
+    now = _now() if now is None else now
+    rec = _require_record(sf, record_id)
+    _require_state(rec, "freeze-abort", STATE_FREEZING)
+    _require_nonce(rec, nonce)
+    remove_captures(rec.id)
+    rec.capture_ansi = ""
+    rec.capture_txt = ""
+    rec.capture_lines = 0
+    _set_state(rec, STATE_LIVE, now)
+    _clear_lease(rec)
+    return sf, f"LIVE:{rec.id}"
+
+
+def restore_begin(
+    sf: SessionsFile,
+    record_id: str,
+    *,
+    mode: str,
+    owner_pid: int,
+    now: float | None = None,
+    pid_alive=None,
+) -> tuple[SessionsFile, str]:
+    """frozen -> restoring. Captures RETAINED. Mints the lease.
+
+    Deliberately NOT legal from ``aborting``: that state is nonce-owned by the
+    aborting attempt until its stand-in is back, so a user or a second
+    controller cannot start another restore in the gap.
+
+    **It also refuses a record whose lease is held** (t1705_6). Before that it
+    minted unconditionally, walking over an existing claim -- which made a
+    holder's claim merely *detect* a concurrent restore instead of preventing
+    one. That is not enough for a DESTRUCTIVE holder: `aitask_frozen.sh drop`
+    claims the record, checks the pane, and then kills it, and a restore
+    squeezing into that window respawns a REPLACEMENT AGENT into the same pane
+    -- which the drop then kills. Detecting the race afterwards does not undo a
+    killed agent. The same two-term staleness rule `lease_take` uses applies, so
+    a crashed coordinator's lease is still taken over and a record can never
+    become permanently un-restorable.
+    """
+    now = _now() if now is None else now
+    if mode not in RESTORE_MODES:
+        raise ValueError(f"bad restore mode: {mode!r}")
+    rec = _require_record(sf, record_id)
+    _require_state(rec, "restore-begin", STATE_FROZEN)
+    if not _lease_stale(rec, now, pid_alive):
+        raise LeaseHeld(f"LEASE_HELD:{rec.id}")
+    rec.restore_mode = mode
+    rec.restore_attempts += 1
+    rec.launch_pid = 0
+    rec.last_error = ""
+    rec.ack = ""
+    _set_state(rec, STATE_RESTORING, now)
+    nonce = _mint_lease(rec, owner_pid, now)
+    return sf, f"RESTORING:{rec.id}|{nonce}"
+
+
+def restore_launched(
+    sf: SessionsFile,
+    record_id: str,
+    *,
+    nonce: str,
+    pane: str,
+    pane_pid: int,
+    now: float | None = None,
+) -> tuple[SessionsFile, str]:
+    """Nonce-bound evidence that a replacement agent was actually started."""
+    now = _now() if now is None else now
+    rec = _require_record(sf, record_id)
+    _require_state(rec, "restore-launched", STATE_RESTORING)
+    _require_nonce(rec, nonce)
+    _set_location(rec, pane, pane_pid)
+    rec.launch_pid = int(pane_pid)
+    return sf, f"LAUNCHED:{rec.id}"
+
+
+def restore_confirm(
+    sf: SessionsFile,
+    record_id: str,
+    *,
+    nonce: str,
+    pane: str,
+    pane_pid: int,
+    rollout_session: str | None = None,
+    now: float | None = None,
+) -> tuple[SessionsFile, str]:
+    """restoring -> live, by LIVENESS or by the resumed codex's open ROLLOUT.
+
+    Both forms require positive evidence that the process in the pane is the one
+    the coordinator launched: ``launch_pid`` must be set and equal to the
+    observed pid. Without that, a stand-in viewer or an unrelated process could
+    be confirmed as a restored agent.
+
+    Both also refuse a record that already carries a session mismatch for THIS
+    attempt (``last_error`` stamped with the current nonce, t2040). The hook can
+    persist one between the coordinator's last poll and this verb; confirming
+    past it would mark as `live` a pane running a different session than the one
+    asked for.
+
+    **Without** ``rollout_session`` this is the liveness confirm: ``ack =
+    liveness``, and the captures are KEPT, because nothing verified the session.
+
+    **With** it (t2040), the caller reports the session id that
+    `codex_session_for_pid` read off the launched process's open rollout. This is
+    verified evidence, of the same fact the hook reports, so the store compares
+    it exactly as it compares a hook ack: a match is ``ack = rollout`` with the
+    captures DELETED, and a mismatch persists ``<nonce>:session_mismatch`` and
+    raises :class:`SessionMismatch`, so the coordinator's next read takes the
+    abort branch. It is accepted only for a codex record in `resume` mode: a
+    re-pick has no expected session to verify, and no other agent holds a
+    rollout.
+    """
+    now = _now() if now is None else now
+    rec = _require_record(sf, record_id)
+    _require_state(rec, "restore-confirm", STATE_RESTORING)
+    _require_nonce(rec, nonce)
+    refused = TransitionRefused(
+        f"TRANSITION_REFUSED:{rec.id}|{rec.state}|restore-confirm")
+    if rec.launch_pid == 0 or rec.launch_pid != int(pane_pid):
+        raise refused
+    if rec.last_error.startswith(f"{nonce}:"):
+        raise refused
+    if rollout_session is not None:
+        if rec.restore_mode != "resume" or rec.agent_kind != "codex":
+            raise refused
+        if rollout_session != rec.codeagent_session_id:
+            # Persisted, then raised: the same channel as the hook's mismatch,
+            # and `main` dumps it before exiting 7.
+            rec.last_error = f"{nonce}:session_mismatch"
+            raise SessionMismatch(f"RESTORE_SESSION_MISMATCH:{rec.id}")
+    _set_location(rec, pane, pane_pid)
+    _set_state(rec, STATE_LIVE, now)
+    _clear_lease(rec)
+    if rollout_session is None:
+        rec.ack = "liveness"
+        return sf, f"LIVE:{rec.id}|liveness"
+    rec.ack = "rollout"
+    rec.last_error = ""
+    _drop_captures(rec)
+    return sf, f"LIVE:{rec.id}|rollout"
+
+
+def restore_abort(
+    sf: SessionsFile, record_id: str, *, nonce: str, error: str = "",
+    now: float | None = None,
+) -> tuple[SessionsFile, str]:
+    """restoring -> aborting. Captures retained; the lease stays with this nonce.
+
+    ``error`` PERSISTS why the attempt failed, stamped with this attempt's nonce
+    in the documented ``"<nonce>:<reason>"`` shape (t1705_6). Before it, only the
+    hook's ``session_mismatch`` was ever recorded: every other failure —
+    ``agent_exited`` chief among them, the ordinary "the resumed agent died
+    immediately" case — left ``last_error`` empty. The coordinator prints its
+    reason to a detached `run-shell` job whose stdout nobody reads, and the
+    viewer that dispatched the restore is REPLACED by the respawned stand-in, so
+    without persisting it the outcome was unobservable to the user: a fresh
+    viewer mounted on a `frozen` record with no indication the restore had even
+    been attempted.
+    """
+    now = _now() if now is None else now
+    rec = _require_record(sf, record_id)
+    _require_state(rec, "restore-abort", STATE_RESTORING)
+    _require_nonce(rec, nonce)
+    if error:
+        rec.last_error = f"{nonce}:{error}"
+    _set_state(rec, STATE_ABORTING, now)
+    return sf, f"ABORTING:{rec.id}"
+
+
+def standin_respawned(
+    sf: SessionsFile,
+    record_id: str,
+    *,
+    nonce: str,
+    pane: str,
+    pane_pid: int,
+    now: float | None = None,
+) -> tuple[SessionsFile, str]:
+    """Record a (re)spawned stand-in viewer's location.
+
+    Three legal sources, and the lease treatment differs (t1705_2 A3):
+
+    - ``freezing`` -> ``freezing``: reconcile respawned a dead stand-in mid
+      freeze. The freeze is STILL IN FLIGHT, so the lease is KEPT and the next
+      reconcile pass commits it. Without this edge the pinned reconcile row
+      "freezing / pane dead -> respawn, standin-respawned, re-check" is
+      unimplementable.
+    - ``aborting`` -> ``frozen``: the stand-in is back after a failed restore;
+      the lease is released.
+    - ``frozen`` -> ``frozen``: a ``lease-take``n relaunch of a dead stand-in.
+    """
+    now = _now() if now is None else now
+    rec = _require_record(sf, record_id)
+    _require_state(
+        rec, "standin-respawned", STATE_FREEZING, STATE_ABORTING, STATE_FROZEN
+    )
+    _require_nonce(rec, nonce)
+    _set_location(rec, pane, pane_pid)
+    rec.standin_pid = int(pane_pid)
+    if rec.state == STATE_FREEZING:
+        return sf, f"STANDIN:{rec.id}"
+    if rec.state == STATE_ABORTING:
+        _set_state(rec, STATE_FROZEN, now)
+    _clear_lease(rec)
+    return sf, f"STANDIN:{rec.id}"
+
+
+def lease_take(
+    sf: SessionsFile,
+    record_id: str,
+    *,
+    owner_pid: int,
+    now: float | None = None,
+    pid_alive=None,
+) -> tuple[SessionsFile, str]:
+    """Acquire ownership of a record whose lease is absent or stale.
+
+    **The attempt's error moves with its ownership (t2040).** ``last_error`` is
+    correlated to an attempt by its ``<nonce>:`` prefix, and taking over the
+    lease changes the nonce. A mismatch the replacement's hook persisted under
+    the OUTGOING nonce is rewritten to the incoming one, inside the same locked
+    write. Otherwise it would stop matching anything. Reconcile judges a
+    mismatch from a read taken BEFORE this verb, so a hook ack landing between
+    that read and the takeover would be missed by its snapshot. It would also be
+    missed by `restore-confirm`'s current-nonce guard, and a known mismatch
+    would be confirmed as `live`. An error from an older attempt (any other
+    prefix), and a record with no lease to take over, are left untouched.
+    """
+    now = _now() if now is None else now
+    rec = _require_record(sf, record_id)
+    if not _lease_stale(rec, now, pid_alive):
+        raise LeaseHeld(f"LEASE_HELD:{rec.id}")
+    outgoing = rec.op_nonce
+    nonce = _mint_lease(rec, owner_pid, now)
+    if outgoing and rec.last_error.startswith(f"{outgoing}:"):
+        rec.last_error = f"{nonce}:{rec.last_error[len(outgoing) + 1:]}"
+    return sf, f"LEASED:{rec.id}|{nonce}"
+
+
+def lease_release(
+    sf: SessionsFile, record_id: str, *, nonce: str
+) -> tuple[SessionsFile, str]:
+    """Give back a lease taken with :func:`lease_take`.
+
+    The counterpart `lease_take` never had (t1705_6). Without it an aborted
+    claim leaves the record leased until `stale_op_grace` elapses AND the owner
+    pid dies -- so a user whose `drop` was refused mid-way could not simply
+    retry, they would have to wait out the grace. Nonce-guarded like every other
+    lease-clearing verb, so one coordinator cannot release another's claim.
+    """
+    rec = _require_record(sf, record_id)
+    _require_nonce(rec, nonce)
+    _clear_lease(rec)
+    return sf, f"RELEASED:{rec.id}"
+
+
+def drop(
+    sf: SessionsFile, record_id: str, *, nonce: str | None = None,
+    skip_harvest: bool = False,
+) -> tuple[SessionsFile, str]:
+    """Remove a record from any state, with its capture files.
+
+    HARVEST GATE (t2175_2). The capture is often the only copy of an agent's
+    closing output, so a record whose capture text has no valid sitrep harvest
+    receipt (:func:`capture_harvested`) is refused with :class:`HarvestRequired`
+    -- nothing written, capture intact. Every drop route reaches this function
+    (`aitask_frozen.sh drop`, which harvests first, and the monitor's kill path,
+    which does not), so the gate covers them all. ``skip_harvest`` is the
+    explicit user discard (`--skip-harvest`), for a record that can never be
+    harvested (its repository is gone).
+
+    Two forms, and the difference is the whole concurrency story (t1705_6):
+
+    * ``drop(sf, id)`` -- unconditional, any state, no nonce. This is
+      `kill_agent_pane_smart`'s contract: the user explicitly killed the pane
+      and it is going away regardless.
+    * ``drop(sf, id, nonce=n)`` -- the **leased** form, and the only safe one
+      for a coordinator. The §A contract already says "every verb that mutates a
+      record holding a lease requires ``--nonce``"; `drop` was its sole
+      exception, which is what let a `drop` delete the record and the only copy
+      of its capture out from under an in-flight restore.
+
+    Why a nonce rather than comparing a snapshotted ``(state, op_nonce)``: that
+    pair is **ABA-vulnerable**. ``standin_respawned`` from ``aborting`` does
+    ``_set_state(FROZEN)`` *and* ``_clear_lease()``, so a full
+    ``frozen -> restoring -> aborting -> frozen`` cycle restores the identical
+    pair -- and that closing transition is precisely the one that registers a
+    newly respawned stand-in viewer. A comparison would accept the stale delete
+    and leave a live stamped viewer whose record and capture are gone. A nonce
+    is a fresh token per claim (:func:`_mint_nonce`), so it cannot recur.
+    """
+    rec = _require_record(sf, record_id)
+    if nonce is not None:
+        _require_nonce(rec, nonce)
+    if not skip_harvest and not capture_harvested(rec):
+        raise HarvestRequired(f"HARVEST_REQUIRED:{rec.id}")
+    remove_captures(rec.id)
+    sf.sessions = [r for r in sf.sessions if r.id != rec.id]
+    return sf, f"DROPPED:{rec.id}"
+
+
+def fill_task(
+    sf: SessionsFile, record_id: str, *, operation: str = "", task_id: str = ""
+) -> tuple[SessionsFile, str]:
+    """Fill a record's BLANK ``operation`` / ``task_id``; never overwrite (t1848).
+
+    The freeze engine's fallback path creates a record the SessionStart hook
+    never saw, so nothing recorded which task the agent was on and the frozen
+    record could not be re-picked. `upsert` cannot fill that gap safely: it
+    takes a blank as a value, and it may select an EXISTING record by pane
+    identity, so sending the window-derived pair would overwrite whatever the
+    hook stored. This verb writes a field only when the stored value is blank
+    and the supplied one is not.
+
+    Not state-gated and takes no lease: it touches only these two descriptive
+    fields -- never state, lease, location or captures -- and the wrapper runs
+    it under the store mutex like every other writer.
+    """
+    rec = _require_record(sf, record_id)
+    filled = []
+    if operation and not rec.operation:
+        rec.operation = operation
+        filled.append("operation")
+    if task_id and not rec.task_id:
+        rec.task_id = task_id
+        filled.append("task_id")
+    if not filled:
+        return sf, f"FILL_NOOP:{rec.id}|unchanged"
+    return sf, f"FILLED:{rec.id}|{','.join(filled)}"
+
+
+# --- observation + purge ----------------------------------------------------
+
+
+@dataclass
+class Observation:
+    """What a producer actually saw. See the pinned observation protocol."""
+
+    roots: set = field(default_factory=set)
+    windows: dict = field(default_factory=dict)
+    panes: dict = field(default_factory=dict)
+    complete: bool = True
+    pane_complete: dict = field(default_factory=dict)
+
+
+def read_observation(path: str) -> Observation:
+    """Parse the observation file, a superset of the agent-marks one.
+
+    ``ROOT<TAB><root>``                           -- successfully enumerated root
+    ``WINDOW<TAB><root><TAB><window>``            -- observed agent window
+    ``PANE<TAB><root><TAB><window><TAB><pane_id><TAB><pane_pid><TAB><pane_dead>``
+    ``INCOMPLETE``                                -- suppress every sweep
+
+    A root with a ``WINDOW`` row but no ``PANE`` row for that window is
+    pane-incomplete: ``dead_window`` still applies to it, ``dead_pane`` does
+    not. Fail closed -- a visibility gap must never cause a deletion.
+    """
+    obs = Observation()
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.rstrip("\n")
+            if not line:
+                continue
+            parts = line.split("\t")
+            kind = parts[0]
+            if kind == "INCOMPLETE":
+                obs.complete = False
+            elif kind == "ROOT" and len(parts) == 2:
+                obs.roots.add(os.path.realpath(parts[1]))
+            elif kind == "WINDOW" and len(parts) == 3:
+                root = os.path.realpath(parts[1])
+                obs.windows.setdefault(root, set()).add(parts[2])
+            elif kind == "PANE" and len(parts) == 6:
+                root = os.path.realpath(parts[1])
+                try:
+                    pane_pid = int(parts[4])
+                    pane_dead = int(parts[5])
+                except ValueError as exc:
+                    raise MalformedSessionsError(f"bad PANE row: {line!r}") from exc
+                obs.panes.setdefault((root, parts[2]), []).append(
+                    (parts[3], pane_pid, pane_dead)
+                )
+            else:
+                raise MalformedSessionsError(f"unknown observation row: {line!r}")
+
+    for root, windows in obs.windows.items():
+        obs.pane_complete[root] = all((root, w) in obs.panes for w in windows)
+    for root in obs.roots:
+        obs.pane_complete.setdefault(root, True)
+    return obs
+
+
+def purge(
+    sf: SessionsFile, observed: Observation, *, pid_alive=None
+) -> tuple[SessionsFile, list[str]]:
+    """Drop records whose agent is provably gone. Fail-closed throughout.
+
+    ``INCOMPLETE`` suppresses everything. Transitional records are NEVER purged
+    by liveness -- ``aitask_frozen.sh reconcile`` resolves those.
+    """
+    alive = pid_alive or _pid_alive
+    if not observed.complete:
+        return sf, []
+
+    dropped: list[str] = []
+    survivors: list[SessionRecord] = []
+    for rec in sf.sessions:
+        reason = None
+        if rec.state == STATE_LIVE and rec.root in observed.roots:
+            windows = observed.windows.get(rec.root, set())
+            if rec.window not in windows:
+                reason = "dead_window"
+            elif observed.pane_complete.get(rec.root, False):
+                rows = observed.panes.get((rec.root, rec.window), [])
+                here = [r for r in rows if r[0] == rec.pane_id]
+                gone = (not here) or all(r[2] == 1 for r in here)
+                if gone and not alive(rec.pane_pid):
+                    reason = "dead_pane"
+        elif rec.state == STATE_FROZEN:
+            # An EMPTY capture path counts as missing. A frozen record exists to
+            # hold a capture the user can still read and restore from; with no
+            # path there is nothing to show and nothing to restore, so the record
+            # is pure garbage that would otherwise survive every purge forever
+            # (it is exempt from the dead_window and dead_pane rules by design).
+            # Purged rather than rejected at parse: one corrupt record must not
+            # make the whole store unreadable for every other agent.
+            if not rec.capture_ansi or not os.path.exists(rec.capture_ansi):
+                reason = "capture_missing"
+
+        if reason and not capture_harvested(rec):
+            # HARVEST GATE (t2175_2), on EVERY branch: a liveness-only restore
+            # keeps a `live` record's captures, so `dead_window` / `dead_pane`
+            # can hold unharvested text just like a frozen `capture_missing`.
+            # Kept, not purged; a successful harvest (or an explicit
+            # `drop --skip-harvest`) releases it.
+            dropped.append(f"KEPT:{rec.id}|unharvested_text")
+            survivors.append(rec)
+        elif reason:
+            dropped.append(f"DROPPED:{rec.id}|{reason}")
+            remove_captures(rec.id)
+        else:
+            survivors.append(rec)
+    sf.sessions = survivors
+    return sf, dropped
+
+
+# --- TUI-side cached reader -------------------------------------------------
+
+
+class SessionsView:
+    """An mtime-gated reader for the refresh tick.
+
+    Re-reads only when the store's ``(st_mtime_ns, st_size, st_ino)`` changes.
+
+    ``st_ino`` is load-bearing, exactly as in ``agent_marks.MarksView``: this
+    store is only ever replaced via ``os.replace`` from a fresh temp file, and
+    a state flip is frequently equal-length, so on a filesystem with coarse
+    timestamp granularity both other fields can be unchanged across a real
+    content change. Every ``os.replace`` yields a new inode, which makes the
+    stamp replacement-sensitive by construction.
+    """
+
+    def __init__(self, path: str | os.PathLike | None = None) -> None:
+        self._path = sessions_path(path)
+        self._stamp: tuple[int, int, int] | None = None
+        self._sf: SessionsFile = _empty()
+        self._loaded = False
+
+    @property
+    def path(self) -> Path:
+        return self._path
+
+    def _stat_stamp(self) -> tuple[int, int, int] | None:
+        try:
+            st = os.stat(self._path)
+        except OSError:
+            return None
+        return (st.st_mtime_ns, st.st_size, st.st_ino)
+
+    def refresh(self) -> bool:
+        """Re-read if the file changed. Returns True when a read happened."""
+        stamp = self._stat_stamp()
+        if self._loaded and stamp == self._stamp:
+            return False
+        self._stamp = stamp
+        self._loaded = True
+        self._sf = load_safe(self._path)
+        return True
+
+    def invalidate(self) -> None:
+        """Force the next :meth:`refresh` to re-read.
+
+        Used right after a write: it may land inside the same coarse mtime tick
+        as the previous read, which the stamp alone would not catch.
+        """
+        self._loaded = False
+        self._stamp = None
+
+    def records(self) -> list[SessionRecord]:
+        self.refresh()
+        return list(self._sf.sessions)
+
+    def frozen(self) -> list[SessionRecord]:
+        return [r for r in self.records() if r.state == STATE_FROZEN]
+
+    def by_id(self, record_id: str) -> SessionRecord | None:
+        self.refresh()
+        return self._sf.by_id(record_id)
+
+
+# --- outcome verdicts for a dispatched coordinator --------------------------
+#
+# A `restore` / `drop` coordinator is dispatched through `tmux run-shell -b`, a
+# DETACHED job whose stdout no caller can read. Its wire lines therefore never
+# reach the UI that started it, and the RECORD is the only channel: a poller
+# re-reads the store and decides what happened. Three UIs do this — the
+# `frozenagent` viewer and both monitor TUIs (t1705_7) — so the decision lives
+# here, once, rather than three times.
+#
+# It lives in THIS module, not in `agent_frozen_ops`, because it is a pure
+# function *of a `SessionRecord`* and needs the `STATE_*` vocabulary defined
+# above. `agent_frozen_ops` deliberately imports neither, so hosting it there
+# would mean re-declaring "live" / "frozen" as string literals — a second copy
+# of the state vocabulary, which is the drift the one-way arrow exists to
+# prevent. Nothing here imports a UI toolkit; the callers own their own timers.
+#
+# `tests/test_frozenagent_restore_poll_characterization.py` pins the verdicts as
+# the viewer produced them BEFORE this extraction, and
+# `tests/test_frozen_restore_verdict.py` pins this surface directly.
+
+
+def restore_verdict(
+    rec: "SessionRecord | None",
+    prev_attempts: int,
+    elapsed: float,
+    *,
+    dispatch_grace: float,
+    settle_timeout: float,
+) -> tuple[bool, str, bool]:
+    """What a dispatched restore has done so far: ``(done, message, warn)``.
+
+    ``rec`` is the record as just re-read (``None`` when it vanished),
+    ``prev_attempts`` its ``restore_attempts`` snapshotted **before** dispatch,
+    and ``elapsed`` the seconds polled so far. ``done`` false means "still
+    waiting" and carries an empty message.
+
+    Two rules here are non-obvious and both have cost a real defect:
+
+    **The pre-begin gate is `restore_attempts`, never `state` and never
+    `last_error`.** `restore-begin` is what clears `last_error`, and it is the
+    only field bumped monotonically per attempt. A poll that fires before the
+    detached coordinator gets that far is looking at the *previous* attempt's
+    error; reading it would report this restore as failed before it started.
+
+    **Do NOT correlate `last_error` against a freshly-read `op_nonce`.**
+    Recovery (`restore-abort` -> `standin-respawned`) returns the record to
+    `frozen` and clears the lease while PRESERVING the error, so by the time it
+    is observed `op_nonce` is `""` and a prefix test can never match — silently
+    turning a failed restore into a reported timeout. The gate above is the
+    correlation: `restore-begin` cleared `last_error` at the start of *this*
+    attempt, so any non-empty value now belongs to it.
+    """
+    if rec is None:
+        return True, "record vanished", True
+
+    if rec.restore_attempts <= prev_attempts:
+        # PRE-BEGIN — see the docstring. Nothing about the record is evidence
+        # about this attempt yet, so only the clock can conclude anything.
+        if elapsed >= dispatch_grace:
+            return True, ("restore did not start — "
+                          "run 'ait frozenagent' or reconcile"), True
+        return False, "", False
+
+    if rec.state == STATE_LIVE:
+        if rec.ack == "liveness":
+            # A SUCCESS: the agent is running, but nothing proved its session
+            # within the grace (no hook ack, and for codex no rollout evidence,
+            # e.g. a process that could not be inspected). Never styled as an error.
+            # `ack == "rollout"` falls through to "restored": it is verified.
+            return True, "restored, unverified — capture kept", False
+        return True, "restored", False
+
+    if rec.state == STATE_FROZEN:
+        # Back at `frozen` after the attempt started: the restore failed and its
+        # stand-in is back. The capture was retained.
+        err = rec.last_error or ""
+        reason = err.split(":", 1)[1] if ":" in err else err
+        if reason:
+            return True, f"restore failed: {reason} — capture kept", True
+        return True, "restore ended — capture kept", True
+
+    if elapsed >= settle_timeout:
+        # A timeout is NOT evidence of success. The record is still transitional
+        # (`restoring` / `aborting`) and only reconcile can settle it; say
+        # exactly that rather than implying it worked.
+        return True, (f"restore still {rec.state} after the grace — "
+                      "run reconcile; capture kept"), True
+
+    return False, "", False
+
+
+#: How long a drop may legitimately keep its record leased. The coordinator
+#: harvests the capture into the sitrep store BEFORE it kills or deletes
+#: anything (t2175_2), for up to `agent_freeze.HARVEST_TIMEOUT_DROP` (120 s),
+#: so this must exceed that budget plus the kill/store steps
+#: (tests/test_sitrep_harvest.py pins the ordering).
+DROP_OBSERVE_CEILING = 180.0
+
+
+def drop_verdict(
+    rec: "SessionRecord | None",
+    elapsed: float,
+    *,
+    drop_grace: float,
+    ceiling: float = DROP_OBSERVE_CEILING,
+    pid_alive=None,
+) -> tuple[bool, str, bool]:
+    """What a dispatched drop has done so far: ``(done, message, warn)``.
+
+    `drop`'s OWN completion path. A dropped record never passes through
+    `restoring` or `live` — it disappears — so :func:`restore_verdict` would
+    wait for a state it can never observe. The coordinator's `DROP_FAILED:` /
+    `DROP_REFUSED:` line goes to a detached job whose stdout is unreadable, so
+    the record itself is the only observable:
+
+    * gone                              -> dropped;
+    * leased by a LIVE owner            -> still working (it harvests first,
+      which can take far longer than `drop_grace`), until ``ceiling``;
+    * not leased once `drop_grace` has passed -> finished without dropping:
+      every refusal path of `drop_record` releases its lease first.
+    """
+    if rec is None:
+        return True, "dropped — capture removed", False
+    alive = pid_alive or _pid_alive
+    working = bool(rec.op_nonce) and alive(rec.op_owner_pid)
+    if working:
+        if elapsed >= ceiling:
+            return True, "drop still running — record kept so far", True
+        return False, "", False
+    if elapsed >= drop_grace:
+        return True, "drop failed — record kept", True
+    return False, "", False
+
+
+# --- transcript fallback ----------------------------------------------------
+#
+# When the SessionStart hook never fired, the store has no codeagent session id
+# and the only remaining source is the agent's own transcript store. For codex
+# that is still a real path. Codex 0.153.4 fired SessionStart under `codex exec`
+# but NOT in the interactive TUI, which is how the framework launches agents.
+# Codex 0.163.0 fires it in the TUI, but only at a session's FIRST TURN (the
+# first version that does lies in between and was not bisected). So an older
+# codex, or a freeze before the first turn, still has no hook-recorded id.
+#
+# The layouts below are pinned by tests/data/session_hooks/transcript_layout.json,
+# captured from real stores. Two of them contradicted the original plan:
+#
+#   * claude encodes BOTH '/' and '_' as '-' in the project directory name
+#     (the '/'-only rule matched 2 of 6 real directories), and whether '.' or
+#     ' ' are also encoded remains UNOBSERVED. So the computed name is a fast
+#     path only -- a candidate is always VERIFIED by reading cwd out of its
+#     transcripts, and a miss falls back to scanning the whole store. That is
+#     correct under every candidate escape rule, which is what stops an
+#     unobserved character from silently yielding "no session".
+#   * codex puts cwd and session_id under `payload`, not at the top level, and
+#     partitions by DATE rather than by project.
+#
+# CORRELATION, NOT RECENCY (t1804). Matching on cwd alone answers "some session
+# of this project", which is NOT the question: with several codex agents in one
+# repo the newest match is routinely a DIFFERENT agent's conversation, and
+# restoring it replays a stranger's session into the frozen pane. So:
+#
+#   * :func:`codex_session_for_pid` resolves a session from the rollout the
+#     agent's OWN process holds open -- exact, and the mechanism the freeze
+#     engine uses while the agent is still alive;
+#   * the uncorrelated scan below REFUSES to guess: more than one session id
+#     under a root is `MISS_AMBIGUOUS`, never "the newest one" -- for claude as
+#     well as codex (t1820). Claude has no fd-correlated resolver: measured, a
+#     live claude process holds no `*.jsonl` open (it appends and closes).
+#
+# Measured (codex 0.154, t1804): a codex TUI opens its rollout at its FIRST
+# TURN, not at launch -- a never-prompted agent holds no rollout and resolves to
+# `MISS_NO_MATCH`, which correctly degrades to re-pick. A process started with
+# `codex resume <sid>` is different: it holds that session's rollout from launch,
+# before any turn (measured on 0.154 and 0.163.0). That is what lets the restore
+# coordinator verify a resume from the process it launched
+# (:func:`codex_resume_evidence`, t2040).
+
+MISS_NO_STORE_DIR = "no_store_dir"
+MISS_NO_PROJECT_DIR = "no_project_dir"
+MISS_NO_MATCH = "no_match"
+MISS_UNSUPPORTED_AGENT = "unsupported_agent"
+#: More than one candidate session -- the resolver refuses to pick one.
+MISS_AMBIGUOUS = "ambiguous"
+#: The process could not be inspected at all (no `/proc` and no `ps`/`lsof`
+#: answer; a gone or unreadable pid; an lsof name that could not be decoded with
+#: certainty). ABSENCE OF EVIDENCE -- never evidence that a stored session
+#: id is stale, which is why `agent_freeze` does not clear on it.
+MISS_NO_PROCESS = "no_process"
+#: The process is inspectable and is NOT codex, so its open files say nothing
+#: about a codex session.
+MISS_NOT_CODEX = "not_codex"
+
+_CODEX_ROLLOUT_RE = re.compile(
+    r"^rollout-.+?-(?P<session_id>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+    r"[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$"
+)
+
+
+def claude_project_dirname(root: str) -> str:
+    """Encode a project path the way Claude Code names its transcript directory.
+
+    Established rule: '/' and '_' both become '-'. Treat the result as a
+    CANDIDATE, never as truth -- see the module note above.
+    """
+    return root.replace("/", "-").replace("_", "-")
+
+
+def _claude_transcript_cwd(path: Path) -> str:
+    """The first non-empty top-level ``cwd`` in a claude transcript.
+
+    NOT on line 1 (observed at lines 2-5), so the file is scanned rather than
+    peeked. Bounded so a huge transcript cannot stall a keypress path.
+    """
+    try:
+        with path.open(encoding="utf-8", errors="replace") as fh:
+            for i, line in enumerate(fh):
+                if i > 50:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except (ValueError, TypeError):
+                    continue
+                if isinstance(obj, dict) and obj.get("cwd"):
+                    return str(obj["cwd"])
+    except OSError:
+        pass
+    return ""
+
+
+def _codex_meta_payload(path: Path) -> dict | None:
+    """A codex rollout's first-line ``payload``, or None if it is not one.
+
+    The ``type == "session_meta"`` check is what lets a caller treat "this file
+    is a codex rollout" as established rather than assumed -- the pid resolver
+    reads files an arbitrary process holds open, and a rollout-SHAPED name is
+    not by itself evidence.
+    """
+    try:
+        with path.open(encoding="utf-8", errors="replace") as fh:
+            first = fh.readline()
+    except OSError:
+        return None
+    try:
+        obj = json.loads(first)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(obj, dict) or obj.get("type") != "session_meta":
+        return None
+    payload = obj.get("payload")
+    return payload if isinstance(payload, dict) else None
+
+
+def _codex_session_meta(path: Path) -> tuple[str, str]:
+    """``(cwd, session_id)`` from a codex rollout's first line.
+
+    First line is ``type: session_meta`` and both values live under ``payload``
+    -- a top-level lookup returns nothing for every codex session.
+    """
+    payload = _codex_meta_payload(path)
+    if payload is None:
+        return "", ""
+    return str(payload.get("cwd") or ""), str(payload.get("session_id") or "")
+
+
+def _codex_rollout_identity(path: Path) -> tuple[str, str]:
+    """``(session_id, cwd)`` for a codex rollout; ``("", "")`` if it is not one.
+
+    The id falls back to the FILENAME's uuid when ``payload.session_id`` is
+    absent -- 159 of 1168 real rollouts are that shape, and their filename id
+    matches ``payload.id`` (measured, t1804).
+
+    A subagent-thread rollout carries its PARENT's ``session_id``, so grouping
+    candidates by this value folds a subagent into the session that spawned it
+    instead of reading as two rival sessions. That is why callers group by id
+    rather than by path, and why no explicit subagent branch is needed.
+    """
+    payload = _codex_meta_payload(path)
+    if payload is None:
+        return "", ""
+    session_id = str(payload.get("session_id") or "")
+    if not session_id:
+        match = _CODEX_ROLLOUT_RE.match(path.name)
+        session_id = match.group("session_id") if match else ""
+    return session_id, str(payload.get("cwd") or "")
+
+
+# MACOS HAS NO /proc (t2048). The same four facts -- argv, job (pgrp, tty,
+# tpgid), direct children, open files -- come from the kernel and from `ps` /
+# `lsof` instead. Each `/proc` reader below dispatches on :func:`_ps_probe`, so
+# the shell / foreground / identity logic above them runs unchanged on both.
+#
+# Measured on macOS 15 (Darwin 24.6), lsof 4.91, codex 0.163.0:
+#   * argv comes from `sysctl(KERN_PROCARGS2)`, NOT `ps -o args=`: ps
+#     space-joins argv, so a single prompt argument "explain -m gpt-5.4" would
+#     re-split into a fake `-m` and invent a model. The sysctl buffer is
+#     ``int argc``, the exec path, NUL padding, then argc NUL-terminated
+#     strings (then the environment). It fails (EINVAL) for a gone pid and for
+#     another user's process.
+#   * `ps -p <pid> -o pgid=,tpgid=,tty=` -> ``18806 18806 ttys005``; a process
+#     with no terminal reports tpgid 0 and tty ``??``. A gone pid exits 1.
+#   * `lsof -Ffn -p <pid>` -> ``p<pid>`` then ``f<fd>`` / ``n<name>`` pairs.
+#     Real descriptors are numeric; ``cwd`` / ``txt`` are pseudo-entries. Under
+#     LC_ALL=C the name is ESCAPED: ``\`` -> ``\\``; newline, tab, CR, BS, FF
+#     by name; bytes >= 0x7f as ``\xNN`` (``café`` -> ``caf\xc3\xa9``); any
+#     other control byte as ``^X`` -- indistinguishable from a literal ``^X``
+#     (captured: tests/data/session_hooks/lsof_escaped_names.json).
+#   * A resumed in-process codex TUI holds its rollout from launch, exactly as
+#     on Linux; a daemon-routed one holds none (the app-server daemon does).
+
+#: The probe backend applies only to the real `/proc` root on macOS. Linux never
+#: reaches it, and a test's fake `proc_root` is never routed to `ps`.
+_PS_PROBE_PLATFORM = sys.platform == "darwin"
+
+#: Per-command bound: a freeze runs on a keypress path. Same bound as the `ps`
+#: fallback in `monitor_core._is_companion_process`.
+_PROBE_TIMEOUT_S = 2
+
+
+def _ps_probe(proc_root: str) -> bool:
+    """Do this root's process facts come from `ps` / `lsof` instead of files?"""
+    return _PS_PROBE_PLATFORM and proc_root == "/proc"
+
+
+def _run_probe(cmd: list[str], env: dict | None = None) -> str | None:
+    """stdout of a read-only probe command; **None when it gave no answer**.
+
+    A missing binary, a timeout, or a non-zero exit is "could not look" --
+    never an empty answer, which a caller could read as a disproof.
+    """
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, errors="replace",
+            timeout=_PROBE_TIMEOUT_S, env=env)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout
+
+
+def _darwin_procargs(pid: int) -> bytes | None:
+    """The raw ``KERN_PROCARGS2`` buffer for ``pid``; None when unreadable."""
+    try:
+        import ctypes
+        import ctypes.util
+
+        libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+        mib = (ctypes.c_int * 3)(1, 49, int(pid))  # CTL_KERN, KERN_PROCARGS2
+        size = ctypes.c_size_t(0)
+        if libc.sysctl(mib, 3, None, ctypes.byref(size), None, 0) != 0:
+            return None
+        buf = ctypes.create_string_buffer(size.value)
+        if libc.sysctl(mib, 3, buf, ctypes.byref(size), None, 0) != 0:
+            return None
+        return buf.raw[:size.value]
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
+
+
+def _parse_procargs2(raw: bytes | None) -> list[str] | None:
+    """argv from a ``KERN_PROCARGS2`` buffer; None on any inconsistency.
+
+    Fails closed: a short buffer, a non-positive argc, or fewer argv strings
+    than argc is "could not look", never a shorter argv.
+    """
+    if not raw or len(raw) < 4:
+        return None
+    argc = int.from_bytes(raw[:4], sys.byteorder, signed=True)
+    if argc <= 0:
+        return None
+    _exec_path, sep, rest = raw[4:].partition(b"\0")
+    if not sep:
+        return None
+    rest = rest.lstrip(b"\0")
+    argv: list[str] = []
+    for _ in range(argc):
+        arg, sep, rest = rest.partition(b"\0")
+        if not sep:
+            return None
+        argv.append(arg.decode("utf-8", errors="replace"))
+    return argv
+
+
+def _ps_job(pid: int) -> tuple[int, str, int] | None:
+    """``(pgrp, tty, tpgid)`` from `ps`; tty is a name, compared for equality only."""
+    out = _run_probe(["ps", "-p", str(int(pid)), "-o", "pgid=,tpgid=,tty="])
+    fields = (out or "").split()
+    if len(fields) != 3:
+        return None
+    try:
+        return int(fields[0]), fields[2], int(fields[1])
+    except ValueError:
+        return None
+
+
+def _ps_children(pid: int) -> list[int] | None:
+    """``pid``'s direct children from one `ps -A` snapshot; None if ``pid`` is absent."""
+    out = _run_probe(["ps", "-A", "-o", "pid=,ppid="])
+    if out is None:
+        return None
+    seen = False
+    children: list[int] = []
+    for line in out.splitlines():
+        fields = line.split()
+        if len(fields) != 2 or not all(f.isdigit() for f in fields):
+            continue
+        child, parent = int(fields[0]), int(fields[1])
+        if child == pid:
+            seen = True
+        if parent == pid:
+            children.append(child)
+    return sorted(set(children)) if seen else None
+
+
+_LSOF_NAMED_ESCAPES = {"\\": b"\\", "n": b"\n", "t": b"\t", "r": b"\r",
+                       "b": b"\b", "f": b"\f"}
+
+
+def _decode_lsof_name(name: str) -> str | None:
+    """The real path behind an lsof ``-Fn`` name (LC_ALL=C); None if uncertain.
+
+    ``^X`` is ambiguous -- lsof prints a control byte and a literal caret
+    sequence the same way -- so any ``^`` is uncertain, as is an unknown or
+    truncated escape.
+    """
+    if "^" in name:
+        return None
+    out = bytearray()
+    i = 0
+    while i < len(name):
+        ch = name[i]
+        if ch != "\\":
+            out += ch.encode("utf-8", errors="surrogateescape")
+            i += 1
+            continue
+        nxt = name[i + 1:i + 2]
+        if nxt in _LSOF_NAMED_ESCAPES:
+            out += _LSOF_NAMED_ESCAPES[nxt]
+            i += 2
+        elif nxt == "x" and re.fullmatch(r"[0-9a-fA-F]{2}", name[i + 2:i + 4]):
+            out.append(int(name[i + 2:i + 4], 16))
+            i += 4
+        else:
+            return None
+    return os.fsdecode(bytes(out))
+
+
+def _lsof_open_files(pid: int) -> list[tuple[str, str | None]] | None:
+    """``(raw name, decoded path or None)`` per numeric fd; None when lsof gave no answer."""
+    out = _run_probe(["lsof", "-n", "-P", "-w", "-Ffn", "-p", str(int(pid))],
+                     env={**os.environ, "LC_ALL": "C"})
+    if out is None:
+        return None
+    lines = out.splitlines()
+    if f"p{int(pid)}" not in lines:
+        return None
+    files: list[tuple[str, str | None]] = []
+    fd = ""
+    for line in lines:
+        if line.startswith("f"):
+            fd = line[1:]
+        elif line.startswith("n") and fd.isdigit():
+            files.append((line[1:], _decode_lsof_name(line[1:])))
+    return files
+
+
+def _codex_cmdline_argv(pid: int, proc_root: str) -> list[str] | None:
+    """``/proc/<pid>/cmdline`` as argv; **None when it could not be read**.
+
+    The None-vs-empty distinction is load-bearing: "could not look" and "looked,
+    and it is not codex" drive opposite decisions in the freeze engine (keep a
+    stored session id vs. clear it). Collapsing them would claim positive
+    evidence that a valid session id is stale whenever a process merely could
+    not be inspected.
+
+    On macOS the exact argv comes from ``KERN_PROCARGS2`` (t2048).
+    """
+    if _ps_probe(proc_root):
+        return _parse_procargs2(_darwin_procargs(pid))
+    try:
+        with open(f"{proc_root}/{int(pid)}/cmdline", "rb") as fh:
+            raw = fh.read()
+    except (OSError, ValueError, TypeError):
+        return None
+    return [arg for arg in raw.decode("utf-8", errors="replace").split("\0") if arg]
+
+
+def _is_codex_argv(argv: list[str] | None) -> bool:
+    """True when argv0's basename is ``codex`` (see :func:`codex_process_model`)."""
+    return bool(argv) and os.path.basename(argv[0]) == "codex"
+
+
+#: Interactive shells a pane runs when the user types an agent at its prompt,
+#: by argv0 basename. A login shell's argv0 carries a leading ``-`` (measured:
+#: tmux starts ``-bash``), which is stripped before the lookup.
+_PANE_SHELLS = frozenset(
+    ("bash", "zsh", "fish", "sh", "dash", "ksh", "mksh", "tcsh", "csh", "nu"))
+
+
+def _direct_children(pid: int, proc_root: str) -> list[int] | None:
+    """``pid``'s direct children, from ``/proc/<pid>/task/*/children``.
+
+    None when that could not be read -- including a kernel built without
+    CONFIG_PROC_CHILDREN, which has no ``children`` file at all. "Could not
+    look" must never read as "has no children". On macOS: one `ps -A` snapshot.
+    """
+    if _ps_probe(proc_root):
+        return _ps_children(int(pid))
+    try:
+        tasks = sorted(Path(proc_root, str(int(pid)), "task").iterdir())
+    except (OSError, ValueError, TypeError):
+        return None
+    if not tasks:
+        return None
+    children: list[int] = []
+    for task in tasks:
+        try:
+            text = (task / "children").read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            return None
+        children.extend(int(tok) for tok in text.split() if tok.isdigit())
+    # A union over the threads: one child listed twice is still one child.
+    return list(dict.fromkeys(children))
+
+
+def _proc_job(pid: int, proc_root: str) -> tuple[int, int | str, int] | None:
+    """``(pgrp, tty_nr, tpgid)`` from ``/proc/<pid>/stat``; None when unreadable.
+
+    ``comm`` (field 2) is parenthesised and may itself contain spaces and
+    ``)``, so the fields are counted from after the LAST ``)``. On macOS it
+    comes from `ps`, with the tty as a name rather than a device number --
+    only ever compared for equality.
+    """
+    if _ps_probe(proc_root):
+        return _ps_job(int(pid))
+    try:
+        with open(f"{proc_root}/{int(pid)}/stat", encoding="utf-8",
+                  errors="replace") as fh:
+            raw = fh.read()
+    except (OSError, ValueError, TypeError):
+        return None
+    _head, sep, rest = raw.rpartition(")")
+    fields = rest.split()
+    # state ppid pgrp session tty_nr tpgid ...
+    if not sep or len(fields) < 6:
+        return None
+    try:
+        return int(fields[2]), int(fields[4]), int(fields[5])
+    except ValueError:
+        return None
+
+
+def _codex_child_of_shell(
+    pid: int, argv: list[str], proc_root: str
+) -> tuple[int, list[str], tuple[int, int, int] | None, str]:
+    """``(child_pid, child_argv, child_job, miss)``: the codex a pane SHELL runs.
+
+    For a pane process that is not codex itself. A codex typed at a shell
+    prompt is the shell's direct child, so the pane pid is the shell (measured,
+    codex 0.163.0, t2077). Exactly one level is inspected, and only through a
+    known shell: a codex child of any other process (a claude pane whose Bash
+    tool ran codex) must never count as the pane's agent.
+
+    **Only the terminal's foreground job counts.** A shell's children include
+    suspended (Ctrl-Z) and background jobs, and a suspended codex still holds
+    its rollout open (measured), so being a child says nothing about which
+    agent the pane is running. The foreground job is the one whose process
+    group is the terminal's ``tpgid``.
+
+    Every answer that could clear a stored id needs a complete look: an
+    unreadable shell stat, children list, or any listed child's cmdline or stat
+    is ``MISS_NO_PROCESS``, because the unread process could be the foreground
+    codex. So is foreground evidence that does not hang together -- the
+    candidate on another terminal, or sharing the shell's process group (no job
+    control, so a ``codex &`` would look exactly the same).
+
+    ``MISS_NOT_CODEX`` (no foreground codex, or several) is a disproof, so it
+    is issued only from a consistent, complete snapshot: every child on the
+    shell's terminal reports the shell's ``tpgid``, the foreground job is one
+    the look actually saw (the shell's own group, or a listed child's), and the
+    shell's job, its children list, and every child's argv and job read the
+    same again afterwards. Anything else -- a job moved to the foreground
+    mid-look, a children list that skipped one (the kernel documents that it
+    can, under concurrent changes), a launcher that exec'd into codex -- is
+    ``MISS_NO_PROCESS``.
+    """
+    if not argv or os.path.basename(argv[0]).lstrip("-") not in _PANE_SHELLS:
+        return 0, [], None, MISS_NOT_CODEX
+    shell_job = _proc_job(pid, proc_root)
+    if shell_job is None or shell_job[2] <= 0:
+        return 0, [], None, MISS_NO_PROCESS
+    children = _direct_children(pid, proc_root)
+    if children is None:
+        return 0, [], None, MISS_NO_PROCESS
+    shell_pgrp, shell_tty, tpgid = shell_job
+
+    foreground_codex = []
+    foreground_seen = shell_pgrp == tpgid
+    observed = []
+    for child in children:
+        child_argv = _codex_cmdline_argv(child, proc_root)
+        child_job = _proc_job(child, proc_root)
+        if child_argv is None or child_job is None:
+            return 0, [], None, MISS_NO_PROCESS
+        observed.append((child, child_argv, child_job))
+        if child_job[1] == shell_tty and child_job[2] != tpgid:
+            # Same terminal, different foreground: the terminal changed hands
+            # between the two reads. Neither snapshot can be trusted.
+            return 0, [], None, MISS_NO_PROCESS
+        if child_job[0] == tpgid:
+            foreground_seen = True
+            if _is_codex_argv(child_argv):
+                foreground_codex.append((child, child_argv, child_job))
+    if len(foreground_codex) != 1:
+        # Every piece of evidence the disproof rests on is read again. A child
+        # keeps its pid, group and place in the list when it execs, so a
+        # launcher (`env … codex resume …`) that turned into codex after its
+        # argv was read is caught only by re-reading that argv.
+        if (not foreground_seen
+                or _proc_job(pid, proc_root) != shell_job
+                or _direct_children(pid, proc_root) != children
+                or any(_codex_cmdline_argv(child, proc_root) != child_argv
+                       or _proc_job(child, proc_root) != child_job
+                       for child, child_argv, child_job in observed)):
+            return 0, [], None, MISS_NO_PROCESS
+        return 0, [], None, MISS_NOT_CODEX
+
+    child, child_argv, child_job = foreground_codex[0]
+    pgrp, tty, child_tpgid = child_job
+    if tty != shell_tty or child_tpgid != tpgid or pgrp == shell_pgrp:
+        return 0, [], None, MISS_NO_PROCESS
+    return child, child_argv, child_job, ""
+
+
+def _observed_process_unchanged(
+    pane_pid: int, agent_pid: int, argv: list[str],
+    child_job: tuple[int, int, int] | None, proc_root: str,
+) -> bool:
+    """Is ``agent_pid`` still the process the observation started from?
+
+    Called AFTER the fd evidence is read (link targets and rollout metadata
+    included), so a process that exited, was replaced, or -- on the shell
+    route -- left the foreground during the read turns the observation into
+    "could not look" instead of a session or an fd-based disproof.
+    """
+    if _codex_cmdline_argv(agent_pid, proc_root) != argv:
+        return False
+    if child_job is None:
+        return True
+    shell_now = _proc_job(pane_pid, proc_root)
+    child_now = _proc_job(agent_pid, proc_root)
+    if shell_now is None or child_now is None:
+        return False
+    pgrp, tty, _tpgid = child_job
+    return (child_now[0] == pgrp and child_now[1] == tty
+            and child_now[2] == pgrp and shell_now[2] == pgrp)
+
+
+def codex_process_model(pid: int, *, proc_root: str = "/proc") -> tuple[bool, str]:
+    """``(is_codex, cli_id)`` for a running process. Never raises.
+
+    ``is_codex`` is decided by argv0's basename. A wrapper prefix does not
+    defeat it: `env A=B codex …` **execs into** codex, so the cmdline is codex's
+    own (the same property `agent_restore._env_prefixed` relies on for the
+    pane-pid anchor).
+
+    ``cli_id`` is the value after ``-m`` / ``--model`` / ``--model=`` ANYWHERE in
+    argv, because a resumed agent is ``codex resume <sid> … -m <id>``. It is ""
+    when the launch named no model.
+    """
+    argv = _codex_cmdline_argv(pid, proc_root)
+    if not _is_codex_argv(argv):
+        return False, ""
+    return True, _argv_model(argv)
+
+
+def _argv_model(argv: list[str]) -> str:
+    """The value after ``-m`` / ``--model`` / ``--model=`` anywhere in argv, else ""."""
+    for index in range(1, len(argv)):
+        arg = argv[index]
+        if arg in ("-m", "--model"):
+            return argv[index + 1] if index + 1 < len(argv) else ""
+        if arg.startswith("--model="):
+            return arg.split("=", 1)[1]
+    return ""
+
+
+#: argv0 basename -> agent kind, for the CLIs whose launch argv names the model.
+#: Only the binaries `aitask_codeagent.sh` launches; anything else has no kind.
+_ARGV0_AGENT_KIND = {"claude": "claudecode", "codex": "codex", "opencode": "opencode"}
+
+
+def process_model_evidence(pid: int, *, proc_root: str = "/proc") -> tuple[str, str]:
+    """``(agent_kind, cli_id)`` read off a live process's argv. Never raises.
+
+    ``agent_kind`` comes from argv0's basename (``claude`` -> ``claudecode``),
+    or "" for an unknown binary or an unreadable cmdline. ``cli_id`` is the
+    ``--model`` value, or "" when the launch named none. The freeze engine uses
+    it to recover a blank record's agent string while the agent is still alive
+    (t1850). `env A=B claude …` execs into claude, so the cmdline is claude's own.
+    """
+    argv = _codex_cmdline_argv(pid, proc_root)
+    if not argv:
+        return "", ""
+    kind = _ARGV0_AGENT_KIND.get(os.path.basename(argv[0]), "")
+    return kind, (_argv_model(argv) if kind else "")
+
+
+def process_environ_value(
+    pid: int, name: str, *, proc_root: str = "/proc"
+) -> str | None:
+    """``name``'s value in ``/proc/<pid>/environ``. Never raises.
+
+    Returns None when the environ could not be read (no `/proc` -- this reader
+    has no macOS rung, so always there -- another user's process, a gone pid) and "" when it was read and the variable is absent.
+    The environ is the one the process was exec'd with, which is what a launch
+    prefix such as `env AITASK_AGENT_STRING=… claude` sets.
+    """
+    try:
+        with open(f"{proc_root}/{int(pid)}/environ", "rb") as fh:
+            raw = fh.read()
+    except (OSError, ValueError, TypeError):
+        return None
+    prefix = f"{name}="
+    for entry in raw.decode("utf-8", errors="replace").split("\0"):
+        if entry.startswith(prefix):
+            return entry[len(prefix):]
+    return ""
+
+
+def _readlink_targets(entries: list[Path]) -> list[str]:
+    """The live targets of `/proc/<pid>/fd` entries; vanished and deleted skipped."""
+    targets: list[str] = []
+    for entry in entries:
+        try:
+            target = os.readlink(str(entry))
+        except OSError:
+            continue
+        if not target.endswith(" (deleted)"):
+            targets.append(target)
+    return targets
+
+
+def _lsof_rollout_targets(pid: int) -> list[str] | None:
+    """The rollout-shaped files ``pid`` holds open, per lsof; None if uncertain.
+
+    A rollout-shaped name (the basename is codex-generated ASCII, so it is
+    matched on the raw rendering) whose path cannot be decoded with certainty,
+    or whose decoded path does not exist, makes the whole look uncertain. Skipping
+    it instead would let a mis-rendered path turn into `MISS_NO_MATCH`, which
+    CLEARS a stored session id.
+    """
+    files = _lsof_open_files(pid)
+    if files is None:
+        return None
+    targets: list[str] = []
+    for raw, decoded in files:
+        if not _CODEX_ROLLOUT_RE.match(raw.rsplit("/", 1)[-1]):
+            continue
+        if decoded is None or not os.path.exists(decoded):
+            return None
+        targets.append(decoded)
+    return targets
+
+
+def codex_session_for_pid(
+    pid: int, *, proc_root: str = "/proc"
+) -> tuple[str, str, str]:
+    """``(session_id, transcript_path, miss_reason)``: :func:`codex_observe_pid`
+    without the model.
+
+    The restore coordinator and reconcile call it, through
+    :func:`codex_resume_evidence`, on the RESUMED process the restore launched:
+    a resumed codex holds its rollout from launch, so this is how a codex
+    resume is verified without waiting for a hook (t2040).
+    """
+    session_id, transcript, _cli_id, miss = codex_observe_pid(
+        pid, proc_root=proc_root)
+    return session_id, transcript, miss
+
+
+def codex_observe_pid(
+    pid: int, *, proc_root: str = "/proc"
+) -> tuple[str, str, str, str]:
+    """Resolve ``(session_id, transcript_path, cli_id, miss_reason)`` from the
+    rollout the codex process behind pane process ``pid`` holds OPEN.
+
+    This is the correlated answer :func:`newest_transcript_for` cannot give: the
+    open file descriptor ties a session to ONE process, so several codex agents
+    in one repo stay distinguishable. The freeze engine calls it while the agent
+    is still alive.
+
+    **Which process.** The pane process itself when it is codex (every
+    framework launch execs through). Otherwise, when the pane process is a
+    known shell, its one FOREGROUND codex child -- a codex the user typed at
+    the prompt (t2077); see :func:`_codex_child_of_shell`. Nothing deeper.
+
+    **One observation, one process.** The session and ``cli_id`` (the
+    ``--model`` value, "" when the launch named none) come from the same
+    process, resolved once: its argv proves it is codex and names the model,
+    and its fds name the session. The process is re-checked AFTER every fd has
+    been read, so one that exited, was replaced, or left the foreground during
+    the read yields ``MISS_NO_PROCESS`` -- never a session, never a disproof.
+
+    **Verifying the process is codex happens HERE, not at the call site**, so no
+    caller can bypass it: a recycled pane, or any program holding a
+    rollout-shaped file, must never be able to write its session into a codex
+    record.
+
+    Linux reads `/proc/<pid>/fd`; macOS reads the same facts from the kernel,
+    `ps` and `lsof` (t2048 -- see the note above :func:`_ps_probe`). Where
+    neither answers, every result is ``MISS_NO_PROCESS``, which leaves callers
+    exactly where they were before this existed (no captured id -> restore
+    falls back to re-pick).
+
+    **It assumes the TUI runs in-process** (t2040, measured on 0.163.0; the
+    same on macOS, t2048). A codex TUI routed through the shared app-server
+    daemon holds no rollout itself: the daemon does, so this returns
+    ``MISS_NO_MATCH``. The framework's
+    launches avoid that through ``tui.alternate_screen=never`` in
+    ``CODEX_TUI_OVERRIDES`` (see `lib/agent_string.sh`); a hand-started
+    `codex` can be daemon-routed. For a restore the miss is harmless (liveness,
+    captures kept). The freeze engine reads it as disproving a stored codex id,
+    and that is correct for a daemon-routed TUI too (t2046): since t2047 the
+    hook records nothing for one, so an id on its record is stale or came from
+    the pre-t2047 hook, which reported the daemon's STARTING pane. The daemon
+    holds every routed pane's rollout, so its fds cannot attribute a
+    conversation to one pane. Such an agent is re-picked, not resumed.
+
+    Miss reasons are distinct on purpose -- see :data:`MISS_NO_PROCESS` vs
+    :data:`MISS_NOT_CODEX`, which the freeze engine treats differently.
+    """
+    try:
+        pid_int = int(pid)
+    except (TypeError, ValueError):
+        return "", "", "", MISS_NO_PROCESS
+    if pid_int <= 0:
+        return "", "", "", MISS_NO_PROCESS
+
+    ps_mode = _ps_probe(proc_root)
+    entries: list[Path] = []
+    if not ps_mode:
+        try:
+            entries = sorted(Path(proc_root, str(pid_int), "fd").iterdir())
+        except OSError:
+            return "", "", "", MISS_NO_PROCESS
+
+    # Read the cmdline only after the fd directory proved readable, so an
+    # unreadable /proc reports "could not look", never "not codex". On macOS
+    # the argv read is itself the "could I look" test (it fails for a gone pid
+    # and for another user's process), and the open files are read below.
+    argv = _codex_cmdline_argv(pid_int, proc_root)
+    if argv is None:
+        return "", "", "", MISS_NO_PROCESS
+
+    # Depth 0, or exactly one level through a known shell -- never deeper, and
+    # never through another agent: descending from a claude pane whose Bash
+    # tool ran codex would capture that child tool's rollout as if it were the
+    # pane's own session.
+    agent_pid = pid_int
+    child_job = None
+    if not _is_codex_argv(argv):
+        agent_pid, argv, child_job, miss = _codex_child_of_shell(
+            pid_int, argv, proc_root)
+        if miss:
+            return "", "", "", miss
+        if not ps_mode:
+            try:
+                entries = sorted(
+                    Path(proc_root, str(agent_pid), "fd").iterdir())
+            except OSError:
+                # The child exited. Never fall back to a replacement child.
+                return "", "", "", MISS_NO_PROCESS
+
+    if ps_mode:
+        targets = _lsof_rollout_targets(agent_pid)
+        if targets is None:
+            return "", "", "", MISS_NO_PROCESS
+    else:
+        targets = _readlink_targets(entries)
+
+    candidates: dict[str, list[Path]] = {}
+    for target in targets:
+        path = Path(target)
+        if not _CODEX_ROLLOUT_RE.match(path.name):
+            continue
+        session_id, _cwd = _codex_rollout_identity(path)
+        if session_id:
+            candidates.setdefault(session_id, []).append(path)
+
+    # Only now -- every link target and rollout header has been read -- is it
+    # known whether the process stayed itself for the whole read. One that
+    # exited mid-loop fails every readlink, and its empty candidate set must
+    # not become `MISS_NO_MATCH`, which clears a stored id.
+    if not _observed_process_unchanged(
+            pid_int, agent_pid, argv, child_job, proc_root):
+        return "", "", "", MISS_NO_PROCESS
+
+    if not candidates:
+        return "", "", "", MISS_NO_MATCH
+    if len(candidates) > 1:
+        return "", "", "", MISS_AMBIGUOUS
+
+    cli_id = _argv_model(argv)
+    session_id, paths = next(iter(candidates.items()))
+    for path in sorted(paths):
+        match = _CODEX_ROLLOUT_RE.match(path.name)
+        if match and match.group("session_id") == session_id:
+            return session_id, str(path), cli_id, ""
+    return session_id, str(sorted(paths)[0]), cli_id, ""
+
+
+def codex_resume_evidence(rec: dict, pid) -> str:
+    """The session a RESUMED codex process provably holds open, else ``""``.
+
+    ``rec`` is the record as `store show` returns it (string values). Only a
+    codex record being restored in `resume` mode has a session to verify. For
+    any other record, and on every miss of :func:`codex_session_for_pid` (no
+    `/proc`, not codex, no rollout yet, more than one), this returns ``""``, and
+    the caller falls back to waiting for the hook and then liveness. A miss is
+    never a verdict.
+
+    A non-empty answer is EVIDENCE, not a verdict either. The caller hands it to
+    `restore-confirm --rollout-session`, and the store compares it against the
+    session the restore asked for: a match verifies, a mismatch aborts.
+
+    The resolver is looked up by name at call time, so tests can patch
+    ``agent_sessions.codex_session_for_pid``.
+    """
+    if rec.get("restore_mode", "") != "resume" or rec.get("agent_kind", "") != "codex":
+        return ""
+    session_id, _path, miss = codex_session_for_pid(pid)
+    return "" if miss else session_id
+
+
+def _newest(paths: list[Path]) -> list[Path]:
+    """Newest first. Ties break on name (descending) so tests cannot flake and
+    a reader can predict which of two same-mtime transcripts wins."""
+    return sorted(paths, key=lambda p: (p.stat().st_mtime, p.name), reverse=True)
+
+
+def _claude_store_roots(home: Path, env) -> list[Path]:
+    """Candidate claude transcript stores, most specific first.
+
+    CLAUDE_CONFIG_DIR relocates `.claude.json`, but whether it also relocates
+    `projects/` is NOT established: tests/test_frozen_standin_spike.sh always
+    launches with it set, yet its scratch projects appear under the DEFAULT
+    ~/.claude/projects (claude 2.1.263). So both are searched, override first.
+    Searching both is correct under either behaviour and cannot regress the
+    default path -- which guessing one root could.
+    """
+    roots: list[Path] = []
+    cfg = (env.get("CLAUDE_CONFIG_DIR") or "").strip()
+    if cfg:
+        roots.append(Path(cfg) / "projects")
+    roots.append(home / ".claude" / "projects")
+    return roots
+
+
+def _codex_store_roots(home: Path, env) -> list[Path]:
+    """Candidate codex transcript stores, most specific first.
+
+    CODEX_HOME relocating `sessions/` IS established -- the spike reads
+    `find "$CODEX_HOME_DIR/sessions"` directly. Without honouring it, an agent
+    launched with a custom CODEX_HOME writes its transcripts there while this
+    resolver scans ~/.codex/sessions and reports no_store_dir, forcing re-pick
+    on exactly the path the fallback exists to rescue.
+    """
+    roots: list[Path] = []
+    ch = (env.get("CODEX_HOME") or "").strip()
+    if ch:
+        roots.append(Path(ch) / "sessions")
+    roots.append(home / ".codex" / "sessions")
+    return roots
+
+
+def _existing(roots: list[Path]) -> list[Path]:
+    """Deduplicate (an override may equal the default) and keep real dirs."""
+    out: list[Path] = []
+    seen: set[str] = set()
+    for r in roots:
+        try:
+            key = str(r.resolve())
+        except OSError:
+            key = str(r)
+        if key in seen:
+            continue
+        seen.add(key)
+        if r.is_dir():
+            out.append(r)
+    return out
+
+
+def _claude_newest_transcript(root: str, home: Path, env) -> tuple[str, str, str]:
+    stores = _existing(_claude_store_roots(home, env))
+    if not stores:
+        return "", "", MISS_NO_STORE_DIR
+
+    # The computed directory name only chooses the miss reason. It is NOT a
+    # scope to stop at: under a uniqueness rule, a session in the computed
+    # directory would hide a DIFFERENT session for the same root in a directory
+    # only the full scan reaches (a changed encoding, an older layout still on
+    # disk), and the "unique" answer would be a stranger's conversation again.
+    computed = [store / claude_project_dirname(root) for store in stores]
+    computed = [c for c in computed if c.is_dir()]
+
+    # Every project directory of every store, each read once: a directory
+    # reached twice (override equal to the default via a symlink) would
+    # otherwise contribute its files twice.
+    dirs: list[Path] = []
+    seen: set[str] = set()
+    for store in stores:
+        try:
+            children = [d for d in store.iterdir() if d.is_dir()]
+        except OSError:
+            continue
+        for d in children:
+            try:
+                key = str(d.resolve())
+            except OSError:
+                key = str(d)
+            if key not in seen:
+                seen.add(key)
+                dirs.append(d)
+
+    files: list[Path] = []
+    for d in dirs:
+        try:
+            files.extend(p for p in d.glob("*.jsonl") if p.is_file())
+        except OSError:
+            continue
+
+    # Group every cwd-match by session id (the file stem), newest first. One
+    # session copied into two stores is still one candidate.
+    candidates: dict[str, list[Path]] = {}
+    for path in _newest(files):
+        if _claude_transcript_cwd(path) == root:
+            candidates.setdefault(path.stem, []).append(path)
+
+    if not candidates:
+        return "", "", (MISS_NO_MATCH if computed else MISS_NO_PROJECT_DIR)
+    if len(candidates) > 1:
+        # Refuse rather than guess, as the codex branch does (t1804). Unlike
+        # codex there is no live-process correlation to fall back on: a claude
+        # process holds no transcript fd (measured t1820 -- 0 open `*.jsonl`
+        # across 25 live agents), so the SessionStart hook is the mechanism.
+        return "", "", MISS_AMBIGUOUS
+    session_id, paths = next(iter(candidates.items()))
+    return session_id, str(paths[0]), ""
+
+
+def _codex_newest_transcript(root: str, home: Path, env) -> tuple[str, str, str]:
+    stores = _existing(_codex_store_roots(home, env))
+    if not stores:
+        return "", "", MISS_NO_STORE_DIR
+    rollouts: list[Path] = []
+    for store in stores:
+        try:
+            rollouts.extend(p for p in store.glob("*/*/*/*.jsonl") if p.is_file())
+        except OSError:
+            continue
+    if not rollouts:
+        return "", "", MISS_NO_MATCH
+
+    # Group every cwd-match by session id -- newest first, so each group's first
+    # path is its newest file. Returning the newest MATCH (the pre-t1804
+    # behaviour) silently handed back another agent's conversation whenever two
+    # codex sessions shared a root, and nothing downstream could tell.
+    candidates: dict[str, list[Path]] = {}
+    for path in _newest(rollouts):
+        session_id, cwd = _codex_rollout_identity(path)
+        if cwd != root or not session_id:
+            continue
+        candidates.setdefault(session_id, []).append(path)
+
+    if not candidates:
+        return "", "", MISS_NO_MATCH
+    if len(candidates) > 1:
+        # Refuse rather than guess: re-picking a task is recoverable, resuming
+        # a stranger's session is not. Correlating a session to its own agent
+        # needs `codex_session_for_pid`, which requires the live process.
+        return "", "", MISS_AMBIGUOUS
+    session_id, paths = next(iter(candidates.items()))
+    return session_id, str(paths[0]), ""
+
+
+def newest_transcript_for(
+    root: str, agent_kind: str, *, home: Path | None = None, env=None
+) -> tuple[str, str, str]:
+    """Resolve ``(session_id, transcript_path, miss_reason)`` from the agent's
+    own transcript store, for use when the SessionStart hook never fired.
+
+    Honours each agent's store-root override (``CLAUDE_CONFIG_DIR`` /
+    ``CODEX_HOME``) IN ADDITION to the default under ``$HOME`` -- an agent
+    launched with a custom root writes its transcripts there, and scanning only
+    the default would report "no session" for exactly the sessions this
+    function exists to find.
+
+    ``home`` and ``env`` are test seams: ``home`` overrides ``$HOME`` for the
+    default roots, ``env`` overrides the environment consulted for the
+    override roots (pass ``{}`` for a hermetic run).
+
+    On success ``miss_reason`` is ``""``. On a miss BOTH ids are ``""`` and
+    ``miss_reason`` says which kind of miss it was -- that third value is the
+    whole point: without it a wrong layout assumption is indistinguishable from
+    "this agent genuinely has no session", and a store-layout change after an
+    agent release would look exactly like normal operation.
+
+    **Both branches resolve only single-session roots** (codex t1804, claude
+    t1820). Nothing here ties a transcript to a particular agent, so two
+    sessions under one root are `MISS_AMBIGUOUS` rather than a guess -- on a
+    busy machine that is the usual answer, and it is the honest one. Capturing a
+    codex session id is the job of :func:`codex_session_for_pid`, called by the
+    freeze engine while the agent's process is still alive; claude has no such
+    counterpart (its process holds no transcript open) and relies on its
+    SessionStart hook.
+    """
+    home = Path(os.path.expanduser("~")) if home is None else home
+    env = os.environ if env is None else env
+    croot = os.path.realpath(root)
+    if agent_kind == "claudecode":
+        return _claude_newest_transcript(croot, home, env)
+    if agent_kind == "codex":
+        return _codex_newest_transcript(croot, home, env)
+    return "", "", MISS_UNSUPPORTED_AGENT
+
+
+# --- CLI --------------------------------------------------------------------
+
+_LIST_FIELDS = (
+    "id", "state", "root", "window", "pane_id", "task_id", "agent_string", "state_at",
+)
+
+
+def _record_line(rec: SessionRecord) -> str:
+    """One whole record as ``RECORD:<json>`` — the lossless wire form (t2067).
+
+    JSON, so a value holding a line break or surrounding whitespace survives
+    the trip, which `show`'s ``key:value`` lines do not.
+    """
+    return "RECORD:" + json.dumps(vars(rec))
+
+#: Exception -> wrapper exit code. The wrapper maps these 1:1.
+_EXIT_CODES = {
+    MalformedSessionsError: 4,
+    TransitionRefused: 5,
+    NonceMismatch: 6,
+    SessionMismatch: 7,
+    LeaseHeld: 8,
+    HarvestRequired: 9,
+}
+
+
+def _arg(argv: list[str], name: str, default=None):
+    """Read ``--name value`` from a flat argv. Returns ``default`` when absent."""
+    flag = f"--{name}"
+    if flag in argv:
+        i = argv.index(flag)
+        if i + 1 < len(argv):
+            return argv[i + 1]
+        raise ValueError(f"{flag} needs a value")
+    return default
+
+
+def _require_arg(argv: list[str], name: str):
+    value = _arg(argv, name)
+    if value is None:
+        raise ValueError(f"missing required --{name}")
+    return value
+
+
+def _int_arg(argv: list[str], name: str, default=None, *, positive=False):
+    raw = _arg(argv, name)
+    if raw is None:
+        if default is None:
+            raise ValueError(f"missing required --{name}")
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"--{name} must be an integer: {raw!r}") from exc
+    if positive and value <= 0:
+        raise ValueError(f"--{name} must be positive: {value}")
+    return value
+
+
+def _pane_pair(argv: list[str]) -> tuple[str, int]:
+    """Read and validate the `--pane` / `--pane-pid` pair.
+
+    Exactly two shapes are legal: a real pane (`%N` + a positive pid) or the
+    gone-pane pair (`""` + `0`) that reconcile commits when the pane vanished.
+    A mixed pair would persist a location that cannot exist -- a live pid at no
+    pane, or a pane with no process -- and `freeze_commit` writes both
+    `pane_id`/`pane_pid` and `standin_pid` from it, so reconcile could never
+    match the record against a real pane again.
+
+    Enforced here as well as in the shell wrapper: this CLI is a documented
+    direct entry point, not merely the wrapper's private backend.
+    """
+    pane = _require_arg(argv, "pane")
+    pane_pid = _int_arg(argv, "pane-pid")
+    if pane_pid < 0:
+        raise ValueError(f"--pane-pid must be non-negative: {pane_pid}")
+    if not pane and pane_pid != 0:
+        raise ValueError(
+            f"--pane '' requires --pane-pid 0 (the gone-pane pair); got {pane_pid}"
+        )
+    if pane and pane_pid == 0:
+        raise ValueError(
+            f"--pane-pid 0 requires --pane '' (the gone-pane pair); got {pane!r}"
+        )
+    return pane, pane_pid
+
+
+def _id_arg(value: str, label: str) -> str:
+    if not valid_id(value):
+        raise ValueError(f"{label} must be 8 lowercase hex: {value!r}")
+    return value
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    path = None
+    if "--file" in argv:
+        i = argv.index("--file")
+        # Bounds-checked BEFORE indexing: this runs above the try block, so a
+        # bare `--file` would otherwise raise an uncaught IndexError and hand
+        # automation a traceback instead of the documented usage exit 2.
+        if i + 1 >= len(argv):
+            print("ERROR:--file needs a value", file=sys.stderr)
+            return 2
+        path = argv[i + 1]
+        del argv[i : i + 2]
+    if not argv:
+        print("usage: agent_sessions.py [--file PATH] <verb> ...", file=sys.stderr)
+        return 2
+
+    verb, rest = argv[0], argv[1:]
+    now = _now()
+
+    try:
+        # Read-only verbs first: no load-modify-dump cycle.
+        if verb == "list":
+            sf = load(path)
+            state = _arg(rest, "state")
+            root = _arg(rest, "root")
+            croot = os.path.realpath(root) if root else None
+            # `--full` is a batch `show --json` (t2041): one whole record per
+            # line, as JSON so a value holding a newline cannot split it.
+            full = "--full" in rest
+            for rec in sorted(sf.sessions, key=lambda r: r.key):
+                if state and rec.state != state:
+                    continue
+                if croot and rec.root != croot:
+                    continue
+                if full:
+                    print(_record_line(rec))
+                    continue
+                values = [str(getattr(rec, f)) for f in _LIST_FIELDS]
+                print("SESSION:" + "|".join(values))
+            return 0
+
+        if verb == "show":
+            # `--json` is the form every action reads (t2067): the `key:value`
+            # lines are for people and shell greps, and they do not round-trip
+            # a value with surrounding whitespace or a line break in it.
+            as_json = "--json" in rest
+            ids = [a for a in rest if a != "--json"]
+            sf = load(path)
+            rec = _require_record(sf, _id_arg(ids[0] if ids else "", "id"))
+            if as_json:
+                print(_record_line(rec))
+                return 0
+            for key, value in vars(rec).items():
+                print(f"{key}:{value}")
+            return 0
+
+        sf = load(path)
+        if verb == "upsert":
+            sf, line = upsert(
+                sf,
+                root=_require_arg(rest, "root"),
+                window=_require_arg(rest, "window"),
+                pane=_pane_pair(rest)[0],
+                pane_pid=_pane_pair(rest)[1],
+                id=_id_arg(_arg(rest, "id"), "--id") if _arg(rest, "id") else None,
+                session=_arg(rest, "session"),
+                session_id=_arg(rest, "session-id"),
+                clear_session_id="--clear-session-id" in rest,
+                transcript=_arg(rest, "transcript"),
+                agent_string=_arg(rest, "agent-string"),
+                agent_kind=_arg(rest, "agent-kind"),
+                operation=_arg(rest, "operation"),
+                task_id=_arg(rest, "task-id"),
+                restore_of=(
+                    _id_arg(_arg(rest, "restore-of"), "--restore-of")
+                    if _arg(rest, "restore-of")
+                    else None
+                ),
+                nonce=(
+                    _id_arg(_arg(rest, "nonce"), "--nonce") if _arg(rest, "nonce") else None
+                ),
+                now=now,
+            )
+        elif verb == "freeze-begin":
+            sf, line = freeze_begin(
+                sf,
+                _id_arg(rest[0], "id"),
+                capture_ansi=_require_arg(rest, "capture-ansi"),
+                capture_txt=_require_arg(rest, "capture-txt"),
+                lines=_int_arg(rest, "lines"),
+                phase=_arg(rest, "phase", ""),
+                owner_pid=_int_arg(rest, "owner-pid", positive=True),
+                now=now,
+            )
+        elif verb == "freeze-commit":
+            sf, line = freeze_commit(
+                sf,
+                _id_arg(rest[0], "id"),
+                nonce=_id_arg(_require_arg(rest, "nonce"), "--nonce"),
+                pane=_pane_pair(rest)[0],
+                pane_pid=_pane_pair(rest)[1],
+                now=now,
+            )
+        elif verb == "freeze-abort":
+            sf, line = freeze_abort(
+                sf,
+                _id_arg(rest[0], "id"),
+                nonce=_id_arg(_require_arg(rest, "nonce"), "--nonce"),
+                now=now,
+            )
+        elif verb == "restore-begin":
+            sf, line = restore_begin(
+                sf,
+                _id_arg(rest[0], "id"),
+                mode=_require_arg(rest, "mode"),
+                owner_pid=_int_arg(rest, "owner-pid", positive=True),
+                now=now,
+            )
+        elif verb == "restore-launched":
+            sf, line = restore_launched(
+                sf,
+                _id_arg(rest[0], "id"),
+                nonce=_id_arg(_require_arg(rest, "nonce"), "--nonce"),
+                pane=_pane_pair(rest)[0],
+                pane_pid=_pane_pair(rest)[1],
+                now=now,
+            )
+        elif verb == "restore-confirm":
+            rollout_session = _arg(rest, "rollout-session")
+            if rollout_session is not None and not rollout_session:
+                raise ValueError("--rollout-session needs a non-empty session id")
+            sf, line = restore_confirm(
+                sf,
+                _id_arg(rest[0], "id"),
+                nonce=_id_arg(_require_arg(rest, "nonce"), "--nonce"),
+                pane=_pane_pair(rest)[0],
+                pane_pid=_pane_pair(rest)[1],
+                rollout_session=rollout_session,
+                now=now,
+            )
+        elif verb == "restore-abort":
+            sf, line = restore_abort(
+                sf,
+                _id_arg(rest[0], "id"),
+                nonce=_id_arg(_require_arg(rest, "nonce"), "--nonce"),
+                error=_arg(rest, "error", ""),
+                now=now,
+            )
+        elif verb == "standin-respawned":
+            sf, line = standin_respawned(
+                sf,
+                _id_arg(rest[0], "id"),
+                nonce=_id_arg(_require_arg(rest, "nonce"), "--nonce"),
+                pane=_pane_pair(rest)[0],
+                pane_pid=_pane_pair(rest)[1],
+                now=now,
+            )
+        elif verb == "lease-take":
+            sf, line = lease_take(
+                sf,
+                _id_arg(rest[0], "id"),
+                owner_pid=_int_arg(rest, "owner-pid", positive=True),
+                now=now,
+            )
+        elif verb == "lease-release":
+            sf, line = lease_release(
+                sf,
+                _id_arg(rest[0], "id"),
+                nonce=_id_arg(_require_arg(rest, "nonce"), "--nonce"),
+            )
+        elif verb == "drop":
+            raw_nonce = _arg(rest, "nonce")
+            sf, line = drop(
+                sf,
+                _id_arg(rest[0], "id"),
+                nonce=_id_arg(raw_nonce, "--nonce") if raw_nonce else None,
+                skip_harvest="--skip-harvest" in rest,
+            )
+        elif verb == "fill-task":
+            sf, line = fill_task(
+                sf,
+                _id_arg(rest[0], "id"),
+                operation=_arg(rest, "operation", ""),
+                task_id=_arg(rest, "task-id", ""),
+            )
+        elif verb == "purge":
+            obs = read_observation(_require_arg(rest, "observed"))
+            sf, lines = purge(sf, obs)
+            dump(sf, path)
+            for entry in lines:
+                print(entry)
+            print(f"PURGED:{sum(1 for e in lines if e.startswith('DROPPED:'))}")
+            return 0
+        else:
+            print(f"unknown verb: {verb}", file=sys.stderr)
+            return 2
+
+        dump(sf, path)
+        print(line)
+        return 0
+
+    except (ValueError, IndexError) as exc:
+        print(f"ERROR:{exc}", file=sys.stderr)
+        return 2
+    except SessionMismatch as exc:
+        # THE ONE refusal that must PERSIST before it reports, and so the one
+        # that cannot share the write-nothing handler below.
+        #
+        # The SessionStart hook has no return channel to the detached restore
+        # coordinator, so `last_error` on the record IS the channel (§A/§D): the
+        # coordinator polls `show <id>` until it sees this nonce, then takes the
+        # abort branch. Dropping the write here loses the report entirely, the
+        # coordinator times out, and it takes the LIVENESS branch instead --
+        # confirming as `live` a pane running a DIFFERENT session than the one
+        # being restored, which is precisely what the mismatch check exists to
+        # prevent. The transition already mutated `sf` before raising; this is
+        # what makes that mutation durable.
+        dump(sf, path)
+        print(str(exc), file=sys.stderr)
+        return _EXIT_CODES[SessionMismatch]
+    except tuple(_EXIT_CODES) as exc:
+        # Every other refusal writes NOTHING -- that is the exit-code contract
+        # (`3/4/5/6/8 ... NOTHING was written`), and the transitions raise
+        # before mutating, so there is nothing to persist.
+        print(str(exc), file=sys.stderr)
+        return _EXIT_CODES[type(exc)]
+
+
+if __name__ == "__main__":
+    sys.exit(main())

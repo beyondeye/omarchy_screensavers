@@ -1,0 +1,1811 @@
+"""tui_switcher - Reusable TUI switcher widget for quick-switching between aitask TUIs in tmux.
+
+Provides a ModalScreen overlay showing all known TUIs with their running status,
+plus any other tmux windows (agents, shells) grouped by type, and a mixin that
+any Textual App can use to add the switcher with a single keybinding.
+
+When multiple aitasks tmux sessions are detected on the current server, the
+overlay grows a top "Session:" row — use Left/Right to select another session;
+the list below refreshes to that session's windows. Enter (or any shortcut
+key) acts on the SELECTED session; a `switch-client` teleport fires
+automatically when the selected session differs from the attached one. When
+only one aitasks session exists, the UI is bit-identical to single-session
+behavior.
+
+Usage:
+    from tui_switcher import TuiSwitcherMixin
+
+    class MyApp(TuiSwitcherMixin, App):
+        BINDINGS = [
+            *TuiSwitcherMixin.SWITCHER_BINDINGS,
+            Binding("q", "quit", "Quit"),
+            # ... other bindings
+        ]
+
+        def __init__(self):
+            super().__init__()
+            self.current_tui_name = "board"  # name of this TUI
+"""
+from __future__ import annotations
+
+import dataclasses
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+from typing import NamedTuple
+
+from textual.binding import Binding
+from textual.containers import Container
+from textual.screen import ModalScreen
+from textual.widgets import Label, ListItem, ListView, Static
+
+# Add lib dir to path for agent_launch_utils import
+_LIB_DIR = str(Path(__file__).resolve().parent)
+if _LIB_DIR not in sys.path:
+    sys.path.insert(0, _LIB_DIR)
+
+from agent_launch_utils import (  # noqa: E402
+    DEFAULT_TMUX_SESSION,
+    PROJECT_GROUP_UNGROUPED_LABEL,
+    DEFAULT_SESSION_FILE_SHAPES,
+    AitasksSession,
+    advance_group_selection,
+    bootstrap_project_session,
+    companion_present,
+    cross_group_ring,
+    cross_group_step,
+    current_tmux_session,
+    default_selected_group,
+    disambiguate_labels,
+    discover_aitasks_sessions,
+    gateway_pane_window,
+    group_members,
+    group_sessions,
+    load_tmux_defaults,
+    resolve_selected_key,
+    tmux_session_target,
+    tmux_window_target,
+)
+from stale_entry_modal import RegistryRefresh, StaleEntryModal  # noqa: E402
+from tmux_exec import TmuxClient  # noqa: E402
+from tui_registry import BRAINSTORM_PREFIX as _BRAINSTORM_PREFIX, TUI_NAMES as _TUI_NAMES, switcher_tuis  # noqa: E402
+from keybinding_registry import register_app_bindings, resolve_key  # noqa: E402
+from shortcut_labels import display_form, render_label  # noqa: E402
+
+# Single Python gateway for raw tmux spawning (t952). Socket args cached once
+# at construction from AITASKS_TMUX_SOCKET (unset → dedicated `-L ait` socket,
+# t953).
+_TMUX = TmuxClient()
+
+_WINDOW_ID_RE = re.compile(r"@\d+")
+
+
+def _session_windows(session: str) -> list[tuple[str, str, str]]:
+    """``(window_id, window_index, name)`` for each of ``session``'s windows.
+
+    The window id (``@N``) is what a row acts on, never the index: an index
+    read when the overlay was populated can belong to another window by the
+    time Enter is pressed, because ``renumber-windows`` closes the gap a closed
+    window leaves (t2230, the switcher twin of t2227). An id is never reused
+    within a server's lifetime, so a window that has gone simply fails to
+    select. Best-effort like the listing it replaces: ``[]`` when tmux cannot
+    be asked, and a row without a well-formed id is left out.
+    """
+    rc, out = _TMUX.run(
+        ["list-windows", "-t", tmux_session_target(session),
+         "-F", "#{window_id}\t#{window_index}\t#{window_name}"]
+    )
+    if rc != 0:
+        return []
+    rows = []
+    for line in out.splitlines():
+        parts = line.split("\t", 2)
+        if len(parts) == 3 and _WINDOW_ID_RE.fullmatch(parts[0]):
+            rows.append((parts[0], parts[1], parts[2]))
+    return rows
+
+
+def _format_desync_lines(lines_output: str) -> str:
+    """Format `desync_state.py snapshot --format lines` output as one line.
+
+    Returns markup like ``main: 1↑/0↓ · aitask-data: 0↑/3↓`` or ``clean``
+    when both refs are at zero. Refs with non-ok status are surfaced as
+    e.g. ``main: missing_remote``.
+    """
+    refs: list[tuple[str, str, int, int]] = []  # (name, status, ahead, behind)
+    cur_name: str | None = None
+    cur_status: str = "ok"
+    cur_ahead: int = 0
+    cur_behind: int = 0
+    for raw in lines_output.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if ":" not in line:
+            continue
+        key, _, val = line.partition(":")
+        key = key.strip()
+        val = val.strip()
+        if key == "REF":
+            if cur_name is not None:
+                refs.append((cur_name, cur_status, cur_ahead, cur_behind))
+            cur_name = val
+            cur_status = "ok"
+            cur_ahead = 0
+            cur_behind = 0
+        elif key == "STATUS":
+            cur_status = val
+        elif key == "AHEAD":
+            try:
+                cur_ahead = int(val)
+            except ValueError:
+                cur_ahead = 0
+        elif key == "BEHIND":
+            try:
+                cur_behind = int(val)
+            except ValueError:
+                cur_behind = 0
+    if cur_name is not None:
+        refs.append((cur_name, cur_status, cur_ahead, cur_behind))
+
+    if not refs:
+        return "[dim]desync: unavailable[/]"
+
+    parts: list[str] = []
+    any_drift = False
+    for name, status, ahead, behind in refs:
+        if status != "ok":
+            parts.append(f"{name}: [dim]{status}[/]")
+            continue
+        if ahead == 0 and behind == 0:
+            parts.append(f"[dim]{name}: clean[/]")
+        else:
+            parts.append(f"{name}: {ahead}↑/{behind}↓")
+            any_drift = True
+    if not any_drift:
+        return "[dim]all refs clean[/]"
+    return " · ".join(parts)
+
+
+# Switcher-visible TUIs sourced from the central registry. See tui_registry.py
+# for the authoritative list and the non-switcher entries (brainstorm, minimonitor)
+# that classify as TUI windows but are not user-launchable from the switcher.
+KNOWN_TUIS = switcher_tuis()
+
+
+def _build_tui_list(project_root: Path | None = None):
+    """Build TUI list including dynamic git TUI entry from config.
+
+    ``project_root`` selects which project's ``project_config.yaml`` is read
+    for the dynamic ``git_tui`` entry. Defaults to ``Path.cwd()`` for legacy
+    callers; the cross-session switcher passes the SELECTED session's
+    project_root so the displayed Git tool matches what would actually launch.
+    """
+    tuis = list(KNOWN_TUIS)
+    try:
+        defaults = load_tmux_defaults(project_root or Path.cwd())
+        git_tui = defaults.get("git_tui", "")
+        if git_tui and git_tui != "none":
+            tuis.insert(2, ("git", f"Git ({git_tui})", git_tui))
+    except Exception:
+        pass
+    return tuis
+
+# Classification constants shared with tmux_monitor.py via tui_registry.
+_AGENT_PREFIXES = ["agent-"]
+
+# Markup styles for the switcher overlay. Named once here because these were
+# previously duplicated across eleven call sites, which is how a single wrong
+# colour name spread through the whole overlay unnoticed (t1453).
+#
+# These spans are parsed by **Textual**, whose palette is CSS colour names — it
+# does NOT know Rich's xterm names, and an unknown name fails *silently*: the
+# span keeps the unresolved string, so no span-level assertion can see it, while
+# the compositor paints the widget's default foreground and drops the `bold`.
+# `bright_cyan` and `bright_green` were both inert here for exactly that reason.
+#
+#: The `(K)` key-hint highlight. `cyan` is #00ffff — the brightest cyan Textual
+#: has, so it is also the closest resolvable thing to the `bright_cyan` that was
+#: intended. Shared with the current-item marker below; they never co-occur in a
+#: row because the hint is suppressed when `is_current`.
+TUI_KEY_HINT_STYLE = "bold cyan"
+
+#: The running-TUI `●`. A **hex literal, not a name**: `bright_green` is Rich's
+#: and Textual rejects it, while Textual's `ansi_bright_green` carries an ANSI
+#: flag that remaps through the *theme's* palette at render time (#98e024 under
+#: textual-dark, #60cb00 under textual-light) — a chartreuse, not the bright
+#: green the name means, and unpinnable in a test. #00ff00 is what Rich's
+#: `bright_green` actually resolves to, and it is stable across every theme.
+TUI_RUNNING_STYLE = "#00ff00"
+
+
+def _markup_literal(text: str) -> str:
+    """``text`` as Textual markup that renders verbatim (t2180).
+
+    For a user-configured shortcut key interpolated into the overlay's markup.
+    Every key here is remappable, and ``[`` is a legal one: unescaped, the open
+    key ``[`` turned the close hint into ``[/Esc[/]``, which Textual rejects
+    with ``MarkupError``, and the switcher could not be opened at all.
+
+    The rule is Textual's, stated canonically on ``monitor_shared.markup_literal``
+    (t2006). Textual opens a tag at any ``[`` not preceded by a backslash, turns
+    exactly ``\\[`` back into ``[``, and keeps every other backslash literal, so
+    prefixing each ``[`` and touching nothing else is an exact round trip.
+    ``rich.markup.escape`` does not do this: it leaves a lone ``[`` alone (it
+    escapes only tag-shaped ``[...]``) and doubles backslashes, which Textual
+    does not collapse. That module is not imported, because ``lib/`` must not
+    pull in the monitor package for one line.
+
+    The one shape this cannot express is a backslash directly before a real tag.
+    Every call site here is safe from it, because the key is always followed by
+    ``)`` or ``/Esc``, never by a tag.
+    """
+    return text.replace("[", "\\[")
+
+
+# Customizable-shortcuts scope for the switcher overlay's quick-jump keys
+# (t876). Distinct from the module-level "shared" scope that registers the
+# `j` key that *opens* the switcher (see bottom of file). The quick-jumps are
+# registered at import (_QUICK_JUMP_LIVE_BINDINGS, spliced into
+# TuiSwitcherOverlay.BINDINGS) — the pattern that
+# actually wires user overrides into Textual's live key map, mirroring
+# brainstorm_dag_display.py. The structural keys (escape/enter/←/→) stay fixed
+# literals and are intentionally NOT registered (not user-customizable).
+_TUI_SWITCHER_SCOPE = "shared.tui_switcher"
+
+# Default quick-jump keys per switchable TUI. These are the registration
+# defaults; the live key (and the hint/list rendering) resolve through
+# `resolve_key(_TUI_SWITCHER_SCOPE, "shortcut_<name>", default)` so a rebind is
+# reflected without going stale.
+_TUI_SHORTCUTS = {
+    "board": "b",
+    "trails": "i",
+    "monitor": "m",
+    "frozenagent": "f",
+    "codebrowser": "c",
+    "settings": "s",
+    "stats": "t",
+    "syncer": "y",
+    "git": "g",
+    "applink": "a",
+    "chatlink": "l",
+}
+
+
+def _resolve_tui_shortcut(tui_name: str) -> str | None:
+    """Active quick-jump key for ``tui_name`` (override-aware), or None.
+
+    The action id is ``shortcut_<tui_name>`` for every entry in
+    ``_TUI_SHORTCUTS``; falls back to the hardcoded default when no override or
+    recorded default exists yet.
+    """
+    default = _TUI_SHORTCUTS.get(tui_name)
+    if default is None:
+        return None
+    return resolve_key(_TUI_SWITCHER_SCOPE, f"shortcut_{tui_name}", default) or default
+
+
+# Ordered (action_id, label, default_key) for the overlay's bottom hint row.
+# Omits applink (the hint historically does not advertise the App Linker key),
+# frozenagent (t1705_6) and trails (t1794_6): this row already renders 122
+# columns wide (re-measured at t1794_6), so it overflows a standard 120-column
+# terminal before anything is added to it.
+# A TUI is fully reachable without a hint entry — the registry row and the
+# quick-jump key are what make it work — so the budget, not completeness,
+# decides membership here. Measure before adding one:
+#     "  ".join(_hint_segment(*item) for item in _HINT_ITEMS)
+_HINT_ITEMS = [
+    ("shortcut_board", "board", "b"),
+    ("shortcut_monitor", "monitor", "m"),
+    ("shortcut_codebrowser", "code", "c"),
+    ("shortcut_settings", "settings", "s"),
+    ("shortcut_stats", "stats", "t"),
+    ("shortcut_syncer", "syncer", "y"),
+    ("shortcut_brainstorm", "brainstorm", "r"),
+    ("shortcut_git", "git", "g"),
+    ("shortcut_explore", "explore", "x"),
+    ("shortcut_explore_pick", "explore+", "X"),
+    ("shortcut_create", "new task", "n"),
+    ("shortcut_agent", "agent", "e"),
+]
+
+#: The first ``(K)`` group ``render_label`` produced. Lazy and non-empty (``.+?``)
+#: rather than ``[^)]*``: the two match the same text for every non-empty group,
+#: since both stop at the first ``)``, but the key ``)`` renders as ``()) board``,
+#: where ``[^)]*`` matched the empty ``()`` and highlighted the wrong span (t2180).
+#: ``render_label`` never emits ``()`` for a non-empty key.
+_KEY_PAREN_RE = re.compile(r"\((.+?)\)")
+
+
+def _hint_segment(
+    action_id: str, label: str, default_key: str, *, spell_shift: bool = False,
+) -> str:
+    """Render one bottom-hint segment with its live key highlighted in cyan.
+
+    ``render_label`` inlines the key into the word where possible
+    (``board`` + ``b`` -> ``(B)oard``) or prefixes it otherwise
+    (``stats`` + ``z`` -> ``(Z) stats``); the regex re-applies the existing
+    cyan markup to whichever ``(K)`` group it produced.
+
+    The rendered text is made markup-literal first (:func:`_markup_literal`),
+    because the key is user-configured and ``[`` is a legal one. Labels are
+    framework words with no ``[``, so only the key can contribute one.
+
+    ``render_label`` uppercases a matched single letter, so ``m`` and ``M``
+    both render as ``(M)``. ``spell_shift`` makes an uppercase single-letter
+    key render as ``(Shift+M) <label>`` instead, for a segment whose key has a
+    lowercase sibling in the same overlay (``M`` companion vs ``m`` monitor).
+    The resolved key is used, so a rebind still shows as itself.
+    """
+    key = resolve_key(_TUI_SWITCHER_SCOPE, action_id, default_key) or default_key
+    if spell_shift and len(key) == 1 and key.isalpha() and key.isupper():
+        key = f"shift+{key.lower()}"
+    rendered = _markup_literal(render_label(label, key))
+    return _KEY_PAREN_RE.sub(rf"[{TUI_KEY_HINT_STYLE}](\1)[/]", rendered, count=1)
+
+
+def _discover_brainstorm_sessions(project_root: Path | None = None) -> list[str]:
+    """Scan a project's .aitask-crews/crew-brainstorm-*/ for brainstorm sessions.
+
+    ``project_root`` selects which project's ``.aitask-crews/`` is scanned.
+    Defaults to ``Path.cwd()`` for legacy callers; the cross-session switcher
+    passes the SELECTED session's project_root so the listed brainstorm
+    sessions match that session's project — not whichever project the
+    attached session's Python process happens to run from.
+
+    Returns list of task numbers with existing sessions.
+    """
+    crews_dir = (project_root or Path.cwd()) / ".aitask-crews"
+    if not crews_dir.is_dir():
+        return []
+    prefix = "crew-brainstorm-"
+    sessions = []
+    for entry in sorted(crews_dir.iterdir()):
+        if entry.is_dir() and entry.name.startswith(prefix):
+            session_file = entry / "br_session.yaml"
+            if session_file.is_file():
+                sessions.append(entry.name[len(prefix):])
+    return sessions
+
+
+def _classify_window(name: str) -> str:
+    """Classify a tmux window name as 'tui', 'agent', or 'other'."""
+    if name in _TUI_NAMES:
+        return "tui"
+    if name.startswith(_BRAINSTORM_PREFIX):
+        return "tui"
+    for prefix in _AGENT_PREFIXES:
+        if name.startswith(prefix):
+            return "agent"
+    return "other"
+
+
+class _WrappingListView(ListView):
+    """ListView that wraps cursor around when reaching edges."""
+
+    def action_cursor_down(self) -> None:
+        old = self.index
+        super().action_cursor_down()
+        if self.index == old and old is not None:
+            # At bottom — wrap to first selectable item
+            for i, child in enumerate(self.children):
+                if isinstance(child, ListItem) and not child.disabled:
+                    self.index = i
+                    return
+
+    def action_cursor_up(self) -> None:
+        old = self.index
+        super().action_cursor_up()
+        if self.index == old and old is not None:
+            # At top — wrap to last selectable item
+            items = list(self.children)
+            for i in range(len(items) - 1, -1, -1):
+                if isinstance(items[i], ListItem) and not items[i].disabled:
+                    self.index = i
+                    return
+
+
+class _GroupHeader(ListItem):
+    """Non-selectable group separator in the switcher list."""
+
+    def __init__(self, title: str) -> None:
+        super().__init__()
+        self._title = title
+        self.disabled = True
+
+    def compose(self):
+        yield Static(f"[bold dim]\u2500\u2500 {self._title} \u2500\u2500[/]")
+
+
+class _TuiListItem(ListItem):
+    """A list item representing a TUI entry in the switcher."""
+
+    def __init__(self, name: str, label: str, running: bool, is_current: bool) -> None:
+        super().__init__()
+        self.tui_name = name
+        self.tui_label = label
+        self.running = running
+        self.is_current = is_current
+
+    def compose(self):
+        if self.is_current:
+            indicator = "[bold cyan]\u25b6[/]"
+            style = "bold cyan"
+        elif self.running:
+            indicator = f"[{TUI_RUNNING_STYLE}]\u25cf[/]"
+            style = TUI_RUNNING_STYLE
+        else:
+            indicator = "[dim]\u25cb[/]"
+            style = "dim"
+        # Show shortcut hint if this TUI has one (resolved so a rebind shows).
+        shortcut = _resolve_tui_shortcut(self.tui_name)
+        hint = (
+            f" [{TUI_KEY_HINT_STYLE}]({_markup_literal(display_form(shortcut))})[/]"
+            if shortcut and not self.is_current
+            else ""
+        )
+        yield Static(f" {indicator}  [{style}]{self.tui_label}[/]{hint}")
+
+
+class _WindowListItem(ListItem):
+    """A list item representing a non-TUI tmux window."""
+
+    def __init__(self, window_name: str, window_id: str) -> None:
+        super().__init__()
+        self.window_name = window_name
+        # The tmux window id (``@N``), never the index (t2230).
+        self.window_id = window_id
+
+    def compose(self):
+        yield Static(f" [{TUI_RUNNING_STYLE}]\u25cf[/]  {self.window_name}")
+
+
+# Quick-jump bindings, registered under `shared.tui_switcher` so they surface
+# in the in-TUI `?` editor and the Settings \u2192 Shortcuts tab and pick up user
+# overrides. Only these are customizable; see TuiSwitcherOverlay.BINDINGS.
+_QUICK_JUMP_BINDINGS = [
+    Binding("a", "shortcut_applink", "App Linker", show=False),
+    Binding("l", "shortcut_chatlink", "Chat Link", show=False),
+    Binding("b", "shortcut_board", "Board", show=False),
+    Binding("i", "shortcut_trails", "Trails", show=False),
+    Binding("m", "shortcut_monitor", "Monitor", show=False),
+    Binding("f", "shortcut_frozenagent", "Frozen Agent", show=False),
+    Binding("c", "shortcut_codebrowser", "Code Browser", show=False),
+    Binding("s", "shortcut_settings", "Settings", show=False),
+    Binding("t", "shortcut_stats", "Statistics", show=False),
+    Binding("y", "shortcut_syncer", "Syncer", show=False),
+    Binding("r", "shortcut_brainstorm", "Brainstorm", show=False),
+    Binding("x", "shortcut_explore", "Explore", show=False),
+    Binding("X", "shortcut_explore_pick", "Explore (pick agent)", show=False),
+    Binding("g", "shortcut_git", "Git", show=False),
+    Binding("n", "shortcut_create", "New Task", show=False),
+    Binding("e", "shortcut_agent", "Code Agent", show=False),
+    Binding("M", "spawn_minimonitor", "Minimonitor here", show=False),
+    # t2175_5: open (or switch to) the selected session's repository sitrep
+    # agent window — `ait sitrep open --root <root> --session <session>`.
+    Binding("S", "shortcut_sitrep", "Sitrep", show=False),
+]
+
+#: Hosts whose window never gets a switcher-spawned companion: they ARE the
+#: monitor, so a companion would be a second one.
+_COMPANION_INELIGIBLE_HOSTS = frozenset({"monitor", "minimonitor"})
+
+
+class _CompanionTarget(NamedTuple):
+    """The host TUI's own pane, beside which the companion key would split.
+
+    Only the pane id is carried, never the window's session or index: the
+    window is re-resolved from the pane when the key is pressed, because a
+    ``renumber-windows`` shift while the overlay is open can hand the
+    mount-time index to a neighbouring window (t2230).
+    """
+
+    pane: str
+    project_root: Path
+
+def _normalized_keys(key: str) -> frozenset[str]:
+    """The Textual key name(s) a binding on ``key`` actually listens for.
+
+    Uses Textual's own unrolling and normalisation (``Binding.make_bindings``):
+    ``"["`` becomes ``left_square_bracket`` and ``"b,k"`` becomes two keys. So a
+    collision check compares what Textual dispatches on, not the raw config
+    spelling.
+    """
+    return frozenset(
+        b.key for b in Binding.make_bindings([Binding(key, "noop", show=False)])
+    )
+
+
+# The quick-jumps with user overrides applied: the keys the overlay really
+# binds. Named once so the collision check below reads the LIVE keys. A rebound
+# quick-jump vacates its default key and occupies its new one.
+_QUICK_JUMP_LIVE_BINDINGS = register_app_bindings(
+    _TUI_SWITCHER_SCOPE, _QUICK_JUMP_BINDINGS
+)
+
+# The overlay closes on the same key that opens it (a toggle). The shared "open
+# switcher" key is resolved at import, so a rebind of the open key carries over
+# to the close key — unless it collides with a key the overlay already uses.
+# Then the fixed or quick-jump key wins, and the toggle gets no close binding.
+# `[` / `]` are reserved for group navigation: they are `priority=True`, so a
+# close binding on them could never fire while there is a group to move to
+# (t2180). Escape always closes regardless.
+_OVERLAY_OPEN_KEY = resolve_key("shared", "tui_switcher", "j") or "j"
+_OVERLAY_RESERVED_KEYS = frozenset().union(
+    *(_normalized_keys(k) for k in ("escape", "enter", "left", "right", "[", "]")),
+    *(_normalized_keys(b.key) for b in _QUICK_JUMP_LIVE_BINDINGS),
+)
+#: Whether the open key also closes the overlay. This one value decides both the
+#: close binding (BINDINGS) and what the hint advertises (_render_hint), so the
+#: hint can never name a key that does not close.
+_OVERLAY_TOGGLE_CLOSES = not (
+    _normalized_keys(_OVERLAY_OPEN_KEY) & _OVERLAY_RESERVED_KEYS
+)
+
+
+class TuiSwitcherOverlay(ModalScreen):
+    """Modal overlay listing known TUIs with status and quick-switch capability."""
+
+    DEFAULT_CSS = """
+    TuiSwitcherOverlay {
+        align: center middle;
+    }
+    #switcher_dialog {
+        width: 44;
+        height: 100%;
+        max-height: 30;
+        background: $surface;
+        border: thick $primary;
+        padding: 1 2;
+    }
+    #switcher_title {
+        text-align: center;
+        text-style: bold;
+        padding: 0 0 1 0;
+        width: 100%;
+    }
+    #switcher_session_row {
+        text-align: center;
+        padding: 0 0 1 0;
+        color: $text;
+        width: 100%;
+    }
+    #switcher_desync {
+        text-align: center;
+        padding: 0 0 1 0;
+        color: $text-muted;
+        width: 100%;
+    }
+    #switcher_list {
+        height: 1fr;
+        min-height: 3;
+    }
+    #switcher_hint {
+        dock: bottom;
+        text-align: center;
+        padding: 1 0 0 0;
+        color: $text-muted;
+        width: 100%;
+    }
+    """
+
+    # Structural keys stay fixed literals; only the quick-jumps are registered
+    # (customizable). The import-time register_app_bindings() call
+    # (_QUICK_JUMP_LIVE_BINDINGS, spliced here) is what wires user overrides into
+    # Textual's live key map AND records the defaults for the editor, mirroring
+    # brainstorm_dag_display.py. The `j`→close toggle tracks the resolved open
+    # key (_OVERLAY_OPEN_KEY), and is bound only when it collides with nothing
+    # above (_OVERLAY_TOGGLE_CLOSES).
+    BINDINGS = [
+        Binding("escape", "dismiss_overlay", "Close", show=False),
+        Binding("enter", "select_tui", "Switch", show=False),
+        Binding("left", "prev_session", "Prev session", show=False, priority=True),
+        Binding("right", "next_session", "Next session", show=False, priority=True),
+        Binding("[", "prev_group", "Prev group", show=False, priority=True),
+        Binding("]", "next_group", "Next group", show=False, priority=True),
+        *(
+            [Binding(_OVERLAY_OPEN_KEY, "dismiss_overlay", "Close", show=False)]
+            if _OVERLAY_TOGGLE_CLOSES
+            else []
+        ),
+        *_QUICK_JUMP_LIVE_BINDINGS,
+    ]
+
+    #: The host TUI's own window, when the companion key is offered there.
+    #: Resolved in on_mount; None hides the hint and makes the key a no-op. A
+    #: class default, so an overlay that never mounted reads None too.
+    _companion_target: _CompanionTarget | None = None
+
+    def __init__(
+        self,
+        session: str,
+        current_tui: str = "",
+        selected_session: str | None = None,
+        narrow: bool = False,
+    ) -> None:
+        super().__init__()
+        # Identity is the unique project_root key (t1099), NOT the tmux session
+        # name — several registered repos can share `session="aitasks"` via the
+        # default-session fallback, so a name is not a reliable identity. The
+        # OPERATING session name is derived from the selected entry via the
+        # `_session` property below (single source of truth; it can never
+        # disagree with the selected entry). Callers pre-select a non-attached
+        # session via ``selected_session`` (e.g. monitor / minimonitor opening
+        # the switcher with the focused agent's session already selected — t836).
+        self._provisional_session = selected_session or session
+        self._has_preselection = selected_session is not None
+        # Provisional identity until discovery resolves it to a real key in
+        # _init_multi_state; pre-discovery the `_session` property returns it
+        # verbatim, preserving legacy single-session behavior.
+        self._selected_key: str = self._provisional_session
+        # _attached_session is the tmux client's current session — used only
+        # by _render_session_row (to mark the attached session with ▶) and
+        # _teleport_if_cross (to decide whether switch-client is needed).
+        self._attached_session = session
+        self._current_tui = current_tui
+        # Whether the switcher's dialogs (currently the raw-agent
+        # AgentCommandScreen) render in the narrow small-pane layout. Set by the
+        # host App via _switcher_narrow() — True for minimonitor, False for the
+        # wide TUIs (board, full monitor). See action_shortcut_agent.
+        self._narrow = narrow
+        self._running_names: set[str] = set()
+        # Multi-session state. Populated in on_mount via
+        # discover_aitasks_sessions(); remains empty / False when only one
+        # aitasks session is running on the server.
+        self._all_sessions: list[AitasksSession] = []
+        self._multi_mode: bool = False
+        # Selected project-group axis (t1025_2). left/right cycles the ring
+        # derived for this group; `[` / `]` cycles which group is selected.
+        # Resolved in on_mount once _all_sessions is populated.
+        self._selected_group: str | None = None
+
+    # ─── Selected-entry resolution (t1099) ──────────────────────────────────
+    #
+    # `_selected_key` is the single source of truth for the selection; the tmux
+    # session name and project root are always derived from the matching entry,
+    # so a session-name collision (two `aitasks` repos) can never route an
+    # action to the wrong project.
+
+    def _selected_entry(self) -> AitasksSession | None:
+        for s in self._all_sessions:
+            if s.key == self._selected_key:
+                return s
+        return None
+
+    @property
+    def _session(self) -> str:
+        """The OPERATING session name — the tmux label/target of the selected
+        entry, derived from `_selected_key`. Falls back to the provisional key
+        when no entry matches (legacy single-session / pre-discovery)."""
+        entry = self._selected_entry()
+        return entry.session if entry is not None else self._selected_key
+
+    def _selected_project_root(self) -> Path:
+        """Project root of the selected entry (t1099). Falls back to the cwd,
+        preserving the legacy single-session behavior when no entry matches."""
+        entry = self._selected_entry()
+        return entry.project_root if entry is not None else Path.cwd()
+
+    def _resolve_initial_key(self) -> str:
+        """Resolve `_selected_key` from the provisional session name via unique
+        context (t1099), shared by _init_multi_state and on_registry_refresh.
+
+        An explicit cross-repo preselection is resolved by session name (the
+        focused live session is unique); otherwise the attached case uses the
+        launch cwd to disambiguate two entries that share `session="aitasks"`.
+        Keeps the provisional string when nothing resolves.
+        """
+        key = resolve_selected_key(
+            self._all_sessions,
+            provisional_session=self._provisional_session,
+            cwd=None if self._has_preselection else Path.cwd(),
+        )
+        return key if key is not None else self._provisional_session
+
+    def compose(self):
+        with Container(id="switcher_dialog"):
+            yield Label("TUI Switcher", id="switcher_title")
+            yield Label("", id="switcher_session_row")
+            yield Label("", id="switcher_desync")
+            yield _WrappingListView(id="switcher_list")
+            yield Label("", id="switcher_hint")
+
+    def on_mount(self) -> None:
+        # include_registered=True surfaces projects from the per-user
+        # registry (~/.config/aitasks/projects.yaml) even when no live
+        # tmux session exists for them. Selecting one bootstraps its
+        # session on-demand (see _ensure_session_live below).
+        self._init_multi_state(discover_aitasks_sessions(include_registered=True))
+        # Default the group axis to the SELECTED (operating) session's group —
+        # the selected key, NOT self._attached_session — so a switcher opened
+        # with a cross-group preselected session (monitor / minimonitor, t836)
+        # lands on that session's group, keeping the preselected repo in the ring.
+        self._selected_group = default_selected_group(
+            self._all_sessions, self._selected_key
+        )
+        self._companion_target = self._resolve_companion_target()
+        self._render_hint()
+        self._render_session_row()
+        self._render_desync_line(self._selected_project_root())
+        self._populate_list_for(self._session)
+
+    def _resolve_companion_target(self) -> _CompanionTarget | None:
+        """The host TUI's own window, when a companion may be offered there.
+
+        The window is ``$TMUX_PANE``'s, verified against the gateway server —
+        independent of the session being browsed with Left/Right. Only the pane
+        is kept; :meth:`action_spawn_minimonitor` re-resolves its window. Fails
+        closed: an ineligible host, an unverifiable pane, or a probe that could
+        not tell (None) all hide the option.
+        """
+        if (not self._current_tui
+                or self._current_tui in _COMPANION_INELIGIBLE_HOSTS):
+            return None
+        pane = os.environ.get("TMUX_PANE", "")
+        location = gateway_pane_window(pane, os.environ.get("TMUX", ""))
+        if location is None:
+            return None
+        if companion_present(pane) is not False:   # present, or unknown
+            return None
+        return _CompanionTarget(pane, Path.cwd())
+
+    def _handle_stale_selection(self) -> bool:
+        """If the SELECTED session is a STALE registry entry, push the
+        StaleEntryModal and return True so the caller short-circuits
+        and does NOT proceed with bootstrap/spawn. Returns False when
+        the entry is not stale (or not tracked) so the caller proceeds
+        normally.
+        """
+        entry = self._selected_entry()
+        if entry is None:
+            return False
+        if not entry.is_stale:
+            return False
+        self._push_stale_modal(entry.project_name, entry.project_root)
+        return True
+
+    def _push_stale_modal(self, name: str, project_root: Path) -> None:
+        self.app.push_screen(StaleEntryModal(name, project_root))
+
+    def on_registry_refresh(self, event: RegistryRefresh) -> None:
+        """Re-run session discovery and rebuild the Session: row after
+        the StaleEntryModal mutates the registry (prune or repoint).
+        """
+        event.stop()
+        self._all_sessions = discover_aitasks_sessions(include_registered=True)
+        # Selected entry may have been removed (prune); fall back to the attached
+        # session (by unique context) so subsequent actions are well-defined.
+        if self._selected_entry() is None:
+            fallback = resolve_selected_key(
+                self._all_sessions,
+                provisional_session=self._attached_session,
+                cwd=Path.cwd(),
+            )
+            if fallback is not None:
+                self._selected_key = fallback
+        self._render_session_row()
+        self._render_desync_line(self._selected_project_root())
+        self._populate_list_for(self._session)
+
+    def _ensure_session_live(self) -> bool:
+        """Bootstrap the selected session if it is registered-but-inactive.
+
+        Called before any action that would spawn a window in
+        ``self._session``. Looks up the entry in ``self._all_sessions``;
+        when ``is_live=False``, runs ``tmux_bootstrap.sh`` (through
+        ``bootstrap_project_session``, shared with the linked-trail jump) to
+        create the session, then flips the cached entry's ``is_live``
+        flag. No-op for live entries and for sessions not tracked in
+        ``self._all_sessions`` (legacy single-session fallback).
+
+        Returns True on success or no-op; False if the bootstrap helper
+        failed (a user-facing notification is emitted in that case).
+        """
+        entry = self._selected_entry()
+        if entry is None or entry.is_live:
+            return True
+        result = bootstrap_project_session(entry.project_root)
+        if not result.ok:
+            if result.stale:
+                # Race: entry was OK at switcher mount but went STALE
+                # before bootstrap. Push the same modal as the up-front
+                # guard so the user can prune/repoint inline.
+                self._push_stale_modal(
+                    entry.project_name, entry.project_root,
+                )
+                return False
+            self.app.notify(
+                f"Failed to bootstrap session for {entry.project_name}: "
+                f"{result.error}",
+                severity="error",
+            )
+            return False
+        # The bootstrap succeeded, but under the fallback name if the project's
+        # tmux.default_session could not be read (t1811). This is the one moment
+        # the user is creating that session, so say so: the discovery-time field
+        # and the helper's stderr sentinel are two routes to the same shape.
+        problem = entry.default_session_problem or result.default_session_problem
+        if problem:
+            if problem == "illegal_tmux_name":
+                # Read fine, unusable anyway (t1828) — neither sentence below
+                # applies: it IS a single-line plain value in valid YAML.
+                what = ("tmux.default_session holds `.` or `:`, which tmux "
+                        "reads as target separators")
+            elif problem in DEFAULT_SESSION_FILE_SHAPES:
+                what = f"project_config.yaml is not valid YAML ({problem})"
+            else:
+                what = (f"tmux.default_session is not a single-line plain or "
+                        f"quoted value ({problem})")
+            self.app.notify(
+                f"{entry.project_name}: {what}; using session "
+                f"'{DEFAULT_TMUX_SESSION}'",
+                severity="warning",
+            )
+        # Flip the cached entry to live so _teleport_if_cross and any
+        # follow-up actions in this overlay session no longer re-trigger
+        # the bootstrap. Dataclass is frozen, so replace only is_live via
+        # dataclasses.replace — a hand-rebuilt AitasksSession(...) would reset
+        # project_group (and is_stale) to their defaults and silently drop a
+        # registered grouped project out of its group after bootstrap (t1025_2).
+        # Locate by unique identity key (t1099) — the tmux session name may be
+        # shared by another repo.
+        for i, s in enumerate(self._all_sessions):
+            if s.key == entry.key:
+                self._all_sessions[i] = dataclasses.replace(entry, is_live=True)
+                break
+        return True
+
+    def _spawn_in_session(
+        self,
+        window_name: str,
+        cmd: str,
+        *,
+        capture_pane_id: bool = False,
+    ):
+        """Run ``tmux new-window`` in the SELECTED session with the right cwd.
+
+        Centralizes the ``-c <project_root>`` flag so cross-session spawns
+        land in the SELECTED session's project directory (not the attached
+        session's cwd). When ``capture_pane_id`` is True, runs synchronously
+        through the gateway and returns the ``(returncode, stdout)`` tuple so
+        callers can read the pane id; otherwise returns the async ``Popen``
+        for fire-and-forget use.
+        """
+        project_root = self._selected_project_root()
+        argv = ["new-window", "-t",
+                tmux_window_target(self._session, ""),
+                "-c", str(project_root),
+                "-n", window_name]
+        if capture_pane_id:
+            argv += ["-P", "-F", "#{pane_id}", cmd]
+            return _TMUX.run(argv)
+        argv += [cmd]
+        return _TMUX.spawn(
+            argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+
+    def _init_multi_state(self, sessions: list[AitasksSession]) -> None:
+        """Decide `_multi_mode` from the discovered sessions.
+
+        True iff at least two aitasks sessions exist (live OR registered
+        but inactive) AND the attached session is one of them. If the
+        overlay was opened from a non-aitasks session (no live entry
+        matches the attached session), fall back to single-session view
+        — even if the registry has entries, since the user is not
+        currently working in an aitasks project context.
+        """
+        self._all_sessions = sessions
+        self._multi_mode = (
+            len(sessions) >= 2
+            and any(s.session == self._attached_session for s in sessions)
+        )
+        # Resolve the provisional session name to a unique identity key via
+        # unique context (cwd walk-up / is_live preference), so a default-session
+        # collision cannot select the wrong repo (t1099).
+        self._selected_key = self._resolve_initial_key()
+        # If the resolution did not land on a discovered entry (e.g. the agent's
+        # session died between focus and overlay push), fall back to the attached
+        # session so the session-row markers and _cycle_session indexing stay
+        # consistent.
+        if sessions and self._selected_entry() is None:
+            fallback = resolve_selected_key(
+                sessions, provisional_session=self._attached_session, cwd=None
+            )
+            if fallback is not None:
+                self._selected_key = fallback
+
+    def _render_hint(self) -> None:
+        hint = self.query_one("#switcher_hint", Label)
+        text = "  ".join(
+            _hint_segment(action_id, label, default_key)
+            for action_id, label, default_key in _HINT_ITEMS
+        ) + "\n"
+        # Advertise the open key as a close key only when it is bound as one
+        # (_OVERLAY_TOGGLE_CLOSES); a toggle that lost a collision closes nothing.
+        if _OVERLAY_TOGGLE_CLOSES:
+            toggle = _markup_literal(display_form(_OVERLAY_OPEN_KEY))
+            close = f"[{TUI_KEY_HINT_STYLE}]{toggle}/Esc[/] close"
+        else:
+            close = f"[{TUI_KEY_HINT_STYLE}]Esc[/] close"
+        if self._companion_target is not None:
+            text += _hint_segment(
+                "spawn_minimonitor", "minimonitor", "M", spell_shift=True,
+            ) + "  "
+        if self._multi_mode:
+            text += (
+                f"[{TUI_KEY_HINT_STYLE}]Enter[/] switch  "
+                f"[{TUI_KEY_HINT_STYLE}]←/→[/] session  "
+            )
+            groups = group_sessions(
+                self._all_sessions, self._selected_group
+            ).groups
+            if len(groups) >= 2:
+                text += f"[{TUI_KEY_HINT_STYLE}]\\[/][/] group  "
+            text += close
+        else:
+            text += f"[{TUI_KEY_HINT_STYLE}]Enter[/] switch  " + close
+        hint.update(text)
+
+    def _render_session_row(self) -> None:
+        """Render the top session row; hidden in single-session mode.
+
+        `display = False` so the row contributes zero rows (its
+        `padding: 0 0 1 0` would otherwise consume one row even when the
+        text is empty, stealing space the docked footer needs in small
+        panes — see t789).
+        """
+        row = self.query_one("#switcher_session_row", Label)
+        if not self._multi_mode:
+            row.update("")
+            row.display = False
+            return
+        row.display = True
+        parts = []
+        # Show ONLY the selected group's projects (t1036). left/right crosses
+        # group boundaries and re-renders this row to the next group's members,
+        # so a per-group view stays exhaustive without listing every session.
+        members = group_members(self._all_sessions, self._selected_group)
+        # Session-name-primary labels (t1099): a unique session renders as the
+        # bare name (narrow-panel-friendly, unchanged from before); colliding
+        # `aitasks` rows disambiguate compactly by project name, escalating to a
+        # unique compact root if the project names also clash.
+        names = disambiguate_labels(
+            [s.session for s in members],
+            [s.project_name for s in members],
+            [str(s.project_root) for s in members],
+        )
+        for s, name in zip(members, names):
+            attached = s.is_live and s.session == self._attached_session
+            selected = s.key == self._selected_key
+            prefix = "▶ " if attached else "  "
+            suffix = " (stale)" if s.is_stale else ""
+            label = f"{prefix}{name}{suffix}"
+            if s.is_stale:
+                # STALE rows render dimmed regardless of selection so
+                # the status remains unambiguous; selection still shows
+                # via reverse on the dimmed text.
+                if selected:
+                    parts.append(f"[reverse][dim]{label}[/][/]")
+                else:
+                    parts.append(f"[dim]{label}[/]")
+            elif selected:
+                parts.append(f"[reverse]{label}[/]")
+            else:
+                parts.append(f"[dim]{label}[/]")
+        # Surface the selected project-group axis (t1025_2) only when there is a
+        # real group to disambiguate (more than the synthetic ungrouped bucket).
+        prefix = ""
+        groups = group_sessions(self._all_sessions, self._selected_group).groups
+        if any(g != PROJECT_GROUP_UNGROUPED_LABEL for g in groups):
+            glabel = self._selected_group or PROJECT_GROUP_UNGROUPED_LABEL
+            prefix = f"[{TUI_KEY_HINT_STYLE}]\\[{glabel}][/]  "
+        row.update(prefix + "Session: " + "  ".join(parts))
+
+    def _render_desync_line(self, project_root: Path) -> None:
+        """Render a compact desync summary line for the selected session's project.
+
+        Invokes ``desync_state.py snapshot --format lines`` as a subprocess
+        with ``cwd=project_root`` so the result reflects the SELECTED
+        session's project (not whichever project owns this Python file).
+        Result is cached on the class for ~30 seconds keyed on project_root
+        to avoid re-invoking on every Left/Right cycle.
+        """
+        line_widgets = self.query("#switcher_desync")
+        if not line_widgets:
+            return
+        line_widget = line_widgets.first(Label)
+        text = self._compute_desync_summary(project_root)
+        line_widget.update(text)
+
+    _DESYNC_TTL_SECONDS = 30
+    _desync_cache: dict[str, tuple[float, str]] = {}
+
+    @classmethod
+    def _compute_desync_summary(cls, project_root: Path) -> str:
+        import time
+        key = str(project_root)
+        now = time.monotonic()
+        cached = cls._desync_cache.get(key)
+        if cached and (now - cached[0]) < cls._DESYNC_TTL_SECONDS:
+            return cached[1]
+        text = cls._fetch_desync_summary(project_root)
+        cls._desync_cache[key] = (now, text)
+        return text
+
+    @staticmethod
+    def _fetch_desync_summary(project_root: Path) -> str:
+        helper = (
+            Path(__file__).resolve().parent / "desync_state.py"
+        )
+        try:
+            proc = subprocess.run(
+                [sys.executable, str(helper), "snapshot", "--format", "lines"],
+                cwd=str(project_root),
+                capture_output=True, text=True, timeout=3,
+            )
+        except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+            return "[dim]desync: unavailable[/]"
+        if proc.returncode != 0:
+            return "[dim]desync: unavailable[/]"
+        return _format_desync_lines(proc.stdout)
+
+    def _populate_list_for(self, session: str) -> None:
+        """Fill the ListView with TUIs and windows from the given session.
+
+        Called on_mount and on every Left/Right session cycle. Clears the
+        ListView first so re-renders are clean. The "current TUI" disabled
+        marker only applies when `session == self._attached_session`
+        (otherwise the user is browsing a different session and no item
+        in that session is "the one I'm attached to right now").
+        """
+        running_windows = _session_windows(session)
+        self._running_names = {name for _, _, name in running_windows}
+        is_attached_session = session == self._attached_session
+
+        list_view = self.query_one("#switcher_list", _WrappingListView)
+        list_view.clear()
+        item_idx = 0
+        first_selectable_idx = None
+
+        # --- TUI Group ---
+        list_view.append(_GroupHeader("TUIs"))
+        item_idx += 1
+
+        # Resolve by the selected entry's unique key (t1099), not by session
+        # name — two repos can share `session="aitasks"`. _populate_list_for is
+        # always invoked with the selected session (`self._session`).
+        session_project_root = self._selected_project_root()
+        for name, label, _cmd in _build_tui_list(session_project_root):
+            is_current = is_attached_session and name == self._current_tui
+            running = name in self._running_names
+            item = _TuiListItem(name, label, running, is_current)
+            if is_current:
+                item.disabled = True
+            elif first_selectable_idx is None:
+                first_selectable_idx = item_idx
+            list_view.append(item)
+            item_idx += 1
+
+        # --- Dynamic brainstorm session entries ---
+        # Scan the SELECTED session's project (session_project_root, set
+        # above) so on-disk brainstorm sessions follow Left/Right cycling
+        # instead of always reflecting the attached session's project (t814).
+        brainstorm_sessions = _discover_brainstorm_sessions(session_project_root)
+        all_brainstorm_nums = set(brainstorm_sessions)
+        for name in self._running_names:
+            if name.startswith(_BRAINSTORM_PREFIX):
+                all_brainstorm_nums.add(name[len(_BRAINSTORM_PREFIX):])
+        for task_num in sorted(all_brainstorm_nums):
+            win_name = f"{_BRAINSTORM_PREFIX}{task_num}"
+            label = f"Brainstorm (t{task_num})"
+            running = win_name in self._running_names
+            is_current = is_attached_session and win_name == self._current_tui
+            item = _TuiListItem(win_name, label, running, is_current)
+            if is_current:
+                item.disabled = True
+            elif first_selectable_idx is None:
+                first_selectable_idx = item_idx
+            list_view.append(item)
+            item_idx += 1
+
+        # --- Classify non-TUI windows ---
+        agents = []
+        others = []
+        for win_id, _win_idx, win_name in running_windows:
+            cat = _classify_window(win_name)
+            # Already listed in the TUI group above, brainstorm-<n> included.
+            if cat == "tui":
+                continue
+            if cat == "agent":
+                agents.append((win_id, win_name))
+            else:
+                others.append((win_id, win_name))
+
+        # --- Agent Group ---
+        if agents:
+            list_view.append(_GroupHeader("Code Agents"))
+            item_idx += 1
+            for win_id, win_name in agents:
+                if first_selectable_idx is None:
+                    first_selectable_idx = item_idx
+                list_view.append(_WindowListItem(win_name, win_id))
+                item_idx += 1
+
+        # --- Other Group ---
+        if others:
+            list_view.append(_GroupHeader("Other"))
+            item_idx += 1
+            for win_id, win_name in others:
+                if first_selectable_idx is None:
+                    first_selectable_idx = item_idx
+                list_view.append(_WindowListItem(win_name, win_id))
+                item_idx += 1
+
+        if first_selectable_idx is not None:
+            list_view.index = first_selectable_idx
+
+    def action_dismiss_overlay(self) -> None:
+        self.dismiss(None)
+
+    def action_prev_session(self) -> None:
+        self._cycle_session(-1)
+
+    def action_next_session(self) -> None:
+        self._cycle_session(+1)
+
+    def action_prev_group(self) -> None:
+        self._cycle_group(-1)
+
+    def action_next_group(self) -> None:
+        self._cycle_group(+1)
+
+    def _group_member_names(self) -> list[str]:
+        """Session names in the SELECTED group only (t1036).
+
+        Used by ``[`` / ``]`` group cycling to decide whether the operating
+        session still belongs to the newly selected group. left/right no longer
+        cycles this list — it walks the cross-group ring (:func:`cross_group_ring`)
+        so it can cross group boundaries.
+        """
+        return [s.session for s in group_members(
+            self._all_sessions, self._selected_group
+        )]
+
+    def _refresh_after_cycle(self) -> None:
+        """Shared refresh trio after left/right or `[`/`]` changes the selection."""
+        self._render_session_row()
+        self._render_desync_line(self._selected_project_root())
+        self._populate_list_for(self._session)
+
+    def _switcher_list_or_skip(self):
+        # Priority-binding guard (CLAUDE.md "Priority bindings + App.query_one"):
+        # scope the guard to this screen via self.screen.query_one and
+        # SkipAction on miss so underlying screens don't have their keys
+        # consumed. Same pattern as board's action_focus_minimap.
+        from textual.actions import SkipAction
+        try:
+            self.screen.query_one("#switcher_list", _WrappingListView)
+        except Exception:
+            raise SkipAction()
+
+    def _cycle_session(self, step: int) -> None:
+        from textual.actions import SkipAction
+        self._switcher_list_or_skip()
+        # left/right walks ONE continuous ring across all groups (t1036):
+        # stepping off a group's last/first member crosses into the adjacent
+        # group (wrapping globally) and re-points the selected-group axis.
+        entries = cross_group_ring(self._all_sessions)
+        if not self._multi_mode or len(entries) < 2:
+            raise SkipAction()
+        target = cross_group_step(entries, self._selected_key, step)
+        if target is None:
+            raise SkipAction()
+        self._selected_key = target.key
+        self._selected_group = target.group
+        self._refresh_after_cycle()
+
+    def _cycle_group(self, step: int) -> None:
+        from textual.actions import SkipAction
+        self._switcher_list_or_skip()
+        if not self._multi_mode:
+            raise SkipAction()
+        target = advance_group_selection(
+            self._all_sessions,
+            self._selected_group,
+            self._selected_key,
+            step,
+        )
+        if target is None:
+            raise SkipAction()
+        self._selected_group = target.selected_group
+        if target.repoint_key is not None:
+            self._selected_key = target.repoint_key
+        self._refresh_after_cycle()
+
+    def action_select_tui(self) -> None:
+        list_view = self.query_one("#switcher_list", _WrappingListView)
+        if list_view.highlighted_child is None:
+            return
+        item = list_view.highlighted_child
+        if isinstance(item, _TuiListItem):
+            if item.is_current:
+                return
+            self._switch_to(item.tui_name, item.running)
+        elif isinstance(item, _WindowListItem):
+            self._switch_to(item.window_name, True, item.window_id)
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        item = event.item
+        if isinstance(item, _TuiListItem):
+            if item.is_current:
+                return
+            self._switch_to(item.tui_name, item.running)
+        elif isinstance(item, _WindowListItem):
+            self._switch_to(item.window_name, True, item.window_id)
+
+    def _shortcut_switch(self, target_name: str) -> None:
+        """Switch directly to a specific TUI by name, launching if not running.
+
+        Shortcuts act on the SELECTED (operating) session — `self._session`
+        is mutated by Left/Right. The `is-current` no-op guard only applies
+        when the selected session IS the attached session; otherwise the
+        user is targeting a TUI in a different session and we should always
+        route through `_switch_to`.
+        """
+        if (self._session == self._attached_session
+                and target_name == self._current_tui):
+            return
+        self._switch_to(target_name, target_name in self._running_names)
+
+    def action_shortcut_applink(self) -> None:
+        self._shortcut_switch("applink")
+
+    def action_shortcut_chatlink(self) -> None:
+        self._shortcut_switch("chatlink")
+
+    def action_shortcut_board(self) -> None:
+        self._shortcut_switch("board")
+
+    def action_shortcut_trails(self) -> None:
+        self._shortcut_switch("trails")
+
+    def action_shortcut_monitor(self) -> None:
+        self._shortcut_switch("monitor")
+
+    def action_shortcut_frozenagent(self) -> None:
+        self._shortcut_switch("frozenagent")
+
+    def action_shortcut_codebrowser(self) -> None:
+        self._shortcut_switch("codebrowser")
+
+    def action_shortcut_settings(self) -> None:
+        self._shortcut_switch("settings")
+
+    def action_shortcut_stats(self) -> None:
+        self._shortcut_switch("stats")
+
+    def action_shortcut_syncer(self) -> None:
+        self._shortcut_switch("syncer")
+
+    def action_shortcut_brainstorm(self) -> None:
+        """Switch to first running brainstorm window in the SELECTED session."""
+        for name in sorted(self._running_names):
+            if name.startswith(_BRAINSTORM_PREFIX):
+                # No-op only when already on this brainstorm window in the
+                # attached session; otherwise teleport via _switch_to.
+                if (self._session == self._attached_session
+                        and name == self._current_tui):
+                    return
+                self._switch_to(name, True)
+                return
+        self.app.notify("No brainstorm session running", severity="warning")
+
+    def action_shortcut_git(self) -> None:
+        """Switch to git TUI if configured, no-op otherwise.
+
+        "Configured" is read from the SELECTED session's project (t2180), the
+        same root `_get_launch_command` launches from. The process cwd is the
+        attached TUI's project, which differs in a cross-repo selection.
+        """
+        project_root = self._selected_project_root()
+        if not any(name == "git" for name, _, _ in _build_tui_list(project_root)):
+            return
+        self._shortcut_switch("git")
+
+    def action_shortcut_explore(self) -> None:
+        """Launch a new explore agent session (always new window) in the SELECTED session."""
+        if self._handle_stale_selection():
+            return
+        if not self._ensure_session_live():
+            return
+        n = 1
+        while f"agent-explore-{n}" in self._running_names:
+            n += 1
+        window_name = f"agent-explore-{n}"
+        project_root = self._selected_project_root()
+        try:
+            self._spawn_in_session(window_name, "ait codeagent invoke explore")
+            from agent_launch_utils import maybe_spawn_minimonitor
+            maybe_spawn_minimonitor(
+                self._session, window_name, project_root=project_root,
+            )
+            self._teleport_if_cross()
+        except (FileNotFoundError, OSError):
+            self.app.notify("Failed to launch explore", severity="error")
+            return
+        self.dismiss(window_name)
+
+    def action_shortcut_sitrep(self) -> None:
+        """Open or switch to the SELECTED session's sitrep window (t2175_5).
+
+        Shortcut-on-selected, like every quick-jump: the root is the selected
+        session's project and the window goes into that session. The launch can
+        take seconds (agent start + stamp), so it runs as a worker on the host
+        App after the overlay closes, and its result arrives as a toast.
+        """
+        if self._handle_stale_selection():
+            return
+        if not self._ensure_session_live():
+            return
+        root = str(self._selected_project_root())
+        session = self._session
+        app = self.app
+        self.dismiss(None)
+        self._dispatch_sitrep_open(app, root, session)
+
+    def _dispatch_sitrep_open(self, app, root: str, session: str) -> None:
+        """The one sync seam that starts the worker (tests stub THIS)."""
+        app.run_worker(_open_sitrep_async(app, root, session),
+                       name="sitrep_open", group="sitrep-open",
+                       exclusive=False, exit_on_error=False)
+
+    def action_shortcut_explore_pick(self) -> None:
+        """Launch an explore agent after opening the agent/model picker dialog.
+
+        Unlike ``action_shortcut_explore`` (fire-and-forget via
+        ``_spawn_in_session`` with the wrapper's default agent), this opens the
+        shared ``AgentCommandScreen`` for ``operation="explore"`` so the user can
+        confirm / change the code agent and model before the explore session
+        starts. Mirrors ``action_shortcut_agent``; the only differences are the
+        explore operation, the ``agent-explore-N`` window base, and a non-empty
+        prompt string.
+        """
+        if self._handle_stale_selection():
+            return
+        if not self._ensure_session_live():
+            return
+        project_root = self._selected_project_root()
+        from agent_command_screen import AgentCommandScreen
+        from agent_launch_utils import (
+            TmuxLaunchConfig,
+            find_terminal,
+            launch_in_tmux,
+            maybe_spawn_minimonitor,
+            resolve_agent_string,
+            resolve_dry_run_command,
+            spawn_in_terminal,
+        )
+        full_cmd = resolve_dry_run_command(project_root, "explore")
+        if not full_cmd:
+            self.app.notify(
+                "Could not resolve agent command — check model configuration.",
+                severity="error",
+            )
+            return
+        agent_string = resolve_agent_string(project_root, "explore")
+        n = 1
+        while f"agent-explore-{n}" in self._running_names:
+            n += 1
+        window_name = f"agent-explore-{n}"
+        screen = AgentCommandScreen(
+            "Launch Explore (pick agent)",
+            full_cmd,
+            "/aitask-explore",
+            default_window_name=window_name,
+            project_root=project_root,
+            operation="explore",
+            operation_args=[],
+            default_agent_string=agent_string,
+            default_tmux_session=self._session,
+            narrow=self._narrow,
+        )
+
+        def on_result(result) -> None:
+            if isinstance(result, TmuxLaunchConfig):
+                _, err = launch_in_tmux(screen.full_command, result)
+                if err:
+                    self.app.notify(err, severity="error")
+                else:
+                    if result.new_window:
+                        maybe_spawn_minimonitor(
+                            result.session, result.window,
+                            project_root=project_root,
+                        )
+                    # Follow the launch to the session the user CONFIRMED in
+                    # the dialog. A new session needs no teleport here:
+                    # launch_in_tmux already switch-clients into it.
+                    if not result.new_session:
+                        self._teleport_if_cross(result.session)
+                self.dismiss(window_name)
+            elif result == "run":
+                terminal = find_terminal()
+                if terminal:
+                    spawn_in_terminal(
+                        terminal, ["sh", "-c", screen.full_command],
+                        cwd=str(project_root),
+                    )
+                    self.dismiss(window_name)
+                else:
+                    self.app.notify(
+                        "No terminal emulator found", severity="error",
+                    )
+            # result is None (cancelled) → leave the overlay open
+
+        self.app.push_screen(screen, on_result)
+
+    def action_shortcut_create(self) -> None:
+        """Launch ait create in a new tmux window in the SELECTED session."""
+        if self._handle_stale_selection():
+            return
+        if not self._ensure_session_live():
+            return
+        project_root = self._selected_project_root()
+        try:
+            proc = self._spawn_in_session("create-task", "ait create")
+            proc.wait()
+            from agent_launch_utils import maybe_spawn_minimonitor
+            maybe_spawn_minimonitor(
+                self._session, "create-task", project_root=project_root,
+            )
+            self._teleport_if_cross()
+        except (FileNotFoundError, OSError):
+            self.app.notify("Failed to launch create", severity="error")
+            return
+        self.dismiss("create-task")
+
+    def action_shortcut_agent(self) -> None:
+        """Open the agent command dialog to launch a bare code agent (no task).
+
+        Unlike the explore/create shortcuts (which fire-and-forget via
+        ``_spawn_in_session``), this opens the shared ``AgentCommandScreen`` with
+        ``operation="raw"`` and an empty prompt so the user can pick agent /
+        model / tmux target before starting an interactive agent that runs no
+        ``/aitask-*`` slash command.
+        """
+        if self._handle_stale_selection():
+            return
+        if not self._ensure_session_live():
+            return
+        project_root = self._selected_project_root()
+        from agent_command_screen import AgentCommandScreen
+        from agent_launch_utils import (
+            TmuxLaunchConfig,
+            find_terminal,
+            launch_in_tmux,
+            maybe_spawn_minimonitor,
+            resolve_agent_string,
+            resolve_dry_run_command,
+            spawn_in_terminal,
+        )
+        full_cmd = resolve_dry_run_command(project_root, "raw")
+        if not full_cmd:
+            self.app.notify(
+                "Could not resolve agent command — check model configuration.",
+                severity="error",
+            )
+            return
+        agent_string = resolve_agent_string(project_root, "raw")
+        n = 1
+        while f"agent-raw-{n}" in self._running_names:
+            n += 1
+        window_name = f"agent-raw-{n}"
+        screen = AgentCommandScreen(
+            "Launch Code Agent (no task)",
+            full_cmd,
+            "",  # empty prompt — no task / no slash command
+            default_window_name=window_name,
+            project_root=project_root,
+            operation="raw",
+            operation_args=[],
+            default_agent_string=agent_string,
+            default_tmux_session=self._session,
+            narrow=self._narrow,
+        )
+
+        def on_result(result) -> None:
+            if isinstance(result, TmuxLaunchConfig):
+                _, err = launch_in_tmux(screen.full_command, result)
+                if err:
+                    self.app.notify(err, severity="error")
+                else:
+                    if result.new_window:
+                        maybe_spawn_minimonitor(
+                            result.session, result.window,
+                            project_root=project_root,
+                        )
+                    # Follow the launch to the session the user CONFIRMED in
+                    # the dialog. A new session needs no teleport here:
+                    # launch_in_tmux already switch-clients into it.
+                    if not result.new_session:
+                        self._teleport_if_cross(result.session)
+                self.dismiss(window_name)
+            elif result == "run":
+                terminal = find_terminal()
+                if terminal:
+                    spawn_in_terminal(
+                        terminal, ["sh", "-c", screen.full_command],
+                        cwd=str(project_root),
+                    )
+                    self.dismiss(window_name)
+                else:
+                    self.app.notify(
+                        "No terminal emulator found", severity="error",
+                    )
+            # result is None (cancelled) → leave the overlay open
+
+        self.app.push_screen(screen, on_result)
+
+    def action_spawn_minimonitor(self) -> None:
+        """Split a minimonitor into the window of the TUI this switcher was
+        opened from — never the browsed session's.
+
+        The mount-time probe only decides whether to offer it; the locked check
+        in maybe_spawn_minimonitor decides whether it happens, and arms the
+        cleanup hook on the TUI pane (explicit ``agent_pane``).
+
+        The pane id is the identity. Its window is resolved here, at key time,
+        not at mount: a window closed while the overlay was open renumbers the
+        ones after it (t2230). maybe_spawn_minimonitor's own check that the
+        window's listing contains ``agent_pane`` closes what is left of that
+        race fail-closed.
+        """
+        target = self._companion_target
+        if target is None:
+            return
+        location = gateway_pane_window(target.pane, os.environ.get("TMUX", ""))
+        if location is None:
+            self.app.notify(
+                "Minimonitor not added: this TUI's pane could not be located",
+                severity="warning",
+            )
+            return
+        session, window_index = location
+        from agent_launch_utils import maybe_spawn_minimonitor
+        companion = maybe_spawn_minimonitor(
+            session, self._current_tui,
+            window_index=window_index, force_companion=True,
+            explicit=True, project_root=target.project_root,
+            agent_pane=target.pane,
+        )
+        if companion is None:
+            self.app.notify(
+                "Minimonitor not added: this window already has one, holds 3+ "
+                "panes, or tmux was busy",
+                severity="warning",
+            )
+            return
+        self.dismiss(None)
+
+    def _switch_to(self, name: str, running: bool, window_id: str | None = None) -> None:
+        # If the selected entry is a STALE registry row (t826_10), push
+        # the StaleEntryModal up-front so the user can prune/repoint
+        # without burning a failing bootstrap subprocess first.
+        if self._handle_stale_selection():
+            return
+        # Bootstrap the selected session if it is registered-but-inactive
+        # (t826_2). No-op for live sessions.
+        if not self._ensure_session_live():
+            return
+        try:
+            if running:
+                # A window row targets its id (`=<session>:@N`); a TUI row its
+                # name. Wait for the answer: when the window has gone since the
+                # overlay listed it, the teleport below must NOT run — it would
+                # land the client on that session's active window, a different
+                # window than the one chosen (t2230).
+                target = tmux_window_target(
+                    self._session, window_id if window_id else name
+                )
+                rc, _ = _TMUX.run(["select-window", "-t", target])
+                if rc != 0:
+                    self.app.notify(
+                        f"Window {_markup_literal(name)} is no longer there",
+                        severity="warning",
+                    )
+                    return
+            elif name == "git":
+                self._launch_git_with_companion()
+            else:
+                project_root = self._selected_project_root()
+                cmd = self._get_launch_command(name, project_root)
+                self._spawn_in_session(name, cmd)
+            # Cross-session: teleport the attached client to the selected
+            # session. Per agent_launch_utils.switch_to_pane_anywhere's
+            # precedent, the target-window operation runs first (setting the
+            # selected session's active window or creating it), then the
+            # switch-client call lands the client there.
+            self._teleport_if_cross()
+        except (FileNotFoundError, OSError):
+            self.app.notify(f"Failed to switch to {name}", severity="error")
+            return
+        self.dismiss(name)
+
+    def _teleport_if_cross(self, session: str | None = None) -> None:
+        """Issue `tmux switch-client` when the target session differs from attached.
+
+        The target defaults to the selected session; the agent-dialog paths
+        pass the session the user confirmed in the dialog instead.
+        """
+        target = session or self._session
+        if target == self._attached_session:
+            return
+        try:
+            _TMUX.spawn(
+                ["switch-client", "-t", tmux_session_target(target)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except (FileNotFoundError, OSError):
+            # Best-effort — if the client detached between selection and
+            # this call, switch-client fails silently; the overlay still
+            # dismisses cleanly.
+            pass
+
+    def _launch_git_with_companion(self) -> None:
+        """Launch the git TUI in a new window with a companion minimonitor.
+
+        Wires a pane-scoped `pane-died` hook on the git pane — via
+        `agent_launch_utils.attach_companion_cleanup_hook`, the one place that
+        does this — so that when the git tool exits, the companion is despawned
+        only if no other sibling pane (user-added shell, codeagent sharing the
+        companion, etc.) is still using the window.
+        """
+        project_root = self._selected_project_root()
+        cmd = self._get_launch_command("git", project_root)
+        rc, stdout = self._spawn_in_session("git", cmd, capture_pane_id=True)
+        if rc != 0:
+            self.app.notify("Failed to launch git TUI", severity="error")
+            return
+        primary_pane = stdout.strip()
+        if not primary_pane:
+            return
+
+        from agent_launch_utils import maybe_spawn_minimonitor
+        companion_pane = maybe_spawn_minimonitor(
+            self._session, "git", force_companion=True,
+            project_root=project_root,
+        )
+
+        if companion_pane:
+            # Slot-safe: attach_companion_cleanup_hook probes show-hooks and
+            # appends at the first free pane-died index. This used to be an
+            # open-coded bare `set-hook -p … pane-died`, which writes index [0]
+            # and silently destroys whatever hook already sits there — the exact
+            # overwrite hazard that helper exists to avoid (t1451).
+            #
+            # Not redundant with the arming inside maybe_spawn_minimonitor
+            # above: that call derives its agent pane from display-message on
+            # the window, whereas primary_pane here is the git pane id captured
+            # directly from the spawn. When both fire with the same pair the
+            # second returns "existing" and installs nothing.
+            from agent_launch_utils import attach_companion_cleanup_hook
+            attach_companion_cleanup_hook(primary_pane, companion_pane)
+
+        # Cross-session teleport is handled by `_switch_to` after this
+        # helper returns — do not issue an additional `switch-client` here.
+
+    @staticmethod
+    def _get_launch_command(name: str, project_root: Path | None = None) -> str:
+        for tui_name, _, cmd in _build_tui_list(project_root):
+            if tui_name == name:
+                return cmd
+        if name.startswith(_BRAINSTORM_PREFIX):
+            task_num = name[len(_BRAINSTORM_PREFIX):]
+            return f"ait brainstorm {task_num}"
+        return f"ait {name}"
+
+
+class TuiSwitcherMixin:
+    """Mixin for Textual Apps to add TUI switcher support.
+
+    Usage:
+        class MyApp(TuiSwitcherMixin, App):
+            BINDINGS = [
+                *TuiSwitcherMixin.SWITCHER_BINDINGS,
+                ...
+            ]
+            def __init__(self):
+                super().__init__()
+                self.current_tui_name = "board"
+    """
+
+    SWITCHER_BINDINGS = [
+        Binding("j", "tui_switcher", "TUI switcher", show=False),
+    ]
+
+    def _switcher_selected_session(self) -> str | None:
+        """Return a tmux session name to pre-select in the switcher overlay.
+
+        Override in subclasses (e.g. monitor / minimonitor) to open the
+        switcher with the focused agent's session already selected.
+        Default ``None`` means use the attached session — the original
+        single-session behavior.
+        """
+        return None
+
+    def _switcher_narrow(self) -> bool:
+        """Whether the switcher's dialogs should use the narrow (small-pane)
+        layout.
+
+        Override in subclasses hosted in a narrow tmux pane (minimonitor) so the
+        raw-agent AgentCommandScreen stacks its rows vertically to fit. Default
+        ``False`` — the wide TUIs (board, full monitor) keep the full layout.
+        """
+        return False
+
+    def action_tui_switcher(self) -> None:
+        if not os.environ.get("TMUX"):
+            self.notify("TUI switcher requires tmux", severity="warning")
+            return
+        # The caller's own session, verified against its server (t1951): it is
+        # the ATTACHED session — a client property, so no project-ownership
+        # check. A caller on another server gets None and the configured one.
+        session = current_tmux_session()
+        if session is None:
+            defaults = load_tmux_defaults(Path.cwd())
+            session = defaults.get("default_session", "aitasks")
+        current = getattr(self, "current_tui_name", "")
+        selected = self._switcher_selected_session()
+        narrow = self._switcher_narrow()
+        self.push_screen(TuiSwitcherOverlay(
+            session=session, current_tui=current, selected_session=selected,
+            narrow=narrow,
+        ))
+
+
+#: `ait sitrep open` launches an agent and waits for its stamp (t2175_5).
+_SITREP_OPEN_TIMEOUT = 45.0
+
+
+async def _open_sitrep_async(app, root: str, session: str) -> None:
+    """Run `aitask_sitrep.sh open --root R --session S`; toast the result.
+
+    Killed (and the cancellation re-raised) if the host App exits first; a
+    timeout kills the child too. The wording is `sitrep_cli.sitrep_open_message`,
+    shared with the monitor TUIs' `S` key.
+    """
+    import asyncio
+    from sitrep_cli import sitrep_open_message
+
+    script = Path(__file__).resolve().parent.parent / "aitask_sitrep.sh"
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            str(script), "open", "--root", root, "--session", session,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+    except OSError as exc:
+        app.notify(f"Sitrep not opened: {exc}", severity="error", markup=False)
+        return
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(),
+                                        timeout=_SITREP_OPEN_TIMEOUT)
+    except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        if isinstance(exc, asyncio.CancelledError):
+            raise
+        app.notify("Sitrep not opened: timed out", severity="error")
+        return
+    msg, severity = sitrep_open_message(
+        proc.returncode or 0, out.decode("utf-8", "replace"))
+    app.notify(msg, severity=severity, markup=False)
+
+
+# Register the switcher binding under a synthetic "shared" scope so the
+# t848_4 shortcuts editor can surface it from every TUI (the `j` key is
+# bound in every host App via the mixin, but the editor enumerates by
+# scope, not by host).
+register_app_bindings("shared", TuiSwitcherMixin.SWITCHER_BINDINGS)

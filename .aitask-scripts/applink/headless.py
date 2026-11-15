@@ -1,0 +1,347 @@
+"""Headless runner for the ait applink bridge (t822_13).
+
+Runs the applink WebSocket listener (control plane + binary push loop) with **no
+Textual TUI** — for a box nobody is watching. It is reached via
+``ait monitor --headless-for-applink`` (the ``aitask_monitor.sh`` launcher routes
+the flag here), NOT through ``applink_app.py`` (which imports Textual at module
+top).
+
+The whole server stack (``server`` / ``router`` / ``pusher`` / ``sessions`` /
+``profiles`` / ``tls`` / ``pairing`` / ``paths`` / ``monitor_core``) is already
+Textual-free, so this runner just assembles the collaborators, starts
+:class:`server.AppLinkServer`, prints the pairing info to stdout, and idles until
+a signal. **This module must never import** ``applink_app`` or ``qr_widget`` —
+both pull in Textual; the no-Textual contract is asserted by
+``tests/test_applink_headless.sh``.
+
+Pairing (headless): there is no TTY to press ``r``, so the runner prints the
+``applink://…`` pairing URI + the cert fingerprint + an ASCII QR to stdout at
+startup. ``SIGHUP`` mints a fresh pairing token and reprints (the no-TTY
+equivalent of the TUI "regenerate"; it never touches already-issued bearers —
+the t822_2 stable-connection-ID invariant). ``SIGINT``/``SIGTERM`` stop cleanly.
+Already-paired bearers persist in ``sessions.json`` across restarts.
+"""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import io
+import signal
+import socket
+import sys
+from pathlib import Path
+
+_APPLINK_DIR = Path(__file__).resolve().parent
+_SCRIPTS_DIR = _APPLINK_DIR.parent
+for _p in (str(_APPLINK_DIR), str(_SCRIPTS_DIR)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+import segno  # noqa: E402
+
+import firewall_doctor  # noqa: E402
+from pairing import (  # noqa: E402
+    advertise_host_argtype,
+    advertise_port_argtype,
+    build_pairing_uri,
+    detect_lan_ip,
+    merge_tunnel_endpoint,
+    resolve_advertised_endpoints,
+)
+from paths import profiles_dir, project_root, sessions_dir  # noqa: E402
+from profiles import ProfileGate  # noqa: E402
+from sessions import SessionTable  # noqa: E402
+from server import (  # noqa: E402
+    AppLinkServer, DEFAULT_PORT, DEFAULT_PAIR_PROFILE, load_applink_config,
+)
+from tls import CertManager, CertError  # noqa: E402
+from tunnel import STATE_STARTING  # noqa: E402
+
+
+def render_pairing_block(uri: str, fingerprint: str, *, show_qr: bool = True) -> str:
+    """Build the stdout pairing block (pure — no I/O, unit-testable).
+
+    Returns the header, fingerprint, pair URL, a hint, and (unless *show_qr* is
+    False) an ASCII QR of *uri* rendered with ``segno``.
+    """
+    lines = [
+        "",
+        "=== ait applink — headless bridge ===",
+        f"Fingerprint: {fingerprint}",
+        f"Pair URL:    {uri}",
+        "Scan the QR (or open the URL) with the ait companion app.",
+        "Signals: SIGHUP = new pairing token + reprint · SIGINT/SIGTERM = stop.",
+    ]
+    block = "\n".join(lines)
+    if show_qr:
+        buf = io.StringIO()
+        segno.make(uri).terminal(buf, border=1)
+        block += "\n\n" + buf.getvalue()
+    return block
+
+
+async def serve(
+    *,
+    port: int,
+    profile: str,
+    show_qr: bool = True,
+    advertise_host: str | None = None,
+    advertise_port: int | None = None,
+    advertise_kind: str | None = None,
+    advertise_trust: str | None = None,
+    auto_tunnel: bool = False,
+) -> int:
+    """Run the headless applink listener until a stop signal. Returns an exit code.
+
+    Input validation happens **before any state-mutating side effect**: an
+    unknown ``--profile`` is rejected before the pairing token is minted, the
+    TLS cert is generated, or any socket is opened. ``CertManager`` and
+    ``SessionTable`` are referenced as module globals so a test can monkeypatch
+    them to prove they are not constructed on the bad-profile path.
+    """
+    # 1. Validate the profile first — ProfileGate.load only reads YAML (no
+    #    token, no cert, no socket), so a typo fails clean with zero side effects.
+    profile_gate = ProfileGate.load(profiles_dir())
+    valid = profile_gate.names()
+    if profile not in valid:
+        print(
+            f"Unknown applink profile {profile!r}. "
+            f"Valid profiles: {', '.join(sorted(valid)) or '(none configured)'}.",
+            file=sys.stderr,
+        )
+        return 2
+
+    # 2. Ensure the persistent self-signed cert (wss:// is the baseline — no
+    #    plaintext fallback, mirroring AppLinkServer.start()).
+    cert = CertManager(sessions_dir())
+    try:
+        fingerprint = cert.fingerprint()
+        ssl_ctx = cert.ssl_context()
+    except (CertError, OSError) as exc:
+        print(f"Cannot start applink bridge: {exc}", file=sys.stderr)
+        return 1
+
+    # 3. Session table + a fresh single-use pairing token.
+    session_table = SessionTable(sessions_dir())
+    token = session_table.mint_pairing_token()
+
+    # 4. Build and start the listener. Auto-tunnel (t1061_3): CLI flag or
+    #    tmux.applink.auto_tunnel config enables the cloudflared quick-tunnel
+    #    supervisor, owned by the server (spawned after the listener binds).
+    applink_cfg = load_applink_config(project_root())
+    tunnel_backend = "cloudflared" if auto_tunnel else applink_cfg["auto_tunnel"]
+    server = AppLinkServer(
+        session_table=session_table,
+        profile_gate=profile_gate,
+        ssl_context=ssl_ctx,
+        port=port,
+        pair_profile=profile,
+        on_change=None,
+        tunnel_backend=tunnel_backend,
+    )
+    await server.start()
+    if server.error:
+        print(f"applink listener error: {server.error}", file=sys.stderr)
+        await server.stop()
+        return 1
+
+    # 5. Print the pairing block (refreshed on SIGHUP via _emit).
+    lan_ip = detect_lan_ip()
+    host = socket.gethostname()
+    # Advertised-endpoint override (t1061_1): CLI group > config group > LAN.
+    # The static config is resolved once; SIGHUP reprints re-mint only the
+    # token. The auto-tunnel endpoint however arrives asynchronously, so it is
+    # merged at EACH emit (never captured in a snapshot) — a SIGHUP after a
+    # late tunnel-up picks it up.
+    adv = resolve_advertised_endpoints(
+        serving_port=port,
+        detected_ip=lan_ip,
+        config=applink_cfg,
+        cli_host=advertise_host,
+        cli_port=advertise_port,
+        cli_kind=advertise_kind,
+        cli_trust=advertise_trust,
+    )
+
+    def _emit() -> None:
+        merged = merge_tunnel_endpoint(adv, server.tunnel_endpoint())
+        uri = build_pairing_uri(
+            token, merged.primary.host, merged.primary.port, fingerprint,
+            host or None,
+            kind=merged.primary.kind if merged.override else None,
+            trust=merged.primary.trust if merged.override else None,
+            alt=merged.alts or None,
+        )
+        print(render_pairing_block(uri, fingerprint, show_qr=show_qr), flush=True)
+
+    if server.tunnel is not None:
+        # Hold the first pairing block until the public URL is known (bounded)
+        # so the printed QR carries the tunnel endpoint. On timeout/failure the
+        # LAN-only block prints with a fail-visible hint (SIGHUP re-emits with
+        # the tunnel once it comes up).
+        url = await server.tunnel.wait_url()
+        _emit()
+        print(f"[applink] {server.tunnel.status_line()}", flush=True)
+        if url is None and server.tunnel.state == STATE_STARTING:
+            print(
+                "[applink] tunnel URL not ready yet — send SIGHUP to reprint "
+                "the pairing block once the tunnel is up.",
+                flush=True,
+            )
+    else:
+        _emit()
+    if adv.warning:
+        # Invalid config override degraded to the LAN address — fail-visible.
+        print(f"[applink] {adv.warning}", flush=True)
+
+    # 5b. Firewall doctor: if a host firewall may block the bound port, advise
+    #     and print the exact LAN-scoped open command. Off-thread + failure-silent
+    #     (non-systemd / slow box never delays startup). No keypress affordance —
+    #     no TTY here; informational only, the user runs the printed command.
+    try:
+        fw = await asyncio.to_thread(
+            firewall_doctor.diagnose, port, lan_ip,
+            adv.primary.host if adv.override else None,
+        )
+    except Exception:
+        fw = None
+    if fw is not None:
+        if fw.detected:
+            print(firewall_doctor.render_firewall_block(fw), flush=True)
+        else:
+            example = firewall_doctor.display_command(
+                firewall_doctor.build_open_commands("ufw", port, fw.cidr)
+            )
+            note = f" {fw.override_note}" if fw.override_note else ""
+            print(
+                f"\n[firewall] No managed firewall auto-detected. If the phone "
+                f"can't connect, open port {port} for {fw.cidr} — e.g. "
+                f"`{example}` (use your backend's command if not ufw).{note}",
+                flush=True,
+            )
+
+    # 6. Signals: SIGINT/SIGTERM stop; SIGHUP re-mints the token and reprints.
+    loop = asyncio.get_running_loop()
+    stop = asyncio.Event()
+
+    def _reprint() -> None:
+        nonlocal token
+        try:
+            token = session_table.mint_pairing_token()
+            _emit()
+        except Exception:
+            # A reprint failure must never take the server down.
+            pass
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, stop.set)
+        except (NotImplementedError, RuntimeError):
+            pass
+    if hasattr(signal, "SIGHUP"):
+        try:
+            loop.add_signal_handler(signal.SIGHUP, _reprint)
+        except (NotImplementedError, RuntimeError):
+            pass
+
+    # 7. Idle until a stop signal, then shut down cleanly.
+    try:
+        await stop.wait()
+    finally:
+        await server.stop()
+    return 0
+
+
+def _parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="ait monitor --headless-for-applink",
+        description=(
+            "Run the ait applink bridge headless (no TUI) on an unattended box: "
+            "serve the mobile companion listener and print pairing info to stdout."
+        ),
+    )
+    parser.add_argument(
+        "--port", type=int, default=DEFAULT_PORT,
+        help=f"TCP port for the wss:// listener (default {DEFAULT_PORT}).",
+    )
+    parser.add_argument(
+        "--profile", default=DEFAULT_PAIR_PROFILE,
+        help=(
+            "Permission profile assigned to a newly paired device "
+            f"(default {DEFAULT_PAIR_PROFILE})."
+        ),
+    )
+    parser.add_argument(
+        "--no-qr", action="store_true",
+        help="Print only the pairing URL + fingerprint, no ASCII QR "
+             "(useful when redirecting stdout to a log file).",
+    )
+    parser.add_argument(
+        "--auto-tunnel", action="store_true",
+        help="Auto-spawn a Cloudflare Quick Tunnel and advertise its public "
+             "hostname as a CA-trusted alternate endpoint in the pairing QR "
+             "(also enabled by tmux.applink.auto_tunnel: cloudflared).",
+    )
+    _add_advertise_args(parser)
+    args = parser.parse_args(argv)
+    _validate_advertise_args(parser, args)
+    return args
+
+
+def _add_advertise_args(parser: argparse.ArgumentParser) -> None:
+    """Advertised-endpoint override flags (t1061_1). Any of these makes the
+    CLI define the entire override — all ``tmux.applink.advertised_*`` config
+    keys are then ignored (group precedence, no field mixing)."""
+    parser.add_argument(
+        "--advertise-host", type=advertise_host_argtype, default=None,
+        help="Advertise this host (FQDN or IP; host:port accepted) in the "
+             "pairing QR instead of the detected LAN IP. Advertisement-only: "
+             "the server still binds 0.0.0.0. Overrides ALL "
+             "tmux.applink.advertised_* config keys.",
+    )
+    parser.add_argument(
+        "--advertise-port", type=advertise_port_argtype, default=None,
+        help="Port to advertise, 1-65535 (default: the serving port; a "
+             "tunnel may expose a different public port).",
+    )
+    parser.add_argument(
+        "--advertise-kind", choices=("lan", "mesh", "tunnel"), default=None,
+        help="Endpoint kind hint for client racing (default: mesh).",
+    )
+    parser.add_argument(
+        "--advertise-trust", choices=("pin", "ca"), default=None,
+        help="Trust mode of the advertised endpoint (default: pin). Use ca "
+             "only for a TLS-terminating tunnel endpoint.",
+    )
+
+
+def _validate_advertise_args(
+    parser: argparse.ArgumentParser, args: argparse.Namespace,
+) -> None:
+    """`--advertise-port/-kind/-trust` are meaningless without a host."""
+    if args.advertise_host is None and any(
+        v is not None
+        for v in (args.advertise_port, args.advertise_kind, args.advertise_trust)
+    ):
+        parser.error(
+            "--advertise-port/--advertise-kind/--advertise-trust require "
+            "--advertise-host"
+        )
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parse_args(list(argv) if argv is not None else sys.argv[1:])
+    return asyncio.run(
+        serve(
+            port=args.port, profile=args.profile, show_qr=not args.no_qr,
+            advertise_host=args.advertise_host,
+            advertise_port=args.advertise_port,
+            advertise_kind=args.advertise_kind,
+            advertise_trust=args.advertise_trust,
+            auto_tunnel=args.auto_tunnel,
+        )
+    )
+
+
+if __name__ == "__main__":
+    sys.exit(main())
