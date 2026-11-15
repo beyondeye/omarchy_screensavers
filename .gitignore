@@ -46,3 +46,7 @@ __pycache__/
 
 # Discovery caches (per-checkout, content-keyed, safe to delete)
 .aitask-cache/
+
+# Framework worktrees (local, per-task and per-crew branches)
+aiwork/
+.aitask-crews/
