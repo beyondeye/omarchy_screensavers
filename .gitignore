@@ -43,3 +43,6 @@ __pycache__/
 
 # Sitrep todo store (per-repo, local-only; not rebuildable)
 .aitask-sitrep/
+
+# Discovery caches (per-checkout, content-keyed, safe to delete)
+.aitask-cache/
