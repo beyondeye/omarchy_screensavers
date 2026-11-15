@@ -1,18 +1,19 @@
-# omarchy_screensavers
+# The dev workspace
 
-A workspace for writing new Omarchy screensaver effects.
+A workspace for writing new Omarchy screensaver effects. New here? Start with
+[onboarding.md](onboarding.md).
 
 ```
 omarchy_screensavers/
 ├── .cargo/config.toml     # [patch]: builds here use ./ttfx instead of the GitHub tag
-├── Makefile               # try / run / headless / check / status
+├── Makefile               # setup / try / run / headless / check / status
 ├── aidocs/                # these docs
-├── ttfx/                  # clone of omacom/ttfx: the effects (branch feat/stub-effect)
-└── omarchy-screensaver/   # clone of omacom/omarchy-screensaver: the Wayland overlay
+├── ttfx/                  # submodule: beyondeye/ttfx, branch feat/stub-effect (the effects)
+└── omarchy-screensaver/   # submodule: beyondeye/omarchy-screensaver, branch main (the Wayland overlay)
 ```
 
-Both clones are their own git repositories and are ignored by this one.
-`make setup` recreates them.
+Both submodules are forks of `omacom/...`. Each has `origin` (the fork, where you
+push) and `upstream` (omacom, where PRs go). `make setup` adds the `upstream` remotes.
 
 ## The loop
 
@@ -22,6 +23,7 @@ make try EFFECT=wipe        # compare with an existing effect
 make headless               # render through the real screensaver, no display
 make run                    # the real overlay on every monitor; any input dismisses it
 make check                  # tests in both repos
+make status                 # branch and changes in both submodules
 ```
 
 For step-by-step testing, with checklists, see [../testing/manual_testing.md](../testing/manual_testing.md).
@@ -40,14 +42,21 @@ Effect options go to ttfx directly, e.g.
 To rename it: rename the file, then replace `stub`/`Stub`/`StubConfig` in those three
 files. Keep the lists alphabetical.
 
-## Submitting
+## Known quirk: omarchy-screensaver's Cargo.lock
+
+The `[patch]` in `.cargo/config.toml` swaps the GitHub ttfx for `./ttfx`, so the first build
+rewrites `omarchy-screensaver/Cargo.lock`. That change is local only and should never be
+committed. `.gitmodules` sets `ignore = dirty` for that submodule, so the workspace's
+`git status` doesn't flag it. Before committing *inside* `omarchy-screensaver`, run
+`git -C omarchy-screensaver checkout Cargo.lock`.
+
+## Submitting upstream
 
 - **The effect:** ttfx is a byte-exact port of
   [TerminalTextEffects](https://github.com/ChrisBuilds/terminaltexteffects) and asks
   for effect ideas to go upstream first. Open an issue there, land the Python
-  effect, then PR the Rust port to `omacom/ttfx`. A new ttfx tag then has to be
-  pulled into `omarchy-screensaver/Cargo.toml`.
-- **Screensaver behaviour:** PR to `omacom/omarchy-screensaver`.
-- Fork first and add your fork as a remote (`gh repo fork --remote` inside a clone).
-- Don't commit `omarchy-screensaver/Cargo.lock` changes: they come from the local
-  `[patch]`. Run `git -C omarchy-screensaver checkout Cargo.lock` before committing there.
+  effect, then PR the Rust port from `beyondeye/ttfx` to `omacom/ttfx`. A new ttfx tag
+  then has to be pulled into `omarchy-screensaver/Cargo.toml`.
+- **Screensaver behaviour:** branch in `omarchy-screensaver/`, push to the fork, and PR to
+  `omacom/omarchy-screensaver`.
+- Open PRs with `gh pr create --repo omacom/<repo>` from inside the submodule.

@@ -51,6 +51,3 @@ __pycache__/
 aiwork/
 .aitask-crews/
 
-# Upstream clones (each is its own git repo; see README.md)
-/ttfx/
-/omarchy-screensaver/

@@ -1,7 +1,7 @@
 # Workspace for developing Omarchy screensaver effects.
 # Docs: aidocs/workspace/dev_workspace.md, aidocs/testing/manual_testing.md
 #
-#   make setup              clone ttfx and omarchy-screensaver (if missing)
+#   make setup              init the submodules, put them on their branches, add upstream remotes
 #   make try  [EFFECT=stub] play an effect in this terminal (ttfx only, fast loop)
 #   make run  [EFFECT=stub] launch the real screensaver overlay with that effect
 #   make headless [EFFECT=stub]  render it without a display (smoke test)
@@ -16,9 +16,14 @@ TEXT   := $(firstword $(wildcard $(HOME)/.config/omarchy/branding/screensaver.tx
 .PHONY: setup try run headless check status
 
 setup:
-	@[ -d ttfx/.git ] || git clone https://github.com/omacom/ttfx.git
-	@[ -d omarchy-screensaver/.git ] || git clone https://github.com/omacom/omarchy-screensaver.git
-	@echo "ready (local ttfx is wired in via .cargo/config.toml)"
+	git submodule update --init
+	@for r in ttfx omarchy-screensaver; do \
+	  b=$$(git config -f .gitmodules submodule.$$r.branch); \
+	  git -C $$r switch -q $$b 2>/dev/null || git -C $$r switch -q -c $$b --track origin/$$b; \
+	  u=$$(git config -f .gitmodules submodule.$$r.upstream); \
+	  git -C $$r remote get-url upstream >/dev/null 2>&1 || git -C $$r remote add upstream $$u; \
+	done
+	@echo "ready: submodules on their branches, upstream remotes added (local ttfx wired in via .cargo/config.toml)"
 
 $(TTFX) ttfx-build:
 	cd ttfx && cargo build --release

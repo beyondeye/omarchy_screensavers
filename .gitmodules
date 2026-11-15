@@ -1,0 +1,11 @@
+[submodule "ttfx"]
+	path = ttfx
+	url = https://github.com/beyondeye/ttfx.git
+	branch = feat/stub-effect
+	upstream = https://github.com/omacom/ttfx.git
+[submodule "omarchy-screensaver"]
+	path = omarchy-screensaver
+	url = https://github.com/beyondeye/omarchy-screensaver.git
+	branch = main
+	ignore = dirty
+	upstream = https://github.com/omacom/omarchy-screensaver.git
