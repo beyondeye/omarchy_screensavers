@@ -174,3 +174,160 @@ Step 9 (Post-Implementation): archive this child via the task workflow.
 
 ### Planned mitigations
 - timing: post-phase | name: frame_data_guard | type: test | priority: high | effort: low | inline_risk: low | added_complexity: low | addresses: frame-derived data leaking into commits | desc: grep the staged diff for large string/array literals and confirm .refs/ is ignored and untracked before committing
+
+## Implementation status (2026-11-15)
+
+Steps 1–6 done; post-phase frame_data_guard runs at commit time (Step 8).
+
+Deviations from the plan:
+- **Test command**: `python3 -I -m unittest tools/frames2text/test_frames2text.py` cannot import a
+  path-style module under `-I` (cwd not on `sys.path`). The test file adds its own dir to `sys.path`
+  and calls `unittest.main()`, so the command is `python3 -I tools/frames2text/test_frames2text.py`
+  (`python3 -I -m unittest discover -s tools/frames2text` also works).
+- **Storage guard, directories**: `git check-ignore` does not match a dir-only pattern (`/.refs/`)
+  against a directory that does not exist yet unless the path ends in `/`. `check_dest` therefore
+  checks directories with a trailing slash. Writes go through `SafeWriter`: it verifies each file's
+  real parent directory once (ignored + nothing tracked under it, cached) and opens files with
+  `O_NOFOLLOW`. A path inside a `.git` directory is refused too.
+- **chafa optimisation**: kept chafa's default `-O 5`. On flat and striped test images it emitted no
+  REP/cursor CSI. `normalize_frame` rejects every CSI except SGR (after removing `?25h/l`), so a
+  future chafa that emits REP fails loudly instead of miscounting cells.
+- **Extra tests**: an ignored dir holding a force-added tracked file is refused; `.git/` is refused;
+  the CLI refuses a tracked `--out`; the committed scene list loads and totals 55–65 s.
+- **Docs**: besides the CLAUDE.md row, the same row went into AGENTS.md (mirrored table) and a pointer
+  line into README.md.
+- **Scene refinement**: the SpaceX footage ends at **244.04 s**, not ~236 s (236.47–244.04 is the
+  wide shot of the caught ship). Scene 11 runs to 244.0.
+
+Verification results:
+- 22 tests pass (chafa, img2txt and tmux tests ran, not skipped).
+- Real `extract` → `convert` (auto → chafa): 604 frames, 60.4 s, every frame normalised to 33×137.
+- Real `play` in a detached tmux pane of exactly 137×33: all 33 captured rows are 137 cells and row 1
+  starts with colour (no scroll); playback ran 60.46 s wall time with exit 0. In a 100×20 pane:
+  exit 2, the size message, nothing drawn.
+- Converters (604 frames, parallel): chafa 4.2 ms/frame, 133 KB; halfblock 5.6 ms, 129 KB;
+  img2txt 2.0 ms, 48 KB (16-colour ASCII, poor fidelity).
+
+## Notes for t1_2
+
+Cut times (ffmpeg `select='gt(scene,0.10)'`, 0–244 s): 11.01, 37.47, 67.30, 77.58, 124.36, 144.01,
+153.62, 179.11, 183.25, 188.12, 191.69, 219.95, 220.09, 223.72, 231.53, 236.47, 244.04 (CNN starts).
+Kept-scene ranges and speeds are in `tools/frames2text/scenes/starship_flight15.toml` (total 60.4 s:
+10.0 / 6.1 / 6.0 / 3.0 / 4.9 / 6.0 / 4.1 / 7.0 / 13.3 s).
+
+Shot contents (from 1 s frame grabs):
+- 1 liftoff: 0–11.01 pad wide shot (tower left of the rocket, white/orange billows spread both sides
+  of the pad, T+1–T+6). 11.01–18 a high aerial angle, top-down-ish over the coast: one big smoke
+  column leans up-left from the pad while the rocket climbs straight up with a short orange flame. The
+  camera tilts up to the coastline by ~18 s.
+- 2 ascent: rocket mid-frame with a long pink plume against blue sky and horizon (T+17), then a small
+  rocket moving up-right across a blue gradient, shrinking (T+25–31).
+- 3 onboard: a fixed camera along the S42 hull. The hull fills the left ~half diagonally (dark tiles,
+  hex pattern, "S42" marking), the engine end points lower-right, the coast/sea is visible far below.
+- 4 high altitude: near-black navy sky, a bright white engine point with a pink/magenta plume trailing
+  downward, centred.
+- 5 hot staging: same onboard framing. ~79 s first flash; ~80 s orange flames engulf the right half;
+  ~81–84 s the booster separates and falls away down the frame, engines glowing.
+- 6 coast: same framing, sky deep blue; Earth limb arc lower-right; sun glare lower-right; drifting
+  white ice flakes over the upper right.
+- 9 ship over Earth: camera from the other side. The hull fills the left; Earth fills the right
+  half as a big disc; a bright sun with flare at upper right; black space.
+- 10 seco: starts black space with the hull; the plume blooms into a blue-white haze that fills the
+  right of the frame (~200–212 s), then fades.
+- 11 catch: 220.1 wide, two towers on a flat brown coast under an overcast grey sky, the ship as a
+  small dark streak falling (upper middle). 223.7 the camera follows the ship down beside the tower
+  (engines firing, a short orange/pink flame). 231.5 top-down close-up of the steel ship held between
+  the arms. 236.5 wide: the ship hangs on the tower.
+
+Motion measurements (`aitask_screen_recording.sh anim --window`, full-frame signal; camera shake and
+compression make these indicative only):
+- liftoff smoke growth (0–11 s): decelerating, best fit `cubic-bezier(0.325, 0.912, 0, 0.7)` over
+  ~6.1 s (M3 standard `cubic-bezier(0.2,0,0,1)` 6.2 s, nearly as good). The billows expand fast,
+  then slow.
+- ascent (22–37 s): no usable curve. The fit degenerates (`cubic-bezier(0.006, 1.409, …)`): the
+  rocket is a small object on a near-uniform sky. By eye it moves up-right ~0.04 frame-heights/s and
+  shrinks steadily: treat it as linear.
+- SECO bloom (192–219.9 s): decelerating over ~21.6 s, `cubic-bezier(0.05, 0.831, 0.113, 0.925)`
+  (M3 emphasized decelerate `cubic-bezier(0.05,0.7,0.1,1)` is within 0.003 rmse).
+- catch descent (223.8–231.5 s): the camera tracks the ship, so it stays upper-middle while the tower
+  rises into view. It decelerates to rest by ~229.5 s and settles: spring fit dampingRatio ≈ 0.8,
+  stiffness ≈ 24 (settles ~1.3 s), or `cubic-bezier(0.3, 0.866, 0, 1.078)` over ~2.3 s (slight
+  overshoot).
+
+## Post-Review Changes
+
+### Change Request 1 (2026-11-15 13:40)
+- **Requested by user:** four review findings, all verified as valid:
+  1. (high) `SafeWriter` cached each parent dir's eligibility, so a file force-added to git after the
+     first write was overwritten by a reused writer.
+  2. (low) `play --fps` accepted negative values (frames dropped, exit 0) and `0` (fell back to the
+     manifest rate).
+  3. (medium) `extract` deleted the previous frames before ffmpeg had succeeded, leaving a manifest
+     that pointed at missing frames.
+  4. (low) `convert` kept every completed future, and with it every frame's text (~147 MiB for 604
+     frames), until the pool finished.
+- **Changes made:**
+  1. Removed the cache: every write, replace and removal re-runs `check_dest` on that file. Files use
+     a one-call fast path (`git check-ignore -q` exits 0 only for an ignored, untracked path in a work
+     tree; 1 → refused; 128 → the full check: temp root / `.git` refusal). Real extract: 7.2 s (was
+     1.5 s cached; 16.6 s with the full three-call check per file).
+  2. argparse types: `--fps`/`--target-fps` must be finite > 0, `--cols/--rows/--jobs/--once-frames`
+     ≥ 1, `--hold` finite ≥ 0; rejected with exit 2 before anything is drawn. `play()` validates too
+     (and treats `fps=0` as an error, not as "unset").
+  3. `extract` writes into `<out>/.staging-<pid>/`; on any failure (ffmpeg error, a scene with no
+     frames, Ctrl-C) the staging dir is removed and the previous output is untouched. On success
+     `_swap_in` removes the old manifest first, clears old frame files, moves the staged files in
+     (both ends checked), and writes the new manifest last. `convert` writes the manifest with
+     `converter: null` before replacing `.ans` files and sets it only on success, so `play` refuses a
+     half-converted set. A missing/short `.rgb` or missing `.png` is now a clean error, not a traceback.
+  4. `as_completed` loop pops each future from the dict once its result is written; pending futures
+     are cancelled on error.
+  - Tests: 22 → 31 (reused-writer force-add and `.gitignore`-edit regressions, end-to-end
+    extract/convert on a synthetic ffmpeg `testsrc` video, failed re-extract keeps old output
+    (bad video, and a scene past the end), re-extract replaces old scenes, failed convert leaves the
+    manifest unconverted and `play` refuses it, CLI/`play()` fps and grid-arg validation).
+  - Doc: storage-rule paragraph (per-write check, failure consistency), `--fps` note.
+- **Files affected:** `tools/frames2text/frames2text.py`, `tools/frames2text/test_frames2text.py`,
+  `aidocs/starship/reference_tooling.md`
+
+## Final Implementation Notes
+- **Actual work done:** `tools/frames2text/frames2text.py` (stdlib-only CLI: `extract` / `convert` /
+  `play` / `all`), `tools/frames2text/test_frames2text.py` (31 tests), the scene list
+  `tools/frames2text/scenes/starship_flight15.toml` (9 scenes, 60.4 s), `aidocs/starship/reference_tooling.md`,
+  `/.refs/` in `.gitignore`, and a doc pointer in CLAUDE.md, AGENTS.md and README.md. Code commit
+  `572ad6a` (`feature: Add the frames2text reference tool (t1_1)`).
+- **Deviations from plan:** see "Implementation status" and "Post-Review Changes" above. In short:
+  the test command is `python3 -I tools/frames2text/test_frames2text.py`; directories are checked with a
+  trailing `/` for git's dir-only patterns; eligibility is re-checked on every write with a one-call
+  `git check-ignore` fast path (no caching); `extract` stages then swaps; `convert` marks the manifest
+  unconverted while it runs; the CLI validates numeric args; the SpaceX footage ends at 244.04 s (not
+  ~236 s).
+- **Issues encountered:** (review, before implementation) chafa 1.18.3 has no PPM loader → PNG
+  intermediate; chafa/img2txt end with a newline that scrolls a 137×33 terminal → `normalize_frame` and
+  newline-free CUP playback; autowrap-off overwrites the last column → no cropping mode. (Review, after
+  implementation) a cached eligibility verdict, unvalidated `--fps`, destructive re-extract and retained
+  futures → fixed in Change Request 1. With the guard committed, README.md in the working tree also
+  held a "Development workflow" section written by someone else during this session; only this task's
+  one README line was staged and committed (via `git update-index --cacheinfo`). The other section was
+  left uncommitted in the working tree.
+- **Key decisions:** chafa is the default converter (`auto`), halfblock is the built-in fallback and the
+  "what the effect can show" view, img2txt is a forced option only. Scene 9 uses its first stretch
+  (179.15–183.2) because the shot is split by the booster splash. Every per-frame write is
+  re-validated; full extract ~7 s.
+- **Upstream defects identified:** None
+- **Notes for sibling tasks:**
+  - Make the animatic with `tools/frames2text/frames2text.py all "<video>" tools/frames2text/scenes/starship_flight15.toml`
+    (outputs in `.refs/starship/`, gitignored). `play` needs a terminal of at least 137×33. For a
+    pixel-exact half-block view (what the `starship` effect can actually draw), run
+    `convert --converter halfblock`.
+  - Scene timings for the effect's 60 s timeline: 10.0 / 6.1 / 6.0 / 3.0 / 4.9 / 6.0 / 4.1 / 7.0 / 13.3 s
+    (liftoff, ascent, onboard, high_altitude, hot_staging, coast, ship_over_earth, seco, catch). Shot
+    contents, cut times and motion fits are in "Notes for t1_2" above. The `anim` full-frame fits are
+    indicative only; the descent/catch settle (spring, damping ≈ 0.8) and the decelerating bloom/smoke
+    curves are the usable ones.
+  - The webcast HUD (timer, gauges) is in the footage; ignore it when comparing.
+  - Exact-size terminal checks without a display: run inside `tmux -L <sock> -f <conf with "set -g
+    status off">` with `new-session -d -x 137 -y 33`, then `capture-pane -p [-e]`. This works for
+    checking the effect's `make try` output as well.
+  - The storage-guard pattern (`check_dest` + `SafeWriter`) can be reused for any future tool that
+    writes video-derived data.
