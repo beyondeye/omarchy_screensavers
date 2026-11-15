@@ -624,7 +624,7 @@ After scenes 1–3:
 ## Risk
 
 ### Code-health risk: medium
-- ttfx's visual pool never frees appearances, and the screensaver re-seeds every loop, so an unconstrained continuous-colour effect grows memory without bound. · severity: high (residual low: the fixed palette bounds the reachable set at |P|² by construction, and an isolated-process saturation of all of P×P measures the byte ceiling) · → mitigation: inline pre-phase renderer_spike; visual_pool_engine_fix
+- ttfx's visual pool never frees appearances, and the screensaver re-seeds every loop, so an unconstrained continuous-colour effect grows memory without bound. · severity: high (residual low: the fixed palette bounds the reachable set at |P|² by construction, and an isolated-process saturation of all of P×P measures the byte ceiling) · → mitigation: inline pre-phase renderer_spike; t4
 - A slow tick at 120 Hz causes catch-up stutter whenever `starship` is picked from the random rotation. · severity: medium · → mitigation: inline pre-phase renderer_spike (forced every-cell-changes stress run at 4K)
 - Invalid timing args (scale 0/NaN/inf, a seek past the end) could cause a division by zero, bad tick maths, or an immediate `None`. · severity: medium (residual low: parser ranges + seek/scale tests) · → mitigation: none (designed into steps 2 and 4)
 - Signature and threshold tests can be brittle (hand-tuned tolerances across grid sizes). · severity: low · → mitigation: none (the thresholds come from the reference-checked storyboard; tuned values are documented)
