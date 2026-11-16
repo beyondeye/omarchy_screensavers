@@ -12,8 +12,9 @@ active_gates_profile: fast
 active_gates_digest: 5892c63ff1b4.681bafac2cb9.d73bba2fc21f
 assigned_to: dario-e@beyond-eye.com
 anchor: 1
+implemented_with: claudecode/opus5_5
 created_at: 2026-11-15 09:59
-updated_at: 2026-11-16 08:31
+updated_at: 2026-11-16 11:45
 ---
 
 ## Context
@@ -136,3 +137,8 @@ palettes from the storyboard.
 > |   follows the changed-cell count.
 
 > **👁 note:read** id=2026-11-16T06:31:30Z.5f38a5605324a0769f1ace64 by=t1_4 at=2026-11-16T06:31:30Z mode=explicit ids=2026-11-15T15:48:57Z.042e2e6a3e9221e4c46ede17,2026-11-15T21:30:55Z.e97b1b44bef5fcb5b996b58b
+
+## Gate Runs
+<!-- Appended by the gate framework. Do not edit by hand; use `./.aitask-scripts/aitask_gate.sh append` for corrections. -->
+
+> **✅ gate:plan_approved** run=2026-11-16T09:45:52Z status=pass attempt=1 type=human
