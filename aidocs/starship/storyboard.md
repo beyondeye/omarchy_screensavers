@@ -459,9 +459,13 @@ scene 3).
 `#4887ce`, hull `#1f2636`, shadow `#0d0e15`, vapour `#c9d2d9`, booster engine
 glow `#e7bb68`.
 
-**Motion**: the booster accelerates away at 0.04 → 0.20 H/s
-[2.6 → 13 px/s], `InQuad`. (Estimated by eye from 1 s frames: about 0.25 H over
-3.6 s of source × 1.48.) It rotates 10° anticlockwise as it falls. Shake
+**Motion**: the booster accelerates away at 0.04 → 0.75 H/s
+[2.6 → 50 px/s], `InQuad`, along ≈ 115° (mostly down, a little left). That is
+≈ 0.63 H of travel, so its whole body is below the bottom edge by 29.75.
+(The first estimate, 0.04 → 0.20 H/s by eye from 1 s frames, gives only
+≈ 0.22 H and cannot carry the body out of the frame by 29.8.) It rotates 10°
+anticlockwise and shrinks to 0.6 × as it recedes, both in step with the
+distance fallen. Shake
 0.012 H at 9 Hz during the burst (25.95–26.6), 0.003 H otherwise.
 
 **Particles**

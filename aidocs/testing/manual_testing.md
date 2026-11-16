@@ -65,6 +65,11 @@ make try EFFECT=starship TTFX_ARGS="--canvas-width 0 --canvas-height 0 --frame-r
          EFFECT_ARGS="--start-at 16"          # jump to a storyboard time (scene 3)
 ```
 
+Scene start times for `--start-at` (storyboard §1.4): 0 liftoff, 10 ascent,
+16 onboard, 22 high altitude, 25 hot staging (the burst at 25.95, the booster
+from 27.4), 30 coast, 35 ship over Earth, 39 SECO (the bloom from 39.05, stars
+from 44), 45 catch, 58 branding.
+
 `starship` options:
 - `--start-at <s>`: start at that storyboard time, in seconds. It must be in [0, 64).
   The animation is simulated up to that point, so the frame is the same as an
