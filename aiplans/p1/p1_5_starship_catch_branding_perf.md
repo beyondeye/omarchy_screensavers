@@ -630,3 +630,81 @@ Step 9 (Post-Implementation): archive this child via the workflow. The parent t1
 - timing: pre-phase | name: palette_budget | type: chore | priority: high | effort: low | inline_risk: low | added_complexity: low | addresses: palette drift in scenes 1–10; P×P memory | desc: remove the cube and the placeholder, add the scene-11 and text ramps, and pass the palette-error, scene 1–10 signature and starship_pool_ceiling tests before any scene code
 - timing: pre-phase | name: text_bound_ceiling | type: test | priority: high | effort: medium | inline_risk: low | added_complexity: low | addresses: an unbounded or over-gate glyph appearance set | desc: the tier ladder (F/G/approach-path sets, ▀ handoff, combined 10 240 budget incl. engine per-symbol defaults, 5 119-symbol scope) and Glyph in emit_appearance; a fresh-process ceiling case runner (fixture, T0 max, T4 saturation, max supported, full-grid overflow) enforces ≤ 64 MB before the branding scene
 - timing: post-phase | name: frame_data_guard | type: chore | priority: medium | effort: low | inline_risk: low | added_complexity: low | addresses: frame-derived data leaking into commits | desc: grep the staged diff for large literals, confirm .refs/ is ignored, commit only synthetic fixtures
+
+## Post-Review Changes
+
+### Change Request 1 (2026-11-16 21:40)
+- **Requested by user:** four review findings, all confirmed:
+  1. Fades ignored `--duration-scale`: the 1-state-per-tick cap made a 0.25 scale miss hold and jump states (37/61 cells late, a 205 RGB fg jump).
+  2. Plates were reselected from the moving scene each tick, so emitted colours jumped (fg 86.7, bg 65.9 on a full 4K grid of `A`).
+  3. The reveal ranking scanned the whole pool per glyph cell (22 ms on the 58.0 tick for 18 358 glyph cells).
+  4. The fade test took glyph mode from the symbol, so `▀` input glyphs skipped their checks.
+- **Changes made:**
+  1. `text::glyph_state`: a pure storyboard-time schedule. The first and last active ticks are the plain scene, and a tick that would jump across the flat state B shows B. `glyph_state_index_is_tick_aligned` now covers scales 0.25 and 4, and `glyph_fades_are_continuous` adds ×0.25 runs (flat-switch checks and visibility right after 59.5).
+  2. The plate is simulation state (`World::step_plates`, `text::step_plate`). It reads a still, particle-free branding scene (`branding::draw_plate_source`, static base cached) and moves by at most 48 RGB per tick through G's capped entries. It is held while the cell blends or is on its path. G is now anchored on the branding tones only, plus their halfway mixes. New test `glyph_fades_full_grid` (137×33 at 60 fps, 274×67 at 120 fps).
+  3. `branding::rank` bins the smoke into a per-cell grid (allocated in `set_text`) in one pass; the RNG draw per cell is unchanged. A settled plate is re-checked only after its source mean moves by more than 2. Glyph visuals get a cache (as `▀`'s). `omarchy-screensaver/benches/timeline.rs` gains `SSAVER_BENCH_TEXT`.
+  4. `check_glyph_fades` derives glyph mode from the state indices and asserts each cell's symbol separately (own symbol in glyph mode, `▀` otherwise).
+- **Files affected:** `ttfx/src/effects/starship/{text.rs, mod.rs, scenes/mod.rs, scenes/branding.rs, scenes/catch.rs}`, `ttfx/tests/starship.rs`, `omarchy-screensaver/benches/timeline.rs`, `aidocs/starship/storyboard.md`, `aidocs/testing/manual_testing.md`.
+
+## Final Implementation Notes
+- **Actual work done:**
+  - ttfx:
+    - `scenes/catch.rs` (scene 11: 11a–11d, `tower_top_11b`, `arm_angle`, `arms`, `ship_11b`, `draw_11d_base`);
+    - `scenes/branding.rs` (B: billows from 57.5, smoke emitter, density ranking, still plate source);
+    - `text.rs` (bounded glyph cells: text ramp F, plate order G, approach path, tier ladder under a 10 240 combined budget, state schedule, plate stepping);
+    - `mod.rs` (`Glyph` in `emit_appearance`, glyph emission with shadow keys and a visual cache, text plan, test hooks `text_plan`, `glyph_cells`, `glyph_symbols`, `glyph_state_of`, `dt`);
+    - `scenes/mod.rs` (6 new slots, an exhaustive dispatch with the placeholder removed, text slots, plate stepping);
+    - `palette.rs` (cube and placeholder removed, `RAMPS_S11`, `RAMPS_TEXT`, trims, `P_CAP` 320, `ramp_colors`/`rgb_of` public).
+  - Tests: 33 → 44 (+4 ignored dev aids), and the ceiling test is now a fresh-process case runner (5 cases).
+  - omarchy-screensaver: `SSAVER_BENCH_TEXT` in the timeline bench.
+  - Workspace docs: storyboard §2.9 notes and §3 rewritten (reveal, reverse dissolve, plates, supported input); `manual_testing.md` (start times, `--anchor-text c`, bench text, memory/stress notes).
+- **Measurements:**
+  - **Palette:** |P| 338 → 317. Palette error synthetic mean 4.94 / p99 14.90; real frames mean 3.11 / p99 12.17. Plate error mean 7.68 / p99 9.11.
+  - **Ceiling** (4K, rebuild overlap, fresh process each):
+
+    | Case | Ceiling (MB) |
+    |---|---|
+    | fixture | 58.72 |
+    | t0_max | 59.22 |
+    | t4_saturate | 59.51 |
+    | max_supported | 59.53 |
+    | overflow_full_grid | 62.87 |
+
+    Model ratio ≤ 1.036 and regrowth 0 in every case.
+  - **Signatures (1080p):**
+
+    | Shot | Near colours | Near-black | Bright |
+    |---|---|---|---|
+    | 11a | `#b2a99e` 54.8, `#6a6054` 36.7, `#524c3e` 31.5 | 0 | 20.6 |
+    | 11b | `#9f9c94` 53.8, `#ada79e` 53.8, `#2d2c22` 17.0 | 0 | 0.9 |
+    | 11c | `#9a8d7c` 56.9, `#c7bbab` 33.7, `#2f2e2b` 10.1 | 0 | 16.9 |
+    | 11d | `#a3a39b` 51.4, `#56544a` 19.6, `#37352b` 28.6 | 0 | 5.2 |
+
+    4K is within 1 point.
+  - **Particles:** max 3 783; scene 11 peak 2 139, B 3 152.
+  - **Perf, default text** (`taskset -c 0-7`, load 3–5): 4K p99 3.24 ms, max 7.6–8.3 ms (the rebuild tick at 64.000 s), 0 over 8.3, longest run 0 or 1; 1080p p99 0.76 ms, max 2.22 ms. Slowest ticks: the first and the rebuild render, then the cuts (6, 35, 25, 16, 54, 51.5, 45: 4.4–5.5 ms at 4K). No perf fallback was needed for the default text. 4K stress (10 s): p99 5.80 ms (t1_4: 10.68).
+  - **Perf, full 4K grid of `A`** (18 358 glyph cells):
+    - effect tick in the branding: p50 2.6 ms, max 3.9 ms (before the fixes p50 8.6, max 16.4; the rank tick was 22 ms);
+    - overlay bench, 3 runs at load 3.5–4: two passed (p99 5.60 / 4.72, max 9.81 / 8.57 at the rebuild tick, 1 over, run 1);
+    - one did not (p99 7.36, max 14.53 at 62.66 s, 26 over, run 4) at the loop fade start, where every cell changes plus the dissolving glyphs.
+    - 1080p full grid: p99 1.78 ms, max 3.36 ms.
+  - **Smoke runs:** `make headless EFFECT=starship FRAMES=7800`: `non_space=4800`. The CLI determinism `cmp` is identical. In a tmux 137×34 pane, `--anchor-text c` shows the box and "omarchy" in hold.
+- **Deviations from plan:**
+  - **Reveal timing:** fades 0.33 s (B = 7 handoff states keep blend steps ≤ 48); starts in [58.0, 59.13]; dissolves in [62.5, 63.37], all done by 63.70.
+  - **Plates:** the full cap is applied in every glyph state, with the cap "weight" carried by the `▀` blend. Plates are stepped simulation state from a still, particle-free branding scene (review). G anchors on 11d/smoke tones only.
+  - **Tower settle:** its height is derived from ttfx's eased curve at x = 1e-3, about 0.449 (the solver uses a lower linear slope below 1e-4).
+  - **Tests:** `events_step_smoothly` gives the tower windows a 5 % changed-fraction floor (a textured lattice moving at sub-pixel speed). The fade test's handoff allowance is 48 + 2 × the cell's own scene change. A `▀` ↔ glyph switch requires a flat neighbour and a plate step ≤ 48, not exact plate equality. The `round(p·last)` mutation is caught by `glyph_state_index_is_tick_aligned`.
+  - **Distinct-visuals assertion:** the ceiling test asserts `|P|² + glyph pairs`. The engine's per-symbol defaults are measured (peak and model) but not counted directly: ttfx has no pool-size accessor, and the engine is not modified.
+  - **Palette trims:** greys stay 16 (trimming them broke the 1→2 fade endpoint). Trimmed instead: S1 none; S2 `3b6187→4f6271` 6, `3b6187→7b8894` 6, `7b8894→4f6271` 4, `d0b3bd→a692a0` 4; S3 three ramps 8 → 6; S6 `0e448a→477db9` 5.
+- **Issues encountered:** the full-grid overflow first measured 65.69 MB at |P| 332 (engine cost: a 16.4 MB build plus 18 k default visuals); trimming P to 317 gives 62.87. The review findings are listed under Post-Review Changes.
+- **Key decisions:**
+  - one combined budget (engine defaults + glyph appearances), so the bound is a constant for any input;
+  - `▀` handoff states cost no memory;
+  - the plate is simulation state, which keeps seeks exact;
+  - the storyboard is the spec, and every deviation is written into §2.9/§3.
+- **Upstream defects identified:** None
+- **Notes for sibling tasks:**
+  - t2 (the manual on-monitor check) is still outstanding.
+  - `make try` needs `--anchor-text c` to show the branding centred as the screensaver does.
+  - `SSAVER_BENCH_TEXT=<file>` benches any input.
+  - The palette has 3 entries of headroom under `P_CAP` 320 (overflow ceiling 62.87 MB of 64).
