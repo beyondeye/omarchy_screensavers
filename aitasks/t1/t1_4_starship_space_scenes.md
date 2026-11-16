@@ -129,3 +129,5 @@ palettes from the storyboard.
 > |   every-cell-changes stress). On this hybrid CPU, pin with `taskset -c 0-7` and compare runs
 > |   taken under the same load. render_delta now redraws only changed cells, so raster cost
 > |   follows the changed-cell count.
+
+> **👁 note:read** id=2026-11-16T06:31:30Z.5f38a5605324a0769f1ace64 by=t1_4 at=2026-11-16T06:31:30Z mode=explicit ids=2026-11-15T15:48:57Z.042e2e6a3e9221e4c46ede17,2026-11-15T21:30:55Z.e97b1b44bef5fcb5b996b58b
