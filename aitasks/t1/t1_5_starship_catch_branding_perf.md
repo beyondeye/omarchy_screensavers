@@ -154,3 +154,28 @@ engine only. No frame-derived data.
 > |   passes with scenes 1–3 (p99 about 2.4 ms unpinned). The every-cell-changes stress
 > |   (`TTFX_STARSHIP_STRESS=1`) still misses p99 at 4K, as an accepted exception. On this hybrid
 > |   CPU, pin with `taskset -c 0-7` and compare runs taken under the same load.
+
+> **✉ note:t1_4** id=2026-11-16T11:25:59Z.6b90052ecc467edafa194176 from=t1_4 from_verified=yes at=2026-11-16T11:25:59Z base=6a3162487b481f6c84ffe916dbc432dd221eb52c base_branch=main dirty=yes host=omg16
+>
+> | Advisory, from t1_4 (starship space scenes), as of commit 6a31624 (ttfx 7b8f9a4).
+> | The full record is the archived plan aiplans/archived/p1/p1_4_starship_space_scenes.md
+> | ("Notes for sibling tasks"). It updates t1_3's note:
+> | 
+> | - Palette budget is now |P| = 338 of P_CAP = 340: 2 entries left, not ~23. t1_4 already
+> |   shrank the coverage cube from 4x4x4 to 3x3x3 to fit the space ramps. Scene 11 and the
+> |   branding ramps need room: the 3x3x3 cube (27 entries) is the last obvious prune, otherwise
+> |   trim ramp steps. starship_pool_ceiling now measures 59.81 MB of 64 (it was 55.7), so the
+> |   branding text appearances have less memory headroom than t1_3's note assumed.
+> | - Signature "near" (RGB distance <= 48) overlaps: before choosing a scene's tones, check the
+> |   pairwise distances of its signature colours. Any tone within 48 of two of them counts for
+> |   both (e.g. #0d0e15/#1f2636/#313a56 and #110d16/#2d2633 were all mutually "near").
+> | - At 1080p the 0.03 H hex tiles are about 2 px, so almost every hull pixel is a seam pixel.
+> |   space::tiled_hull takes two seam tones, and those decide how a hull counts.
+> | - Geometry: use space::circle_through (it returns the radius actually used) or
+> |   space::arc_by_depth for circles defined by points, and test on the ASPECTS list in
+> |   tests/starship.rs (it includes a 274x33 ultrawide).
+> | - Shared helpers: space::glare(.., solid, ..) gives blown-out light sources;
+> |   World::spawn_area handles area emitters; Starship::world() plus a scene's draw_opts gives
+> |   with/without render diffs.
+> | - Perf: scene cuts are the slowest ticks (full-frame change, about 5-6.5 ms at 4K pinned
+> |   under load). Also, p1_5's "FRAMES=7320" is stale: the headless smoke run is FRAMES=7800.
