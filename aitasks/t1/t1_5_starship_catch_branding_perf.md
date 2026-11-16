@@ -1,5 +1,7 @@
 ---
 priority: medium
+risk_code_health: low
+risk_goal_achievement: medium
 effort: high
 depends: [t1_4]
 issue_type: feature
@@ -192,3 +194,5 @@ engine only. No frame-derived data.
 <!-- Appended by the gate framework. Do not edit by hand; use `./.aitask-scripts/aitask_gate.sh append` for corrections. -->
 
 > **✅ gate:plan_approved** run=2026-11-16T15:10:01Z status=pass attempt=1 type=human
+
+> **✅ gate:review_approved** run=2026-11-16T20:31:52Z status=pass attempt=1 type=human
