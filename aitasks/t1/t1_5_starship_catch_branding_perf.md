@@ -12,8 +12,9 @@ active_gates_profile: fast
 active_gates_digest: 5892c63ff1b4.681bafac2cb9.d73bba2fc21f
 assigned_to: dario-e@beyond-eye.com
 anchor: 1
+implemented_with: claudecode/opus5_5
 created_at: 2026-11-15 09:59
-updated_at: 2026-11-16 13:42
+updated_at: 2026-11-16 17:10
 ---
 
 ## Context
@@ -186,3 +187,8 @@ engine only. No frame-derived data.
 > |   under load). Also, p1_5's "FRAMES=7320" is stale: the headless smoke run is FRAMES=7800.
 
 > **👁 note:read** id=2026-11-16T11:42:32Z.022e185aac42343e73377c73 by=t1_5 at=2026-11-16T11:42:32Z mode=explicit ids=2026-11-15T10:59:06Z.565a39e63339669b80dded5a,2026-11-15T15:48:59Z.31534e50e3b6564f0e143dc9,2026-11-15T21:30:57Z.378ae362617f8f2289dc93d3,2026-11-16T11:25:59Z.6b90052ecc467edafa194176
+
+## Gate Runs
+<!-- Appended by the gate framework. Do not edit by hand; use `./.aitask-scripts/aitask_gate.sh append` for corrections. -->
+
+> **✅ gate:plan_approved** run=2026-11-16T15:10:01Z status=pass attempt=1 type=human
