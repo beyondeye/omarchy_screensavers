@@ -51,3 +51,23 @@ What to decide:
 Done when: the design is written up (aidocs/), and either implemented with the existing ttfx
 test suite + starship tests green and the ceiling test re-run, or explicitly rejected with
 reasons.
+
+## Inbox
+<!-- Appended by the note framework. Do not edit by hand; use `./ait note`. -->
+
+> **✉ note:t1_5** id=2026-11-16T20:32:56Z.72f1f1241b8868a41108d1fd from=t1_5 from_verified=yes at=2026-11-16T20:32:56Z base=ab2945c2571cd1cb1859def47a6922ea853963c5 base_branch=main dirty=yes host=omg16
+>
+> | Advisory, from t1_5, as of ttfx 228fd59. Numbers relevant to the engine-side visual-pool fix:
+> | 
+> | - The engine interns a default CharacterVisual per distinct input symbol (Animation::new ->
+> |   CharacterVisual::interned, engine/animation.rs:594-605). A 4K grid filled with 18 358 distinct
+> |   symbols measures 62.87 MB of the 64 MB gate (build 16.7 MB; P x P at |P| = 317), with no
+> |   effect-side glyphs at all. starship therefore counts these defaults in its text budget
+> |   (text.rs SYMBOL_BUDGET = 10 240, combined with the glyph appearances).
+> | - starship now emits glyph cells (the input's own symbols) with colours from fixed per-tier
+> |   sets, plus a second visual cache keyed by (symbol, fg, bg). Like the existing per-pair cache,
+> |   it holds only pointers the engine already interned, and it works around set_appearance's
+> |   4096-slot memo at heavy churn.
+> | - palette: |P| = 317 (cap 320; the cube and the placeholder were removed). The ceiling test is
+> |   now a fresh-process case runner (tests/starship_pool_ceiling.rs, 5 cases) and could serve as
+> |   the harness for measuring an engine fix.
