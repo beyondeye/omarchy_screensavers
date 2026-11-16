@@ -283,3 +283,51 @@ Step 9 (Post-Implementation): archive via the workflow.
 - timing: pre-phase | name: palette_budget | type: chore | priority: high | effort: low | inline_risk: low | added_complexity: low | addresses: palette headroom; scene 1–3 drift; memory ceiling | desc: shrink the coverage cube to 3 levels, add the space-scene ramps, and pass the palette-error, scene 1–3 signature and starship_pool_ceiling (≤ 64 MB) tests before writing scenes
 - timing: post-phase | name: perf_gate_4k | type: test | priority: medium | effort: low | inline_risk: low | added_complexity: low | addresses: 120 Hz stutter at 4K | desc: pinned idle-machine make perf at 4K/1080p with slow ticks attributed to scenes; contingency pixel-quantised shake / 30 Hz bloom redraw
 - timing: post-phase | name: frame_data_guard | type: chore | priority: medium | effort: low | inline_risk: low | added_complexity: low | addresses: frame-derived data leaking into commits | desc: grep the staged diff for large literals and confirm .refs/ is ignored before each commit
+
+## Post-Review Changes
+
+### Change Request 1 (2026-11-16 12:50)
+- **Requested by user:** (1) scene 9's sun sat inside the Earth disc (signed distance −0.106 H at 1080p), against storyboard §2.7 and the reference: put it in black space and add a positional check; (2) scene 10's top limb used a fixed 0.29 H radius, and on a 274×33 ultrawide (A = 3.633) the chord exceeds the diameter, so `space::circle_through` silently clamped and drew arc pixels down to v ≈ 0.2: derive the circle from the aspect and the arc depth, and cover an ultrawide grid.
+- **Changes made:**
+  - `space::circle_through` now returns the radius it used (`max(r, half chord)`), so it always passes through both points; new `space::arc_by_depth` derives the radius from the chord and the dip.
+  - Scene 9: the Earth's edge is the storyboard's (0.68, 0) → (0.40, 0.82), radius 1.5 H, centre left (`over_earth::earth(aspect)`); the sun is 0.36 H outside it at 1080p. The larger black-space area was retuned: a plum airglow along the edge (`#352d3d` → `#191421` → `#0d0e15`), lit tiles `#352d3d` and seams `#2d2633`/`#3d3446` (tones on the far side of `#2d2633` from `#110d16`), and a solid sun core. One palette ramp added (`#2d2633→#3d3446`, 3 steps): |P| 336 → 338, ceiling 59.81 MB.
+  - Scene 10: `seco::limb_arc(aspect)` via `arc_by_depth` (ends (0.42, 0)/(0.60, 0), dip 0.05 H).
+  - Tests: `ship_over_earth_sun_is_in_space` and `seco_limb_arc_holds_on_any_aspect` over five aspects (100×33, 182×45, 274×67, 137×33, 274×33), the latter with a render probe on the 274×33 grid; mutation-checked (the old construction gives 10 stray limb pixels).
+- **Files affected:** `ttfx/src/effects/starship/scenes/{space,over_earth,seco,hot_staging}.rs`, `ttfx/src/effects/starship/palette.rs`, `ttfx/tests/starship.rs`.
+
+## Final Implementation Notes
+- **Actual work done:**
+  - `ttfx/src/effects/starship/scenes/`: `high_altitude.rs` (4), `hot_staging.rs` (5: vapour burst, the falling booster with `booster(t, aspect)` and the `draw_opts` hook, ice flakes, shared framing constants), `coast.rs` (6), `over_earth.rs` (9: `earth(aspect)`, `SUN_AT`, `SUN_CORE_R`), `seco.rs` (10: `bloom(t)`, `star_alpha(t)`, `limb_arc(aspect)`), and `space.rs` (shared: `world_of`, `circle_through` (returns the radius used), `arc_by_depth`, `limb`, `glare` (optional solid core), `spikes`, `tiled_hull` (alternating seam tones), `star`/`star_luma`/`stars`).
+  - `scenes/mod.rs`: 8 new slots (`SLOTS = 16`), `World::spawn_area` (draws u, v for every due spawn, also on a full pool), dispatch arms. `onboard.rs`: `inside`/`to_px`/`on_seam` are `pub(super)`; `on_seam` takes the grid height (no per-tick probe buffer).
+  - `palette.rs`: coverage cube 4 → 3 levels; `RAMPS_S4/S5/S6/S9/S10` in `ALL_RAMPS`. |P| 317 → 338 (cap 340).
+  - `mod.rs`: read-only `Starship::world()` test hook.
+  - `tests/starship.rs`: 6 signature rows (all 11 at 1080p; 1a/3/5/9/10b at 4K); `PLACEHOLDER_SCENES = [S11, B]`; cut/pool-clear/motion lists extended; new `particle_budget_holds`, `booster_falls_away`, `seco_stars_and_bloom`, `events_step_smoothly`, `ship_over_earth_sun_is_in_space`, `seco_limb_arc_holds_on_any_aspect`; space-scene overlay pairs in `palette_error_synthetic`; `calibrate_distances` boundaries. 33 tests + 3 ignored dev aids, about 5 s in release.
+  - Workspace: storyboard §2.5 booster motion corrected; `manual_testing.md` lists the scene start times.
+- **Measurements:**
+  - Palette (pre-phase): |P| 336 → 338 after review; `starship_pool_ceiling` 59.40 → **59.81 MB ≤ 64** (model ratio 1.022, regrowth 0 bytes). Palette error synthetic mean 4.87 / p99 15.68; real frames (all 11 signature times) mean 3.21 / p99 12.69.
+  - Signatures (1080p, seed 1): 4: `#0d1725` 98.5 / `#392d3a` 22.6, bright 0.1; 5: 25.5 / 32.0 / 27.3, nb 15.3, bright 2.3; 6: 31.9 / 31.4 / 12.9, nb 17.1, bright 2.9; 9: 47.4 / 45.2 / 7.4 / 2.3, nb 25.0, bright 7.2; 10a: 59.3, nb 59.3, bright 3.7; 10b: 38.6 / 40.9, nb 33.9, bright 3.4. 4K within ~0.5 points.
+  - Particles: max live 3 783 (< 5 000, no drops); scene 5 peak 2 715, scene 10 peak 3 132.
+  - `events_step_smoothly` (120 fps): burst 25.95–26.6 worst step 9.27 (limit 12; the storyboard's 0.012 H shake at peak velocity), booster 3.83, bloom start 0.56.
+  - Perf (`taskset -c 0-7`, machine under unrelated load 6–14): 4K timeline p99 3.05 ms / max 7.78 ms, 0 over 8.3 (load 9); after review p99 4.20 / max 9.07, 2 isolated ticks over (the full first renders at 0 s and 64 s), longest run 1 (load 13.9). 1080p p99 2.33 / max 4.99, 0 over. Slowest space-scene ticks are the cuts at 25/35/39 (~5–6.5 ms). Stress 4K unchanged (p99 10.68, the kept exception). **No perf fallback was needed**, so the playback-rate inspection step did not apply.
+  - `make headless EFFECT=starship FRAMES=7800`: `non_space=4800`. `make try --start-at 22` in a 137×33 tmux pane: all 4521 cells `▀`, no magenta until scene 11 (45 s).
+- **Deviations from plan:**
+  - Layouts follow the reference frames where the storyboard prose and the signatures disagree (scratch block-classification maps of `.refs/` frames; nothing derived was committed): scene 5's upper hull is in deep shadow (`#030509 → #1f2636`) and its lit tiles are `#414550`; scene 6 uses `#414550` tiles with alternating `#070b15`/`#2a2f3f` seams and a smaller shadow; scene 10's hull is the reference's upper-left block (not scene 5's shape), which leaves the black the 39.6 signature needs.
+  - Scene 4's glow is a wide 0.46 × 0.40 H radial around the engine (the reference's dim halo), not a narrow plume only.
+  - Scene 6's glare is a 0.24 H halo with a 0.12 H blown-out core, plus a hull glint at (0.06, 0.68) (the reference's bright pixels); scene 5's and 9's suns also got solid cores.
+  - Flakes (scenes 5, 6) are drawn at 45 % alpha: at the storyboard's counts (peaks 400/750) full-opacity flakes read as a snowstorm.
+  - Booster: end speed 0.75 H/s (storyboard corrected); rotation and shrink follow the distance fallen (time-based shrink made the far corners rise while it fell slowly).
+  - Burst: alpha eases in over 0.12 s; shake amplitude ramps 0.003 ↔ 0.012 H over 0.05/0.1 s instead of stepping.
+  - SECO haze builds up over 2.5 s (radius per the storyboard's bezier) so 39.6 stays mostly black; stars are drawn under the haze (the blend is the "1 − haze alpha" weighting).
+  - `events_step_smoothly` allows the changed fraction up to 3 × median + 2 % (an absolute floor so a near-static window is not flagged).
+- **Issues encountered:**
+  - `#0d0e15`, `#1f2636` and `#313a56` (and `#110d16`/`#2d2633`) are all within the 48 "near" threshold of each other, so hull tones had to be chosen on the far side of the shared colours; at 1080p the 0.03 H hex tiles are ~2 px and almost every hull pixel is a seam, so seam tones decide a hull's class.
+  - Review round 1 (both confirmed and fixed, see Post-Review Changes): scene 9's sun inside the Earth; scene 10's fixed-radius limb arc clamped on ultrawide grids.
+- **Key decisions:** the storyboard is the spec where the task body disagrees (blue-white burst, faint stars); signatures are tuned to the reference frames' measured layout; one shared `space.rs` for the space scenes; every geometric circle goes through `circle_through`/`arc_by_depth`, which never miss their endpoints.
+- **Upstream defects identified:** None
+- **Notes for sibling tasks (t1_5):**
+  - **Palette:** |P| = 338 of `P_CAP = 340`: only 2 entries of headroom. Scene 11 and the branding ramps will need room: the 3×3×3 cube (27) is the last obvious prune, or trim ramp steps; the branding text appearances add to the ceiling as noted in p1_3. Re-run `starship_pool_ceiling` (59.81 MB now) and `palette_error_*`.
+  - **"Near" overlaps:** before choosing a scene's tones, check the pairwise distances of its signature colours; any tone within 48 of two of them counts for both. The scratch block-map approach (classify `.refs/` frames by signature colour) was the fastest way to see the layout.
+  - **Tiles:** at 1080p the hex tiles are mostly seam pixels; use `space::tiled_hull` with two seam tones to steer a hull's class.
+  - **Geometry:** use `space::circle_through` (returns the radius used) or `space::arc_by_depth` for any circle defined by points; test geometry on the `ASPECTS` list in `tests/starship.rs` (includes 274×33 ultrawide).
+  - **Shared helpers:** `space::glare(.., solid, ..)` for blown-out light sources; `World::spawn_area` for area emitters; `Starship::world()` + a scene's `draw_opts` pattern for with/without render diffs.
+  - **Perf:** scene cuts are the slowest ticks (full-frame change, ~5–6.5 ms at 4K); the burst shake changes ~11 % of pixels per tick at 120 fps.
