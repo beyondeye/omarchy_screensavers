@@ -1,0 +1,75 @@
+{
+  "schema": 1,
+  "models": {
+    "opus4_7": {
+      "verifiedstats": {}
+    },
+    "opus4_7_1m": {
+      "verifiedstats": {}
+    },
+    "opus4_8": {
+      "verifiedstats": {}
+    },
+    "opus4_8_1m": {
+      "verifiedstats": {}
+    },
+    "fable5": {
+      "verifiedstats": {}
+    },
+    "opus5": {
+      "verifiedstats": {}
+    },
+    "sonnet5": {
+      "verifiedstats": {}
+    },
+    "fable5_1": {
+      "verifiedstats": {}
+    },
+    "opus5_1m": {
+      "verifiedstats": {}
+    },
+    "opus5_5": {
+      "usagestats": {
+        "pick": {
+          "all_time": {
+            "runs": 5
+          },
+          "prev_month": {
+            "period": "",
+            "runs": 0
+          },
+          "month": {
+            "period": "2026-11",
+            "runs": 5
+          },
+          "week": {
+            "period": "2026-W47",
+            "runs": 2
+          }
+        }
+      },
+      "verifiedstats": {}
+    },
+    "opus5_5_1m": {
+      "verifiedstats": {}
+    },
+    "sonnet5_5": {
+      "verifiedstats": {}
+    },
+    "sonnet5_5_1m": {
+      "verifiedstats": {}
+    },
+    "haiku5_5": {
+      "verifiedstats": {}
+    },
+    "haiku5_5_1m": {
+      "verifiedstats": {}
+    },
+    "fable5_2": {
+      "verifiedstats": {}
+    },
+    "fable5_2_1m": {
+      "verifiedstats": {}
+    }
+  }
+}
