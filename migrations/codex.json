@@ -1,0 +1,10 @@
+{
+  "schema": 1,
+  "agent": "codex",
+  "migration_id": "5e91b7f3a1274ab2b142ca3973c1cb45",
+  "strip_commit": "a8cca718aa861966e2ee179ef1f47e1472d6ebb1",
+  "source_commit": "439a867005a83b69741bd863e4bf20cbe6f455cd",
+  "source_blob": "f259daa66cb619e0173be40d259d7082bffec872",
+  "absorbed_runs": 0,
+  "absorbed_at": "2026-11-17T23:50:05Z"
+}

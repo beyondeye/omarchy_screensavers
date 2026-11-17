@@ -1,0 +1,47 @@
+{
+  "schema": 1,
+  "models": {
+    "gpt5_6_sol": {
+      "verifiedstats": {}
+    },
+    "gpt5_6_terra": {
+      "verifiedstats": {}
+    },
+    "gpt5_6_luna": {
+      "verifiedstats": {}
+    },
+    "gpt5_5": {
+      "verifiedstats": {}
+    },
+    "gpt5_4": {
+      "verifiedstats": {}
+    },
+    "gpt5_4_mini": {
+      "verifiedstats": {}
+    },
+    "gpt5_3codex": {
+      "verifiedstats": {}
+    },
+    "gpt5_3codex_spark": {
+      "verifiedstats": {}
+    },
+    "gpt5_2": {
+      "verifiedstats": {}
+    },
+    "gpt6_sol": {
+      "verifiedstats": {}
+    },
+    "gpt6_luna": {
+      "verifiedstats": {}
+    },
+    "gpt6_1_sol": {
+      "verifiedstats": {}
+    },
+    "gpt6_1_terra": {
+      "verifiedstats": {}
+    },
+    "gpt6_astra": {
+      "verifiedstats": {}
+    }
+  }
+}
